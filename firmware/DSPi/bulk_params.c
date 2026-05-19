@@ -13,6 +13,7 @@
 #include "config.h"
 #include "audio_input.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "usb_audio.h"
 #include "crossfeed.h"
 #include "leveller.h"
@@ -223,6 +224,29 @@ void bulk_params_collect(WireBulkParams *out) {
         dac_hw_mute_get_config(&hw);
         memcpy(&out->dac_hw_mute, &hw, sizeof(out->dac_hw_mute));
     }
+
+    // Crossover bands (V11+).  Mirror PEQ's per-band copy but with the
+    // crossover-side recipe array.  Master rows (channel < CH_OUT_1) are
+    // zeroed: crossovers are an output-channel-only feature, and emitting
+    // their live state on master rows would mislead the host into thinking
+    // crossover bands exist for inputs.
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+        bool is_master = (ch < CH_OUT_1);
+        for (int b = 0; b < MAX_XOVER_BANDS; b++) {
+            WireBandParams *wb = &out->crossovers.bands[ch][b];
+            if (is_master) {
+                memset(wb, 0, sizeof(*wb));
+                continue;
+            }
+            wb->type    = xover_recipes[ch][b].type;
+            wb->bypass  = (xover_recipes[ch][b].bypass == 1) ? 1 : 0;
+            wb->reserved[0] = 0;
+            wb->reserved[1] = 0;
+            wb->freq    = xover_recipes[ch][b].freq;
+            wb->q       = xover_recipes[ch][b].Q;
+            wb->gain_db = xover_recipes[ch][b].gain_db;
+        }
+    }
 }
 
 // ============================================================================
@@ -247,25 +271,17 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         return -3;
     if (in->header.num_output_channels != NUM_OUTPUT_CHANNELS)
         return -3;
-    // Accept payload sizes from V2 through current.
-    // V2: no I2S/leveller/preamp/master/input/lg_sound_sync/user_volume/dac_hw_mute.
-    // V3-V5: no preamp/master/input/lg_sound_sync/user_volume/dac_hw_mute.
-    // V6: no input/lg_sound_sync/user_volume/dac_hw_mute.
-    // V7: no lg_sound_sync/user_volume/dac_hw_mute.
-    // V8: no user_volume/dac_hw_mute.  V9: no dac_hw_mute.  V10: current full size.
-    // The lower bound is shared with the dispatcher gate via WIRE_BULK_PARAMS_MIN_SIZE
-    // in bulk_params.h (== v2_size); per-section locals below are kept for the
-    // defense-in-depth size checks each section uses to refuse a short payload
-    // that claims a newer format_version.
-    uint16_t v9_size = sizeof(WireBulkParams) - sizeof(WireDacHwMute);
-    uint16_t v8_size = v9_size - sizeof(WireUserVolume);
-    uint16_t v7_size = v8_size - sizeof(WireLgSoundSync);
-    uint16_t v6_size = v7_size - sizeof(WireInputConfig);
-    uint16_t v5_size = v6_size - sizeof(WirePreampConfig) - sizeof(WireMasterVolume);
-    (void)v7_size; (void)v6_size;  // Currently only v5_size, v8_size, v9_size are referenced
-                                    // by apply gates below; keep the chain for documentation.
+    // Per-version payload size anchors are defined in bulk_params.h. Each
+    // legacy-section gate below MUST compare against its own version's
+    // anchor — NOT against sizeof(WireBulkParams), which grows whenever a
+    // new section is appended and would silently exclude older payloads
+    // from sections they actually carry (e.g. before this rebase, V10
+    // DAC-hw-mute was gated on sizeof(WireBulkParams), so adding V11
+    // crossover would have made V10 payloads stop applying their DAC
+    // tail).  When you add a new section, also add a new V{N}_SIZE
+    // anchor in bulk_params.h and use it for that section's gate here.
     if (in->header.payload_length < WIRE_BULK_PARAMS_MIN_SIZE ||
-        in->header.payload_length > sizeof(WireBulkParams))
+        in->header.payload_length > WIRE_BULK_PARAMS_V11_SIZE)
         return -4;
 
     // Bracket the wholesale state rewrite.  Per-field writes are suppressed
@@ -396,9 +412,12 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         channel_names[ch][PRESET_NAME_LEN - 1] = '\0';  // Enforce NUL termination
     }
 
-    // I2S configuration (V3+ payloads — V2 payloads skip this)
+    // I2S configuration (V3+ payloads — V2 payloads skip this).  Gate uses
+    // V5 anchor because the V3/V4/V5 in-place reinterpretation of
+    // mck_multiplier doesn't change the section's byte position; any
+    // payload claiming >= V3 with the full V5 tail can apply this block.
     if (in->header.format_version >= 3 &&
-        in->header.payload_length >= v5_size) {
+        in->header.payload_length >= WIRE_BULK_PARAMS_V5_SIZE) {
         extern uint8_t output_types[];
         extern uint8_t i2s_bck_pin;
         extern uint8_t i2s_mck_pin;
@@ -497,7 +516,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // away from being relaxed (e.g. for forward-compat smaller V8s),
     // so guard here too.  Keeps the apply contract self-defending.
     if (in->header.format_version >= 8 &&
-        in->header.payload_length >= v8_size) {
+        in->header.payload_length >= WIRE_BULK_PARAMS_V8_SIZE) {
         lg_sound_sync_set_enabled(in->lg_sound_sync.enabled != 0);
     }
 
@@ -507,7 +526,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // invalidated).  user_mute is a plain bool so the apply is just a
     // store + notify_param_write, suppressed by the bulk bracket.
     if (in->header.format_version >= 9 &&
-        in->header.payload_length >= v9_size) {
+        in->header.payload_length >= WIRE_BULK_PARAMS_V9_SIZE) {
         update_user_volume(in->user_volume.user_volume_db);
         user_mute = (in->user_volume.user_mute != 0);
         uint8_t mv = user_mute ? 1 : 0;
@@ -524,12 +543,39 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // can.  Bulk SETs that include a dac_hw_mute section that fails
     // validation leave the previous config in place.
     if (in->header.format_version >= 10 &&
-        in->header.payload_length >= sizeof(WireBulkParams)) {
+        in->header.payload_length >= WIRE_BULK_PARAMS_V10_SIZE) {
         DacHwMuteConfig hw;
         _Static_assert(sizeof(hw) == sizeof(in->dac_hw_mute),
                        "WireDacHwMute and DacHwMuteConfig must match");
         memcpy(&hw, &in->dac_hw_mute, sizeof(hw));
         (void)dac_hw_mute_set_config(&hw);
+    }
+
+    // Crossover bands (V11+).  V<11 payloads leave current crossover state
+    // untouched — an older host couldn't possibly intend to clobber a
+    // feature it doesn't know exists.  Output rows applied; master rows
+    // skipped (crossover is output-channel-only).  Band-field is always
+    // overwritten with the wire index `MAX_BANDS + i` so a stale local
+    // index in the payload cannot trigger the live-edit misrouting bug
+    // described in crossover_filters_spec.md.
+    if (in->header.format_version >= 11 &&
+        in->header.payload_length >= WIRE_BULK_PARAMS_V11_SIZE) {
+        for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+            if (ch < CH_OUT_1) continue;   // Master rows: skip
+            for (int b = 0; b < MAX_XOVER_BANDS; b++) {
+                const WireBandParams *wb = &in->crossovers.bands[ch][b];
+                xover_recipes[ch][b].channel = (uint8_t)ch;
+                xover_recipes[ch][b].band    = (uint8_t)(MAX_BANDS + b);
+                xover_recipes[ch][b].type    = wb->type;
+                xover_recipes[ch][b].bypass  = (wb->bypass == 1) ? 1 : 0;
+                xover_recipes[ch][b].freq    = wb->freq;
+                xover_recipes[ch][b].Q       = wb->q;
+                xover_recipes[ch][b].gain_db = wb->gain_db;
+            }
+        }
+        // Caller is responsible for invoking dsp_recalculate_all_filters()
+        // after this returns; that path rebuilds every crossover section
+        // alongside the PEQ filters.
     }
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).

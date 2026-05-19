@@ -29,7 +29,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      10   // V10: + WireDacHwMute (DAC hardware mute pin config)
+#define WIRE_FORMAT_VERSION      11   // V11: + WireCrossoverConfig (per-channel crossover bands)
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -255,6 +255,30 @@ typedef struct __attribute__((packed)) {
 } WireDacHwMute;                     // 16 bytes
 
 // ============================================================================
+// Section 19: Crossover Bands (704 bytes) — V11+
+// ============================================================================
+//
+// Per-channel crossover bands, layout exactly mirrors `eq[][]` but with
+// MAX_XOVER_BANDS columns (4 vs 12 for EQ).  Wire band indices for crossover
+// are MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 (12..15) when addressed via
+// vendor commands — see Documentation/Features/crossover_filters_spec.md.
+// `band` field in WireBandParams (which the legacy EQ section also doesn't
+// carry) is implicit in the section's array position; row index = channel,
+// column index = local crossover-band index (0..3).
+//
+// `q` and `gain_db` are unused for crossover filter types (any value in the
+// FILTER_XOVER_FIRST..FILTER_XOVER_LAST range) — the design code ignores
+// them — but they exist in the struct for wire-format parity with EQ.
+// Master rows (channel 0..1, the CH_MASTER_* slots) are zeroed on collect
+// and skipped on apply because crossovers are an output-channel-only
+// feature; storage symmetry with EQ is a UI convenience, not a usable slot.
+#define WIRE_MAX_XOVER_BANDS  4   // == MAX_XOVER_BANDS
+
+typedef struct __attribute__((packed)) {
+    WireBandParams bands[WIRE_MAX_CHANNELS][WIRE_MAX_XOVER_BANDS];  // 11 × 4 × 16 = 704
+} WireCrossoverConfig;                                              // 704 bytes
+
+// ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
@@ -276,26 +300,39 @@ typedef struct __attribute__((packed)) {
     WireLgSoundSync     lg_sound_sync;                                     //   16
     WireUserVolume      user_volume;                                       //   16
     WireDacHwMute       dac_hw_mute;                                       //   16
-} WireBulkParams;                    // Total: 2960 bytes (V10)
+    WireCrossoverConfig crossovers;                                        //  704
+} WireBulkParams;                    // Total: 3664 bytes (V11)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
-// Smallest bulk SET payload accepted — corresponds to V2 (pre-I2S, pre-leveller,
-// pre-preamp, pre-master, pre-input, pre-LG, pre-user-volume).  Kept in lockstep
-// with the size-compat chain inside bulk_params_apply(): every section appended
-// after V2 shows up as a subtraction here.  The dispatcher gate (vendor_commands.c
-// REQ_SET_ALL_PARAMS branch) and the apply path's lower bound must agree on this
-// number, so it lives in the header rather than being recomputed in two places.
-#define WIRE_BULK_PARAMS_MIN_SIZE \
-    (sizeof(WireBulkParams)            \
-     - sizeof(WireDacHwMute)           \
-     - sizeof(WireUserVolume)          \
-     - sizeof(WireLgSoundSync)         \
-     - sizeof(WireInputConfig)         \
-     - sizeof(WirePreampConfig)        \
-     - sizeof(WireMasterVolume)        \
-     - sizeof(WireI2SConfig)           \
-     - sizeof(WireLevellerConfig))
+// Per-version size anchors.  CRITICAL: legacy section gates inside
+// bulk_params_apply() compare payload_length against THESE constants, NOT
+// against sizeof(WireBulkParams) — the latter is the size of the CURRENT
+// (V11) layout, which would silently lock out V10-and-older payloads from
+// the very feature they own (DAC hardware mute for V10, etc.).  Each entry
+// below is computed by subtracting the tail sections added after that
+// version, starting from the current sizeof().  When a new version is
+// added, append its anchor as
+//   #define WIRE_BULK_PARAMS_V{N-1}_SIZE (WIRE_BULK_PARAMS_V{N}_SIZE - sizeof(WireFooConfig))
+// and chain older anchors off the new V{N-1}_SIZE.
+#define WIRE_BULK_PARAMS_V11_SIZE   sizeof(WireBulkParams)
+#define WIRE_BULK_PARAMS_V10_SIZE   (WIRE_BULK_PARAMS_V11_SIZE - sizeof(WireCrossoverConfig))
+#define WIRE_BULK_PARAMS_V9_SIZE    (WIRE_BULK_PARAMS_V10_SIZE - sizeof(WireDacHwMute))
+#define WIRE_BULK_PARAMS_V8_SIZE    (WIRE_BULK_PARAMS_V9_SIZE  - sizeof(WireUserVolume))
+#define WIRE_BULK_PARAMS_V7_SIZE    (WIRE_BULK_PARAMS_V8_SIZE  - sizeof(WireLgSoundSync))
+#define WIRE_BULK_PARAMS_V6_SIZE    (WIRE_BULK_PARAMS_V7_SIZE  - sizeof(WireInputConfig))
+#define WIRE_BULK_PARAMS_V5_SIZE    (WIRE_BULK_PARAMS_V6_SIZE  \
+                                     - sizeof(WirePreampConfig) \
+                                     - sizeof(WireMasterVolume))
+#define WIRE_BULK_PARAMS_V4_SIZE    WIRE_BULK_PARAMS_V5_SIZE   /* V4/V5 differ only in field interpretation */
+#define WIRE_BULK_PARAMS_V3_SIZE    (WIRE_BULK_PARAMS_V4_SIZE - sizeof(WireLevellerConfig))
+#define WIRE_BULK_PARAMS_V2_SIZE    (WIRE_BULK_PARAMS_V3_SIZE - sizeof(WireI2SConfig))
+
+// Smallest bulk SET payload accepted — corresponds to V2.  Kept in lockstep
+// with the size-compat chain inside bulk_params_apply().  The dispatcher
+// gate (vendor_commands.c REQ_SET_ALL_PARAMS branch) and the apply path's
+// lower bound must agree on this number.
+#define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_V2_SIZE
 
 // Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE)
 #define WIRE_BULK_BUF_SIZE     4096

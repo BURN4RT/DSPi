@@ -14,6 +14,7 @@
 #include "audio_input.h"
 #include "config.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "loudness.h"
 #include "crossfeed.h"
 #include "leveller.h"
@@ -379,6 +380,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (!matrix_mixer.outputs[out].enabled) continue;
             if (!matrix_mixer.outputs[out].mute) {
                 uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
                 if (!channel_bypassed[eq_ch]) {
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
                 }
@@ -474,6 +477,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (!matrix_mixer.outputs[out].enabled) continue;
             if (!matrix_mixer.outputs[out].mute) {
                 uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
                 if (!channel_bypassed[eq_ch]) {
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
                 }
@@ -721,6 +726,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (!matrix_mixer.outputs[out].enabled) continue;
             if (!matrix_mixer.outputs[out].mute) {
                 uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
                 if (!is_bypassed && !channel_bypassed[eq_ch])
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
             }
@@ -810,6 +817,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (!matrix_mixer.outputs[out].enabled) continue;
             if (!matrix_mixer.outputs[out].mute) {
                 uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
                 if (!is_bypassed && !channel_bypassed[eq_ch])
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
             }

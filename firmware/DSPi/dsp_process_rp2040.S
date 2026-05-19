@@ -200,6 +200,43 @@ dsp_process_channel:
 // ============================================================================
 
 .section .time_critical.dsp_process_channel_block, "ax"
+
+// ----------------------------------------------------------------------------
+// Crossover-cascade entry point (used by crossover.c).  Shares the inner-loop
+// body with dsp_process_channel_block — only the band-count source differs:
+// here it's the num_sections parameter (r3), there it's looked up from
+// channel_band_counts[channel].  Both entries live in the same section so
+// the shared local labels (.Lblk_band_loop, .Lblk_done) resolve with short
+// PC-relative branches.
+// ----------------------------------------------------------------------------
+.global dsp_process_band_cascade_block
+.type dsp_process_band_cascade_block, %function
+
+// void dsp_process_band_cascade_block(Biquad *sections, int32_t *samples,
+//                                     uint32_t count, uint32_t num_sections)
+// r0: sections pointer (cascade of Biquads)
+// r1: samples pointer
+// r2: sample count
+// r3: num_sections (already in place — no channel_band_counts lookup)
+dsp_process_band_cascade_block:
+    push {r4-r7, lr}
+    mov r4, r8
+    mov r5, r9
+    mov r6, r10
+    mov r7, r11
+    push {r4-r7}
+
+    cmp r3, #0
+    beq .Lblk_done
+
+    // Save loop-invariant values on stack for outer band loop (layout MUST
+    // match the channel entry below: sp+0 = samples, sp+4 = count, sp+8 = bands).
+    push {r1, r2, r3}
+    b .Lblk_band_loop
+
+// ----------------------------------------------------------------------------
+// Channel entry point (existing) — band count from channel_band_counts[ch].
+// ----------------------------------------------------------------------------
 .global dsp_process_channel_block
 .type dsp_process_channel_block, %function
 

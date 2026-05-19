@@ -24,6 +24,7 @@
 #include "lg_sound_sync.h"
 #include "dac_hw_mute.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "flash_clkdiv.h"
 #include "flash_storage.h"
 #include "pico/audio_i2s_multi.h"
@@ -1459,34 +1460,59 @@ int main(void) {
             }
         }
 
-        // Handle EQ parameter updates from USB
+        // Handle EQ / crossover band parameter updates from USB.  The
+        // pending_packet's `band` field is the wire band index (already
+        // normalized at the vendor handler boundary — see
+        // crossover_filters_spec.md):
+        //   0..channel_band_counts-1 → PEQ
+        //   MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 → crossover band (band - MAX_BANDS)
+        // Anything else is invalid and would have been rejected upstream.
         if (eq_update_pending) {
             EqParamPacket p = pending_packet;
             eq_update_pending = false;
-            filter_recipes[p.channel][p.band] = p;
 
-            // Shadow-notify the host of the new band params.  The wire
-            // struct layout (WireBandParams: type, reserved[3], freq, Q, gain_db)
-            // differs from EqParamPacket, so we marshal into a temp.
-            {
+            bool is_xover = (p.band >= MAX_BANDS &&
+                             p.band < (MAX_BANDS + MAX_XOVER_BANDS));
+            uint8_t local = is_xover ? (uint8_t)(p.band - MAX_BANDS) : p.band;
+
+            if (is_xover) {
+                xover_recipes[p.channel][local] = p;
+                // Notification offset points into the WireCrossoverConfig
+                // section, NOT eq[].  Apps receiving PARAM_CHANGED can
+                // distinguish the section by offset; bulk readers see the
+                // same byte position they got from REQ_GET_ALL_PARAMS.
                 WireBandParams wbp;
                 memset(&wbp, 0, sizeof(wbp));
-                wbp.type = (uint8_t)p.type;
-                wbp.bypass = (p.bypass == 1) ? 1 : 0;
-                wbp.freq = p.freq;
-                wbp.q = p.Q;
+                wbp.type    = (uint8_t)p.type;
+                wbp.bypass  = (p.bypass == 1) ? 1 : 0;
+                wbp.freq    = p.freq;
+                wbp.q       = p.Q;
+                wbp.gain_db = p.gain_db;
+                uint16_t off = (uint16_t)(offsetof(WireBulkParams, crossovers)
+                    + offsetof(WireCrossoverConfig, bands)
+                    + ((uint16_t)p.channel * WIRE_MAX_XOVER_BANDS + local) * sizeof(WireBandParams));
+                notify_param_write(off, sizeof(WireBandParams), &wbp);
+            } else {
+                filter_recipes[p.channel][p.band] = p;
+                WireBandParams wbp;
+                memset(&wbp, 0, sizeof(wbp));
+                wbp.type    = (uint8_t)p.type;
+                wbp.bypass  = (p.bypass == 1) ? 1 : 0;
+                wbp.freq    = p.freq;
+                wbp.q       = p.Q;
                 wbp.gain_db = p.gain_db;
                 uint16_t off = (uint16_t)(offsetof(WireBulkParams, eq)
                     + ((uint16_t)p.channel * WIRE_MAX_BANDS + p.band) * sizeof(WireBandParams));
                 notify_param_write(off, sizeof(WireBandParams), &wbp);
             }
 
-            // If updating a Core 1 EQ channel, wait for Core 1 to finish
-            // current work before modifying coefficients
+            // If updating a Core 1 output's channel, wait for Core 1 to
+            // finish current work before modifying coefficients.  Applies
+            // equally to PEQ and crossover — both run on Core 1 for the
+            // same output range when EQ_WORKER mode is active.
             bool is_core1_channel = (p.channel >= (CH_OUT_1 + CORE1_EQ_FIRST_OUTPUT) &&
                                      p.channel <= (CH_OUT_1 + CORE1_EQ_LAST_OUTPUT));
             if (is_core1_channel && core1_mode == CORE1_MODE_EQ_WORKER) {
-                // Spin-wait until Core 1 is idle (work_done or no work dispatched)
                 while (core1_eq_work.work_ready && !core1_eq_work.work_done) {
                     tight_loop_contents();
                 }
@@ -1494,18 +1520,23 @@ int main(void) {
             }
 
             uint32_t flags = save_and_disable_interrupts();
-            dsp_compute_coefficients(&p, &filters[p.channel][p.band], (float)audio_state.freq);
-
-            // Recalculate channel bypass flag
-            bool all_bypassed = true;
-            for (int b = 0; b < channel_band_counts[p.channel]; b++) {
-                if (!filters[p.channel][b].bypass) {
-                    all_bypassed = false;
-                    break;
+            if (is_xover) {
+                xover_design_filter(&p, &xover_filters[p.channel][local],
+                                    (float)audio_state.freq);
+                xover_update_channel_bypass(p.channel);
+            } else {
+                dsp_compute_coefficients(&p, &filters[p.channel][p.band],
+                                        (float)audio_state.freq);
+                // Recalculate channel bypass flag (PEQ side)
+                bool all_bypassed = true;
+                for (int b = 0; b < channel_band_counts[p.channel]; b++) {
+                    if (!filters[p.channel][b].bypass) {
+                        all_bypassed = false;
+                        break;
+                    }
                 }
+                channel_bypassed[p.channel] = all_bypassed;
             }
-            channel_bypassed[p.channel] = all_bypassed;
-
             restore_interrupts(flags);
         }
 

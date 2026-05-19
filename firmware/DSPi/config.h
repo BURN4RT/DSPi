@@ -439,6 +439,14 @@ extern volatile uint32_t nominal_feedback_10_14;
 #endif
 #define MAX_BANDS        12
 
+// Crossover filter bands per channel. Crossover bands live at wire band
+// indices [MAX_BANDS .. MAX_BANDS + MAX_XOVER_BANDS - 1] (i.e. 12..15) for
+// vendor command addressing — see Documentation/Features/crossover_filters_spec.md.
+// Bands 10..11 are reserved for future PEQ-count expansion and rejected
+// by handlers today.
+#define MAX_XOVER_BANDS   4
+#define TOTAL_BAND_INDICES (MAX_BANDS + MAX_XOVER_BANDS)  // 16
+
 // Legacy aliases for backward compatibility
 #define CH_OUT_LEFT      CH_OUT_1
 #define CH_OUT_RIGHT     CH_OUT_2
@@ -559,7 +567,32 @@ typedef struct {
 enum FilterType {
     FILTER_FLAT = 0, FILTER_PEAKING = 1, FILTER_LOWSHELF = 2,
     FILTER_HIGHSHELF = 3, FILTER_LOWPASS = 4, FILTER_HIGHPASS = 5,
-    FILTER_NOTCH = 6, FILTER_ALLPASS = 7
+    FILTER_NOTCH = 6, FILTER_ALLPASS = 7,
+
+    // Crossover filter types — indices 8..37. See crossover.h /
+    // Documentation/Features/crossover_filters_spec.md for semantics.
+    // Each value encodes (family, order, LP/HP); section count per filter is
+    // ceil(order/2) for BW/Bes and order/2 for LR.
+    FILTER_LR2_LP   =  8, FILTER_LR2_HP   =  9,
+    FILTER_LR4_LP   = 10, FILTER_LR4_HP   = 11,
+    FILTER_LR8_LP   = 12, FILTER_LR8_HP   = 13,
+
+    FILTER_BW1_LP   = 14, FILTER_BW1_HP   = 15,
+    FILTER_BW2_LP   = 16, FILTER_BW2_HP   = 17,
+    FILTER_BW3_LP   = 18, FILTER_BW3_HP   = 19,
+    FILTER_BW4_LP   = 20, FILTER_BW4_HP   = 21,
+    FILTER_BW5_LP   = 22, FILTER_BW5_HP   = 23,
+    FILTER_BW6_LP   = 24, FILTER_BW6_HP   = 25,
+    FILTER_BW7_LP   = 26, FILTER_BW7_HP   = 27,
+    FILTER_BW8_LP   = 28, FILTER_BW8_HP   = 29,
+
+    FILTER_BES2_LP  = 30, FILTER_BES2_HP  = 31,
+    FILTER_BES4_LP  = 32, FILTER_BES4_HP  = 33,
+    FILTER_BES6_LP  = 34, FILTER_BES6_HP  = 35,
+    FILTER_BES8_LP  = 36, FILTER_BES8_HP  = 37,
+
+    FILTER_XOVER_FIRST = FILTER_LR2_LP,
+    FILTER_XOVER_LAST  = FILTER_BES8_HP,
 };
 
 typedef struct __attribute__((packed)) {

@@ -236,7 +236,7 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 **v2 core design (`notify.c/notify.h`):** every parameter is identified by its `offsetof` into `WireBulkParams`. A single event ID (`NOTIFY_EVT_PARAM_CHANGED = 0x02`) carries `(wire_offset, wire_size, source, value)`. Host dispatch is a flat lookup on offset, not a hand-written switch — adding a parameter requires zero wire-format changes.
 
 **Subsystem state:**
-- `param_shadow`: mirror of `WireBulkParams` (2912 B BSS). `notify_param_write` compares writes against it; notifications only fire on real byte-level changes.
+- `param_shadow`: mirror of `WireBulkParams` (3664 B BSS at V11). `notify_param_write` compares writes against it; notifications only fire on real byte-level changes.
 - `notify_ring[32]`: SPSC ring of pending events (1920 B BSS). Coalesces PARAM_CHANGED entries on `(event_id, offset, size)` — a swept knob generates one queued entry, not hundreds.
 - `notify_bulk_depth`: nesting counter. While `> 0`, per-field `param_write` calls are suppressed (shadow still updates) and the outermost `notify_end_bulk()` emits a single `BULK_INVALIDATED` event.
 - `notify_current_source`: global source tag set by scoped brackets (see below).
@@ -537,6 +537,72 @@ NUM_DELAY_CHANNELS = NUM_OUTPUT_CHANNELS (platform-dependent).
 Circular buffer: `delay_lines[ch][(write_idx - delay_samples) & MAX_DELAY_MASK]`
 
 PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples = 2.67ms).
+
+---
+
+## Crossover Filters
+*Last updated: 2026-05-18*
+
+### Purpose
+
+A dedicated per-output crossover stage between the matrix mixer (PASS 4) and per-output PEQ (PASS 5+). Lets each output be band-limited to a specific driver — woofer LP, tweeter HP, midrange BP, sub LP. Standard pro-audio active-monitor signal flow: matrix → driver split → driver-correction PEQ → output.
+
+### User model
+
+- 4 crossover bands per channel (`MAX_XOVER_BANDS = 4`).
+- Each band is one user-visible filter; internally a cascade of up to 4 biquad sections.
+- Same `EqParamPacket` wire shape as PEQ; `Q` and `gain_db` fields exist but are ignored for crossover filter types.
+- Crossover applies to output channels only. Storage is uniform across NUM_CHANNELS, but writes to master channels (CH_MASTER_LEFT/RIGHT) are rejected at the vendor handler.
+
+### Band-index addressing
+
+Crossover bands share the band-index space with PEQ for all band-addressing vendor commands (REQ_SET_EQ_PARAM, REQ_GET_EQ_PARAM, REQ_SET_BAND_BYPASS, REQ_GET_BAND_BYPASS):
+
+- 0..9 = active PEQ band
+- 10..11 = reserved (rejected)
+- 12..15 = crossover band 0..3
+
+### Filter families
+
+`FilterType` enum extended at indices 8..37 covering 30 types: LR2/4/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. First-order sub-sections (BW1/3/5/7) always use TDF2 (the Cytomic SVF is fundamentally a 2nd-order topology). Second-order sections use the existing hybrid SVF/biquad selection on RP2350 — SVF below Fs/7.5, TDF2 above — same rule per section that PEQ uses per filter.
+
+### Pipeline insertion
+
+```
+matrix mixer → CROSSOVER → per-output PEQ → gain → delay → output encoding
+```
+
+Implemented as `xover_process_channel_block()` calls in:
+- `audio_pipeline.c` single-core and dual-core branches on both platforms (4 sites)
+- `pdm_generator.c` Core 1 EQ worker on both platforms (2 sites)
+
+Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner loops. RP2040 calls a new assembly entry point `dsp_process_band_cascade_block` that shares the inner-loop body with `dsp_process_channel_block` via local labels — only the band-loop terminator differs (parameter-supplied `num_sections` vs `channel_band_counts[channel]` lookup).
+
+### State
+
+- `xover_filters[NUM_CHANNELS][MAX_XOVER_BANDS]` — designed biquad cascades
+- `xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS]` — user-supplied recipe (EqParamPacket)
+- `channel_xover_bypassed[NUM_CHANNELS]` — fast-path flag; the stage is skipped entirely for a channel when all 4 bands are bypassed (the default)
+
+### Band-field normalization (critical correctness invariant)
+
+`xover_recipes[ch][i].band` always stores the **wire band index** (`MAX_BANDS + i` = 12..15), NOT the local 0..3. The dispatch path through `pending_packet → main.c::eq_update_pending` keys on `p.band` to choose between PEQ and crossover storage. If a stale local index leaked through (via REQ_SET_BAND_BYPASS's read-modify-write of the existing recipe), the update would misroute to PEQ band 0. Init, preset load, bulk apply, and the vendor handlers all explicitly normalize the band field — see `crossover_filters_spec.md` for the full discussion.
+
+### Defaults
+
+Every default band: `type=FILTER_FLAT, freq=1000.0, Q=0.707, gain_db=0, bypass=0, band=MAX_BANDS+i`. Because FLAT is not a crossover type, the design routine produces a bypassed cascade and `channel_xover_bypassed[*] = true`. Zero per-sample cost until the user picks a real crossover type.
+
+### Files
+
+- `firmware/DSPi/crossover.h` / `.c` — coefficient design + per-platform processing kernels
+- `firmware/DSPi/dsp_process_rp2040.S` — adds `dsp_process_band_cascade_block` entry sharing inner loop with PEQ kernel
+- Pipeline insertion in `audio_pipeline.c` and `pdm_generator.c`
+- Persistence in `flash_storage.c` (PresetSlot V16)
+- Wire format in `bulk_params.h` / `.c` (WireBulkParams V11, new WireCrossoverConfig section)
+- Live-edit dispatch in `main.c::eq_update_pending`
+- Vendor handlers in `vendor_commands.c` (band-range extension)
+
+Spec: `Documentation/Features/crossover_filters_spec.md`.
 
 ---
 
@@ -1195,7 +1261,9 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Processing mode | Block-based (two-phase) | Block-based |
 | EQ bands (master) | 10 | 10 |
 | EQ bands (output) | 10 | 10 |
-| Max biquads | 70 | 110 |
+| Crossover bands (per output) | 4 | 4 |
+| Max crossover sections per band | 4 | 4 |
+| Max biquads (PEQ + crossover worst case) | 70 + 80 = 150 | 110 + 144 = 254 |
 | Matrix outputs | 5 | 9 |
 | S/PDIF outputs | 2 pairs | 4 pairs |
 | USB input bit depth | 16-bit or 24-bit (alt setting) | 16-bit or 24-bit (alt setting) |
@@ -1222,7 +1290,9 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | PDM mode | Yes | Yes |
 | EQ worker mode | Yes (outputs 2-3) | Yes (outputs 2-7) |
 | Parallel EQ | Core 0: input + 0-1, Core 1: 2-3 | Core 0: input + 0-1, Core 1: 2-7 |
+| Parallel crossover (V11+) | Same dispatch as PEQ — Core 1 owns its output range | Same dispatch as PEQ |
 | EQ worker data type | int32_t Q28, block-based | float, block-based, hybrid SVF/biquad |
+| Crossover-stage availability when PDM enabled | Single-core (Core 0 only) | Single-core (Core 0 only) |
 
 ### DMA
 
@@ -1270,9 +1340,11 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Delay lines (5 × 2048 × 4) | 40 KB |
 | Output buffers (5 × 192 × 4 + 2 × 192 × 4) | ~5.25 KB |
 | Filters + recipes (7 channels) | ~8 KB |
+| Crossover filters + recipes (7 × 4 × Biquad + recipes) | ~4.1 KB |
 | Loudness tables (2 × 61 × 2 × ~13B) | ~3 KB |
 | Preset system (dir_cache + slot_buf + write_buf) | ~6 KB |
-| Bulk param buffer (4 KB aligned) | ~4 KB |
+| Bulk param buffer (4 KB aligned, holds V11 = 3664 B) | ~4 KB |
+| `notify_rebaseline` static scratch (V11 WireBulkParams) | ~3.7 KB |
 | USB audio ring buffer (4 × 578) | ~2.3 KB |
 | Channel names (7 × 32) | ~224 B |
 | Leveller state + lookahead | ~2 KB |
@@ -1290,9 +1362,11 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 |---------|---------------|
 | Delay lines (9 × 2048 × 4) | 72 KB |
 | Filters + recipes | ~18 KB |
+| Crossover filters + recipes (11 × 4 × Biquad + recipes) | ~15 KB |
 | Output buffers (9 × 192 × 4) | ~7 KB |
 | Preset system (dir_cache + slot_buf + write_buf) | ~7 KB |
-| Bulk param buffer (4 KB aligned) | ~4 KB |
+| Bulk param buffer (4 KB aligned, holds V11 = 3664 B) | ~4 KB |
+| `notify_rebaseline` static scratch (V11 WireBulkParams) | ~3.7 KB |
 | USB audio ring buffer (4 × 578) | ~2.3 KB |
 | Channel names (11 × 32) | ~352 B |
 | Leveller state + lookahead | ~2 KB |
@@ -1421,7 +1495,19 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-05-08*
+*Last updated: 2026-05-18*
+
+**Band-index map (PEQ and crossover share one address space):**
+
+| Band index | Meaning |
+|---|---|
+| 0..9 | Active PEQ band (10 bands per channel today) |
+| 10..11 | Reserved for future PEQ-count growth; rejected by handlers |
+| 12..15 | Crossover band 0..3 |
+| ≥16 | Rejected |
+
+`REQ_SET_EQ_PARAM`, `REQ_GET_EQ_PARAM`, `REQ_SET_BAND_BYPASS`, and `REQ_GET_BAND_BYPASS` all accept the unified band range. Crossover bands (12..15) are rejected on master channels (channel < `CH_OUT_1` = 2). See `Documentation/Features/crossover_filters_spec.md` for the complete crossover spec.
+
 
 | Command | Code | Direction | Description |
 |---------|------|-----------|-------------|
@@ -1487,8 +1573,8 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 | REQ_PRESET_GET_ACTIVE | 0x9A | IN | Get active preset slot (1 byte, always 0-9) |
 | REQ_SET_CHANNEL_NAME | 0x9B | OUT | Set channel name (wValue=channel, payload=1-32 bytes) |
 | REQ_GET_CHANNEL_NAME | 0x9C | IN | Get channel name (wValue=channel, returns 32 bytes) |
-| REQ_GET_ALL_PARAMS | 0xA0 | IN | Get complete DSP state (~2832 bytes, multi-packet control transfer) |
-| REQ_SET_ALL_PARAMS | 0xA1 | OUT | Set complete DSP state (~2832 bytes, multi-packet control transfer) |
+| REQ_GET_ALL_PARAMS | 0xA0 | IN | Get complete DSP state (3664 bytes at V11, multi-packet control transfer) |
+| REQ_SET_ALL_PARAMS | 0xA1 | OUT | Set complete DSP state (3664 bytes at V11, multi-packet control transfer) |
 | REQ_GET_BUFFER_STATS | 0xB0 | IN | Get 44-byte buffer fill level statistics packet |
 | REQ_RESET_BUFFER_STATS | 0xB1 | IN | Reset watermarks (wValue bit 0), returns 1-byte ack |
 | REQ_SET_LEVELLER_ENABLE | 0xB4 | OUT | Enable/disable volume leveller |
@@ -1536,11 +1622,13 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 | REQ_GET_LG_SOUND_SYNC_STATUS | 0xE8 | IN | Get 16-byte LgSoundSyncStatus (enabled/present/volume/muted + reserved) |
 
 ### Bulk Parameter Transfer
-*Last updated: 2026-05-08*
+*Last updated: 2026-05-18*
 
-Transfers the complete DSP state in a single USB control transfer (~2944 bytes at V9), replacing dozens of individual vendor requests.
+Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 9) — packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), and user volume/mute (`WireUserVolume`, 16 bytes — V9: float `user_volume_db` mirrors `audio_state.volume`, `user_mute` mirrors the vendor mute flag, both honored on bulk SET via `update_user_volume()` and a direct `user_mute` store; per-field notify is suppressed by the bulk bracket). All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 bands). Unused entries zero-padded.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 11) — packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply.
+
+**Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..11). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor — NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply.
 
 **Transport:** Multi-packet USB EP0 control transfers using `usb_stream_transfer` from pico-extras. Packets are 64 bytes. No modifications to `usb_device.c` required — uses only public API (`usb_stream_setup_transfer`, `usb_start_transfer`, `usb_start_empty_transfer`).
 
@@ -1651,7 +1739,11 @@ MCK is driven directly by **CLK_GPOUTn** (hardware clock peripheral output) — 
 - `WIRE_FORMAT_VERSION` = 6: adds `WirePreampConfig` (16 bytes) and `WireMasterVolume` (16 bytes) to `WireBulkParams`
 - `WIRE_FORMAT_VERSION` = 7: adds `WireInputConfig` (16 bytes) — input source + SPDIF RX pin
 - `WIRE_FORMAT_VERSION` = 8: adds `WireLgSoundSync` (16 bytes) — LG Sound Sync per-preset gate + runtime status
-- Backward compatible: V<9 slots default to all-S/PDIF; V9-V10 slots use old MCK encoding; V<12 slots use single preamp value for all channels, default master volume 0 dB; older wire payloads accepted without new fields
+- `WIRE_FORMAT_VERSION` = 9: adds `WireUserVolume` (16 bytes) — vendor-channel user volume + mute mirror
+- `WIRE_FORMAT_VERSION` = 10: adds `WireDacHwMute` (16 bytes) — DAC hardware mute pin config
+- `WIRE_FORMAT_VERSION` = 11: adds `WireCrossoverConfig` (704 bytes = 11 × 4 × WireBandParams) — per-channel crossover bands. Bulk total: 3664 bytes. **Per-version size anchors live in `bulk_params.h`** (`WIRE_BULK_PARAMS_V{N}_SIZE`) and each legacy section gate in `bulk_params_apply()` compares against its own version's anchor, NOT `sizeof(WireBulkParams)` — without this discipline, growing the struct silently locks older payloads out of their own tail sections.
+- `SLOT_DATA_VERSION` = 16: appends `xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS]` to `PresetSlot` (struct grew — first growth since V12). **CRC migration:** `slot_data_size_for_version()` uses explicit per-version `case` labels so the validator picks the right byte range. V12-V15 share one size; V16 adds the crossover tail. `migrate_legacy()` produces a real V16 slot (sets `version = SLOT_DATA_VERSION`, CRCs over V16 size) — otherwise migrated slots would fail the new validator on next reboot. **Field-default discipline:** because the migrated slot is V16-tagged, every `slot->version >= N` gate in `apply_slot_to_live()` fires and reads the slot's bytes directly, so migrate must populate every V8–V16 field with the value the V<N default branch would have produced — including `user_vol_index = CENTER_VOLUME_INDEX` (NOT zero — zero maps to -CENTER dB which would silently mute migrated devices), default channel names via `get_default_channel_name()`, I2S pins at compile-time defaults, leveller `LEVELLER_DEFAULT_*` values, and crossover FLAT defaults with `band = MAX_BANDS+i`.
+- Backward compatible: V<9 slots default to all-S/PDIF; V9-V10 slots use old MCK encoding; V<12 slots use single preamp value for all channels, default master volume 0 dB; V<11 bulk payloads leave crossover state untouched on apply; V<16 preset slots apply crossover defaults on load; older wire payloads accepted without new fields
 
 ### BSS Impact
 
@@ -2101,7 +2193,7 @@ Done in Phase 2:
 
 - Vendor interface (class 0xFF, 0 endpoints) re-added to the config descriptor at itf 2 (outside the AC+AS IAD).
 - `vendor_commands.c` adapted: public entry point is `vendor_control_xfer_cb(rhport, stage, req)`, invoked from our UAC1 class driver's `control_xfer_cb` when a vendor-class request targets the vendor interface. A legacy `vendor_buffer_t` shim and a `vendor_send_response()` wrapper keep all 30+ SET/GET case bodies unchanged.
-- `REQ_GET_ALL_PARAMS` / `REQ_SET_ALL_PARAMS` (~2912 bytes) now use `tud_control_xfer()`'s native EP0 chunking — the old `usb_stream_setup_transfer` / `_vendor_stream` / `_vendor_*_complete` plumbing is gone.
+- `REQ_GET_ALL_PARAMS` / `REQ_SET_ALL_PARAMS` (3664 bytes at V11) now use `tud_control_xfer()`'s native EP0 chunking — the old `usb_stream_setup_transfer` / `_vendor_stream` / `_vendor_*_complete` plumbing is gone.
 - `REQ_GET_USB_ERROR_STATS` / `REQ_RESET_USB_ERROR_STATS` return zeros / no-op under TinyUSB (pico-extras' per-category error counters have no TinyUSB equivalent yet).
 
 Deferred to Phase 2b:

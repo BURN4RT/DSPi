@@ -161,7 +161,13 @@ void notify_rebaseline(void) {
     // if collect() reads from any volatile globals racily.  Our collect is
     // synchronous with live state, so this is defensive rather than strictly
     // necessary.
-    WireBulkParams tmp;
+    //
+    // Scratch is `static` (BSS), NOT a stack local: sizeof(WireBulkParams)
+    // is ~3.6 KB after the V11 crossover section, well above what's safe to
+    // park on Core 0's stack.  All callers of notify_rebaseline() run on the
+    // Core 0 main loop (preset load/delete/save + bulk apply); no ISR path
+    // re-enters the function, so a function-static is race-free.
+    static __attribute__((aligned(4))) WireBulkParams tmp;
     bulk_params_collect(&tmp);
     uint32_t flags = save_and_disable_interrupts();
     memcpy(&param_shadow, &tmp, sizeof(param_shadow));

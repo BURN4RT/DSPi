@@ -30,6 +30,7 @@
 #include "audio_input.h"
 #include "spdif_input.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "flash_clkdiv.h"
 #include "usb_audio.h"
 #include "crossfeed.h"
@@ -74,8 +75,17 @@
 #define SLOT_MAGIC              0x44535033  // "DSP3"
 #define LEGACY_MAGIC            0x44535031  // "DSP1" (original format)
 
-// Current data version for preset slot contents
-#define SLOT_DATA_VERSION       15   // V15: User volume vol_index per-preset
+// Current data version for preset slot contents.
+//
+//   V12: Per-channel preamp + master volume (struct grew)
+//   V13: Input source + spdif_rx_pin (consumed V12 padding — same size)
+//   V14: LG Sound Sync (consumed remaining padding — same size)
+//   V15: User volume vol_index (consumed last padding byte — same size)
+//   V16: Crossover bands appended (xover_recipes — struct grows). Older
+//        versions retain their original on-disk size; the CRC validator
+//        uses slot_data_size_for_version() to pick the right byte range
+//        per stored version.
+#define SLOT_DATA_VERSION       16
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -299,6 +309,15 @@ typedef struct __attribute__((packed)) {
     // growth (with explicit migration of pre-V15 slots) or directory-
     // level storage in the master-volume "independent" pattern.
     uint8_t user_vol_index;
+
+    // Crossover bands (V16+).  Stored with the same EqParamPacket shape as
+    // PEQ — `band` MUST be the wire band index (MAX_BANDS + i) for every
+    // entry, because live-edit dispatch (main.c::eq_update_pending) routes
+    // by the recipe's `band` field.  apply_slot_to_live() re-normalizes on
+    // load defensively; migrate_legacy() initialises this section with
+    // crossover defaults (FLAT type, fc=1000, band=12+i) before CRC.  See
+    // Documentation/Features/crossover_filters_spec.md.
+    EqParamPacket xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS];
 } PresetSlot;
 
 // --- Legacy single-sector format (for migration) ---
@@ -383,6 +402,11 @@ volatile uint32_t preset_mute_counter = 0;
 static void apply_factory_defaults(void);
 static inline void dir_apply_dac_hw_mute_defaults(void);  // defined below
 static void io_config_defaults(FlashOutputConfig *cfg);    // defined below (IO config section)
+// Forward declaration — defined alongside validate_slot() in the SLOT
+// VALIDATION section.  collect_live_state() and migrate_legacy() use it
+// to compute the CRC byte range that matches whatever version they're
+// writing, so the same range is used at save and read time.
+static size_t slot_data_size_for_version(uint8_t version);
 
 // RAM-cached copy of the directory — updated on every directory write and
 // loaded once at boot.  Avoids repeated flash reads for queries.
@@ -955,10 +979,16 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
         slot->user_vol_index = (uint8_t)((uint32_t)vol >> 8u);
     }
 
-    // Compute CRC over the data section (everything after the 12-byte header)
+    // Crossover bands (V16+).  Copy the recipes; the wire-band-index `12+i`
+    // is already baked into xover_recipes[][] by xover_init_default_filters /
+    // xover_update_band, so no normalization needed here.
+    memcpy(slot->xover_recipes, (void *)xover_recipes, sizeof(slot->xover_recipes));
+
+    // Compute CRC over the data section using THIS version's byte range
+    // (immutable for the version we're saving; the validator looks it up
+    // again on load via slot_data_size_for_version()).
     const uint8_t *data_start = (const uint8_t *)&slot->filter_recipes;
-    size_t data_len = sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes);
-    slot->crc32 = crc32(data_start, data_len);
+    slot->crc32 = crc32(data_start, slot_data_size_for_version(SLOT_DATA_VERSION));
 }
 
 // Apply a dB value to the live master volume globals.  NaN/Inf falls back
@@ -1192,11 +1222,62 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         float db = (float)((int32_t)idx - (int32_t)CENTER_VOLUME_INDEX);
         update_user_volume(db);
     }
+
+    // Crossover bands (V16+).  Pre-V16 slots predate this feature; reset
+    // crossovers to defaults rather than leaving whatever live values
+    // existed (matches the model where preset load is a complete state
+    // restore).  In either case re-normalize the wire-band-index `12+i`
+    // defensively — a stale local-index leaking into pending_packet via
+    // REQ_SET_BAND_BYPASS would misroute the next live edit into PEQ band 0.
+    if (slot->version >= 16) {
+        memcpy((void *)xover_recipes, slot->xover_recipes, sizeof(xover_recipes));
+        for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+            for (int i = 0; i < MAX_XOVER_BANDS; i++) {
+                xover_recipes[ch][i].channel = (uint8_t)ch;
+                xover_recipes[ch][i].band    = (uint8_t)(MAX_BANDS + i);
+                xover_recipes[ch][i].bypass  = (xover_recipes[ch][i].bypass == 1) ? 1 : 0;
+            }
+        }
+    } else {
+        // V<16: no crossover data in the slot — apply defaults.
+        xover_init_default_filters();
+    }
 }
 
 // ============================================================================
 // SLOT VALIDATION
 // ============================================================================
+
+// Pre-V16 data section length (every accepted same-size legacy version uses
+// this exact byte count — see comment on SLOT_DATA_VERSION above).  The
+// xover_recipes field lives strictly at the end of PresetSlot in V16+, so
+// pre-V16 size = sizeof(PresetSlot) - sizeof(xover_recipes).
+#define SLOT_DATA_SIZE_PRE_XOVER \
+    (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes) \
+     - sizeof(((PresetSlot *)0)->xover_recipes))
+
+#define SLOT_DATA_SIZE_V16 \
+    (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
+
+// Map a slot version code to the CRC byte range it was written with. Pre-V16
+// versions all share the same on-disk size (V13/V14/V15 each consumed
+// reserved bytes of V12 without growing the struct).  Any version outside
+// the explicit case list is invalidated — older firmware predates
+// reliable struct-length conventions, and unknown future versions are also
+// not safely interpretable.
+static size_t slot_data_size_for_version(uint8_t version) {
+    switch (version) {
+        case 12:
+        case 13:
+        case 14:
+        case 15:
+            return SLOT_DATA_SIZE_PRE_XOVER;
+        case 16:
+            return SLOT_DATA_SIZE_V16;
+        default:
+            return 0;
+    }
+}
 
 // Read and validate a preset slot from flash.
 // Returns a pointer to the flash-mapped slot if valid, NULL otherwise.
@@ -1204,9 +1285,11 @@ static const PresetSlot *validate_slot(uint8_t slot) {
     const PresetSlot *s = SLOT_ADDR(slot);
     if (s->magic != SLOT_MAGIC) return NULL;
     if (s->slot_index != slot) return NULL;
-    // CRC check
+
+    size_t data_len = slot_data_size_for_version(s->version);
+    if (data_len == 0) return NULL;
+
     const uint8_t *data_start = (const uint8_t *)&s->filter_recipes;
-    size_t data_len = sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes);
     if (crc32(data_start, data_len) != s->crc32) return NULL;
     return s;
 }
@@ -1514,21 +1597,102 @@ static bool migrate_legacy(void) {
     if (crc32(data_start, data_len) != legacy->crc32) return false;
 
     // Build a PresetSlot from the legacy data.
-    // The data section layout is identical, so we can memcpy the data portion.
+    // The data section layout is identical up through V6 fields (output_pins),
+    // so we can memcpy that portion.  Everything from channel_names (V8)
+    // onward is NOT in LegacyFlashStorage and must be explicitly defaulted
+    // below, because the slot is written as V16 — the apply path's
+    // `slot->version >= N` gates will read these fields rather than fall
+    // through to their default-init branches.
     static PresetSlot slot_buf;
     memset(&slot_buf, 0, sizeof(slot_buf));
     slot_buf.magic = SLOT_MAGIC;
-    slot_buf.version = legacy->version;
+    // CRITICAL: write a current-version slot, NOT the legacy version.  The
+    // V16+ validator looks up the data length by version via
+    // slot_data_size_for_version(); if we left version = legacy->version
+    // here, the validator would look up the pre-V16 byte range while the
+    // CRC we compute below is over the V16 range — slot would fail
+    // validation on next reboot.  Producing a clean V16 slot is also the
+    // semantic intent of migrate: project legacy data into the current
+    // format.
+    slot_buf.version = SLOT_DATA_VERSION;
     slot_buf.slot_index = 0;
 
-    // Copy data fields (identical layout from filter_recipes onward)
+    // Copy data fields (identical layout from filter_recipes onward, up
+    // through output_pins which is where LegacyFlashStorage ends).
     memcpy(&slot_buf.filter_recipes, &legacy->filter_recipes,
            sizeof(LegacyFlashStorage) - offsetof(LegacyFlashStorage, filter_recipes));
 
-    // Recompute CRC for the slot format
+    // ---- Post-legacy field defaults (V8 through V16) ----
+    // CRITICAL: every field added after V6 must be explicitly initialized
+    // here to the value its corresponding V<N gate in apply_slot_to_live()
+    // would have produced.  Without this, a V16-tagged slot with zero-
+    // initialized tail fields silently applies wrong values — e.g. blank
+    // channel names, MCK pin = 0, leveller defaults overridden by zeros,
+    // and worst, user_vol_index = 0 → -127 dB user volume (full mute) on
+    // boot after upgrade.  See migrate_legacy() history.
+
+    // V8: Channel names — defaults via the standard helper (output_types
+    // is all-SPDIF / NULL pointer indicates pre-I2S).
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+        get_default_channel_name((uint8_t)ch, INPUT_SOURCE_USB, NULL,
+                                 slot_buf.channel_names[ch]);
+    }
+
+    // V9: I2S — all S/PDIF (output_types[] already 0 from memset).  BCK
+    // and MCK pins at their compile-time defaults, MCK off, 128× multiplier.
+    slot_buf.i2s_bck_pin       = PICO_I2S_BCK_PIN;
+    slot_buf.i2s_mck_pin       = PICO_I2S_MCK_PIN;
+    slot_buf.i2s_mck_enabled   = 0;
+    slot_buf.i2s_mck_multiplier = 0;   // V11+ encoding: 0 = 128×
+
+    // V10: Volume Leveller — module defaults.
+    slot_buf.leveller_enabled          = LEVELLER_DEFAULT_ENABLED ? 1 : 0;
+    slot_buf.leveller_speed            = LEVELLER_DEFAULT_SPEED;
+    slot_buf.leveller_lookahead        = LEVELLER_DEFAULT_LOOKAHEAD ? 1 : 0;
+    slot_buf.leveller_amount           = LEVELLER_DEFAULT_AMOUNT;
+    slot_buf.leveller_max_gain_db      = LEVELLER_DEFAULT_MAX_GAIN_DB;
+    slot_buf.leveller_gate_threshold_db = LEVELLER_DEFAULT_GATE_DB;
+
+    // V12: per-channel preamp + master volume.  Pre-V12 behavior applied
+    // slot->preamp_db (the legacy single value) to every input channel —
+    // replicate that here so V12 apply gates see consistent values.
+    for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+        slot_buf.preamp_db_per_ch[i] = slot_buf.preamp_db;
+    }
+    // Master volume slot field is dormant when the directory is in
+    // MASTER_VOLUME_MODE_INDEPENDENT (the default this migration sets).
+    // Store 0 dB (unity) as a safe placeholder; a future user switch to
+    // MASTER_VOLUME_MODE_WITH_PRESET would then read this value.
+    slot_buf.master_volume_db = MASTER_VOL_MAX_DB;
+
+    // V13: Input source = USB (already 0 from memset).  spdif_rx_pin = 0
+    // is treated by apply_slot_to_live() as "invalid, leave live value
+    // alone" — leave at 0.
+
+    // V14: LG Sound Sync disabled (already 0 from memset).  Matches
+    // LG_SOUND_SYNC_DEFAULT_ENABLED == 0.
+
+    // V15: User volume — CRITICAL fix.  vol_index = 0 maps to
+    // -CENTER_VOLUME_INDEX dB (full attenuation).  Set to CENTER so the
+    // migrated device boots at 0 dB unity user volume.
+    slot_buf.user_vol_index = CENTER_VOLUME_INDEX;
+
+    // V16: Crossover bands — FLAT defaults with wire-band-index baked in.
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+        for (int i = 0; i < MAX_XOVER_BANDS; i++) {
+            slot_buf.xover_recipes[ch][i].channel = (uint8_t)ch;
+            slot_buf.xover_recipes[ch][i].band    = (uint8_t)(MAX_BANDS + i);
+            slot_buf.xover_recipes[ch][i].type    = FILTER_FLAT;
+            slot_buf.xover_recipes[ch][i].bypass  = 0;
+            slot_buf.xover_recipes[ch][i].freq    = 1000.0f;
+            slot_buf.xover_recipes[ch][i].Q       = 0.707f;
+            slot_buf.xover_recipes[ch][i].gain_db = 0.0f;
+        }
+    }
+
+    // Recompute CRC for the (now V16) slot format
     const uint8_t *slot_data = (const uint8_t *)&slot_buf.filter_recipes;
-    size_t slot_data_len = sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes);
-    slot_buf.crc32 = crc32(slot_data, slot_data_len);
+    slot_buf.crc32 = crc32(slot_data, slot_data_size_for_version(SLOT_DATA_VERSION));
 
     // Write slot 0
     if (flash_write_sector(SLOT_SECTOR_OFFSET(0), &slot_buf, sizeof(slot_buf)) != 0) {

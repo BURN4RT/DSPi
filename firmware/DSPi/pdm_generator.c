@@ -3,6 +3,7 @@
 #include <math.h>
 #include "pdm_generator.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "usb_audio.h"
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
@@ -448,9 +449,11 @@ static void __not_in_flash_func(eq_worker_loop)() {
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) continue;
 
-            // Output EQ
+            // Output crossover + EQ
             if (!matrix_mixer.outputs[out].mute) {
                 uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
                 if (!channel_bypassed[eq_ch]) {
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
                 }
@@ -582,9 +585,11 @@ static void __not_in_flash_func(eq_worker_loop)() {
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) continue;
 
-            // Output EQ (block-based)
+            // Output crossover + EQ (block-based)
             if (!matrix_mixer.outputs[out].mute) {
                 uint8_t eq_ch = CH_OUT_1 + out;
+                if (!channel_xover_bypassed[eq_ch])
+                    xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
                 if (!is_bypassed && !channel_bypassed[eq_ch]) {
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
                 }

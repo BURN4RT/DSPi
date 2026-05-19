@@ -2,9 +2,19 @@
 #include <string.h>
 #include "dsp_pipeline.h"
 #include "dcp_inline.h"
+#include "crossover.h"
 
 static inline bool is_filter_flat(const EqParamPacket *p) {
     if (p->type == FILTER_FLAT) return true;
+    // Any type outside the PEQ range (FILTER_FLAT..FILTER_ALLPASS) is not a
+    // valid PEQ filter — bypass the band rather than producing garbage. The
+    // most important case this defends against is a crossover filter type
+    // (FILTER_XOVER_FIRST..FILTER_XOVER_LAST) ending up in a PEQ band slot
+    // via a host bug or a mis-routed REQ_SET_EQ_PARAM / bulk apply / preset
+    // load: on the RP2350 SVF path the unknown type leaves the output mix
+    // coefficients zeroed (svm0=svm1=svm2=0), and the band would output
+    // silence at low fc. Treat as bypass instead, recipe round-trips.
+    if (p->type > FILTER_ALLPASS) return true;
     if (p->freq <= 0.0f) return true;
 
     // Peaking/shelf with ~0dB gain is effectively flat
@@ -208,6 +218,10 @@ void dsp_init_default_filters() {
             filter_recipes[ch][b].gain_db = 0.0f;
         }
     }
+
+    // Crossover bands default-init.  Writes wire-band-index (MAX_BANDS + i)
+    // into each recipe's `band` field — see crossover_filters_spec.md.
+    xover_init_default_filters();
 }
 
 void dsp_update_delay_samples(float sample_rate) {
@@ -247,6 +261,10 @@ void dsp_recalculate_all_filters(float sample_rate) {
         }
         channel_bypassed[ch] = all_bypassed;
     }
+    // Rebuild all crossover sections at the new Fs.  Section state is reset
+    // on SVF/biquad path change inside xover_design_filter(), same convention
+    // as PEQ above.
+    xover_recalculate_all(sample_rate);
 }
 
 #if PICO_RP2350

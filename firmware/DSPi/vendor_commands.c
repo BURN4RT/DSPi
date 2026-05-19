@@ -20,6 +20,7 @@
 #include "audio_pipeline.h"
 #include "config.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "flash_storage.h"
 #include "loudness.h"
 #include "crossfeed.h"
@@ -233,23 +234,57 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
                 // Normalize bypass byte at the boundary so legacy hosts
                 // sending 0xFF padding cannot accidentally bypass the band.
                 pending_packet.bypass = (pending_packet.bypass == 1) ? 1 : 0;
-                if (pending_packet.channel < NUM_CHANNELS &&
-                    pending_packet.band < channel_band_counts[pending_packet.channel]) {
-                    eq_update_pending = true;
+
+                uint8_t ch = pending_packet.channel;
+                uint8_t b  = pending_packet.band;
+                if (ch < NUM_CHANNELS) {
+                    // Two band-index ranges are accepted:
+                    //   0..channel_band_counts[ch]-1 → PEQ (existing)
+                    //   MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 → crossover (new)
+                    // Bands in [channel_band_counts, MAX_BANDS) are the
+                    // reserved gap for future PEQ-count expansion; reject
+                    // silently.  Crossover on master channels is rejected
+                    // (feature is output-channel-only).  See
+                    // Documentation/Features/crossover_filters_spec.md.
+                    bool is_peq = (b < channel_band_counts[ch]);
+                    bool is_xover = (b >= MAX_BANDS && b < MAX_BANDS + MAX_XOVER_BANDS);
+                    if (is_peq || (is_xover && ch >= CH_OUT_1)) {
+                        eq_update_pending = true;
+                    }
                 }
             }
             break;
 
         case REQ_SET_BAND_BYPASS: {
-            // wValue = (channel << 8) | band; payload = 1 byte (1 = bypass, anything else = active)
+            // wValue = (channel << 8) | band; payload = 1 byte (1 = bypass, anything else = active).
+            // Accepts both PEQ and crossover band indices — see
+            // crossover_filters_spec.md for the unified band-index map.
             uint8_t channel = (vendor_last_wValue >> 8) & 0xFF;
             uint8_t band = vendor_last_wValue & 0xFF;
-            if (channel < NUM_CHANNELS && band < channel_band_counts[channel] &&
-                buffer->data_len >= 1) {
-                EqParamPacket p = filter_recipes[channel][band];
-                p.bypass = (vendor_rx_buf[0] == 1) ? 1 : 0;
-                memcpy((void*)&pending_packet, &p, sizeof(EqParamPacket));
-                eq_update_pending = true;
+            if (channel < NUM_CHANNELS && buffer->data_len >= 1) {
+                EqParamPacket p;
+                bool valid = false;
+                if (band < channel_band_counts[channel]) {
+                    p = filter_recipes[channel][band];
+                    valid = true;
+                } else if (band >= MAX_BANDS && band < (MAX_BANDS + MAX_XOVER_BANDS)
+                           && channel >= CH_OUT_1) {
+                    p = xover_recipes[channel][band - MAX_BANDS];
+                    valid = true;
+                }
+                if (valid) {
+                    // Normalize the band field at the wire boundary.  Without
+                    // this, a stale local-band-index inadvertently stored in
+                    // either recipe array would propagate via pending_packet
+                    // and main.c::eq_update_pending would misroute the write
+                    // to the wrong storage.  See "Band-field normalization"
+                    // in crossover_filters_spec.md.
+                    p.channel = channel;
+                    p.band    = band;
+                    p.bypass  = (vendor_rx_buf[0] == 1) ? 1 : 0;
+                    memcpy((void*)&pending_packet, &p, sizeof(EqParamPacket));
+                    eq_update_pending = true;
+                }
             }
             break;
         }
@@ -1106,33 +1141,58 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_BAND_BYPASS: {
-                // wValue = (channel << 8) | band; returns 1 byte (0 or 1)
+                // wValue = (channel << 8) | band; returns 1 byte (0 or 1).
+                // PEQ bands 0..channel_band_counts-1 and crossover bands
+                // MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 both supported.
                 uint8_t channel = (setup->wValue >> 8) & 0xFF;
                 uint8_t band = setup->wValue & 0xFF;
-                if (channel < NUM_CHANNELS && band < channel_band_counts[channel]) {
-                    uint8_t v = (filter_recipes[channel][band].bypass == 1) ? 1 : 0;
-                    usb_start_tiny_control_in_transfer(v, 1);
-                    return true;
+                if (channel < NUM_CHANNELS) {
+                    uint8_t v;
+                    bool ok = false;
+                    if (band < channel_band_counts[channel]) {
+                        v = (filter_recipes[channel][band].bypass == 1) ? 1 : 0;
+                        ok = true;
+                    } else if (band >= MAX_BANDS && band < (MAX_BANDS + MAX_XOVER_BANDS)
+                               && channel >= CH_OUT_1) {
+                        v = (xover_recipes[channel][band - MAX_BANDS].bypass == 1) ? 1 : 0;
+                        ok = true;
+                    }
+                    if (ok) {
+                        usb_start_tiny_control_in_transfer(v, 1);
+                        return true;
+                    }
                 }
                 return false;
             }
 
             case REQ_GET_EQ_PARAM: {
+                // wValue: bits[15:8]=channel, bits[7:4]=band (0..15),
+                //         bits[3:0]=param-nibble (0=type, 1=freq, 2=Q,
+                //         3=gain_db, 4=bypass).  Returns 4 bytes regardless
+                //         of which scalar — the unused bytes are zeroed.
                 uint8_t channel = (setup->wValue >> 8) & 0xFF;
                 uint8_t band = (setup->wValue >> 4) & 0x0F;
                 uint8_t param = setup->wValue & 0x0F;
-                if (channel < NUM_CHANNELS && band < channel_band_counts[channel]) {
-                    uint32_t val_to_send = 0;
-                    EqParamPacket *p = &filter_recipes[channel][band];
-                    switch (param) {
-                        case 0: val_to_send = (uint32_t)p->type; break;
-                        case 1: memcpy(&val_to_send, &p->freq, 4); break;
-                        case 2: memcpy(&val_to_send, &p->Q, 4); break;
-                        case 3: memcpy(&val_to_send, &p->gain_db, 4); break;
-                        case 4: val_to_send = (p->bypass == 1) ? 1u : 0u; break;
+                if (channel < NUM_CHANNELS) {
+                    EqParamPacket *p = NULL;
+                    if (band < channel_band_counts[channel]) {
+                        p = &filter_recipes[channel][band];
+                    } else if (band >= MAX_BANDS && band < (MAX_BANDS + MAX_XOVER_BANDS)
+                               && channel >= CH_OUT_1) {
+                        p = &xover_recipes[channel][band - MAX_BANDS];
                     }
-                    usb_start_tiny_control_in_transfer(val_to_send, 4);
-                    return true;
+                    if (p) {
+                        uint32_t val_to_send = 0;
+                        switch (param) {
+                            case 0: val_to_send = (uint32_t)p->type; break;
+                            case 1: memcpy(&val_to_send, &p->freq, 4); break;
+                            case 2: memcpy(&val_to_send, &p->Q, 4); break;
+                            case 3: memcpy(&val_to_send, &p->gain_db, 4); break;
+                            case 4: val_to_send = (p->bypass == 1) ? 1u : 0u; break;
+                        }
+                        usb_start_tiny_control_in_transfer(val_to_send, 4);
+                        return true;
+                    }
                 }
                 return false;
             }
