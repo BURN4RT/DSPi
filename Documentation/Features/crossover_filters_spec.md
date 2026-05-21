@@ -51,38 +51,40 @@ Crossovers apply only to **output channels**. Master channels (`CH_MASTER_LEFT=0
 | 9 | `FILTER_LR2_HP` | Linkwitz-Riley | 2 | HP | 1 |
 | 10 | `FILTER_LR4_LP` | Linkwitz-Riley | 4 | LP | 2 |
 | 11 | `FILTER_LR4_HP` | Linkwitz-Riley | 4 | HP | 2 |
-| 12 | `FILTER_LR8_LP` | Linkwitz-Riley | 8 | LP | 4 |
-| 13 | `FILTER_LR8_HP` | Linkwitz-Riley | 8 | HP | 4 |
-| 14 | `FILTER_BW1_LP` | Butterworth | 1 | LP | 1 (1st-order) |
-| 15 | `FILTER_BW1_HP` | Butterworth | 1 | HP | 1 (1st-order) |
-| 16 | `FILTER_BW2_LP` | Butterworth | 2 | LP | 1 |
-| 17 | `FILTER_BW2_HP` | Butterworth | 2 | HP | 1 |
-| 18 | `FILTER_BW3_LP` | Butterworth | 3 | LP | 2 (1st-order + biquad) |
-| 19 | `FILTER_BW3_HP` | Butterworth | 3 | HP | 2 |
-| 20 | `FILTER_BW4_LP` | Butterworth | 4 | LP | 2 |
-| 21 | `FILTER_BW4_HP` | Butterworth | 4 | HP | 2 |
-| 22 | `FILTER_BW5_LP` | Butterworth | 5 | LP | 3 (1st-order + 2 biquads) |
-| 23 | `FILTER_BW5_HP` | Butterworth | 5 | HP | 3 |
-| 24 | `FILTER_BW6_LP` | Butterworth | 6 | LP | 3 |
-| 25 | `FILTER_BW6_HP` | Butterworth | 6 | HP | 3 |
-| 26 | `FILTER_BW7_LP` | Butterworth | 7 | LP | 4 (1st-order + 3 biquads) |
-| 27 | `FILTER_BW7_HP` | Butterworth | 7 | HP | 4 |
-| 28 | `FILTER_BW8_LP` | Butterworth | 8 | LP | 4 |
-| 29 | `FILTER_BW8_HP` | Butterworth | 8 | HP | 4 |
-| 30 | `FILTER_BES2_LP` | Bessel | 2 | LP | 1 |
-| 31 | `FILTER_BES2_HP` | Bessel | 2 | HP | 1 |
-| 32 | `FILTER_BES4_LP` | Bessel | 4 | LP | 2 |
-| 33 | `FILTER_BES4_HP` | Bessel | 4 | HP | 2 |
-| 34 | `FILTER_BES6_LP` | Bessel | 6 | LP | 3 |
-| 35 | `FILTER_BES6_HP` | Bessel | 6 | HP | 3 |
-| 36 | `FILTER_BES8_LP` | Bessel | 8 | LP | 4 |
-| 37 | `FILTER_BES8_HP` | Bessel | 8 | HP | 4 |
+| 12 | `FILTER_LR6_LP` | Linkwitz-Riley | 6 | LP | 4 (2 first-order + 2 biquads) |
+| 13 | `FILTER_LR6_HP` | Linkwitz-Riley | 6 | HP | 4 |
+| 14 | `FILTER_LR8_LP` | Linkwitz-Riley | 8 | LP | 4 |
+| 15 | `FILTER_LR8_HP` | Linkwitz-Riley | 8 | HP | 4 |
+| 16 | `FILTER_BW1_LP` | Butterworth | 1 | LP | 1 (1st-order) |
+| 17 | `FILTER_BW1_HP` | Butterworth | 1 | HP | 1 (1st-order) |
+| 18 | `FILTER_BW2_LP` | Butterworth | 2 | LP | 1 |
+| 19 | `FILTER_BW2_HP` | Butterworth | 2 | HP | 1 |
+| 20 | `FILTER_BW3_LP` | Butterworth | 3 | LP | 2 (1st-order + biquad) |
+| 21 | `FILTER_BW3_HP` | Butterworth | 3 | HP | 2 |
+| 22 | `FILTER_BW4_LP` | Butterworth | 4 | LP | 2 |
+| 23 | `FILTER_BW4_HP` | Butterworth | 4 | HP | 2 |
+| 24 | `FILTER_BW5_LP` | Butterworth | 5 | LP | 3 (1st-order + 2 biquads) |
+| 25 | `FILTER_BW5_HP` | Butterworth | 5 | HP | 3 |
+| 26 | `FILTER_BW6_LP` | Butterworth | 6 | LP | 3 |
+| 27 | `FILTER_BW6_HP` | Butterworth | 6 | HP | 3 |
+| 28 | `FILTER_BW7_LP` | Butterworth | 7 | LP | 4 (1st-order + 3 biquads) |
+| 29 | `FILTER_BW7_HP` | Butterworth | 7 | HP | 4 |
+| 30 | `FILTER_BW8_LP` | Butterworth | 8 | LP | 4 |
+| 31 | `FILTER_BW8_HP` | Butterworth | 8 | HP | 4 |
+| 32 | `FILTER_BES2_LP` | Bessel | 2 | LP | 1 |
+| 33 | `FILTER_BES2_HP` | Bessel | 2 | HP | 1 |
+| 34 | `FILTER_BES4_LP` | Bessel | 4 | LP | 2 |
+| 35 | `FILTER_BES4_HP` | Bessel | 4 | HP | 2 |
+| 36 | `FILTER_BES6_LP` | Bessel | 6 | LP | 3 |
+| 37 | `FILTER_BES6_HP` | Bessel | 6 | HP | 3 |
+| 38 | `FILTER_BES8_LP` | Bessel | 8 | LP | 4 |
+| 39 | `FILTER_BES8_HP` | Bessel | 8 | HP | 4 |
 
-`FILTER_XOVER_FIRST` = 8, `FILTER_XOVER_LAST` = 37. Any type outside this range written into a crossover band slot (bands 12–15) is treated as bypassed; the recipe round-trips the value so the app can detect the mismatch.
+`FILTER_XOVER_FIRST` = 8, `FILTER_XOVER_LAST` = 39 (32 crossover filter types total). Any type outside this range written into a crossover band slot (bands 12–15) is treated as bypassed; the recipe round-trips the value so the app can detect the mismatch.
 
 ### Filter response conventions
 
-- **Linkwitz-Riley** is the most common crossover family; LR2/LR4/LR8 sum to -6 dB at fc when paired (allpass-sum behavior). LR4 is the de-facto standard.
+- **Linkwitz-Riley** is the most common crossover family; LR2/LR4/LR6/LR8 sum to -6 dB at fc when paired (allpass-sum behavior). LR4 is the de-facto standard; LR6 is the canonical between LR4 and LR8 and is implemented as `(BW3)²` — its cascade includes two first-order sections plus two biquads, using the full 4-section per-band budget.
 - **Butterworth** is maximally flat in passband; odd orders sum to allpass with the complementary HP/LP, even orders sum to +3 dB at fc.
 - **Bessel** has approximately linear phase (small group-delay variation) but a wider crossover region. The pole tables use the -3 dB normalization convention (Rane / Williams reference) — cutoff frequency in vendor commands lands at the -3 dB point.
 
@@ -441,7 +443,7 @@ Two paths:
 
 - Hide crossover controls for master channels (CH_MASTER_LEFT / CH_MASTER_RIGHT).
 - Hide bands 10–11 from the band picker (they're reserved).
-- "Filter type" picker for crossover bands shows only the 30 crossover values. PEQ bands should show only PEQ values (0..7).
+- "Filter type" picker for crossover bands shows only the 32 crossover values (indices 8..39). PEQ bands should show only PEQ values (0..7).
 - When loading a preset, the app can detect crossover state by checking `xover_recipes[ch][i].type != FILTER_FLAT && xover_recipes[ch][i].bypass != 1` for each band.
 
 ---

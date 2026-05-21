@@ -65,11 +65,13 @@ typedef struct {
 #define XOVER_TYPE_COUNT (FILTER_XOVER_LAST - FILTER_XOVER_FIRST + 1)
 
 static const XoverTypeMeta xover_type_table[] = {
-    // FILTER_LR2_LP=8 .. FILTER_LR8_HP=13
+    // FILTER_LR2_LP=8 .. FILTER_LR8_HP=15
     { XOVER_FAMILY_LR,  2, 0, 1 },  // LR2 LP
     { XOVER_FAMILY_LR,  2, 1, 1 },  // LR2 HP
     { XOVER_FAMILY_LR,  4, 0, 2 },  // LR4 LP
     { XOVER_FAMILY_LR,  4, 1, 2 },  // LR4 HP
+    { XOVER_FAMILY_LR,  6, 0, 4 },  // LR6 LP — (BW3)² = 2 first-order + 2 biquads
+    { XOVER_FAMILY_LR,  6, 1, 4 },  // LR6 HP
     { XOVER_FAMILY_LR,  8, 0, 4 },  // LR8 LP
     { XOVER_FAMILY_LR,  8, 1, 4 },  // LR8 HP
 
@@ -469,6 +471,15 @@ static void design_butterworth(XoverFilter *band,
 // is a single biquad with a double real pole at -1, equivalent to two
 // cascaded 1st-order sections — we use the single-biquad form for tighter
 // state and one less per-sample multiply.
+//
+// For odd-N BW (LR6 = BW3²), BW_N includes a 1st-order section in addition
+// to the biquad(s). We emit BW_N's sections in their canonical "1st-order
+// first, then biquads in ascending angle" order, then duplicate the whole
+// cascade. Resulting layout for each supported LR:
+//   LR2 → [biq]
+//   LR4 → [biq0, biq0_dup]
+//   LR6 → [1st, biq0, 1st_dup, biq0_dup]
+//   LR8 → [biq0, biq1, biq0_dup, biq1_dup]
 static void design_linkwitz_riley(XoverFilter *band,
                                   uint8_t order_lr, bool is_hp,
                                   float omega_a, float Fs, float fc) {
@@ -479,11 +490,17 @@ static void design_linkwitz_riley(XoverFilter *band,
         band->num_sections = 1;
         return;
     }
-    // LR2N = (BW_N)² where N = order_lr / 2. BW_N here is always even
-    // (N = 2 for LR4, N = 4 for LR8), so it's a pure biquad cascade.
+    // LR_{2N} = (BW_N)² for N ∈ {2, 3, 4} → LR4/LR6/LR8.
     uint8_t bw_order = order_lr / 2;
     uint8_t pairs    = bw_order / 2;
+    bool    has_1st  = (bw_order & 1u) != 0;
     uint8_t idx      = 0;
+
+    // ---- Emit BW_N's sections (1st-order first, then biquads) ----
+    if (has_1st) {
+        // Butterworth real pole at σ_n = 1.
+        section_emit_1st_order(&band->sections[idx++], 1.0f, omega_a, is_hp, Fs);
+    }
     for (uint8_t p = 0; p < pairs; p++) {
         AnalogPolePair pole;
         bw_pole_pair(bw_order, p, &pole);
@@ -491,10 +508,13 @@ static void design_linkwitz_riley(XoverFilter *band,
                                pole.sigma, pole.omega,
                                omega_a, is_hp, Fs, fc);
     }
-    // Duplicate every section to realise (BW_N)².
-    for (uint8_t p = 0; p < pairs; p++) {
-        Biquad copy = band->sections[p];
-        // Fresh state on the duplicate (don't share state between sections).
+
+    // ---- Duplicate the BW_N cascade for (BW_N)² ----
+    // Same coefficients, fresh state on each duplicate so the two cascaded
+    // copies don't share internal state.
+    uint8_t bw_section_count = idx;
+    for (uint8_t i = 0; i < bw_section_count; i++) {
+        Biquad copy = band->sections[i];
         copy.s1 = copy.s2 = 0;
 #if PICO_RP2350
         copy.svic1eq = copy.svic2eq = 0.0f;

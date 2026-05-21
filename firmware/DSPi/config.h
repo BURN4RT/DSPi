@@ -569,27 +569,28 @@ enum FilterType {
     FILTER_HIGHSHELF = 3, FILTER_LOWPASS = 4, FILTER_HIGHPASS = 5,
     FILTER_NOTCH = 6, FILTER_ALLPASS = 7,
 
-    // Crossover filter types — indices 8..37. See crossover.h /
+    // Crossover filter types — indices 8..39. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.
     // Each value encodes (family, order, LP/HP); section count per filter is
     // ceil(order/2) for BW/Bes and order/2 for LR.
     FILTER_LR2_LP   =  8, FILTER_LR2_HP   =  9,
     FILTER_LR4_LP   = 10, FILTER_LR4_HP   = 11,
-    FILTER_LR8_LP   = 12, FILTER_LR8_HP   = 13,
+    FILTER_LR6_LP   = 12, FILTER_LR6_HP   = 13,
+    FILTER_LR8_LP   = 14, FILTER_LR8_HP   = 15,
 
-    FILTER_BW1_LP   = 14, FILTER_BW1_HP   = 15,
-    FILTER_BW2_LP   = 16, FILTER_BW2_HP   = 17,
-    FILTER_BW3_LP   = 18, FILTER_BW3_HP   = 19,
-    FILTER_BW4_LP   = 20, FILTER_BW4_HP   = 21,
-    FILTER_BW5_LP   = 22, FILTER_BW5_HP   = 23,
-    FILTER_BW6_LP   = 24, FILTER_BW6_HP   = 25,
-    FILTER_BW7_LP   = 26, FILTER_BW7_HP   = 27,
-    FILTER_BW8_LP   = 28, FILTER_BW8_HP   = 29,
+    FILTER_BW1_LP   = 16, FILTER_BW1_HP   = 17,
+    FILTER_BW2_LP   = 18, FILTER_BW2_HP   = 19,
+    FILTER_BW3_LP   = 20, FILTER_BW3_HP   = 21,
+    FILTER_BW4_LP   = 22, FILTER_BW4_HP   = 23,
+    FILTER_BW5_LP   = 24, FILTER_BW5_HP   = 25,
+    FILTER_BW6_LP   = 26, FILTER_BW6_HP   = 27,
+    FILTER_BW7_LP   = 28, FILTER_BW7_HP   = 29,
+    FILTER_BW8_LP   = 30, FILTER_BW8_HP   = 31,
 
-    FILTER_BES2_LP  = 30, FILTER_BES2_HP  = 31,
-    FILTER_BES4_LP  = 32, FILTER_BES4_HP  = 33,
-    FILTER_BES6_LP  = 34, FILTER_BES6_HP  = 35,
-    FILTER_BES8_LP  = 36, FILTER_BES8_HP  = 37,
+    FILTER_BES2_LP  = 32, FILTER_BES2_HP  = 33,
+    FILTER_BES4_LP  = 34, FILTER_BES4_HP  = 35,
+    FILTER_BES6_LP  = 36, FILTER_BES6_HP  = 37,
+    FILTER_BES8_LP  = 38, FILTER_BES8_HP  = 39,
 
     FILTER_XOVER_FIRST = FILTER_LR2_LP,
     FILTER_XOVER_LAST  = FILTER_BES8_HP,

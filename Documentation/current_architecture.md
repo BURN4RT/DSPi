@@ -564,7 +564,7 @@ Crossover bands share the band-index space with PEQ for all band-addressing vend
 
 ### Filter families
 
-`FilterType` enum extended at indices 8..37 covering 30 types: LR2/4/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. First-order sub-sections (BW1/3/5/7) always use TDF2 (the Cytomic SVF is fundamentally a 2nd-order topology). Second-order sections use the existing hybrid SVF/biquad selection on RP2350 — SVF below Fs/7.5, TDF2 above — same rule per section that PEQ uses per filter.
+`FilterType` enum extended at indices 8..39 covering 32 types: LR2/4/6/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. First-order sub-sections (BW1/3/5/7 and LR6, which is `(BW3)²`) always use TDF2 (the Cytomic SVF is fundamentally a 2nd-order topology). Second-order sections use the existing hybrid SVF/biquad selection on RP2350 — SVF below Fs/7.5, TDF2 above — same rule per section that PEQ uses per filter.
 
 ### Pipeline insertion
 
