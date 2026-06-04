@@ -1465,15 +1465,15 @@ int main(void) {
         // normalized at the vendor handler boundary — see
         // crossover_filters_spec.md):
         //   0..channel_band_counts-1 → PEQ
-        //   MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 → crossover band (band - MAX_BANDS)
+        //   XOVER_BAND_BASE..XOVER_BAND_BASE+MAX_XOVER_BANDS-1 → crossover band (band - XOVER_BAND_BASE)
         // Anything else is invalid and would have been rejected upstream.
         if (eq_update_pending) {
             EqParamPacket p = pending_packet;
             eq_update_pending = false;
 
-            bool is_xover = (p.band >= MAX_BANDS &&
-                             p.band < (MAX_BANDS + MAX_XOVER_BANDS));
-            uint8_t local = is_xover ? (uint8_t)(p.band - MAX_BANDS) : p.band;
+            bool is_xover = (p.band >= XOVER_BAND_BASE &&
+                             p.band < (XOVER_BAND_BASE + MAX_XOVER_BANDS));
+            uint8_t local = is_xover ? (uint8_t)(p.band - XOVER_BAND_BASE) : p.band;
 
             if (is_xover) {
                 xover_recipes[p.channel][local] = p;

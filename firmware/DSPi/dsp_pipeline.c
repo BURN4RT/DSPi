@@ -219,8 +219,8 @@ void dsp_init_default_filters() {
         }
     }
 
-    // Crossover bands default-init.  Writes wire-band-index (MAX_BANDS + i)
-    // into each recipe's `band` field — see crossover_filters_spec.md.
+    // Crossover bands default-init.  Writes wire-band-index (XOVER_BAND_BASE + i)
+    // into each recipe's `band` field; see crossover_filters_spec.md.
     xover_init_default_filters();
 }
 

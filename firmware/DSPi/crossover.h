@@ -12,10 +12,10 @@
  * (PASS 5+).
  *
  * Wire-protocol band addressing:
- *     bands 0..9   — active PEQ (filter_recipes[][])
- *     bands 10..11 — reserved; rejected by handlers today
- *     bands 12..15 — crossover (xover_recipes[][band - MAX_BANDS])
- *     bands 16+    — rejected
+ *     bands 0..9    active PEQ (filter_recipes[][])
+ *     bands 10..19  reserved gap; rejected by handlers today
+ *     bands 20..23  crossover (xover_recipes[][band - XOVER_BAND_BASE])
+ *     bands 24+     rejected
  *
  * Storage is uniform across NUM_CHANNELS for indexing symmetry with PEQ;
  * crossover bands on master channels (channel < CH_OUT_1) are rejected at
@@ -90,7 +90,7 @@ extern bool channel_xover_bypassed[NUM_CHANNELS];
 
 // Initialise xover_recipes/xover_filters to defaults:
 //   type=FILTER_FLAT, freq=1000.0f, Q=0.707f, gain_db=0.0f, bypass=0
-//   channel = ch, band = MAX_BANDS + i (wire band index — critical: see
+//   channel = ch, band = XOVER_BAND_BASE + i (wire band index; critical: see
 //   spec, "Band-field normalization", to prevent live-edit misrouting).
 // Called from dsp_init_default_filters() and apply_factory_defaults().
 void xover_init_default_filters(void);

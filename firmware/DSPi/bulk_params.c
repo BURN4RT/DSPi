@@ -555,7 +555,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // untouched — an older host couldn't possibly intend to clobber a
     // feature it doesn't know exists.  Output rows applied; master rows
     // skipped (crossover is output-channel-only).  Band-field is always
-    // overwritten with the wire index `MAX_BANDS + i` so a stale local
+    // overwritten with the wire index `XOVER_BAND_BASE + i` so a stale local
     // index in the payload cannot trigger the live-edit misrouting bug
     // described in crossover_filters_spec.md.
     if (in->header.format_version >= 11 &&
@@ -565,7 +565,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             for (int b = 0; b < MAX_XOVER_BANDS; b++) {
                 const WireBandParams *wb = &in->crossovers.bands[ch][b];
                 xover_recipes[ch][b].channel = (uint8_t)ch;
-                xover_recipes[ch][b].band    = (uint8_t)(MAX_BANDS + b);
+                xover_recipes[ch][b].band    = (uint8_t)(XOVER_BAND_BASE + b);
                 xover_recipes[ch][b].type    = wb->type;
                 xover_recipes[ch][b].bypass  = (wb->bypass == 1) ? 1 : 0;
                 xover_recipes[ch][b].freq    = wb->freq;

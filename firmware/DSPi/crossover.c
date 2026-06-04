@@ -618,13 +618,13 @@ void xover_init_default_filters(void) {
         for (int i = 0; i < MAX_XOVER_BANDS; i++) {
             EqParamPacket *r = &xover_recipes[ch][i];
             r->channel  = (uint8_t)ch;
-            // CRITICAL: store the WIRE band index (MAX_BANDS + i), not the
-            // local index. Live-edit dispatch in main.c reads p.band to
+            // CRITICAL: store the WIRE band index (XOVER_BAND_BASE + i), not
+            // the local index. Live-edit dispatch in main.c reads p.band to
             // route the update; if a stale local-index leaked into
             // pending_packet via REQ_SET_BAND_BYPASS we'd misroute the
             // write to PEQ band 0. See crossover_filters_spec.md for the
             // full discussion.
-            r->band     = (uint8_t)(MAX_BANDS + i);
+            r->band     = (uint8_t)(XOVER_BAND_BASE + i);
             r->type     = FILTER_FLAT;
             r->bypass   = 0;
             r->freq     = 1000.0f;

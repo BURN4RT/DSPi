@@ -32,7 +32,10 @@ def _set_band(dev, ch, band, ftype, freq, Q, gain, bypass=0):
 
 
 def _get(dev, ch, band, param):
-    wv = (ch << 8) | (band << 4) | param
+    # GET_EQ_PARAM wValue: channel<<8 | band<<3 (5-bit band) | param (3-bit).
+    # The band field was widened from 4 to 5 bits when the crossover base
+    # moved 12 -> 20 (see crossover_filters_spec.md, 2026-06-04).
+    wv = (ch << 8) | (band << 3) | param
     if param in (P_FREQ, P_Q, P_GAIN):
         return dev.get_f32(OP.GET_EQ_PARAM, wvalue=wv)
     return dev.get_u32(OP.GET_EQ_PARAM, wvalue=wv)

@@ -50,8 +50,8 @@ def index_ceiling_stalls(dev, profile, chk):
         # (label, fn-just-past-ceiling, fn-last-valid)
         ("EQ channel", lambda: dev.get(OP.GET_EQ_PARAM, 4, wvalue=(nc << 8)),
                        lambda: dev.get(OP.GET_EQ_PARAM, 4, wvalue=((nc - 1) << 8))),
-        ("EQ band", lambda: dev.get(OP.GET_EQ_PARAM, 4, wvalue=(nb << 4)),
-                    lambda: dev.get(OP.GET_EQ_PARAM, 4, wvalue=((nb - 1) << 4))),
+        ("EQ band", lambda: dev.get(OP.GET_EQ_PARAM, 4, wvalue=(nb << 3)),
+                    lambda: dev.get(OP.GET_EQ_PARAM, 4, wvalue=((nb - 1) << 3))),
         ("delay channel", lambda: dev.get(OP.GET_DELAY, 4, wvalue=nc),
                           lambda: dev.get(OP.GET_DELAY, 4, wvalue=nc - 1)),
         ("legacy gain", lambda: dev.get(OP.GET_CHANNEL_GAIN, 4, wvalue=3),

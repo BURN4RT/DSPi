@@ -68,10 +68,10 @@ class PlatformProfile:
 def _probe_band_ceiling(dev: DspiDevice, channel: int, hi: int = 16) -> int:
     """Smallest band index that STALLs on GET_EQ_PARAM == the ceiling.
 
-    wValue = (channel<<8)|(band<<4)|param(=0 type).
+    wValue = (channel<<8)|(band<<3)|param(=0 type); band is a 5-bit field.
     """
     for band in range(hi + 1):
-        wv = (channel << 8) | (band << 4) | 0
+        wv = (channel << 8) | (band << 3) | 0
         try:
             dev.get(OP.GET_EQ_PARAM, 4, wvalue=wv)
         except Stall:
@@ -82,7 +82,7 @@ def _probe_band_ceiling(dev: DspiDevice, channel: int, hi: int = 16) -> int:
 def _probe_channel_ceiling(dev: DspiDevice, hi: int = 16) -> int:
     """Smallest channel index that STALLs on GET_EQ_PARAM (band 0) == count."""
     for ch in range(hi + 1):
-        wv = (ch << 8) | (0 << 4) | 0
+        wv = (ch << 8) | (0 << 3) | 0
         try:
             dev.get(OP.GET_EQ_PARAM, 4, wvalue=wv)
         except Stall:

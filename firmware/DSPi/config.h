@@ -440,12 +440,22 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define MAX_BANDS        12
 
 // Crossover filter bands per channel. Crossover bands live at wire band
-// indices [MAX_BANDS .. MAX_BANDS + MAX_XOVER_BANDS - 1] (i.e. 12..15) for
-// vendor command addressing — see Documentation/Features/crossover_filters_spec.md.
-// Bands 10..11 are reserved for future PEQ-count expansion and rejected
-// by handlers today.
+// indices [XOVER_BAND_BASE .. XOVER_BAND_BASE + MAX_XOVER_BANDS - 1]
+// (i.e. 20..23) for vendor command addressing; see
+// Documentation/Features/crossover_filters_spec.md.
+//
+// MAX_BANDS (12) is the PEQ storage depth; only bands 0..9 are active today.
+// XOVER_BAND_BASE is deliberately set well above MAX_BANDS so the indices
+// between active PEQ and crossover form a wide reserved gap: PEQ can grow to
+// 20 bands (storage permitting) before it would ever collide with crossover.
+// Band indices in [channel_band_counts[ch] .. XOVER_BAND_BASE) are rejected
+// by the vendor handlers today.
+//
+// NOTE: REQ_GET_EQ_PARAM packs the band index into a 5-bit wValue field
+// (bits[7:3]); XOVER_BAND_BASE + MAX_XOVER_BANDS - 1 (= 23) must stay <= 31.
+#define XOVER_BAND_BASE   20
 #define MAX_XOVER_BANDS   4
-#define TOTAL_BAND_INDICES (MAX_BANDS + MAX_XOVER_BANDS)  // 16
+#define TOTAL_BAND_INDICES (XOVER_BAND_BASE + MAX_XOVER_BANDS)  // 24
 
 // Legacy aliases for backward compatibility
 #define CH_OUT_LEFT      CH_OUT_1

@@ -541,7 +541,7 @@ PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples =
 ---
 
 ## Crossover Filters
-*Last updated: 2026-05-18*
+*Last updated: 2026-06-04*
 
 ### Purpose
 
@@ -559,8 +559,10 @@ A dedicated per-output crossover stage between the matrix mixer (PASS 4) and per
 Crossover bands share the band-index space with PEQ for all band-addressing vendor commands (REQ_SET_EQ_PARAM, REQ_GET_EQ_PARAM, REQ_SET_BAND_BYPASS, REQ_GET_BAND_BYPASS):
 
 - 0..9 = active PEQ band
-- 10..11 = reserved (rejected)
-- 12..15 = crossover band 0..3
+- 10..19 = reserved (rejected); wide gap so PEQ can grow without moving crossover
+- 20..23 = crossover band 0..3 (`XOVER_BAND_BASE = 20`)
+
+The crossover base was widened from 12 to 20 on 2026-06-04. Because `REQ_GET_EQ_PARAM` previously packed the band into a 4-bit `wValue` field (max 15), its `wValue` layout changed to a 5-bit band field: `(channel << 8) | (band << 3) | param` (param dropped from 4 bits to 3; only 5 values exist). The other three band-addressing commands and the bulk transfer already use an 8-bit band field and were unaffected. The wire-format size, persistence layout, and filter-type enum are all unchanged.
 
 ### Filter families
 
@@ -586,11 +588,11 @@ Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner
 
 ### Band-field normalization (critical correctness invariant)
 
-`xover_recipes[ch][i].band` always stores the **wire band index** (`MAX_BANDS + i` = 12..15), NOT the local 0..3. The dispatch path through `pending_packet → main.c::eq_update_pending` keys on `p.band` to choose between PEQ and crossover storage. If a stale local index leaked through (via REQ_SET_BAND_BYPASS's read-modify-write of the existing recipe), the update would misroute to PEQ band 0. Init, preset load, bulk apply, and the vendor handlers all explicitly normalize the band field — see `crossover_filters_spec.md` for the full discussion.
+`xover_recipes[ch][i].band` always stores the **wire band index** (`XOVER_BAND_BASE + i` = 20..23), NOT the local 0..3. The dispatch path through `pending_packet → main.c::eq_update_pending` keys on `p.band` to choose between PEQ and crossover storage. If a stale local index leaked through (via REQ_SET_BAND_BYPASS's read-modify-write of the existing recipe), the update would misroute to PEQ band 0. Init, preset load, bulk apply, and the vendor handlers all explicitly normalize the band field — see `crossover_filters_spec.md` for the full discussion.
 
 ### Defaults
 
-Every default band: `type=FILTER_FLAT, freq=1000.0, Q=0.707, gain_db=0, bypass=0, band=MAX_BANDS+i`. Because FLAT is not a crossover type, the design routine produces a bypassed cascade and `channel_xover_bypassed[*] = true`. Zero per-sample cost until the user picks a real crossover type.
+Every default band: `type=FILTER_FLAT, freq=1000.0, Q=0.707, gain_db=0, bypass=0, band=XOVER_BAND_BASE+i`. Because FLAT is not a crossover type, the design routine produces a bypassed cascade and `channel_xover_bypassed[*] = true`. Zero per-sample cost until the user picks a real crossover type.
 
 ### Files
 
@@ -1495,18 +1497,18 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-05-18*
+*Last updated: 2026-06-04*
 
 **Band-index map (PEQ and crossover share one address space):**
 
 | Band index | Meaning |
 |---|---|
 | 0..9 | Active PEQ band (10 bands per channel today) |
-| 10..11 | Reserved for future PEQ-count growth; rejected by handlers |
-| 12..15 | Crossover band 0..3 |
-| ≥16 | Rejected |
+| 10..19 | Reserved for future PEQ-count growth; rejected by handlers |
+| 20..23 | Crossover band 0..3 (`XOVER_BAND_BASE = 20`) |
+| ≥24 | Rejected |
 
-`REQ_SET_EQ_PARAM`, `REQ_GET_EQ_PARAM`, `REQ_SET_BAND_BYPASS`, and `REQ_GET_BAND_BYPASS` all accept the unified band range. Crossover bands (12..15) are rejected on master channels (channel < `CH_OUT_1` = 2). See `Documentation/Features/crossover_filters_spec.md` for the complete crossover spec.
+`REQ_SET_EQ_PARAM`, `REQ_GET_EQ_PARAM`, `REQ_SET_BAND_BYPASS`, and `REQ_GET_BAND_BYPASS` all accept the unified band range. Crossover bands (20..23) are rejected on master channels (channel < `CH_OUT_1` = 2). `REQ_GET_EQ_PARAM` packs the band into a 5-bit `wValue` field: `(channel << 8) | (band << 3) | param` (band 0..31, param 0..4); the other three commands carry the band in a full 8-bit field. See `Documentation/Features/crossover_filters_spec.md` for the complete crossover spec.
 
 
 | Command | Code | Direction | Description |
@@ -1742,7 +1744,7 @@ MCK is driven directly by **CLK_GPOUTn** (hardware clock peripheral output) — 
 - `WIRE_FORMAT_VERSION` = 9: adds `WireUserVolume` (16 bytes) — vendor-channel user volume + mute mirror
 - `WIRE_FORMAT_VERSION` = 10: adds `WireDacHwMute` (16 bytes) — DAC hardware mute pin config
 - `WIRE_FORMAT_VERSION` = 11: adds `WireCrossoverConfig` (704 bytes = 11 × 4 × WireBandParams) — per-channel crossover bands. Bulk total: 3664 bytes. **Per-version size anchors live in `bulk_params.h`** (`WIRE_BULK_PARAMS_V{N}_SIZE`) and each legacy section gate in `bulk_params_apply()` compares against its own version's anchor, NOT `sizeof(WireBulkParams)` — without this discipline, growing the struct silently locks older payloads out of their own tail sections.
-- `SLOT_DATA_VERSION` = 16: appends `xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS]` to `PresetSlot` (struct grew — first growth since V12). **CRC migration:** `slot_data_size_for_version()` uses explicit per-version `case` labels so the validator picks the right byte range. V12-V15 share one size; V16 adds the crossover tail. `migrate_legacy()` produces a real V16 slot (sets `version = SLOT_DATA_VERSION`, CRCs over V16 size) — otherwise migrated slots would fail the new validator on next reboot. **Field-default discipline:** because the migrated slot is V16-tagged, every `slot->version >= N` gate in `apply_slot_to_live()` fires and reads the slot's bytes directly, so migrate must populate every V8–V16 field with the value the V<N default branch would have produced — including `user_vol_index = CENTER_VOLUME_INDEX` (NOT zero — zero maps to -CENTER dB which would silently mute migrated devices), default channel names via `get_default_channel_name()`, I2S pins at compile-time defaults, leveller `LEVELLER_DEFAULT_*` values, and crossover FLAT defaults with `band = MAX_BANDS+i`.
+- `SLOT_DATA_VERSION` = 16: appends `xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS]` to `PresetSlot` (struct grew — first growth since V12). **CRC migration:** `slot_data_size_for_version()` uses explicit per-version `case` labels so the validator picks the right byte range. V12-V15 share one size; V16 adds the crossover tail. `migrate_legacy()` produces a real V16 slot (sets `version = SLOT_DATA_VERSION`, CRCs over V16 size) — otherwise migrated slots would fail the new validator on next reboot. **Field-default discipline:** because the migrated slot is V16-tagged, every `slot->version >= N` gate in `apply_slot_to_live()` fires and reads the slot's bytes directly, so migrate must populate every V8–V16 field with the value the V<N default branch would have produced — including `user_vol_index = CENTER_VOLUME_INDEX` (NOT zero — zero maps to -CENTER dB which would silently mute migrated devices), default channel names via `get_default_channel_name()`, I2S pins at compile-time defaults, leveller `LEVELLER_DEFAULT_*` values, and crossover FLAT defaults with `band = XOVER_BAND_BASE+i`.
 - Backward compatible: V<9 slots default to all-S/PDIF; V9-V10 slots use old MCK encoding; V<12 slots use single preamp value for all channels, default master volume 0 dB; V<11 bulk payloads leave crossover state untouched on apply; V<16 preset slots apply crossover defaults on load; older wire payloads accepted without new fields
 
 ### BSS Impact

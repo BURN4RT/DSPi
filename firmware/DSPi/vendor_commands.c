@@ -240,14 +240,14 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
                 if (ch < NUM_CHANNELS) {
                     // Two band-index ranges are accepted:
                     //   0..channel_band_counts[ch]-1 → PEQ (existing)
-                    //   MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 → crossover (new)
-                    // Bands in [channel_band_counts, MAX_BANDS) are the
+                    //   XOVER_BAND_BASE..XOVER_BAND_BASE+MAX_XOVER_BANDS-1 → crossover
+                    // Bands in [channel_band_counts, XOVER_BAND_BASE) are the
                     // reserved gap for future PEQ-count expansion; reject
                     // silently.  Crossover on master channels is rejected
                     // (feature is output-channel-only).  See
                     // Documentation/Features/crossover_filters_spec.md.
                     bool is_peq = (b < channel_band_counts[ch]);
-                    bool is_xover = (b >= MAX_BANDS && b < MAX_BANDS + MAX_XOVER_BANDS);
+                    bool is_xover = (b >= XOVER_BAND_BASE && b < XOVER_BAND_BASE + MAX_XOVER_BANDS);
                     if (is_peq || (is_xover && ch >= CH_OUT_1)) {
                         eq_update_pending = true;
                     }
@@ -267,9 +267,9 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
                 if (band < channel_band_counts[channel]) {
                     p = filter_recipes[channel][band];
                     valid = true;
-                } else if (band >= MAX_BANDS && band < (MAX_BANDS + MAX_XOVER_BANDS)
+                } else if (band >= XOVER_BAND_BASE && band < (XOVER_BAND_BASE + MAX_XOVER_BANDS)
                            && channel >= CH_OUT_1) {
-                    p = xover_recipes[channel][band - MAX_BANDS];
+                    p = xover_recipes[channel][band - XOVER_BAND_BASE];
                     valid = true;
                 }
                 if (valid) {
@@ -1143,7 +1143,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_BAND_BYPASS: {
                 // wValue = (channel << 8) | band; returns 1 byte (0 or 1).
                 // PEQ bands 0..channel_band_counts-1 and crossover bands
-                // MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 both supported.
+                // XOVER_BAND_BASE..XOVER_BAND_BASE+MAX_XOVER_BANDS-1 both supported.
                 uint8_t channel = (setup->wValue >> 8) & 0xFF;
                 uint8_t band = setup->wValue & 0xFF;
                 if (channel < NUM_CHANNELS) {
@@ -1152,9 +1152,9 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     if (band < channel_band_counts[channel]) {
                         v = (filter_recipes[channel][band].bypass == 1) ? 1 : 0;
                         ok = true;
-                    } else if (band >= MAX_BANDS && band < (MAX_BANDS + MAX_XOVER_BANDS)
+                    } else if (band >= XOVER_BAND_BASE && band < (XOVER_BAND_BASE + MAX_XOVER_BANDS)
                                && channel >= CH_OUT_1) {
-                        v = (xover_recipes[channel][band - MAX_BANDS].bypass == 1) ? 1 : 0;
+                        v = (xover_recipes[channel][band - XOVER_BAND_BASE].bypass == 1) ? 1 : 0;
                         ok = true;
                     }
                     if (ok) {
@@ -1166,20 +1166,25 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_EQ_PARAM: {
-                // wValue: bits[15:8]=channel, bits[7:4]=band (0..15),
-                //         bits[3:0]=param-nibble (0=type, 1=freq, 2=Q,
-                //         3=gain_db, 4=bypass).  Returns 4 bytes regardless
-                //         of which scalar — the unused bytes are zeroed.
+                // wValue: bits[15:8]=channel, bits[7:3]=band (5 bits, 0..31),
+                //         bits[2:0]=param (0=type, 1=freq, 2=Q, 3=gain_db,
+                //         4=bypass).  Returns 4 bytes regardless of which
+                //         scalar; the unused bytes are zeroed.
+                //
+                // The band field is 5 bits (not the original 4) so crossover
+                // bands at XOVER_BAND_BASE..+3 (= 20..23) remain addressable
+                // after the reserved gap was widened.  Hosts must build
+                // wValue as (channel<<8) | (band<<3) | param.
                 uint8_t channel = (setup->wValue >> 8) & 0xFF;
-                uint8_t band = (setup->wValue >> 4) & 0x0F;
-                uint8_t param = setup->wValue & 0x0F;
+                uint8_t band = (setup->wValue >> 3) & 0x1F;
+                uint8_t param = setup->wValue & 0x07;
                 if (channel < NUM_CHANNELS) {
                     EqParamPacket *p = NULL;
                     if (band < channel_band_counts[channel]) {
                         p = &filter_recipes[channel][band];
-                    } else if (band >= MAX_BANDS && band < (MAX_BANDS + MAX_XOVER_BANDS)
+                    } else if (band >= XOVER_BAND_BASE && band < (XOVER_BAND_BASE + MAX_XOVER_BANDS)
                                && channel >= CH_OUT_1) {
-                        p = &xover_recipes[channel][band - MAX_BANDS];
+                        p = &xover_recipes[channel][band - XOVER_BAND_BASE];
                     }
                     if (p) {
                         uint32_t val_to_send = 0;

@@ -311,12 +311,12 @@ typedef struct __attribute__((packed)) {
     uint8_t user_vol_index;
 
     // Crossover bands (V16+).  Stored with the same EqParamPacket shape as
-    // PEQ — `band` MUST be the wire band index (MAX_BANDS + i) for every
+    // PEQ; `band` MUST be the wire band index (XOVER_BAND_BASE + i) for every
     // entry, because live-edit dispatch (main.c::eq_update_pending) routes
     // by the recipe's `band` field.  apply_slot_to_live() re-normalizes on
     // load defensively; migrate_legacy() initialises this section with
-    // crossover defaults (FLAT type, fc=1000, band=12+i) before CRC.  See
-    // Documentation/Features/crossover_filters_spec.md.
+    // crossover defaults (FLAT type, fc=1000, band=XOVER_BAND_BASE+i) before
+    // CRC.  See Documentation/Features/crossover_filters_spec.md.
     EqParamPacket xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS];
 } PresetSlot;
 
@@ -1234,7 +1234,7 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         for (int ch = 0; ch < NUM_CHANNELS; ch++) {
             for (int i = 0; i < MAX_XOVER_BANDS; i++) {
                 xover_recipes[ch][i].channel = (uint8_t)ch;
-                xover_recipes[ch][i].band    = (uint8_t)(MAX_BANDS + i);
+                xover_recipes[ch][i].band    = (uint8_t)(XOVER_BAND_BASE + i);
                 xover_recipes[ch][i].bypass  = (xover_recipes[ch][i].bypass == 1) ? 1 : 0;
             }
         }
@@ -1681,7 +1681,7 @@ static bool migrate_legacy(void) {
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         for (int i = 0; i < MAX_XOVER_BANDS; i++) {
             slot_buf.xover_recipes[ch][i].channel = (uint8_t)ch;
-            slot_buf.xover_recipes[ch][i].band    = (uint8_t)(MAX_BANDS + i);
+            slot_buf.xover_recipes[ch][i].band    = (uint8_t)(XOVER_BAND_BASE + i);
             slot_buf.xover_recipes[ch][i].type    = FILTER_FLAT;
             slot_buf.xover_recipes[ch][i].bypass  = 0;
             slot_buf.xover_recipes[ch][i].freq    = 1000.0f;

@@ -260,15 +260,16 @@ typedef struct __attribute__((packed)) {
 //
 // Per-channel crossover bands, layout exactly mirrors `eq[][]` but with
 // MAX_XOVER_BANDS columns (4 vs 12 for EQ).  Wire band indices for crossover
-// are MAX_BANDS..MAX_BANDS+MAX_XOVER_BANDS-1 (12..15) when addressed via
-// vendor commands — see Documentation/Features/crossover_filters_spec.md.
+// are XOVER_BAND_BASE..XOVER_BAND_BASE+MAX_XOVER_BANDS-1 (20..23) when
+// addressed via vendor commands; see
+// Documentation/Features/crossover_filters_spec.md.
 // `band` field in WireBandParams (which the legacy EQ section also doesn't
 // carry) is implicit in the section's array position; row index = channel,
 // column index = local crossover-band index (0..3).
 //
 // `q` and `gain_db` are unused for crossover filter types (any value in the
-// FILTER_XOVER_FIRST..FILTER_XOVER_LAST range) — the design code ignores
-// them — but they exist in the struct for wire-format parity with EQ.
+// FILTER_XOVER_FIRST..FILTER_XOVER_LAST range); the design code ignores
+// them, but they exist in the struct for wire-format parity with EQ.
 // Master rows (channel 0..1, the CH_MASTER_* slots) are zeroed on collect
 // and skipped on apply because crossovers are an output-channel-only
 // feature; storage symmetry with EQ is a UI convenience, not a usable slot.
