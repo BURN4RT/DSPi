@@ -27,7 +27,7 @@
    - [6.6 Outputs (SPDIF / I2S / PDM / DAC mute)](#66-outputs)
    - [6.7 Dual-Core Workers](#67-dual-core-workers)
    - [6.8 USB Stack (descriptors / UAC1 driver / feedback)](#68-usb-stack)
-   - [6.9 Control Surface (vendor commands / I2C / notifications)](#69-control-surface)
+   - [6.9 Control Surface (vendor commands / notifications)](#69-control-surface)
    - [6.10 Persistence (flash / presets / bulk params)](#610-persistence)
    - [6.11 Pico Audio Libraries](#611-pico-audio-libraries)
 7. [Data Model Reference](#7-data-model-reference)
@@ -45,10 +45,10 @@
 - **"I'm touching the audio path."** Read [4.2](#42-the-dsp-pipeline-passes), [6.3](#63-dsp-pipeline-core), and **especially** [Section 9](#9-concurrency--timing-rules) (slot alignment is inviolable; never change coefficients while Core 1 is mid-block).
 - **"I'm adding a persisted setting."** Read [6.10 Persistence](#610-persistence): you will touch `PresetSlot` (flash version bump) **and** `WireBulkParams` (wire version bump) **and** `bulk_params_collect/apply`.
 
-**Golden rules before you commit anything in the audio path** (from `CLAUDE.md`):
+**Golden rules before you commit anything in the audio path:**
 - Inter-output sample alignment is sacred. Never let the four SPDIF instances, I2S slots, and PDM drift relative to each other.
+- Never block the main loop or an ISR. Real-time work (USB ISR, audio callback, SOF) must stay non-blocking; slow or flash-touching work is deferred to the main loop via `*_pending` flags (see [Section 9](#9-concurrency--timing-rules)).
 - After firmware changes, update `Documentation/current_architecture.md`.
-- Never use an em-dash anywhere. Never commit/push without an explicit instruction.
 
 ---
 
@@ -76,7 +76,6 @@ firmware/
 │   ├── audio_input.c/.h          Input-source abstraction (USB vs SPDIF)
 │   ├── lg_sound_sync.c/.h        LG TV volume/mute via SPDIF channel status
 │   ├── dac_hw_mute.c/.h          Hardware DAC mute GPIO (glitch-free resets)
-│   ├── i2c_target.c/.h           I2C slave -> same vendor command surface as USB
 │   ├── notify.c/.h               Device->host change notifications (EP 0x83)
 │   ├── flash_storage.c/.h        10-slot preset system, directory, factory defaults
 │   ├── bulk_params.c/.h          Whole-DSP-state wire format (GET/SET all params)
@@ -111,7 +110,7 @@ The single most important thing to internalize: **the same source builds two ver
 | Max delay | `MAX_DELAY_SAMPLES` = **1024** (21 ms) | **2048** (42 ms) |
 | Defined in | `config.h:90`, `409-410`, `437-438` | `config.h:88`, `406-407`, `432-433` |
 
-Build commands (from `CLAUDE.md`):
+Build commands:
 ```
 cmake --build build-rp2040 --clean-first
 cmake --build build-rp2350 --clean-first
@@ -250,7 +249,6 @@ The rookie's lookup table. Find your topic, jump to the code.
 | Factory defaults | `apply_factory_defaults()` — `flash_storage.c:1821` |
 | Whole-state GET/SET | `bulk_params_collect()` `bulk_params.c:81`, `bulk_params_apply()` `:256` |
 | Device->host notifications | `notify.c` (`notify_param_write():204`) |
-| I2C control (alt to USB) | `i2c_target.c` (`i2c_target_poll():593`) |
 | USB descriptors | `usb_descriptors.c` |
 
 ---
@@ -471,11 +469,10 @@ TinyUSB device stack with a **custom UAC1 class driver** (TinyUSB's built-in aud
 
 ### 6.9 Control Surface
 
-Three transports converge on one command set:
+Two transports converge on one command set:
 
 1. **USB control transfers** — `tud_vendor_control_xfer_cb()` (`vendor_commands.c:1954`) dispatches via stages: SETUP routes to `vendor_handle_get()` (`:860`) for IN requests or stages a DATA buffer for OUT; DATA calls `vendor_handle_set_data()` (`:214`).
-2. **I2C target** — `i2c_target.c` stages the same `bReq/wValue/wIndex/wLen` frames and dispatches them through `i2c_target_poll()` (`:593`), sharing the bulk buffer with USB.
-3. **Notifications out** — `notify.c` watches a shadow copy of the whole param state and emits `PARAM_CHANGED` / `BULK_INVALIDATED` / `PRESET_LOADED` events on EP 0x83 (`notify_param_write():204`, `notify_peek_next():357`).
+2. **Notifications out** — `notify.c` watches a shadow copy of the whole param state and emits `PARAM_CHANGED` / `BULK_INVALIDATED` / `PRESET_LOADED` events on EP 0x83 (`notify_param_write():204`, `notify_peek_next():357`).
 
 Heavy or flash-touching commands set a `*_pending` flag and return immediately; the main loop does the real work. See the [complete command table](#8-vendor-command-reference-complete).
 
@@ -736,7 +733,7 @@ if (is_core1_channel && core1_mode == CORE1_MODE_EQ_WORKER) {
 ```
 This lives in the main loop's EQ-update block (`main.c` ~1463-1541).
 
-**3. Slot alignment is inviolable.** Every reconfiguration (rate change, preset load, type/pin switch, flash write, input switch) ends by restarting **all** output slots through one synchronized path (`complete_pipeline_reset()` / `enable_outputs_in_sync()` / `audio_spdif_enable_sync()`). Never restart one slot independently. The SPDIF prefill handler deliberately skips a second restart while prefilling to avoid double-starting. See `CLAUDE.md` "Hard Constraints".
+**3. Slot alignment is inviolable.** Every reconfiguration (rate change, preset load, type/pin switch, flash write, input switch) ends by restarting **all** output slots through one synchronized path (`complete_pipeline_reset()` / `enable_outputs_in_sync()` / `audio_spdif_enable_sync()`). Never restart one slot independently. The SPDIF prefill handler deliberately skips a second restart while prefilling to avoid double-starting.
 
 **4. Mute brackets around flash.** Flash erase/program stalls XIP for tens of ms. `prepare_flash_write_operation()` mutes + suspends RX first; `complete_flash_write_operation_*()` restores after. The ring buffer is RAM-resident so the USB ISR survives the blackout.
 
@@ -766,6 +763,5 @@ This lives in the main loop's EQ-update block (`main.c` ~1463-1541).
 - **Line numbers drift.** If you do a large edit to a mapped file, re-anchor the affected rows (search by symbol, not line). Treat function/struct names as the source of truth.
 - When you add a vendor command, add a row to [Section 8](#8-vendor-command-reference-complete) and the relevant quick-index row in [Section 5](#5-where-do-i-find-quick-index).
 - When you add a persisted field, follow the checklist at the end of [6.10](#610-persistence).
-- Keep the writing-style rules from `CLAUDE.md`: no em-dashes anywhere.
 
 *Document generated from a full read of `firmware/DSPi/` and the pico-extras audio libraries. Verify any line number against the current source before relying on it.*
