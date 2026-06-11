@@ -979,9 +979,10 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
         slot->user_vol_index = (uint8_t)((uint32_t)vol >> 8u);
     }
 
-    // Crossover bands (V16+).  Copy the recipes; the wire-band-index `12+i`
-    // is already baked into xover_recipes[][] by xover_init_default_filters /
-    // xover_update_band, so no normalization needed here.
+    // Crossover bands (V16+).  Copy the recipes; the wire band index
+    // (XOVER_BAND_BASE + i) is already baked into xover_recipes[][] by
+    // xover_init_default_filters() and the live-edit path in main.c, so no
+    // normalization is needed here.
     memcpy(slot->xover_recipes, (void *)xover_recipes, sizeof(slot->xover_recipes));
 
     // Compute CRC over the data section using THIS version's byte range
@@ -1226,8 +1227,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     // Crossover bands (V16+).  Pre-V16 slots predate this feature; reset
     // crossovers to defaults rather than leaving whatever live values
     // existed (matches the model where preset load is a complete state
-    // restore).  In either case re-normalize the wire-band-index `12+i`
-    // defensively — a stale local-index leaking into pending_packet via
+    // restore).  In either case re-normalize the wire band index
+    // (XOVER_BAND_BASE + i) defensively; a stale local index leaking into pending_packet via
     // REQ_SET_BAND_BYPASS would misroute the next live edit into PEQ band 0.
     if (slot->version >= 16) {
         memcpy((void *)xover_recipes, slot->xover_recipes, sizeof(xover_recipes));

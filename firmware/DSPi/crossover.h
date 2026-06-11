@@ -96,8 +96,10 @@ extern bool channel_xover_bypassed[NUM_CHANNELS];
 void xover_init_default_filters(void);
 
 // Design one band: read recipe, populate sections + num_sections + bypass.
-// Idempotent. Resets section state on path change (use_svf ↔ TDF2) following
-// the same convention as dsp_compute_coefficients().
+// Idempotent. Section state is preserved across redesigns so live edits do
+// not click; state is reset when a section's SVF/TDF2 path changes, when the
+// band is bypassed or re-enabled, or when the section drops out of the new
+// cascade (same convention as dsp_compute_coefficients()).
 void xover_design_filter(const EqParamPacket *recipe,
                          XoverFilter *band,
                          float sample_rate);

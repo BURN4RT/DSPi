@@ -541,7 +541,7 @@ PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples =
 ---
 
 ## Crossover Filters
-*Last updated: 2026-06-04*
+*Last updated: 2026-06-11*
 
 ### Purpose
 
@@ -585,6 +585,14 @@ Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner
 - `xover_filters[NUM_CHANNELS][MAX_XOVER_BANDS]` — designed biquad cascades
 - `xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS]` — user-supplied recipe (EqParamPacket)
 - `channel_xover_bypassed[NUM_CHANNELS]` — fast-path flag; the stage is skipped entirely for a channel when all 4 bands are bypassed (the default)
+
+### State preservation across redesigns (2026-06-11)
+
+`xover_design_filter()` snapshots each section's filter state (`s1`/`s2`, `svic1eq`/`svic2eq`) before the passthrough reset and restores it for sections that survive the redesign, so live edits (dragging fc, changing order) do not zero the cascade's memory and click. State is reset only when a section's SVF/TDF2 path changes, when the section drops out of the new cascade, or when the band toggles bypass; this matches the PEQ convention in `dsp_compute_coefficients()`.
+
+### Interaction with global EQ bypass
+
+`REQ_SET_BYPASS` (`bypass_master_eq`) intentionally does NOT bypass the crossover stage on either platform: crossover filters are speaker-protection critical (a tweeter high-pass must survive a global "EQ off" toggle). Only per-band bypass and the channel-level fast path disable crossover processing.
 
 ### Band-field normalization (critical correctness invariant)
 

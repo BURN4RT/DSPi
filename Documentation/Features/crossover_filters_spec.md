@@ -339,6 +339,8 @@ The crossover stage is in-place on the existing `buf_out[output][]` arrays. It d
 
 Core 1 EQ worker (when active — see CPU section): runs crossover before PEQ on its assigned output range.
 
+**Global EQ bypass (`REQ_SET_BYPASS`) intentionally does NOT bypass the crossover stage.** Crossover filters are speaker-protection critical: a tweeter's high-pass must survive a global "EQ off" toggle, or the comparison listen could damage the driver. Only per-band bypass (`REQ_SET_BAND_BYPASS` or the recipe's `bypass` byte) and the channel-level `channel_xover_bypassed` fast path disable crossover processing.
+
 ---
 
 ## 7. Defaults
@@ -361,8 +363,8 @@ Because `FILTER_FLAT` is not in the crossover range, every default band is autom
 - **Type ≥ FILTER_XOVER_LAST + 1:** treated as bypassed.
 - **`fc <= 0` or `Fs <= 0`:** treated as bypassed.
 - **Bypass byte normalization:** the firmware accepts only `bypass == 1` as "bypassed". Any other value (including 0xFF from legacy hosts that fail to zero-init padding) is treated as active. Apps should always send `bypass = 0` or `1`.
-- **Rate change:** all crossover sections are redesigned at the new Fs (in `dsp_recalculate_all_filters()`). Section state (`s1`, `s2`, `svic1eq`, `svic2eq`) is reset on each redesign — this can produce a small transient on rate change. The PEQ stage has the same behavior; the preset-mute envelope does NOT cover rate change today (consistent with existing PEQ limitation).
-- **Live edit (REQ_SET_EQ_PARAM with same band twice):** each edit redesigns just that band's sections, then recomputes `channel_xover_bypassed[ch]`. A small click is possible (consistent with PEQ).
+- **Rate change:** all crossover sections are redesigned at the new Fs (in `dsp_recalculate_all_filters()`). Section state (`s1`, `s2`, `svic1eq`, `svic2eq`) is preserved across the redesign and reset only when a section's SVF/TDF2 path changes (e.g. fc crossing the Fs/7.5 gate at the new rate), when a section drops out of the new cascade, or when the band toggles bypass. A small transient from the coefficient step itself is still possible; the PEQ stage has the same behavior, and the preset-mute envelope does NOT cover rate change today (consistent with existing PEQ limitation).
+- **Live edit (REQ_SET_EQ_PARAM with same band twice):** each edit redesigns just that band's sections, then recomputes `channel_xover_bypassed[ch]`. Section state is preserved across the redesign (matching the PEQ convention in `dsp_compute_coefficients()`), so dragging fc or switching order does not zero the cascade's memory; any residual transient comes from the coefficient step, as with PEQ.
 - **Reserved band indices 10..19:** rejected at the vendor handler.
 - **Crossover on master channels:** rejected. Use output channels (CH_OUT_1 and above) only.
 

@@ -75,7 +75,7 @@ static const XoverTypeMeta xover_type_table[] = {
     { XOVER_FAMILY_LR,  8, 0, 4 },  // LR8 LP
     { XOVER_FAMILY_LR,  8, 1, 4 },  // LR8 HP
 
-    // FILTER_BW1_LP=14 .. FILTER_BW8_HP=29
+    // FILTER_BW1_LP=16 .. FILTER_BW8_HP=31
     { XOVER_FAMILY_BW,  1, 0, 1 },  // BW1 LP
     { XOVER_FAMILY_BW,  1, 1, 1 },  // BW1 HP
     { XOVER_FAMILY_BW,  2, 0, 1 },  // BW2 LP
@@ -93,7 +93,7 @@ static const XoverTypeMeta xover_type_table[] = {
     { XOVER_FAMILY_BW,  8, 0, 4 },  // BW8 LP
     { XOVER_FAMILY_BW,  8, 1, 4 },  // BW8 HP
 
-    // FILTER_BES2_LP=30 .. FILTER_BES8_HP=37
+    // FILTER_BES2_LP=32 .. FILTER_BES8_HP=39
     { XOVER_FAMILY_BES, 2, 0, 1 },  // Bes2 LP
     { XOVER_FAMILY_BES, 2, 1, 1 },  // Bes2 HP
     { XOVER_FAMILY_BES, 4, 0, 2 },  // Bes4 LP
@@ -555,8 +555,32 @@ void xover_design_filter(const EqParamPacket *recipe,
     // (== 1 strictly bypasses; any other value leaves active).
     bool user_bypass = (recipe && recipe->bypass == 1);
 
+    // Snapshot per-section filter state before the passthrough reset below
+    // wipes it. A live redesign (e.g. the user dragging fc) must keep the
+    // cascade's memory or the output steps discontinuously on every update;
+    // PEQ has the same convention (dsp_compute_coefficients preserves s1/s2
+    // across coefficient updates, resetting only on an SVF/TDF2 path change).
+#if PICO_RP2350
+    float old_s1[MAX_XOVER_BAND_SECTIONS], old_s2[MAX_XOVER_BAND_SECTIONS];
+    float old_ic1[MAX_XOVER_BAND_SECTIONS], old_ic2[MAX_XOVER_BAND_SECTIONS];
+    bool  old_svf[MAX_XOVER_BAND_SECTIONS];
+#else
+    int32_t old_s1[MAX_XOVER_BAND_SECTIONS], old_s2[MAX_XOVER_BAND_SECTIONS];
+#endif
+    uint8_t old_active = (band->num_sections <= MAX_XOVER_BAND_SECTIONS)
+                         ? band->num_sections : 0;
+    for (uint8_t i = 0; i < old_active; i++) {
+        old_s1[i] = band->sections[i].s1;
+        old_s2[i] = band->sections[i].s2;
+#if PICO_RP2350
+        old_ic1[i] = band->sections[i].svic1eq;
+        old_ic2[i] = band->sections[i].svic2eq;
+        old_svf[i] = band->sections[i].use_svf;
+#endif
+    }
+
     // Mark all sections passthrough first, so any unused slots are inert
-    // even if the design fails partway. Also resets state on path changes.
+    // even if the design fails partway.
     for (uint8_t i = 0; i < MAX_XOVER_BAND_SECTIONS; i++) {
         biquad_set_passthrough(&band->sections[i]);
     }
@@ -595,6 +619,21 @@ void xover_design_filter(const EqParamPacket *recipe,
 
     if (band->num_sections > 0 && band->num_sections <= MAX_XOVER_BAND_SECTIONS) {
         band->bypass = false;
+        // Restore surviving sections' state (the passthrough reset above
+        // zeroed it). A section that was bypassed, dropped out of the new
+        // cascade, or changed SVF/TDF2 path stays zeroed, matching the PEQ
+        // path-change convention.
+        uint8_t keep = (band->num_sections < old_active)
+                       ? band->num_sections : old_active;
+        for (uint8_t i = 0; i < keep; i++) {
+#if PICO_RP2350
+            if (band->sections[i].use_svf != old_svf[i]) continue;
+            band->sections[i].svic1eq = old_ic1[i];
+            band->sections[i].svic2eq = old_ic2[i];
+#endif
+            band->sections[i].s1 = old_s1[i];
+            band->sections[i].s2 = old_s2[i];
+        }
     }
 }
 
