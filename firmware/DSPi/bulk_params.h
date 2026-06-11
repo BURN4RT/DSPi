@@ -29,7 +29,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      11   // V11: + WireCrossoverConfig (per-channel crossover bands)
+#define WIRE_FORMAT_VERSION      12   // V12: + i2s_rx_pin / i2s_input_rate in WireInputConfig (same byte size as V11)
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -189,9 +189,11 @@ typedef struct __attribute__((packed)) {
 // Section 15: Input Source Configuration (16 bytes) — V7+
 // ============================================================================
 typedef struct __attribute__((packed)) {
-    uint8_t  input_source;           // InputSource enum (0=USB, 1=SPDIF)
+    uint8_t  input_source;           // InputSource enum (0=USB, 1=SPDIF, 2=I2S)
     uint8_t  spdif_rx_pin;          // SPDIF RX GPIO pin (applied on SET when apply_pins=true)
-    uint8_t  reserved[14];           // Future expansion (pad to 16 bytes)
+    uint8_t  i2s_rx_pin;             // I2S RX data GPIO pin (V12+, same gate as spdif_rx_pin)
+    uint8_t  i2s_input_rate;         // I2S input rate enum: 0=44100, 1=48000, 2=96000 (V12+)
+    uint8_t  reserved[12];           // Future expansion (pad to 16 bytes)
 } WireInputConfig;                   // 16 bytes
 
 // ============================================================================
@@ -316,7 +318,8 @@ typedef struct __attribute__((packed)) {
 // added, append its anchor as
 //   #define WIRE_BULK_PARAMS_V{N-1}_SIZE (WIRE_BULK_PARAMS_V{N}_SIZE - sizeof(WireFooConfig))
 // and chain older anchors off the new V{N-1}_SIZE.
-#define WIRE_BULK_PARAMS_V11_SIZE   sizeof(WireBulkParams)
+#define WIRE_BULK_PARAMS_V12_SIZE   sizeof(WireBulkParams)
+#define WIRE_BULK_PARAMS_V11_SIZE   WIRE_BULK_PARAMS_V12_SIZE  /* V12 fields live in V11's WireInputConfig reserved bytes */
 #define WIRE_BULK_PARAMS_V10_SIZE   (WIRE_BULK_PARAMS_V11_SIZE - sizeof(WireCrossoverConfig))
 #define WIRE_BULK_PARAMS_V9_SIZE    (WIRE_BULK_PARAMS_V10_SIZE - sizeof(WireDacHwMute))
 #define WIRE_BULK_PARAMS_V8_SIZE    (WIRE_BULK_PARAMS_V9_SIZE  - sizeof(WireUserVolume))

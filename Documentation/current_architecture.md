@@ -53,7 +53,7 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 ---
 
 ## Source File Map
-*Last updated: 2026-04-18*
+*Last updated: 2026-06-11*
 
 ### Core Firmware (`firmware/DSPi/`)
 
@@ -80,6 +80,9 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 | `leveller.h` | Volume leveller API, state/config structs |
 | `lg_sound_sync.c` | LG Sound Sync detection state machine + apply path (drives host volume from LG-decoded TV remote) |
 | `lg_sound_sync.h` | LG Sound Sync API, status struct, default constant |
+| `i2s_input.c` | I2S RX integration: master/slave PIO lifecycle, IRQ-less DMA ring, poll into pipeline |
+| `i2s_input.h` | I2S input API (start/stop/resync/poll), state enum |
+| `i2s_input.pio` | I2S RX PIO programs (clock-master and wait-driven slave variants) |
 | `flash_storage.c` | Parameter save/load to last 4KB flash sector |
 | `flash_storage.h` | Flash storage API |
 | `bulk_params.c` | Bulk parameter collect/apply (wire format ↔ live state) |
@@ -1326,7 +1329,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## Memory Layout
-*Last updated: 2026-05-31 (consumer pools moved heap -> static BSS, shared per slot)*
+*Last updated: 2026-06-11 (added I2S RX DMA rings; BSS re-measured)*
 
 > **Static consumer pools (2026-05-31).** The per-output-slot consumer buffer pool
 > is now a single statically-allocated (BSS) pool per slot, **shared by the slot's
@@ -1360,8 +1363,9 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Leveller state + lookahead | ~2 KB |
 | Per-channel preamp + master volume | ~48 B |
 | Consumer pools + silence (static, 2 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~27 KB |
+| I2S RX DMA ring (1024 × 4, 4 KB aligned) | 4 KB |
 | Other BSS | ~20 KB |
-| **Total BSS** | **~116 KB** (measured) |
+| **Total BSS** | **~126 KB** (measured 2026-06-11: 129432 B) |
 | Code in RAM (.text copy_to_ram) | ~114 KB |
 | SPDIF producer pools (heap, 2 × 8 × 192 × 8) | ~24 KB |
 | Stack + remaining heap | ~6 KB |
@@ -1382,8 +1386,9 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Leveller state + lookahead | ~2 KB |
 | Per-channel preamp + master volume | ~48 B |
 | Consumer pools + silence (static, 4 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~55 KB |
+| I2S RX DMA ring (2048 × 4, 8 KB aligned) | 8 KB |
 | Other BSS | ~24 KB |
-| **Total BSS** | **~206 KB** (measured) |
+| **Total BSS** | **~232 KB** (measured 2026-06-11: 237404 B) |
 | Code in RAM (.time_critical + copy_to_ram) | ~109 KB |
 | SPDIF producer pools (heap, 4 × 8 × 192 × 8) | ~48 KB |
 | Stack + remaining heap | ~150 KB |
@@ -1505,7 +1510,7 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-06-04*
+*Last updated: 2026-06-11*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -1621,7 +1626,7 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 | REQ_GET_USER_VOLUME | 0xDB | IN | Get user-perceived volume (float dB) |
 | REQ_SET_USER_MUTE | 0xDC | OUT | Set vendor-channel `user_mute` flag (1 byte 0/1); always honored regardless of input source. Distinct from `audio_state.mute` (UAC1) which is USB-gated; pipeline ORs them. |
 | REQ_GET_USER_MUTE | 0xDD | IN | Get vendor-channel `user_mute` (UAC1 mute is read via UAC1 GET_CUR) |
-| REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF) |
+| REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF, 2=I2S) |
 | REQ_GET_INPUT_SOURCE | 0xE1 | IN | Get active input source |
 | REQ_GET_SPDIF_RX_STATUS | 0xE2 | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | REQ_GET_SPDIF_RX_CH_STATUS | 0xE3 | IN | Get IEC 60958 channel status (24 bytes) |
@@ -1630,15 +1635,19 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 | REQ_SET_LG_SOUND_SYNC_ENABLE | 0xE6 | OUT | Set LG Sound Sync enable flag (per-preset; live until REQ_SAVE_PRESET) |
 | REQ_GET_LG_SOUND_SYNC_ENABLE | 0xE7 | IN | Get LG Sound Sync enable flag |
 | REQ_GET_LG_SOUND_SYNC_STATUS | 0xE8 | IN | Get 16-byte LgSoundSyncStatus (enabled/present/volume/muted + reserved) |
+| REQ_SET_INPUT_RATE | 0xED | OUT | Set I2S input sample rate (uint32_t Hz: 44100/48000/96000; applied live when I2S input active) |
+| REQ_GET_INPUT_RATE | 0xEE | IN | Returns 8 bytes: 2x uint32_t {current pipeline Hz, selected I2S input Hz} |
+| REQ_SET_I2S_RX_PIN | 0xF1 | IN* | Set I2S RX data GPIO pin (wValue=pin, returns status) |
+| REQ_GET_I2S_RX_PIN | 0xF2 | IN | Get I2S RX data GPIO pin |
 
 ### Bulk Parameter Transfer
-*Last updated: 2026-05-18*
+*Last updated: 2026-06-11*
 
-Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11), replacing dozens of individual vendor requests.
+Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 11) — packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 12) — packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply.
 
-**Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..11). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor — NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply.
+**Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 
 **Transport:** Multi-packet USB EP0 control transfers using `usb_stream_transfer` from pico-extras. Packets are 64 bytes. No modifications to `usb_device.c` required — uses only public API (`usb_stream_setup_transfer`, `usb_start_transfer`, `usb_start_empty_transfer`).
 
@@ -1852,13 +1861,13 @@ Master volume is re-derived on every preset *context* change (preset load, activ
 ---
 
 ## Audio Input Source System
-*Last updated: 2026-05-04*
+*Last updated: 2026-06-11*
 
-Abstraction layer enabling selection between multiple audio input sources. Currently supports USB (default) and SPDIF. Designed for future extensibility to I2S and ADAT inputs without restructuring.
+Abstraction layer enabling selection between multiple audio input sources. Currently supports USB (default), SPDIF and I2S. Designed for future extensibility to ADAT input without restructuring.
 
 ### Files
 
-- `audio_input.h` — `InputSource` enum, globals, constants
+- `audio_input.h`: `InputSource` enum, globals, constants, I2S rate enum helpers
 - `audio_input.c` — Global definitions
 
 ### Input Source Enum
@@ -1867,7 +1876,8 @@ Abstraction layer enabling selection between multiple audio input sources. Curre
 typedef enum {
     INPUT_SOURCE_USB   = 0,
     INPUT_SOURCE_SPDIF = 1,
-    // Future: INPUT_SOURCE_I2S = 2, INPUT_SOURCE_ADAT = 3
+    INPUT_SOURCE_I2S   = 2,
+    // Future: INPUT_SOURCE_ADAT = 3
 } InputSource;
 ```
 
@@ -1876,7 +1886,8 @@ typedef enum {
 - Source switching is deferred to the main loop via `input_source_change_pending` / `pending_input_source` flags (same pattern as output type switching)
 - On switch: drain USB ring, `prepare_pipeline_reset()`, update `active_input_source`, `complete_pipeline_reset()`
 - When input is not USB, `usb_audio_drain_ring()` is skipped — USB enumeration stays active but audio data is silently dropped
-- SPDIF RX hardware only runs when SPDIF is the selected input source
+- SPDIF RX hardware only runs when SPDIF is the selected input source; I2S RX hardware only runs when I2S is the selected input source. The two share the same PIO SM and DMA channels, which is safe because inputs are switched, never mixed
+- Switching to I2S applies the selected `i2s_input_rate` (via `perform_rate_change()` when it differs from the current rate) and then completes the reset USB-style; there is no lock or prefill handshake because the input is synchronous to our own clocks
 
 ### USB Behavior While Non-USB Input is Active (2026-05-04)
 
@@ -1942,26 +1953,61 @@ This matches the user's product-level decision; it differs from the industry-sta
 
 **Files**: `spdif_input.h` (API + status struct), `spdif_input.c` (lifecycle, audio extraction, clock servo, status queries)
 
+### I2S Input
+*Last updated: 2026-06-11*
+
+I2S input keeps the device as the clock authority (master architecture): the external source slaves to our BCK/LRCLK, the same shared clock pair the I2S outputs use (`i2s_bck_pin` / +1). Because the input is synchronous to the device clock domain, there is **no clock servo, no rate detection and no lock state machine**; the subsystem is structurally a much simpler sibling of SPDIF RX. State is just INACTIVE / RUNNING.
+
+**Files**: `i2s_input.h` (API), `i2s_input.c` (lifecycle, DMA ring, poll), `i2s_input.pio` (both RX PIO programs).
+
+**Clock-master election.** The input SM has two roles, decided by `i2s_input_should_be_master()` in `main.c`:
+
+- **Slave** (at least one output slot is I2S): the lowest-index I2S output slot remains the clock master as before; the input SM runs a wait-driven program (`audio_i2s_rx_slave`, 7 instructions, divider 1.0) that samples the data pin against the BCK/LRCLK pads. The BCK/LRCLK `wait gpio` instructions are patched with the runtime pin numbers at load time (program copied to RAM, 5-bit GPIO field rewritten) because `i2s_bck_pin` is user-configurable.
+- **Clock master** (no output slot is I2S): the input SM runs `audio_i2s_rx_clkmaster` (12 instructions), driving BCK/LRCLK via side-set with the exact TX-master divider (`sys_clk * 2 / Fs`, 24.8 ceiling) while shifting data in. Cross-PIO-block sync is never needed: input-as-master only happens when zero I2S outputs exist, and I2S TX slaves are divider-locked within their own block.
+
+Both programs: in_base = data pin, IN shift left, autopush 32, RX FIFO joined, 24-bit audio MSB-aligned in 32-bit frames, standard I2S 1-bit delay (LRCLK transitions during the last bit cell, matching `audio_i2s_clkout.pio`). The first word pushed after any (re)start is always a LEFT word.
+
+**Resources.** Reuses the SPDIF RX footprint, free whenever SPDIF input is inactive: PIO1 SM2 (RP2040) / PIO2 SM0 (RP2350), DMA channels `PICO_SPDIF_RX_DMA_CH0/CH1` (4/5 RP2040, 5/6 RP2350). SM and DMA channels are claimed in `i2s_input_start()` and unclaimed in `i2s_input_stop()` so the SDK claim table stays consistent across input switches.
+
+**IRQ-less DMA ring.** Channel A moves PIO RX FIFO words into a power-of-2-aligned word ring (write-address wrap, transfer count = ring words) and chains to channel B, which rewrites A's `al2_write_addr_trig` with the ring base, retriggering it forever. Zero IRQs, so capture survives IRQ-disabled windows. `i2s_input_poll()` derives the fill level from the DMA write address, consumes whole stereo pairs only (capped at 192 frames per poll), masks the low byte, applies preamp (same Q28/float conversion conventions as SPDIF RX), and feeds `process_input_block()`. Because the ring length is even and the read pointer only moves in pairs, a word's ring position fixes its channel permanently; even a writer-laps-reader overrun garbles audio momentarily but can never swap L/R.
+
+**Slave resync invariant.** `complete_pipeline_reset()` and `enable_outputs_in_sync()` rewind the I2S TX clock master to its PIO entry point, resetting LRCLK phase. A running slave-role input SM would misframe permanently, so both functions end with `i2s_input_resync()`: a no-op unless the input is RUNNING in the slave role, otherwise disable SM, drain the RX FIFO into the ring, re-anchor the read pointer at the DMA write address, restart the SM at its sync preamble. This makes the invariant structural; no call site needs to remember it.
+
+**Suspend/resume sites** (mirroring SPDIF RX): `perform_rate_change()` (stop before, restart after; covers the master-divider change), `process_type_switches()` (restart with a freshly elected role; this is the role re-election point), flash-write brackets (`i2s_suspended_for_flash` + `resume_i2s_after_flash()`), preset load, factory reset, bulk-params apply, and the input-switch handler. `process_pin_changes()` needs no suspension: output data-pin moves never change the input role, and the structural resync covers the slave re-phase.
+
+**Sample-rate authority.** With USB the host picks Fs, with SPDIF the source does; with I2S input *we* do. `i2s_input_rate` (44100/48000/96000, default 48000) is set via `REQ_SET_INPUT_RATE` and applied through the standard deferred `pending_rate` / `rate_change_pending` mechanism whenever I2S input is active. As part of this feature, `perform_rate_change()` now writes `audio_state.freq = new_freq`; previously only the USB host path updated it, so SPDIF-driven rate changes left the loudness/crossfeed/leveller recompute handlers and `REQ_GET_STATUS` on a stale Fs (latent defect, fixed).
+
+**MCK.** The external source may need MCK, so the MCK run condition is now "any output slot is I2S **or** I2S is the active input": extended in `process_type_switches()` and started/stopped by the input-switch handler when entering/leaving I2S input with no I2S outputs (divider before enable, matching `REQ_SET_MCK_ENABLE` ordering).
+
+**I2S RX data pin.** Default GPIO 4 (`PICO_I2S_RX_PIN_DEFAULT`, unused by any other default). Same persistence and hot-swap model as `spdif_rx_pin`: RAM-only on SET, slot-scoped via `REQ_PRESET_SAVE` (with-preset mode) or `REQ_SAVE_OUTPUT_CONFIG` (independent mode); changes while I2S input is active set `i2s_rx_pin_change_pending`, handled by a deferred main-loop restart. A BCK pin change while the input SM is the clock master (allowed; the any-I2S-output case is rejected as before) sets `i2s_input_restart_pending` for the same handler.
+
 ### Vendor Commands
 
 | Code | Command | Direction | Description |
 |------|---------|-----------|-------------|
-| 0xE0 | REQ_SET_INPUT_SOURCE | OUT | Set active input source (uint8_t payload) |
+| 0xE0 | REQ_SET_INPUT_SOURCE | OUT | Set active input source (uint8_t payload; 2 = I2S) |
 | 0xE1 | REQ_GET_INPUT_SOURCE | IN | Get active input source (returns uint8_t) |
 | 0xE2 | REQ_GET_SPDIF_RX_STATUS | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | 0xE3 | REQ_GET_SPDIF_RX_CH_STATUS | IN | Get IEC 60958 channel status (24 bytes) |
 | 0xE4 | REQ_SET_SPDIF_RX_PIN | IN* | Set SPDIF RX pin (wValue=pin, returns status byte) |
 | 0xE5 | REQ_GET_SPDIF_RX_PIN | IN | Get SPDIF RX pin (returns uint8_t) |
+| 0xED | REQ_SET_INPUT_RATE | OUT | Set I2S input rate (uint32_t Hz: 44100/48000/96000) |
+| 0xEE | REQ_GET_INPUT_RATE | IN | Returns 2x uint32_t {current pipeline Hz, selected I2S Hz} |
+| 0xF1 | REQ_SET_I2S_RX_PIN | IN* | Set I2S RX data pin (wValue=pin, returns status byte) |
+| 0xF2 | REQ_GET_I2S_RX_PIN | IN | Get I2S RX data pin (returns uint8_t) |
 
-*0xE4 uses the immediate-response SET pattern (same as `REQ_SET_I2S_BCK_PIN`).
+*0xE4/0xF1 use the immediate-response SET pattern (same as `REQ_SET_I2S_BCK_PIN`).
 
 ### Persistence
+*Last updated: 2026-06-11*
 
 - `SLOT_DATA_VERSION` 13 adds `input_source` (uint8_t) to `PresetSlot`
 - Slots with version < 13 leave input source at its current value (USB by default)
 - Factory reset sets `active_input_source = INPUT_SOURCE_USB`
-- `WireInputConfig` (16 bytes) section in `WireBulkParams` V7+
+- `WireInputConfig` (16 bytes) section in `WireBulkParams` V7+; wire V12 claims two of its reserved bytes for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000), same byte size as V11
 - SPDIF RX pin stored in `PresetDirectory` (consumed existing padding byte, no directory format change)
+- `SLOT_DATA_VERSION` 17 appends `i2s_rx_pin` (0 = unset, use default) and `i2s_input_rate` to `PresetSlot` (struct grows 2 bytes; per-version CRC ranges via `slot_data_size_for_version()`, same mechanism as V16)
+- `FlashOutputConfig` claims two reserved bytes for `i2s_rx_pin` (0 = unset) and `i2s_input_rate_p1` (+1 sentinel so old zeroed directories read as "unset" instead of 44.1 kHz), so both survive boot in independent IO mode via `REQ_SAVE_OUTPUT_CONFIG`
 
 ---
 

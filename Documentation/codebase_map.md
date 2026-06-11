@@ -73,7 +73,8 @@ firmware/
 │   ├── leveller.c/.h             Volume leveller (RMS compressor)
 │   ├── pdm_generator.c/.h        PDM sub output + Core 1 dispatch (PDM / EQ worker)
 │   ├── spdif_input.c/.h          SPDIF RX integration, lock state, clock servo
-│   ├── audio_input.c/.h          Input-source abstraction (USB vs SPDIF)
+│   ├── i2s_input.c/.h (+.pio)    I2S RX integration: master/slave PIO programs, IRQ-less DMA ring
+│   ├── audio_input.c/.h          Input-source abstraction (USB / SPDIF / I2S)
 │   ├── lg_sound_sync.c/.h        LG TV volume/mute via SPDIF channel status
 │   ├── dac_hw_mute.c/.h          Hardware DAC mute GPIO (glitch-free resets)
 │   ├── notify.c/.h               Device->host change notifications (EP 0x83)
@@ -227,7 +228,9 @@ The rookie's lookup table. Find your topic, jump to the code.
 | USB audio packet decode | `process_audio_packet()` — `usb_audio.c:487` |
 | SPDIF input poll / decode | `spdif_input_poll()` — `spdif_input.c:238` |
 | SPDIF clock servo | `spdif_input_update_clock_servo()` — `spdif_input.c:352` |
-| Input source switch (USB<->SPDIF) | `audio_input.c` flags; handler in `main.c` (~2029) |
+| I2S input poll / decode | `i2s_input_poll()` in `i2s_input.c`; start/stop/resync in same file |
+| I2S input role election | `i2s_input_should_be_master()` in `main.c` (master only when no I2S outputs) |
+| Input source switch (USB<->SPDIF<->I2S) | `audio_input.c` flags; handler in `main.c` (~2230) |
 | LG Sound Sync (TV volume) | `lg_sound_sync_tick()` — `lg_sound_sync.c:351` |
 
 ### Outputs
@@ -303,6 +306,8 @@ The Core 0 main loop (`main.c:1245`+) is a giant dispatcher of deferred work: US
 Two sources, one abstraction. `active_input_source` (`audio_input.c:11`) selects USB (0) or SPDIF (1). Switching is deferred to the main loop via `input_source_change_pending` / `pending_input_source`.
 
 **USB input** is decoded in the main loop (not the ISR): the ISR pushes raw packets into the SPSC ring (`usb_audio_ring.h`), and `usb_audio_drain_ring()` (`usb_audio.c:648`) pulls them through `process_audio_packet()` (`usb_audio.c:487`), which decodes 16/24-bit, applies preamp, tracks sync, and calls `process_input_block()`.
+
+**I2S input** (`i2s_input.c`, `i2s_input.pio`) keeps the device as the I2S clock authority: the external source slaves to our BCK/LRCLK (`i2s_bck_pin` / +1, shared with I2S outputs). Synchronous to our clock domain, so there is no clock servo, no rate detection and no lock state machine; state is just INACTIVE / RUNNING. Two PIO program roles, elected by `i2s_input_should_be_master()` in `main.c`: clock-master (no I2S outputs; drives BCK/LRCLK via side-set) and wait-driven slave (an I2S output is the master; the BCK/LRCLK `wait gpio` instructions are patched with runtime pins at load). Reuses the SPDIF RX SM and DMA channels (mutually exclusive by input switching) with an IRQ-less two-channel DMA ring. The selected sample rate (`i2s_input_rate`, REQ 0xED) is applied through the standard deferred rate-change path. A slave-role input is re-phased by `i2s_input_resync()` at the end of every synchronized output restart (see Section 9).
 
 **SPDIF input** (`spdif_input.c`) wraps the `pico_spdif_rx` library:
 
@@ -694,6 +699,8 @@ All `REQ_*` are `#define`d in `config.h` and dispatched from `vendor_commands.c`
 | `REQ_GET_LG_SOUND_SYNC_STATUS` | 0xE8 | `:1894` |
 | `REQ_SET_DAC_HW_MUTE_CONFIG` / `_GET` | 0xEA / 0xEB | `:759` / `:1906` |
 | `REQ_TEST_DAC_HW_MUTE` | 0xEC | `:1917` |
+| `REQ_SET_INPUT_RATE` / `_GET` | 0xED / 0xEE | set in `vendor_handle_set_data`; I2S input rate (uint32 Hz) |
+| `REQ_SET_I2S_RX_PIN` / `_GET` | 0xF1 / 0xF2 | mirrors 0xE4/0xE5; I2S RX data pin |
 
 **Bulk / legacy / system**
 
@@ -734,6 +741,8 @@ if (is_core1_channel && core1_mode == CORE1_MODE_EQ_WORKER) {
 This lives in the main loop's EQ-update block (`main.c` ~1463-1541).
 
 **3. Slot alignment is inviolable.** Every reconfiguration (rate change, preset load, type/pin switch, flash write, input switch) ends by restarting **all** output slots through one synchronized path (`complete_pipeline_reset()` / `enable_outputs_in_sync()` / `audio_spdif_enable_sync()`). Never restart one slot independently. The SPDIF prefill handler deliberately skips a second restart while prefilling to avoid double-starting.
+
+**3b. I2S input slave resync.** The synchronized output restart rewinds the I2S TX clock master to its PIO entry point, resetting LRCLK phase; a running slave-role I2S input SM would misframe and swap L/R permanently. Both `complete_pipeline_reset()` and `enable_outputs_in_sync()` therefore end with `i2s_input_resync()` (no-op unless the input is RUNNING as slave). If you add a new path that restarts the I2S TX master, it must go through one of those two functions (or call the resync itself).
 
 **4. Mute brackets around flash.** Flash erase/program stalls XIP for tens of ms. `prepare_flash_write_operation()` mutes + suspends RX first; `complete_flash_write_operation_*()` restores after. The ring buffer is RAM-resident so the USB ISR survives the blackout.
 

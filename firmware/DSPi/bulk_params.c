@@ -34,6 +34,9 @@
 // and the host SDK consumes both via the same parser.  If they ever drift
 // (someone adds a field to one but not the other), this static assert
 // fails at compile time before silent struct mismatches reach runtime.
+_Static_assert(sizeof(WireInputConfig) == 16,
+               "V12 claimed WireInputConfig reserved bytes; the section size "
+               "must not change (V12 and V11 payloads are byte-identical)");
 _Static_assert(sizeof(WireLgSoundSync) == sizeof(LgSoundSyncStatus),
                "WireLgSoundSync and LgSoundSyncStatus must have identical layout");
 
@@ -192,9 +195,11 @@ void bulk_params_collect(WireBulkParams *out) {
     // Master volume (V6+)
     out->master_volume.master_volume_db = master_volume_db;
 
-    // Input source configuration (V7+)
+    // Input source configuration (V7+; I2S fields V12+)
     out->input_config.input_source = active_input_source;
     out->input_config.spdif_rx_pin = spdif_rx_pin;
+    out->input_config.i2s_rx_pin = i2s_rx_pin;
+    out->input_config.i2s_input_rate = i2s_rate_encode(i2s_input_rate);
 
     // LG Sound Sync (V8+).  All four fields are filled here so a single
     // GET round-trips both the user toggle and the runtime observation.
@@ -389,6 +394,24 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
                 }
             }
         }
+
+        // I2S RX data pin: same gate and hot-swap pattern (V12+ payloads;
+        // older payloads have zeroed reserved bytes here, rejected by the
+        // pin > 0 check anyway).
+        if (in->header.format_version >= 12) {
+            uint8_t pin = in->input_config.i2s_rx_pin;
+            bool valid = (pin > 0) && (pin <= 29) && (pin != 12) &&
+                         !(pin >= 23 && pin <= 25);
+#if !PICO_RP2350
+            if (pin > 28) valid = false;
+#endif
+            if (valid && pin != i2s_rx_pin) {
+                i2s_rx_pin = pin;
+                if (active_input_source == INPUT_SOURCE_I2S) {
+                    i2s_rx_pin_change_pending = true;
+                }
+            }
+        }
     }
 
     // EQ bands
@@ -498,6 +521,14 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             __dmb();
             input_source_change_pending = true;
         }
+    }
+
+    // I2S input rate (V12+ payloads).  Store only; the bulk_params_pending
+    // handler in main.c owns triggering a deferred rate change after it
+    // restarts the input, and an input-source switch picks the rate up on
+    // its own.
+    if (in->header.format_version >= 12) {
+        i2s_input_rate = i2s_rate_decode(in->input_config.i2s_input_rate);
     }
 
     // LG Sound Sync (V8+ payloads).  Only `enabled` is honored — the

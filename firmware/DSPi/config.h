@@ -319,6 +319,14 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_SPDIF_RX_PIN        0xE4  // wValue = GPIO pin, returns status byte
 #define REQ_GET_SPDIF_RX_PIN        0xE5  // returns uint8_t
 
+// I2S Input Commands. The device is the rate authority while I2S input is
+// active (the external source slaves to our BCK/LRCLK), so the sample rate
+// is selected by command instead of detected.
+#define REQ_SET_INPUT_RATE          0xED  // payload = uint32_t Hz (44100/48000/96000)
+#define REQ_GET_INPUT_RATE          0xEE  // returns 2x uint32_t {current Hz, selected I2S Hz}
+#define REQ_SET_I2S_RX_PIN          0xF1  // wValue = GPIO pin, returns status byte
+#define REQ_GET_I2S_RX_PIN          0xF2  // returns uint8_t
+
 // LG Sound Sync (optical) Commands.  Per-preset feature: gate is stored in
 // PresetSlot, vendor SET only updates live state — flash persistence happens
 // on REQ_SAVE_PRESET (matching loudness/crossfeed/leveller toggle semantics).

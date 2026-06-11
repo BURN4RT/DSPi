@@ -5,7 +5,7 @@ add_compile_options(-O2)
 
 # Use -O3 for DSP-critical files
 set_source_files_properties(
-    dsp_pipeline.c usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c leveller.c crossover.c spdif_input.c lg_sound_sync.c dac_hw_mute.c
+    dsp_pipeline.c usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c leveller.c crossover.c spdif_input.c i2s_input.c lg_sound_sync.c dac_hw_mute.c
     PROPERTIES COMPILE_FLAGS "-O3"
 )
 
@@ -30,6 +30,8 @@ add_executable(DSPi
     flash_clkdiv.h
     flash_storage.c
     flash_storage.h
+    i2s_input.c
+    i2s_input.h
     leveller.c
     leveller.h
     lg_sound_sync.c
@@ -59,16 +61,20 @@ if (PICO_PLATFORM STREQUAL "rp2040")
 endif()
 
 if (PICO_PLATFORM STREQUAL "rp2040")
-    # RP2040: SPDIF RX on PIO1 SM2 (SM0=PDM, SM1=MCK occupied)
+    # RP2040: SPDIF RX on PIO1 SM2 (SM0=PDM; SM1 free since MCK moved to
+    # CLK_GPOUT). I2S RX reuses the same SM when SPDIF RX is inactive.
     target_compile_definitions(DSPi PRIVATE PICO_SPDIF_RX_PIO=1)
 else()
-    # RP2350: SPDIF RX on PIO2 (dedicated block, proven working)
+    # RP2350: SPDIF RX on PIO2 (dedicated block, proven working).
+    # I2S RX reuses the same SM when SPDIF RX is inactive.
     target_compile_definitions(DSPi PRIVATE PICO_SPDIF_RX_PIO=2)
 endif()
 # PICO_FLASH_SPI_CLKDIV=6 is set at the top-level CMakeLists so it reaches
 # the boot2 build (target-level defines don't propagate to it).
 
 pico_set_binary_type(DSPi copy_to_ram)
+
+pico_generate_pio_header(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/i2s_input.pio)
 
 target_include_directories(DSPi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

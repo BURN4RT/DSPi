@@ -85,7 +85,10 @@
 //        versions retain their original on-disk size; the CRC validator
 //        uses slot_data_size_for_version() to pick the right byte range
 //        per stored version.
-#define SLOT_DATA_VERSION       16
+//   V17: I2S input pin + rate appended (i2s_rx_pin, i2s_input_rate;
+//        struct grows by 2 bytes, same per-version CRC range mechanism
+//        as V16).
+#define SLOT_DATA_VERSION       17
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -121,7 +124,15 @@ typedef struct __attribute__((packed)) {
     uint8_t i2s_mck_enabled;         // MCK on/off (0 or 1)
     uint8_t i2s_mck_multiplier;      // 0 = 128x, 1 = 256x
     uint8_t spdif_rx_pin;            // SPDIF RX GPIO (device-level)
-    uint8_t reserved[3];
+    uint8_t i2s_rx_pin;              // I2S RX data GPIO (0 = unset → default);
+                                     // claimed from reserved[0], old directories
+                                     // have it zeroed so CRC stays valid
+    uint8_t i2s_input_rate_p1;       // I2S input rate, wire encoding PLUS ONE
+                                     // (0 = unset → 48 kHz; 1=44100, 2=48000,
+                                     // 3=96000).  +1 sentinel because old
+                                     // directories carry zeros here and plain
+                                     // encoding 0 would mean 44.1 kHz
+    uint8_t reserved[1];
 } FlashOutputConfig;                 // 20 bytes
 
 // --- Preset Directory v1 (legacy — kept only for upgrade migration) ---
@@ -318,6 +329,14 @@ typedef struct __attribute__((packed)) {
     // crossover defaults (FLAT type, fc=1000, band=XOVER_BAND_BASE+i) before
     // CRC.  See Documentation/Features/crossover_filters_spec.md.
     EqParamPacket xover_recipes[NUM_CHANNELS][MAX_XOVER_BANDS];
+
+    // I2S input (V17+, struct grows by 2 bytes).  Same unset semantics as
+    // spdif_rx_pin: i2s_rx_pin == 0 means "absent, use the live default".
+    // i2s_input_rate uses the wire encoding (0=44100, 1=48000, 2=96000)
+    // and is gated on version >= 17 in io_config_from_slot(), so the
+    // missing-field case never decodes a bogus 44.1 kHz from a zero byte.
+    uint8_t i2s_rx_pin;
+    uint8_t i2s_input_rate;
 } PresetSlot;
 
 // --- Legacy single-sector format (for migration) ---
@@ -753,6 +772,8 @@ static void io_config_defaults(FlashOutputConfig *cfg) {
     cfg->i2s_mck_enabled    = 0;
     cfg->i2s_mck_multiplier = 0;             // 0 = 128x
     cfg->spdif_rx_pin       = PICO_SPDIF_RX_PIN_DEFAULT;
+    cfg->i2s_rx_pin         = PICO_I2S_RX_PIN_DEFAULT;
+    cfg->i2s_input_rate_p1  = (uint8_t)(i2s_rate_encode(48000) + 1);
 }
 
 // Snapshot the live IO globals into cfg (for REQ_SAVE_OUTPUT_CONFIG).
@@ -765,6 +786,8 @@ static void io_config_from_live(FlashOutputConfig *cfg) {
     cfg->i2s_mck_enabled    = i2s_mck_enabled ? 1 : 0;
     cfg->i2s_mck_multiplier = (i2s_mck_multiplier == 256) ? 1 : 0;  // 0=128x, 1=256x
     cfg->spdif_rx_pin       = spdif_rx_pin;
+    cfg->i2s_rx_pin         = i2s_rx_pin;
+    cfg->i2s_input_rate_p1  = (uint8_t)(i2s_rate_encode(i2s_input_rate) + 1);
 }
 
 // Extract a slot's IO config into cfg, honoring the slot's data version
@@ -791,6 +814,15 @@ static void io_config_from_slot(const PresetSlot *slot, FlashOutputConfig *cfg) 
     }
     if (slot->version >= 13 && slot->spdif_rx_pin != 0)
         cfg->spdif_rx_pin = slot->spdif_rx_pin;
+
+    // I2S input pin + rate (V17+): device-level baseline, slot overrides.
+    cfg->i2s_rx_pin        = dir_cache.output_config.i2s_rx_pin;
+    cfg->i2s_input_rate_p1 = dir_cache.output_config.i2s_input_rate_p1;
+    if (slot->version >= 17) {
+        if (slot->i2s_rx_pin != 0)
+            cfg->i2s_rx_pin = slot->i2s_rx_pin;
+        cfg->i2s_input_rate_p1 = (uint8_t)(slot->i2s_input_rate + 1);
+    }
 }
 
 // Apply a FlashOutputConfig to the live IO globals.  Validates pins (invalid →
@@ -836,6 +868,22 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
         spdif_rx_pin = cfg->spdif_rx_pin;
         if (active_input_source == INPUT_SOURCE_SPDIF)
             spdif_rx_pin_change_pending = true;
+    }
+
+    // I2S RX data pin (same unset/hot-swap semantics as spdif_rx_pin).
+    if (cfg->i2s_rx_pin != 0 && io_pin_valid(cfg->i2s_rx_pin) &&
+        cfg->i2s_rx_pin != i2s_rx_pin) {
+        i2s_rx_pin = cfg->i2s_rx_pin;
+        if (active_input_source == INPUT_SOURCE_I2S)
+            i2s_rx_pin_change_pending = true;
+    }
+
+    // I2S input rate (+1 sentinel: 0 = unset, leave live value alone).
+    // No rate-change trigger here; the preset-load / bulk-apply handlers
+    // in main.c compare i2s_input_rate against audio_state.freq after the
+    // input restarts and defer the change themselves.
+    if (cfg->i2s_input_rate_p1 != 0) {
+        i2s_input_rate = i2s_rate_decode((uint8_t)(cfg->i2s_input_rate_p1 - 1));
     }
 }
 
@@ -926,6 +974,10 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
 
     // SPDIF RX pin: stored alongside output_pins, applied per output_config_mode.
     slot->spdif_rx_pin = spdif_rx_pin;
+
+    // I2S input pin + rate (V17): same storage/apply model as spdif_rx_pin.
+    slot->i2s_rx_pin = i2s_rx_pin;
+    slot->i2s_input_rate = i2s_rate_encode(i2s_input_rate);
 
     // Channel names
     memcpy(slot->channel_names, channel_names, sizeof(slot->channel_names));
@@ -1249,16 +1301,18 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // SLOT VALIDATION
 // ============================================================================
 
-// Pre-V16 data section length (every accepted same-size legacy version uses
-// this exact byte count — see comment on SLOT_DATA_VERSION above).  The
-// xover_recipes field lives strictly at the end of PresetSlot in V16+, so
-// pre-V16 size = sizeof(PresetSlot) - sizeof(xover_recipes).
-#define SLOT_DATA_SIZE_PRE_XOVER \
-    (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes) \
-     - sizeof(((PresetSlot *)0)->xover_recipes))
-
-#define SLOT_DATA_SIZE_V16 \
+// Per-version data section lengths.  Fields are only ever appended, so each
+// older version's size is the next version's size minus its appended tail
+// (see comment on SLOT_DATA_VERSION above).
+#define SLOT_DATA_SIZE_V17 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
+
+// V16 predates the 2 appended I2S input bytes.
+#define SLOT_DATA_SIZE_V16  (SLOT_DATA_SIZE_V17 - 2)
+
+// Pre-V16 versions additionally predate xover_recipes.
+#define SLOT_DATA_SIZE_PRE_XOVER \
+    (SLOT_DATA_SIZE_V16 - sizeof(((PresetSlot *)0)->xover_recipes))
 
 // Map a slot version code to the CRC byte range it was written with. Pre-V16
 // versions all share the same on-disk size (V13/V14/V15 each consumed
@@ -1275,6 +1329,8 @@ static size_t slot_data_size_for_version(uint8_t version) {
             return SLOT_DATA_SIZE_PRE_XOVER;
         case 16:
             return SLOT_DATA_SIZE_V16;
+        case 17:
+            return SLOT_DATA_SIZE_V17;
         default:
             return 0;
     }
@@ -1690,6 +1746,11 @@ static bool migrate_legacy(void) {
             slot_buf.xover_recipes[ch][i].gain_db = 0.0f;
         }
     }
+
+    // V17: I2S input.  Pin 0 = "unset, use live default" (same convention
+    // as spdif_rx_pin, already 0 from memset).  Rate must be set explicitly:
+    // the zero from memset would decode as 44.1 kHz, not the 48 kHz default.
+    slot_buf.i2s_input_rate = i2s_rate_encode(48000);
 
     // Recompute CRC for the (now V16) slot format
     const uint8_t *slot_data = (const uint8_t *)&slot_buf.filter_recipes;

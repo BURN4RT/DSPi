@@ -190,17 +190,24 @@ bool is_pin_in_use(uint8_t pin, uint8_t exclude) {
         if (i == exclude) continue;
         if (output_pins[i] == pin) return true;
     }
-    // Also check I2S BCK and LRCLK pins if any slot is I2S
+    // Also check I2S BCK and LRCLK pins if any slot is I2S, or if I2S is
+    // the active input (the input SM uses the same clock pair in both its
+    // master and slave roles)
+    bool i2s_clocks_in_use = (active_input_source == INPUT_SOURCE_I2S);
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (output_types[i] == OUTPUT_TYPE_I2S) {
-            if (pin == i2s_bck_pin || pin == (i2s_bck_pin + 1)) return true;
+            i2s_clocks_in_use = true;
             break;  // All I2S slots share the same BCK/LRCLK
         }
     }
+    if (i2s_clocks_in_use &&
+        (pin == i2s_bck_pin || pin == (i2s_bck_pin + 1))) return true;
     // Check MCK pin if enabled
     if (i2s_mck_enabled && pin == i2s_mck_pin) return true;
     // Check SPDIF RX input pin
     if (pin == spdif_rx_pin) return true;
+    // Check I2S RX data pin
+    if (pin == i2s_rx_pin) return true;
     // Check DAC hardware-mute pins (board-level config, may be unset
     // — owns_pin returns false when feature is disabled).
     if (dac_hw_mute_owns_pin(pin)) return true;
@@ -804,6 +811,32 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
                     pending_input_source = src;
                     __dmb();
                     input_source_change_pending = true;
+                }
+            }
+            break;
+        }
+
+        case REQ_SET_INPUT_RATE: {
+            // Payload: uint32_t Hz (44100 / 48000 / 96000). The device is
+            // the rate authority in I2S input mode, so the selection is
+            // stored always and applied immediately (deferred rate change,
+            // same mechanism as spdif_input_check_rate_change) when I2S is
+            // the active input.
+            if (buffer->data_len >= 4) {
+                uint32_t rate;
+                memcpy(&rate, vendor_rx_buf, 4);
+                if (rate == 44100 || rate == 48000 || rate == 96000) {
+                    i2s_input_rate = rate;
+                    uint8_t enc = i2s_rate_encode(rate);
+                    notify_param_write(offsetof(WireBulkParams,
+                                                input_config.i2s_input_rate),
+                                       1, &enc);
+                    if (active_input_source == INPUT_SOURCE_I2S &&
+                        rate != audio_state.freq) {
+                        pending_rate = rate;
+                        __dmb();
+                        rate_change_pending = true;
+                    }
                 }
             }
             break;
@@ -1700,6 +1733,12 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                         status = PIN_CONFIG_PIN_IN_USE;
                     } else {
                         i2s_bck_pin = new_pin;
+                        if (active_input_source == INPUT_SOURCE_I2S) {
+                            // Input SM is the clock master here (any-I2S-output
+                            // was rejected above); restart it on the new pins.
+                            // Deferred: PIO teardown is too heavy for ISR context.
+                            i2s_input_restart_pending = true;
+                        }
                         status = PIN_CONFIG_SUCCESS;
                         notify_param_write(offsetof(WireBulkParams, i2s_config.bck_pin),
                                            1, &i2s_bck_pin);
@@ -1868,6 +1907,48 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_SPDIF_RX_PIN: {
                 resp_buf[0] = spdif_rx_pin;
                 vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_I2S_RX_PIN: {
+                // Mirrors REQ_SET_SPDIF_RX_PIN: RAM-only update, slot-scoped
+                // persistence via REQ_PRESET_SAVE, hot-swap deferred to the
+                // main loop when I2S input is active.
+                //
+                // wValue = new GPIO pin number.
+                uint8_t new_pin = (uint8_t)setup->wValue;
+                uint8_t status;
+                if (!is_valid_gpio_pin(new_pin)) {
+                    status = PIN_CONFIG_INVALID_PIN;
+                } else if (new_pin == i2s_rx_pin) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op
+                } else if (is_pin_in_use(new_pin, 0xFF)) {
+                    status = PIN_CONFIG_PIN_IN_USE;
+                } else {
+                    i2s_rx_pin = new_pin;
+                    if (active_input_source == INPUT_SOURCE_I2S) {
+                        i2s_rx_pin_change_pending = true;
+                    }
+                    status = PIN_CONFIG_SUCCESS;
+                    notify_param_write(offsetof(WireBulkParams, input_config.i2s_rx_pin),
+                                       1, &i2s_rx_pin);
+                }
+                resp_buf[0] = status;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_I2S_RX_PIN: {
+                resp_buf[0] = i2s_rx_pin;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_INPUT_RATE: {
+                // {current pipeline Hz, selected I2S input Hz}
+                uint32_t vals[2] = { audio_state.freq, i2s_input_rate };
+                memcpy(resp_buf, vals, sizeof(vals));
+                vendor_send_response(resp_buf, sizeof(vals));
                 return true;
             }
 

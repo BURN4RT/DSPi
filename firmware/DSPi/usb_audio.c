@@ -253,6 +253,7 @@ void get_default_channel_name(int ch, uint8_t input_source,
         const char *prefix;
         switch (input_source) {
             case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
+            case INPUT_SOURCE_I2S:   prefix = "I2S";   break;
             case INPUT_SOURCE_USB:   /* fallthrough */
             default:                 prefix = "USB";   break;
         }
