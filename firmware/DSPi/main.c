@@ -1874,6 +1874,10 @@ int main(void) {
                     active_input_source == INPUT_SOURCE_I2S &&
                     !input_source_change_pending) {
                     i2s_input_start(i2s_input_should_be_master());
+                    // io_config_apply() may have flagged a pin hot-swap while
+                    // applying the slot; this restart already used the new
+                    // pin, so consume the flag to avoid a redundant cycle.
+                    i2s_rx_pin_change_pending = false;
                     if (i2s_input_rate != audio_state.freq) {
                         pending_rate = i2s_input_rate;
                         __dmb();
