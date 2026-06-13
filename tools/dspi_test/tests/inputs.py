@@ -77,6 +77,50 @@ def input_source_i2s_switch(dev, profile, chk):
         chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), orig, "input source restored")
 
 
+@test("inputs", mutating=True)
+def i2s_input_output_type_switch_stress(dev, profile, chk):
+    """Regression: output-type switches and the USB return while on I2S input must not hang.
+
+    Reproduces the DMA-ring teardown race that intermittently watchdog-reset the
+    device. Every output-type switch (and the switch back to USB) tears down the
+    I2S input's self-retriggering chained capture DMA via i2s_input_stop(); doing
+    that naively could leave a channel re-arming the other, hanging the abort.
+    Each switch also flips the input clock-master/slave role. The runner's
+    liveness sentinel after this mutating test catches a hang/crash.
+    """
+    from .outputs import _poll_type, TYPE_SPDIF, TYPE_I2S  # noqa: F401
+
+    orig_src = dev.get_u8(OP.GET_INPUT_SOURCE)
+    orig_t0 = dev.get_u8(OP.GET_OUTPUT_TYPE, wvalue=0)
+    try:
+        _switch_source(dev, INPUT_I2S)
+        if dev.get_u8(OP.GET_INPUT_SOURCE) != INPUT_I2S:
+            chk.note("could not switch to I2S input; skipping")
+            return
+        other = TYPE_I2S if orig_t0 == TYPE_SPDIF else TYPE_SPDIF
+        # Toggle slot 0's output type repeatedly while on I2S input. Each
+        # switch tears down and rebuilds the capture ring and re-elects the
+        # input clock role (master <-> slave); the exact crash trigger.
+        for i in range(4):
+            t = other if (i % 2 == 0) else orig_t0
+            st = dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(t << 8) | 0)
+            chk.eq(st, PIN_SUCCESS, f"type switch #{i} -> {t} accepted")
+            chk.ok(_poll_type(dev, 0, t), f"slot0 type became {t}")
+            chk.ok(dev.wait_ready(), f"device responsive after type switch #{i}")
+        # Restore slot 0 type, confirm live, THEN return to USB (the second
+        # reported crash path: a change on I2S followed by the USB switch).
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(orig_t0 << 8) | 0)
+        chk.ok(_poll_type(dev, 0, orig_t0), "slot0 type restored on I2S")
+        _switch_source(dev, INPUT_USB)
+        chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), INPUT_USB, "returned to USB after change")
+    finally:
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(orig_t0 << 8) | 0)
+        _poll_type(dev, 0, orig_t0)
+        _switch_source(dev, orig_src)
+        chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), orig_src, "input source restored")
+        chk.eq(dev.get_u8(OP.GET_OUTPUT_TYPE, wvalue=0), orig_t0, "slot0 type restored")
+
+
 @test("inputs")
 def spdif_rx_status_plausible(dev, profile, chk):
     """0xE2 returns a 16-byte status with in-range fields (idle/no-cable tolerated)."""
