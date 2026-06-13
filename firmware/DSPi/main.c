@@ -198,6 +198,38 @@ static void perform_rate_change(uint32_t new_freq) {
     }
 }
 
+// Bring up I2S input and hand off to the main-loop prefill handshake.
+//
+// Precondition: the caller has already engaged the mute (prepare_pipeline_reset)
+// and set active_input_source = INPUT_SOURCE_I2S. This applies the selected
+// rate and MCK, starts the input, and deliberately does NOT enable outputs:
+// it leaves preset_loading set so the main-loop I2S block drains the outputs,
+// fills the consumer pools to 50%, and starts them in sync (mirroring the
+// SPDIF lock-acquisition prefill, minus the lock wait).
+//
+// When the selected rate differs from the live pipeline rate, perform_rate_change
+// is used: it must run its full reset so SPDIF TX dividers are reprogrammed
+// (they update via instance teardown/restart). That briefly enables outputs
+// emitting muted silence; the main-loop block then re-drains and prefills.
+static void i2s_input_bringup_prefill(void) {
+    bool master = i2s_input_should_be_master();
+
+    if (i2s_input_rate != audio_state.freq) {
+        perform_rate_change(i2s_input_rate);
+    }
+
+    extern bool i2s_mck_enabled;
+    extern uint16_t i2s_mck_multiplier;
+    if (i2s_mck_enabled && master) {
+        // External source may need MCK; master role implies no I2S outputs,
+        // so MCK is not already running for an output. Divider before enable.
+        audio_i2s_mck_update_frequency(i2s_input_rate, i2s_mck_multiplier);
+        audio_i2s_mck_set_enabled(true);
+    }
+
+    i2s_input_start(master);
+}
+
 // Reset an SPDIF instance's software queue state so it can restart in phase with
 // other SPDIF instances after output-type switching.
 static void spdif_reset_consumer_pipeline(audio_spdif_instance_t *inst) {
@@ -243,6 +275,13 @@ static void enable_outputs_in_sync(void);
 
 // SPDIF input prefill: outputs disabled while consumer buffers fill to 50%
 static bool spdif_prefilling = false;
+
+// I2S input prefill: same handshake as SPDIF (drain outputs, fill consumer
+// pools to 50%, then enable in sync) but with no lock wait, since the I2S
+// input is synchronous to our own clock domain and runs as soon as started.
+// Cleared by prepare_pipeline_reset() so every disruptive op restarts the
+// handshake cleanly. Driven by the main-loop I2S block.
+static bool i2s_prefilling = false;
 
 // ---------------------------------------------------------------------------
 // process_type_switches — unified output type transition handler
@@ -637,6 +676,10 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
     }
     preset_mute_counter = mute_samples;
     preset_loading = true;
+    // Cancel any in-progress I2S prefill: this disruptive op will re-trigger
+    // the handshake via preset_loading once it completes. (No effect on the
+    // SPDIF path, which manages spdif_prefilling at its own call sites.)
+    i2s_prefilling = false;
     __dmb();
     dac_hw_mute_assert();
 }
@@ -1334,14 +1377,12 @@ void core0_init() {
         // input_source_change_pending, so boot-into-I2S normally runs
         // through the main-loop switch handler instead; this covers any
         // path that sets the source directly before we get here.
+        //
+        // Bring up the input with the rate applied but outputs left muted;
+        // the main-loop I2S block prefills the consumer pools to 50% then
+        // enables in sync (same handshake as the runtime switch).
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
-        i2s_input_start(i2s_input_should_be_master());
-        complete_pipeline_reset();
-        if (i2s_input_rate != audio_state.freq) {
-            pending_rate = i2s_input_rate;
-            __dmb();
-            rate_change_pending = true;
-        }
+        i2s_input_bringup_prefill();
     }
 
     // Baseline the notification shadow from the fully-initialised live state.
@@ -1460,11 +1501,43 @@ int main(void) {
             spdif_input_update_clock_servo();
         }
 
-        // Poll I2S input when active.  No lock handling, no prefill
-        // handshake and no clock servo: the input is synchronous to our
-        // own clock domain, so it behaves like the USB path (outputs run
-        // at nominal dividers and the fill level is stable by construction).
+        // Poll I2S input when active.  No lock handling and no clock servo
+        // (the input is synchronous to our own clock domain), but it DOES use
+        // the same prefill handshake as SPDIF so outputs start against a 50%
+        // consumer fill instead of whatever low level the startup transient
+        // leaves.  Trigger is preset_loading (set by every disruptive op via
+        // prepare_pipeline_reset); there is no lock to wait for, so prefill
+        // begins as soon as the DAC-mute hold has elapsed.
         else if (active_input_source == INPUT_SOURCE_I2S) {
+            bool i2s_master = i2s_input_is_clock_master();
+
+            if (preset_loading && !i2s_prefilling && dac_hw_mute_hold_elapsed()) {
+                // Disable outputs and drain consumer pools so they can be
+                // prefilled before playback begins.
+                drain_and_disable_outputs();
+                preset_loading = false;
+                preset_mute_counter = 0;
+                i2s_prefilling = true;
+            }
+
+            if (i2s_prefilling &&
+                get_slot_consumer_fill(0) >= SPDIF_CONSUMER_BUFFER_COUNT / 2) {
+                enable_outputs_in_sync();
+                i2s_prefilling = false;
+                // Release the DAC hardware mute now that clocks are running
+                // (Phase 4 ordering, same as the SPDIF prefill path).
+                dac_hw_mute_release();
+            } else if (i2s_prefilling && !i2s_master) {
+                // Slave role: the drain above stopped the I2S output clock
+                // master that supplies the input's BCK/LRCLK, so the input
+                // produces no samples and i2s_input_poll() cannot fill the
+                // pools. Synthesize a silent block instead; real audio resumes
+                // after enable_outputs_in_sync() restarts the clock master and
+                // re-phases the input ring (i2s_input_resync). Master role
+                // self-clocks and fills with real audio via the poll below.
+                i2s_input_prefill_silence(192);
+            }
+
             i2s_input_poll();
         }
 
@@ -2324,30 +2397,14 @@ int main(void) {
                     // Don't complete_pipeline_reset yet — output stays muted
                     // until SPDIF lock is acquired (handled in polling block below)
                 } else if (new_source == INPUT_SOURCE_I2S) {
-                    // I2S input is synchronous to our clocks: no lock, no
-                    // prefill handshake; USB-style completion.
-                    bool master = i2s_input_should_be_master();
-
-                    // Start MCK for the external source if enabled and not
-                    // already running for I2S outputs (master role implies
-                    // no I2S outputs).  Divider before enable, matching the
-                    // REQ_SET_MCK_ENABLE ordering.
-                    if (i2s_mck_enabled && master) {
-                        audio_i2s_mck_update_frequency(i2s_input_rate,
-                                                       i2s_mck_multiplier);
-                        audio_i2s_mck_set_enabled(true);
-                    }
-
-                    if (i2s_input_rate != audio_state.freq) {
-                        // Bring the whole pipeline to the selected I2S rate
-                        // first (includes complete_pipeline_reset), then
-                        // start the input at that rate.
-                        perform_rate_change(i2s_input_rate);
-                        i2s_input_start(master);
-                    } else {
-                        i2s_input_start(master);
-                        complete_pipeline_reset();
-                    }
+                    // Apply rate + MCK and start the input, but do NOT enable
+                    // outputs here.  The mute is already engaged (the
+                    // prepare_pipeline_reset above), so the main-loop I2S block
+                    // drains the outputs, prefills the consumer pools to 50%,
+                    // and starts them in sync.  This gives I2S the same startup
+                    // fill margin as USB/SPDIF instead of whatever low level the
+                    // transient leaves.
+                    i2s_input_bringup_prefill();
                 } else {
                     // Switching to USB: flush stale ring data, complete reset
                     usb_audio_flush_ring();
@@ -2395,11 +2452,11 @@ int main(void) {
         }
 
         // Handle deferred I2S RX restarts: data-pin hot-swap and full
-        // restart after a BCK pin change in the input-master role.  Unlike
-        // the SPDIF pin swap there is no lock block to finish the reset for
-        // us, so this handler runs the one-shot prepare/complete bracket
-        // itself (same shape as perform_rate_change), gated on
-        // pipeline_reset_ready() like every other reset handler.
+        // restart after a BCK pin change in the input-master role.  Gated on
+        // pipeline_reset_ready() like every other reset handler.  Outputs are
+        // left muted after the restart; the main-loop I2S block above prefills
+        // the consumer pools to 50% and enables them in sync, so no explicit
+        // complete_pipeline_reset() is needed here.
         if ((i2s_rx_pin_change_pending || i2s_input_restart_pending) &&
             pipeline_reset_ready()) {
             i2s_rx_pin_change_pending = false;
@@ -2409,7 +2466,6 @@ int main(void) {
                 prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
                 i2s_input_stop();
                 i2s_input_start(i2s_input_should_be_master());
-                complete_pipeline_reset();
             }
         }
 
