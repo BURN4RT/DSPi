@@ -158,7 +158,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 10.  **Per-Output Gain & Mute:** Independent gain (-inf to +12 dB) and mute for each output channel.
 11. **Time Alignment:** Per-output delay for speaker alignment, up to 85 ms (4096 samples at 48 kHz). Automatic latency compensation between S/PDIF/I2S and PDM output paths.
 12. **Master Volume:** Device-side output ceiling, -128 to 0 dB with a true-mute sentinel at -128. Folded into the per-output multiplier at PASS 5 so it's effectively free CPU-wise. Independent of the USB host volume — the two multiply together. Does not affect loudness-compensation behavior.
-12. **Outputs:** Each numbered slot is configurable as either 24-bit S/PDIF or 24-bit I2S (left-justified, MSB-first). I2S slots share a common BCK/LRCLK clock pair (LRCLK is always BCK + 1 due to a PIO side-set constraint). An optional master clock (MCK) at 128× or 256× Fs can be routed to a separate GPIO. PDM subwoofer is always on its own dedicated output and pin.
+13. **Outputs:** Each numbered slot is configurable as either 24-bit S/PDIF or 24-bit I2S (left-justified, MSB-first). I2S slots share a common BCK/LRCLK clock pair (LRCLK is always BCK + 1 due to a PIO side-set constraint). An optional master clock (MCK) at 128× or 256× Fs can be routed to a separate GPIO. PDM subwoofer is always on its own dedicated output and pin.
 
 ---
 
@@ -201,6 +201,8 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 | **I2S LRCLK** (I2S only) | `GPIO 15` (BCK + 1, fixed) | Word/frame clock; always BCK + 1 |
 | **I2S MCK** (optional) | `GPIO 13` (default) | 128× or 256× Fs master clock when MCK is enabled |
 | **USB** | `Micro-USB` | Host device (PC/Mac/Mobile Device) |
+
+> **Warning:** RP2040 input pins are not 5v tolerant, use only 3.3v external devices such as optical receivers.
 
 > **Notes:** S/PDIF input requires either a Toshiba TORX141 optical receiver or a suitable receiver circuit. Possible receiver circuits are described by ST Microelectronics [here](https://www.st.com/resource/en/application_note/an5073-receiving-spdif-audio-stream-with-the-stm32f4f7h7-series-stmicroelectronics.pdf). S/PDIF output requires either a Toshiba TX179 optical transmitter or a simple resistor divider. I2S output is a standard 24-bit-in-32-bit left-justified frame — wires straight into most I2S DACs. PDM output is a 1-bit logic signal that requires a resistor and capacitor to form a low-pass filter for conversion to analog audio.
 
