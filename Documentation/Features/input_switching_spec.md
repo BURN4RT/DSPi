@@ -310,7 +310,7 @@ Changes the GPIO pin used for S/PDIF receiver input. This is a device-level sett
 | **wLength** | 1 |
 | **Response** | 1 byte: GPIO pin number |
 
-Returns the GPIO pin currently configured for S/PDIF receiver input. Default: GPIO 11 (`PICO_SPDIF_RX_PIN_DEFAULT`).
+Returns the GPIO pin currently configured for S/PDIF receiver input. Default: GPIO 5 (`PICO_SPDIF_RX_PIN_DEFAULT`).
 
 ---
 
@@ -343,7 +343,7 @@ Offset: 00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F
 Data:   01 0B 00 00 00 00 00 00 00 00 00 00 00 00 00 00
         ^  ^  ^----------------------------------------------
         |  |  reserved (zeros)
-        |  spdif_rx_pin = GPIO 11
+        |  spdif_rx_pin = GPIO 5
         input_source = SPDIF (1)
 ```
 
@@ -440,7 +440,7 @@ Applied when loading an empty slot or on factory reset (`REQ_FACTORY_RESET` / 0x
 | Parameter | Default value |
 |-----------|---------------|
 | input_source | 0 (USB) |
-| spdif_rx_pin | 11 (GPIO 11, stored in directory) |
+| spdif_rx_pin | 5 (GPIO 5, stored in directory) |
 
 ---
 
@@ -765,7 +765,7 @@ Recommended UI layout for an input source selector:
  │  ( ) USB Audio                                    │
  │  (*) S/PDIF   [Locked 48000 Hz]                  │
  │                                                   │
- │  S/PDIF RX Pin: [GPIO 11]  [Change...]            │
+ │  S/PDIF RX Pin: [GPIO 5]  [Change...]             │
  │                                                   │
  │  ┌── S/PDIF Status ──────────────────────────┐    │
  │  │  State:       Locked                       │    │
@@ -846,7 +846,7 @@ bulk_buf[0] = 7;  // header.format_version
 
 // Populate WireInputConfig at offset 2896
 bulk_buf[WIRE_INPUT_CONFIG_OFFSET]     = INPUT_SOURCE_SPDIF;  // input_source
-bulk_buf[WIRE_INPUT_CONFIG_OFFSET + 1] = 11;                  // spdif_rx_pin (informational only)
+bulk_buf[WIRE_INPUT_CONFIG_OFFSET + 1] = 5;                   // spdif_rx_pin (informational only)
 // bytes 2-15 are reserved (already zero from memset)
 
 // Send the complete 2912-byte payload via SET 0xA1
@@ -924,7 +924,7 @@ Input source switching is available on both RP2040 and RP2350. The vendor comman
 | Internal precision | Q28 fixed-point | IEEE 754 float |
 | Supported input rates | 44.1-192 kHz | 44.1-192 kHz |
 | Input bit depth | 24-bit | 24-bit |
-| Default RX pin | GPIO 11 | GPIO 11 |
+| Default RX pin | GPIO 5 | GPIO 5 |
 
 Control software does not need to differentiate between platforms for input source functionality. The same vendor commands and struct layouts are used on both.
 

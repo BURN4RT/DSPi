@@ -24,7 +24,7 @@ typedef enum {
 } InputSource;
 
 #define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF
-#define PICO_SPDIF_RX_PIN_DEFAULT  11
+#define PICO_SPDIF_RX_PIN_DEFAULT  5
 ```
 
 ---
@@ -480,7 +480,7 @@ Valid GPIO pins must satisfy ALL of the following:
 - **Not in use:** Must not conflict with any SPDIF output data pin, I2S data pin, I2S BCK or LRCLK (BCK+1), or MCK pin
 - **Not active:** The SPDIF input must be INACTIVE (switch to USB first before changing the pin)
 
-The pin setting persists across reboots (stored in the preset directory sector of flash). The default pin is GPIO 11 (`PICO_SPDIF_RX_PIN_DEFAULT`).
+The pin setting persists across reboots (stored in the preset directory sector of flash). The default pin is GPIO 5 (`PICO_SPDIF_RX_PIN_DEFAULT`).
 
 #### Hex example
 
@@ -520,7 +520,7 @@ Query the current GPIO pin configured for S/PDIF input.
 
 | Offset | Size | Type | Field | Values |
 |--------|------|------|-------|--------|
-| 0 | 1 | uint8_t | `pin` | GPIO pin number (default: 11) |
+| 0 | 1 | uint8_t | `pin` | GPIO pin number (default: 5) |
 
 #### Hex example
 
@@ -530,7 +530,7 @@ bRequest:      0xE5
 wValue:        0x0000
 wIndex:        0x0002
 wLength:       0x0001
-Response:      0B       (GPIO 11)
+Response:      05       (GPIO 5)
 ```
 
 ---
@@ -746,7 +746,7 @@ The firmware checks all of these via `is_pin_in_use()` before allowing the chang
 
 ### Persistence
 
-The RX pin is stored in the preset directory (device-level, not per-preset). It persists across reboots and preset changes. On first boot (no directory), it defaults to GPIO 11.
+The RX pin is stored in the preset directory (device-level, not per-preset). It persists across reboots and preset changes. On first boot (no directory), it defaults to GPIO 5.
 
 ---
 
@@ -815,7 +815,7 @@ When a preset is loaded that switches the input source, the standard 256-sample 
 | Sample conversion | `raw >> 4` then `fast_mul_q28()` | `raw * inv_2147483648 * preamp` |
 | Supported input rates | 44.1, 48, 96 kHz | 44.1, 48, 96 kHz |
 | Input bit depth | 24-bit | 24-bit |
-| Default RX pin | GPIO 11 | GPIO 11 |
+| Default RX pin | GPIO 5 | GPIO 5 |
 | SPDIF output slots | 2 (4 channels) | 4 (8 channels) |
 
 DMA IRQ assignment: SPDIF RX uses DMA_IRQ_0 (shared with I2S TX when active). DMA_IRQ_1 is dedicated to SPDIF TX only. This isolates SPDIF RX from SPDIF TX, avoiding shared handler conflicts.
@@ -1201,6 +1201,6 @@ No existing vendor commands are modified by the S/PDIF input feature. All prior 
 | `0xE2` | `REQ_GET_SPDIF_RX_STATUS` | IN (0xC1) | 16 bytes: SpdifRxStatusPacket | Query receiver state, rate, errors, FIFO fill |
 | `0xE3` | `REQ_GET_SPDIF_RX_CH_STATUS` | IN (0xC1) | 24 bytes: IEC 60958 channel status | Raw channel status bits from received stream |
 | `0xE4` | `REQ_SET_SPDIF_RX_PIN` | IN (0xC1)* | wValue=pin, 1 byte response: status | Set RX GPIO pin (immediate response) |
-| `0xE5` | `REQ_GET_SPDIF_RX_PIN` | IN (0xC1) | 1 byte: pin number (default 11) | Query current RX GPIO pin |
+| `0xE5` | `REQ_GET_SPDIF_RX_PIN` | IN (0xC1) | 1 byte: pin number (default 5) | Query current RX GPIO pin |
 
 \* `REQ_SET_SPDIF_RX_PIN` uses IN direction (`0xC1` bmRequestType) with an immediate 1-byte status response. Status codes: `0x00`=success, `0x01`=invalid pin, `0x02`=pin in use, `0x04`=RX active.
