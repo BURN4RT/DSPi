@@ -1,9 +1,11 @@
 """
-Inputs / SPDIF-RX / LG Sound Sync / DAC hardware mute group.
+Inputs / SPDIF-RX / I2S-RX / LG Sound Sync / DAC hardware mute group.
 
 Input source        0xE0/0xE1
 SPDIF RX status     0xE2 (16B) / channel status 0xE3 (24B)
 SPDIF RX pin        0xE4/0xE5
+I2S input rate      0xED/0xEE (uint32 Hz set / {current,selected} 8B get)
+I2S RX data pin     0xF1/0xF2
 LG Sound Sync       0xE6/0xE7 / status 0xE8 (16B)
 DAC hardware mute   0xEA/0xEB (config 16B) / 0xEC test pulse
 """
@@ -16,37 +18,62 @@ from ..framework import test
 from ..helpers import bool_roundtrip
 
 PIN_SUCCESS, PIN_INVALID_PIN, PIN_IN_USE, PIN_INVALID_OUTPUT, PIN_OUTPUT_ACTIVE = range(5)
-INPUT_USB, INPUT_SPDIF = 0, 1
+INPUT_USB, INPUT_SPDIF, INPUT_I2S = 0, 1, 2
+# First value past INPUT_SOURCE_MAX (== INPUT_I2S); must be rejected/ignored.
+INPUT_INVALID = INPUT_I2S + 1
+I2S_RATES = (44100, 48000, 96000)
+
+
+def _switch_source(dev, target, timeout_s=1.5):
+    """Request a deferred input-source switch and wait for it to apply."""
+    dev.set_u8(OP.SET_INPUT_SOURCE, target)
+    dev.wait_ready()
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline and dev.get_u8(OP.GET_INPUT_SOURCE) != target:
+        time.sleep(0.03)
 
 
 @test("inputs")
 def input_source_get(dev, profile, chk):
-    """0xE1 returns a valid InputSource enum value."""
-    chk.member(dev.get_u8(OP.GET_INPUT_SOURCE), (INPUT_USB, INPUT_SPDIF), "input source")
+    """0xE1 returns a valid InputSource enum value (USB / SPDIF / I2S)."""
+    chk.member(dev.get_u8(OP.GET_INPUT_SOURCE),
+               (INPUT_USB, INPUT_SPDIF, INPUT_I2S), "input source")
 
 
 @test("inputs", mutating=True)
 def input_source_switch_roundtrip(dev, profile, chk):
-    """0xE0/0xE1: switch to the other source and back (deferred, mute+reset); invalid dropped."""
+    """0xE0/0xE1: switch USB<->SPDIF and back (deferred, mute+reset); out-of-range dropped."""
     orig = dev.get_u8(OP.GET_INPUT_SOURCE)
     other = INPUT_USB if orig == INPUT_SPDIF else INPUT_SPDIF
     try:
-        dev.set_u8(OP.SET_INPUT_SOURCE, other)
-        dev.wait_ready()
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline and dev.get_u8(OP.GET_INPUT_SOURCE) != other:
-            time.sleep(0.03)
+        _switch_source(dev, other)
         chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), other, f"switched to {other}")
-        # Invalid source silently dropped (no STALL, no change).
-        chk.no_stall(lambda: dev.set_u8(OP.SET_INPUT_SOURCE, 2), "invalid source no STALL")
+        # Out-of-range source (past INPUT_SOURCE_MAX) silently dropped (no STALL, no change).
+        chk.no_stall(lambda: dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_INVALID), "invalid source no STALL")
         time.sleep(0.05)
         chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), other, "invalid source ignored")
     finally:
-        dev.set_u8(OP.SET_INPUT_SOURCE, orig)
-        dev.wait_ready()
-        deadline = time.monotonic() + 1.5
-        while time.monotonic() < deadline and dev.get_u8(OP.GET_INPUT_SOURCE) != orig:
-            time.sleep(0.03)
+        _switch_source(dev, orig)
+        chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), orig, "input source restored")
+
+
+@test("inputs", mutating=True)
+def input_source_i2s_switch(dev, profile, chk):
+    """0xE0/0xE1: switch to I2S input and back.
+
+    The device is the I2S clock master, so no external source need be connected;
+    the input SM simply drives BCK/LRCLK and reads the (idle) data pin. The
+    liveness sentinel confirms the deferred mute+reset switch did not wedge.
+    """
+    orig = dev.get_u8(OP.GET_INPUT_SOURCE)
+    if orig == INPUT_I2S:
+        chk.note("already on I2S input")
+        return
+    try:
+        _switch_source(dev, INPUT_I2S)
+        chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), INPUT_I2S, "switched to I2S")
+    finally:
+        _switch_source(dev, orig)
         chk.eq(dev.get_u8(OP.GET_INPUT_SOURCE), orig, "input source restored")
 
 
@@ -59,7 +86,7 @@ def spdif_rx_status_plausible(dev, profile, chk):
     sample_rate = struct.unpack_from("<I", data, 4)[0]
     fifo = struct.unpack_from("<H", data, 12)[0]
     chk.in_range(state, 0, 3, "RX state enum")
-    chk.member(in_src, (0, 1), "RX input_source")
+    chk.member(in_src, (INPUT_USB, INPUT_SPDIF, INPUT_I2S), "RX input_source")
     chk.in_range(fifo, 0, 100, "RX fifo fill %")
     chk.member(sample_rate, (0, 44100, 48000, 88200, 96000), "RX sample rate")
     chk.note(f"RX state={state} src={in_src} rate={sample_rate} fifo={fifo}% locks={lock_cnt} losses={loss_cnt}")
@@ -99,6 +126,86 @@ def spdif_rx_pin_validation(dev, profile, chk):
     finally:
         dev.get_u8(OP.SET_SPDIF_RX_PIN, wvalue=orig)
         chk.eq(dev.get_u8(OP.GET_SPDIF_RX_PIN), orig, "RX pin restored")
+
+
+def _selected_i2s_rate(dev):
+    """Stored I2S input rate (bytes 4..7 of 0xEE); valid on any active source."""
+    return struct.unpack("<II", dev.get(OP.GET_INPUT_RATE, 8))[1]
+
+
+@test("inputs")
+def i2s_input_rate_get(dev, profile, chk):
+    """0xEE returns 8 bytes: {current pipeline Hz, selected I2S Hz}, both supported rates."""
+    data = dev.get(OP.GET_INPUT_RATE, 8)
+    chk.eq(len(data), 8, "input rate length")
+    current, selected = struct.unpack("<II", data)
+    chk.member(current, I2S_RATES, "current pipeline rate")
+    chk.member(selected, I2S_RATES, "selected I2S rate")
+    chk.note(f"input rate current={current} selected={selected}")
+
+
+@test("inputs", mutating=True)
+def i2s_input_rate_roundtrip(dev, profile, chk):
+    """0xED/0xEE: each supported rate stores into the selected field; bad rate ignored.
+
+    Verified via the selected field (bytes 4..7) so the check holds on any active
+    source; a live pipeline rate change only happens while I2S is the active input
+    (the liveness sentinel then confirms the deferred reset did not wedge).
+    """
+    orig = _selected_i2s_rate(dev)
+    try:
+        for hz in I2S_RATES:
+            dev.set(OP.SET_INPUT_RATE, struct.pack("<I", hz))
+            dev.wait_ready()
+            chk.eq(_selected_i2s_rate(dev), hz, f"selected rate -> {hz}")
+        # Unsupported rate silently ignored (OUT command has no error channel).
+        keep = _selected_i2s_rate(dev)
+        chk.no_stall(lambda: dev.set(OP.SET_INPUT_RATE, struct.pack("<I", 88200)),
+                     "unsupported rate no STALL")
+        dev.wait_ready()
+        chk.eq(_selected_i2s_rate(dev), keep, "unsupported rate ignored")
+        # Too-short payload ignored, no STALL.
+        chk.no_stall(lambda: dev.set(OP.SET_INPUT_RATE, b"\x80\xbb"), "short payload no STALL")
+        dev.wait_ready()
+        chk.eq(_selected_i2s_rate(dev), keep, "short payload ignored")
+    finally:
+        dev.set(OP.SET_INPUT_RATE, struct.pack("<I", orig))
+        dev.wait_ready()
+        chk.eq(_selected_i2s_rate(dev), orig, "selected rate restored")
+
+
+@test("inputs", mutating=True)
+def i2s_rx_pin_validation(dev, profile, chk):
+    """0xF1/0xF2: validation status codes (no state change); move tested only off I2S input."""
+    orig = dev.get_u8(OP.GET_I2S_RX_PIN)
+    # Invalid pin -> INVALID_PIN (no move).
+    chk.eq(dev.get_u8(OP.SET_I2S_RX_PIN, wvalue=12), PIN_INVALID_PIN, "pin 12 -> INVALID_PIN")
+    # Same pin -> SUCCESS no-op.
+    chk.eq(dev.get_u8(OP.SET_I2S_RX_PIN, wvalue=orig), PIN_SUCCESS, "same pin -> SUCCESS")
+    # A pin used by an output -> PIN_IN_USE.
+    out_pin = dev.get_u8(OP.GET_OUTPUT_PIN, wvalue=0)
+    chk.eq(dev.get_u8(OP.SET_I2S_RX_PIN, wvalue=out_pin), PIN_IN_USE, f"pin {out_pin} -> PIN_IN_USE")
+    # The SPDIF RX pin is also reserved against the I2S RX pin.
+    spdif_pin = dev.get_u8(OP.GET_SPDIF_RX_PIN)
+    if spdif_pin != orig:
+        chk.eq(dev.get_u8(OP.SET_I2S_RX_PIN, wvalue=spdif_pin), PIN_IN_USE,
+               f"SPDIF RX pin {spdif_pin} -> PIN_IN_USE")
+    chk.eq(dev.get_u8(OP.GET_I2S_RX_PIN), orig, "pin unchanged by rejected sets")
+    # Actual move only when NOT on I2S input (avoids a live hot-swap blackout).
+    if dev.get_u8(OP.GET_INPUT_SOURCE) == INPUT_I2S:
+        chk.note("on I2S input — skipping live RX pin move to avoid hot-swap")
+        return
+    from .outputs import _free_pin
+    free = _free_pin(dev, profile, prefer=(16, 17, 18, 19, 20))
+    if free is None:
+        chk.note("no free pin for I2S RX move")
+        return
+    try:
+        chk.eq(dev.get_u8(OP.SET_I2S_RX_PIN, wvalue=free), PIN_SUCCESS, f"I2S RX move -> {free}")
+        chk.eq(dev.get_u8(OP.GET_I2S_RX_PIN), free, "I2S RX pin reflects move")
+    finally:
+        dev.get_u8(OP.SET_I2S_RX_PIN, wvalue=orig)
+        chk.eq(dev.get_u8(OP.GET_I2S_RX_PIN), orig, "I2S RX pin restored")
 
 
 @test("inputs", mutating=True)
