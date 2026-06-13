@@ -40,6 +40,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 ## Key Capabilities
 
 *   **USB Audio Interface:** Plug-and-play under macOS, Windows, Linux, and iOS. Supports 16-bit and 24-bit PCM input at 44.1, 48, and 96 kHz.
+*   **S/PDIF Input:** 24-bit PCM stereo audio at 44.1 or 48kHz. Channel status bits and LG SoundSync are decoded. LG Soundsync volume and mute status is optionally used to control the DSPi user volume and output mute.
 *   **24-bit S/PDIF or I2S Outputs:** Up to four independent stereo output slots (8 channels on RP2350, 4 channels on RP2040). Each slot can be switched at runtime between S/PDIF and I2S, enabling direct connection to any standard DAC. I2S slots share a common BCK/LRCLK and can optionally produce a 128×/256× master clock.
 *   **Per-Channel Preamp:** Independent gain control for each USB input channel (L/R), applied as PASS 1 of the DSP pipeline before any other processing.
 *   **Matrix Mixer:** Route either or both USB input channels to any output with independent gain and phase invert per crosspoint. 2x9 on RP2350, 2x5 on RP2040.
@@ -76,6 +77,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 | **Math Engine** | Hand-optimized ARM Assembly | Hardware FPU (hybrid SVF/biquad EQ) |
 | **Dual-Core EQ** | Yes (Core 1 processes outputs 3-4) | Yes (Core 1 processes outputs 3-8) |
 | **User Presets** | 10 slots | 10 slots |
+| **S/PDIF Input** | Yes | Yes |
 | **Status** | Production | Production |
 
 Both platforms are fully tested and production-ready. The RP2040 reaches 307.2 MHz with a slight voltage bump; the RP2350 hits the same frequency at the same voltage. Clock is fixed (no rate-dependent switching), and PIO dividers are integer at every supported sample rate. The RP2350 offers significantly more processing headroom thanks to its hardware floating-point unit, enabling more output channels and a hybrid SVF/biquad filter architecture for improved low-frequency accuracy.
@@ -90,6 +92,8 @@ DSPi processes audio in a linear, low-latency pipeline:
 
 ```
 USB Input (16/24-bit PCM Stereo, 44.1 / 48 / 96 kHz)
+or
+S/PDIF Input (24 bit PCM Stereo, 44.1 / 48 kHz)
     |
 PASS 1: Per-Channel Preamp (independent L/R gain) + USB Volume
     |
@@ -117,6 +121,8 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 ```
 USB Input (16/24-bit PCM Stereo, 44.1 / 48 / 96 kHz)
+or
+S/PDIF Input (24 bit PCM Stereo, 44.1 / 48 kHz)
     |
 PASS 1: Per-Channel Preamp + USB Volume
     |
@@ -141,16 +147,17 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 ### Signal Chain Details
 
 1.  **Input (USB):** 16-bit or 24-bit PCM stereo audio at 44.1, 48, or 96 kHz. Bit depth is selected via USB alt setting; sample rate via the USB Audio Class rate-set request.
-2.  **Per-Channel Preamp (PASS 1):** Independent gain control for the USB Left and Right input channels in dB. Applied at the very start of the DSP chain so its setting affects all downstream processing.
-3.  **Master EQ (PASS 2):** Up to 10 bands of parametric EQ per channel (Left/Right). Supports peaking, low shelf, high shelf, low pass, and high pass filter types.
-4.  **Volume Leveller (PASS 2.5):** Optional feedforward, stereo-linked, single-band RMS compressor with soft-knee upward compression — quieter content is boosted toward a target level while content above the threshold passes through untouched. Configurable speed, max-gain ceiling, and noise gate. Optional 10 ms lookahead. A -6 dBFS gain-reduction safety limiter prevents output overshoots.
-5.  **Headphone Crossfeed (PASS 3):** Optional BS2B crossfeed that mixes a filtered, delayed portion of each channel into the opposite channel. Uses a complementary filter design with interaural time delay (ITD) via an all-pass filter. Three presets (Default, Chu Moy, Jan Meier) plus custom frequency and feed level. ITD can be independently toggled. Master peak metering taps into this stage.
-6.  **Loudness Compensation:** Optional ISO 226:2003 equal-loudness EQ that adapts to the current volume level. At low volumes, bass and treble are boosted to compensate for the ear's reduced sensitivity. Configurable reference SPL and intensity. Driven by the USB host volume position so it remains correct regardless of master-volume attenuation downstream.
-7.  **Matrix Mixer (PASS 4):** Routes the two USB input channels (Left/Right) to all output channels. Each crosspoint has independent enable, gain (-inf to +12 dB), and phase invert. Outputs can be individually enabled/disabled to save CPU. RP2350 has a 2x9 matrix (9 outputs), RP2040 has a 2x5 matrix (5 outputs).
-8.  **Output EQ (PASS 5):** Independent 10-band EQ per output channel on both platforms. Ideal for crossover filters and per-driver correction. On RP2350, filters below Fs/7.5 use SVF topology for superior low-frequency accuracy; higher frequencies use traditional biquad.
-9.  **Per-Output Gain & Mute:** Independent gain (-inf to +12 dB) and mute for each output channel.
-10. **Time Alignment:** Per-output delay for speaker alignment, up to 85 ms (4096 samples at 48 kHz). Automatic latency compensation between S/PDIF/I2S and PDM output paths.
-11. **Master Volume:** Device-side output ceiling, -128 to 0 dB with a true-mute sentinel at -128. Folded into the per-output multiplier at PASS 5 so it's effectively free CPU-wise. Independent of the USB host volume — the two multiply together. Does not affect loudness-compensation behavior.
+2.  **Input (S/PDIF):** 24-bit PCM stereo audio at 44.1 or 48kHz. Channel status bits and LG SoundSync are decoded. LG Soundsync volume and mute status is optionally used to control the DSPi user volume and output mute.
+3.  **Per-Channel Preamp (PASS 1):** Independent gain control for the USB Left and Right input channels in dB. Applied at the very start of the DSP chain so its setting affects all downstream processing.
+4.  **Master EQ (PASS 2):** Up to 10 bands of parametric EQ per channel (Left/Right). Supports peaking, low shelf, high shelf, low pass, and high pass filter types.
+5.  **Volume Leveller (PASS 2.5):** Optional feedforward, stereo-linked, single-band RMS compressor with soft-knee upward compression — quieter content is boosted toward a target level while content above the threshold passes through untouched. Configurable speed, max-gain ceiling, and noise gate. Optional 10 ms lookahead. A -6 dBFS gain-reduction safety limiter prevents output overshoots.
+6.  **Headphone Crossfeed (PASS 3):** Optional BS2B crossfeed that mixes a filtered, delayed portion of each channel into the opposite channel. Uses a complementary filter design with interaural time delay (ITD) via an all-pass filter. Three presets (Default, Chu Moy, Jan Meier) plus custom frequency and feed level. ITD can be independently toggled. Master peak metering taps into this stage.
+7.  **Loudness Compensation:** Optional ISO 226:2003 equal-loudness EQ that adapts to the current volume level. At low volumes, bass and treble are boosted to compensate for the ear's reduced sensitivity. Configurable reference SPL and intensity. Driven by the USB host volume position so it remains correct regardless of master-volume attenuation downstream.
+8.  **Matrix Mixer (PASS 4):** Routes the two USB input channels (Left/Right) to all output channels. Each crosspoint has independent enable, gain (-inf to +12 dB), and phase invert. Outputs can be individually enabled/disabled to save CPU. RP2350 has a 2x9 matrix (9 outputs), RP2040 has a 2x5 matrix (5 outputs).
+9.  **Output EQ (PASS 5):** Independent 10-band EQ per output channel on both platforms. Ideal for crossover filters and per-driver correction. On RP2350, filters below Fs/7.5 use SVF topology for superior low-frequency accuracy; higher frequencies use traditional biquad.
+10.  **Per-Output Gain & Mute:** Independent gain (-inf to +12 dB) and mute for each output channel.
+11. **Time Alignment:** Per-output delay for speaker alignment, up to 85 ms (4096 samples at 48 kHz). Automatic latency compensation between S/PDIF/I2S and PDM output paths.
+12. **Master Volume:** Device-side output ceiling, -128 to 0 dB with a true-mute sentinel at -128. Folded into the per-output multiplier at PASS 5 so it's effectively free CPU-wise. Independent of the USB host volume — the two multiply together. Does not affect loudness-compensation behavior.
 12. **Outputs:** Each numbered slot is configurable as either 24-bit S/PDIF or 24-bit I2S (left-justified, MSB-first). I2S slots share a common BCK/LRCLK clock pair (LRCLK is always BCK + 1 due to a PIO side-set constraint). An optional master clock (MCK) at 128× or 256× Fs can be routed to a separate GPIO. PDM subwoofer is always on its own dedicated output and pin.
 
 ---
@@ -171,6 +178,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 | Function | Pin | Connection |
 | :--- | :--- | :--- |
+| **S/PDIF Input** | `GPIO 5` (default) | S/PDIF Input |
 | **Output Slot 0** (Out 1-2) | `GPIO 6` (default) | S/PDIF or I2S data for main L/R or multi-way pair 1 |
 | **Output Slot 1** (Out 3-4) | `GPIO 7` (default) | S/PDIF or I2S data for multi-way pair 2 |
 | **Output Slot 2** (Out 5-6) | `GPIO 8` (default) | S/PDIF or I2S data for multi-way pair 3 |
@@ -185,6 +193,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 | Function | Pin | Connection |
 | :--- | :--- | :--- |
+| **S/PDIF Input** | `GPIO 5` (default) | S/PDIF Input |
 | **Output Slot 0** (Out 1-2) | `GPIO 6` (default) | S/PDIF or I2S data for main L/R or stereo pair 1 |
 | **Output Slot 1** (Out 3-4) | `GPIO 7` (default) | S/PDIF or I2S data for stereo pair 2 |
 | **Subwoofer Out** (PDM, Out 5) | `GPIO 10` (default) | Active subwoofer or PDM-to-analog filter |
@@ -193,7 +202,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 | **I2S MCK** (optional) | `GPIO 13` (default) | 128× or 256× Fs master clock when MCK is enabled |
 | **USB** | `Micro-USB` | Host device (PC/Mac/Mobile Device) |
 
-> **Notes:** S/PDIF output requires either a Toshiba TX179 optical transmitter or a simple resistor divider. I2S output is a standard 24-bit-in-32-bit left-justified frame — wires straight into most I2S DACs. PDM output is a 1-bit logic signal that requires a resistor and capacitor to form a low-pass filter for conversion to analog audio.
+> **Notes:** S/PDIF input requires either a Toshiba TORX141 optical receiver or a suitable receiver circuit. Possible receiver circuits are described by ST Microelectronics [here](https://www.st.com/resource/en/application_note/an5073-receiving-spdif-audio-stream-with-the-stm32f4f7h7-series-stmicroelectronics.pdf). S/PDIF output requires either a Toshiba TX179 optical transmitter or a simple resistor divider. I2S output is a standard 24-bit-in-32-bit left-justified frame — wires straight into most I2S DACs. PDM output is a 1-bit logic signal that requires a resistor and capacitor to form a low-pass filter for conversion to analog audio.
 
 ### Custom Pin Assignments
 
