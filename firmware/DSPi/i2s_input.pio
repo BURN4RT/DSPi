@@ -1,0 +1,163 @@
+;
+; Copyright (c) 2026 WeebLabs
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+
+; I2S input (RX) - 24-bit audio in 32-bit frames, two program variants.
+;
+; Both variants shift data IN from a single data pin (in_base = data pin),
+; IN shift direction left (MSB first), autopush at 32 bits, RX FIFO joined.
+; Each pushed word is one channel sample: audio in bits [31:8], bits [7:0]
+; are whatever the source drives after the 24th bit (masked in software).
+; Word order in the FIFO is Left, Right, Left, Right, ... ; the first word
+; pushed after the documented start procedure is always a LEFT word.
+;
+; Framing matches the TX master (audio_i2s_clkout.pio): standard I2S with
+; the 1-bit delay, i.e. LRCLK transitions during the last bit cell of the
+; outgoing channel and the MSB of the next channel follows one BCK period
+; after the transition.
+
+; ----------------------------------------------------------------------------
+; audio_i2s_rx_clkmaster - input state machine IS the clock master.
+;
+; Used when the active input is I2S and no output slot is I2S: this SM
+; drives BCK/LRCLK via side-set (bit 0 = BCK, bit 1 = LRCLK, same mapping
+; as the TX master) while sampling the external source's data pin.
+;
+; Each bit cell is 2 PIO cycles: a BCK-low cycle (source shifts its next
+; bit out) followed by a BCK-high cycle that executes `in pins, 1` (data
+; stable since the falling edge). Divider is identical to the TX master:
+; 24.8 fixed point, sys_clk * 2 / Fs, so BCK runs at Fs * 64.
+;
+; Cell map per channel (32 cells): cells 1..31 carry the steady LRCLK
+; level; LRCLK flips at the BCK-low cycle of cell 32 (the 1-bit delay),
+; and the last bit of the channel is sampled at cell 32's BCK-high cycle.
+;
+; Start procedure (see i2s_input.c): clear FIFOs, pio_sm_restart,
+; pio_sm_exec(set x, 29), pio_sm_exec(jmp wrap_target), then enable.
+
+.program audio_i2s_rx_clkmaster
+.side_set 2
+
+                                ;        /--- LRCLK (side-set bit 1)
+                                ;        |/-- BCK   (side-set bit 0)
+.wrap_target                    ;        ||
+    nop               side 0b00 ; low,  cell 1 L
+bitloop0:
+    in pins, 1        side 0b01 ; high, cells 1..30 L: sample
+    jmp x-- bitloop0  side 0b00 ; low,  cells 2..31 L
+    in pins, 1        side 0b01 ; high, cell 31 L
+    set x, 29         side 0b10 ; low,  cell 32 L: LRCLK rises, reload counter
+    in pins, 1        side 0b11 ; high, cell 32 L: last left bit
+    nop               side 0b10 ; low,  cell 1 R
+bitloop1:
+    in pins, 1        side 0b11 ; high, cells 1..30 R: sample
+    jmp x-- bitloop1  side 0b10 ; low,  cells 2..31 R
+    in pins, 1        side 0b11 ; high, cell 31 R
+public entry_point:
+    set x, 29         side 0b00 ; low,  cell 32 R: LRCLK falls, reload counter
+    in pins, 1        side 0b01 ; high, cell 32 R: last right bit
+.wrap
+
+; Total: 12 instructions.
+
+; ----------------------------------------------------------------------------
+; audio_i2s_rx_slave - clocks come from the I2S TX master on another PIO
+; block; this SM samples data against the BCK/LRCLK pads.
+;
+; Used when the active input is I2S and at least one output slot is I2S.
+; Runs at divider 1.0 (wait-driven; at 307.2 MHz there are ~50 PIO cycles
+; per BCK period even at 96 kHz).
+;
+; The BCK/LRCLK `wait gpio` instructions below are assembled with GPIO 0
+; placeholders. i2s_input.c copies the program to RAM and patches the
+; 5-bit GPIO index of each wait before loading, because i2s_bck_pin is
+; runtime-configurable. Patch map (instruction index -> pin):
+;   0, 1       -> LRCLK (i2s_bck_pin + 1)
+;   2, 3, 4, 5 -> BCK   (i2s_bck_pin)
+;
+; Sync preamble: find the LRCLK falling edge (start of the last right bit
+; cell), consume that cell's rising edge without sampling, then sample one
+; bit per subsequent rising edge; the first sampled bit is the left MSB.
+; The extra `wait 0` on BCK before the first rising-edge wait guards
+; against pad/synchronizer skew between LRCLK and BCK falling together.
+
+.program audio_i2s_rx_slave
+
+public entry_point:
+    wait 1 gpio 0               ; [patched: LRCLK] ensure right-channel phase
+    wait 0 gpio 0               ; [patched: LRCLK] falling edge
+    wait 0 gpio 0               ; [patched: BCK] skew guard
+    wait 1 gpio 0               ; [patched: BCK] rising edge clocks last R bit
+.wrap_target
+    wait 0 gpio 0               ; [patched: BCK]
+    wait 1 gpio 0               ; [patched: BCK] rising edge: data stable
+    in pins, 1                  ; sample
+.wrap
+
+; Total: 7 instructions.
+
+% c-sdk {
+
+// ---------------------------------------------------------------------------
+// audio_i2s_rx_clkmaster_program_init - configure an SM as I2S RX clock master
+//
+//   pio            - PIO block
+//   sm             - state machine index
+//   offset         - from pio_add_program()
+//   data_pin       - GPIO for serial audio data IN
+//   clock_pin_base - GPIO for BCK; LRCLK is clock_pin_base + 1
+//
+// Caller still owns: divider (sys_clk * 2 / Fs, ceiling, 24.8; identical to
+// the TX master so BCK frequency matches exactly), input enables on the data
+// pin, and the start procedure documented above.
+// ---------------------------------------------------------------------------
+static inline void audio_i2s_rx_clkmaster_program_init(PIO pio, uint sm, uint offset,
+                                                       uint data_pin, uint clock_pin_base) {
+    pio_sm_config sm_config = audio_i2s_rx_clkmaster_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&sm_config, data_pin);
+    sm_config_set_sideset_pins(&sm_config, clock_pin_base);
+
+    // MSB first into bit 31 after 32 shifts; autopush per channel word
+    sm_config_set_in_shift(&sm_config, false, true, 32);
+
+    // Join both FIFOs for RX (depth 8 words)
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset, &sm_config);
+
+    // BCK + LRCLK out, data pin in
+    uint clock_mask = 3u << clock_pin_base;
+    pio_sm_set_pindirs_with_mask(pio, sm, clock_mask, clock_mask | (1u << data_pin));
+
+    // Drive clocks low initially
+    pio_sm_set_pins(pio, sm, 0);
+}
+
+// ---------------------------------------------------------------------------
+// audio_i2s_rx_slave_program_init - configure an SM as wait-driven I2S RX slave
+//
+//   pio      - PIO block
+//   sm       - state machine index
+//   offset   - from pio_add_program() of the PATCHED program copy
+//   data_pin - GPIO for serial audio data IN
+//
+// Divider stays 1.0 (wait-driven). Caller owns input enables on data, BCK
+// and LRCLK pads, and starts execution at entry_point.
+// ---------------------------------------------------------------------------
+static inline void audio_i2s_rx_slave_program_init(PIO pio, uint sm, uint offset,
+                                                   uint data_pin) {
+    pio_sm_config sm_config = audio_i2s_rx_slave_program_get_default_config(offset);
+
+    sm_config_set_in_pins(&sm_config, data_pin);
+    sm_config_set_in_shift(&sm_config, false, true, 32);
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_RX);
+
+    pio_sm_init(pio, sm, offset, &sm_config);
+
+    pio_sm_set_pindirs_with_mask(pio, sm, 0, 1u << data_pin);
+}
+
+%}
