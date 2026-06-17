@@ -206,6 +206,14 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 > **Notes:** S/PDIF input requires either a Toshiba TORX141 optical receiver or a suitable receiver circuit. Possible receiver circuits are described by ST Microelectronics [here](https://www.st.com/resource/en/application_note/an5073-receiving-spdif-audio-stream-with-the-stm32f4f7h7-series-stmicroelectronics.pdf). S/PDIF output requires either a Toshiba TX179 optical transmitter or a simple resistor divider. I2S output is a standard 24-bit-in-32-bit left-justified frame — wires straight into most I2S DACs. PDM output is a 1-bit logic signal that requires a resistor and capacitor to form a low-pass filter for conversion to analog audio.
 
+#### PCM1808 ADC Module on Pico 2 (I2S Input)
+
+<img src="Images/pcm1808_pico2_i2s_wiring.svg" alt="Wiring diagram for connecting a PCM1808 ADC module to DSPi firmware on a Raspberry Pi Pico 2" width="100%">
+
+Use the PCM1808 in slave, standard-I2S mode: `MD1 = LOW`, `MD0 = LOW`, and `FMT = LOW`. In DSPi Console, select **I2S** as the input source, set RX data to `GPIO 4`, keep BCK on `GPIO 14` (`GPIO 15` is LRCLK), enable MCK on `GPIO 13`, and set the MCK multiplier to **256x**. That gives the PCM1808 `SCKI/MCLK` frequencies of 11.2896 MHz at 44.1 kHz, 12.288 MHz at 48 kHz, and 24.576 MHz at 96 kHz.
+
+PCM1808 modules vary: some expose separate `VDD/3V3` and `VCC/5V` pins, while others have a regulator and only expose `VCC`. Follow the module silkscreen for power, keep all digital I/O at 3.3 V logic, and always share ground with the Pico 2.
+
 ### Custom Pin Assignments
 
 All default pin assignments above work out of the box, but every output pin — including I2S BCK and MCK — can be reassigned at runtime through the DSPi Console application. No reflashing required. This is useful when designing custom PCBs or adapting to boards where the default GPIOs are inconvenient.

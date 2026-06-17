@@ -43,6 +43,8 @@ Connect the external I2S source (slave mode) to the DSPi:
 | DATA | source → DSPi | `i2s_rx_pin` (4) | Sampled on BCK rising edge |
 | MCK (optional) | DSPi → source | `i2s_mck_pin` (21 on RP2040, 13 on RP2350) | 128x or 256x Fs, only if enabled |
 
+For a concrete Pico 2 wiring example using a PCM1808 ADC module, see [`Images/pcm1808_pico2_i2s_wiring.svg`](../../Images/pcm1808_pico2_i2s_wiring.svg). The PCM1808 should be strapped for slave, standard-I2S mode (`MD1 = LOW`, `MD0 = LOW`, `FMT = LOW`) and should receive `SCKI/MCLK` from DSPi MCK with the multiplier set to **256x**.
+
 Electrical and format requirements:
 
 - 3.3 V logic levels.
