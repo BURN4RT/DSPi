@@ -6,15 +6,17 @@
 
 static inline bool is_filter_flat(const EqParamPacket *p) {
     if (p->type == FILTER_FLAT) return true;
-    // Any type outside the PEQ range (FILTER_FLAT..FILTER_ALLPASS) is not a
-    // valid PEQ filter — bypass the band rather than producing garbage. The
-    // most important case this defends against is a crossover filter type
-    // (FILTER_XOVER_FIRST..FILTER_XOVER_LAST) ending up in a PEQ band slot
-    // via a host bug or a mis-routed REQ_SET_EQ_PARAM / bulk apply / preset
-    // load: on the RP2350 SVF path the unknown type leaves the output mix
-    // coefficients zeroed (svm0=svm1=svm2=0), and the band would output
-    // silence at low fc. Treat as bypass instead, recipe round-trips.
-    if (p->type > FILTER_ALLPASS) return true;
+    // Any type outside the PEQ block (see filter_is_peq_type / the FilterType
+    // value-space contract in config.h) is not a valid PEQ filter — bypass the
+    // band rather than producing garbage. The most important case this defends
+    // against is a crossover filter type (FILTER_XOVER_FIRST..FILTER_XOVER_LAST)
+    // ending up in a PEQ band slot via a host bug or a mis-routed
+    // REQ_SET_EQ_PARAM / bulk apply / preset load: on the RP2350 SVF path the
+    // unknown type leaves the output mix coefficients zeroed (svm0=svm1=svm2=0),
+    // and the band would output silence at low fc. Treat as bypass instead,
+    // recipe round-trips. (An undefined value in the reserved PEQ padding falls
+    // through to a unity passthrough via the coefficient switch default.)
+    if (!filter_is_peq_type(p->type)) return true;
     if (p->freq <= 0.0f) return true;
 
     // Peaking/shelf with ~0dB gain is effectively flat
@@ -101,6 +103,10 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
     // SVF/biquad crossover decision + state reset on path change
     bool was_svf = bq->use_svf;
     bq->use_svf = (p->freq < (sample_rate / 7.5f));
+    // The first-order all-pass is a genuine 1st-order section; it cannot be
+    // represented in the 2nd-order SVF topology, so always run it through the
+    // TDF2 biquad path (b2 = a2 = 0), at every frequency.
+    if (p->type == FILTER_ALLPASS1) bq->use_svf = false;
     if (was_svf != bq->use_svf) {
         bq->s1 = 0.0f; bq->s2 = 0.0f;
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
@@ -171,6 +177,17 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
         case FILTER_HIGHSHELF: b0_f = A*((A+1)+(A-1)*cs+2*sqrtf(A)*alpha); b1_f = -2*A*((A-1)+(A+1)*cs); b2_f = A*((A+1)+(A-1)*cs-2*sqrtf(A)*alpha); a0_f = (A+1)-(A-1)*cs+2*sqrtf(A)*alpha; a1_f = 2*((A-1)-(A+1)*cs); a2_f = (A+1)-(A-1)*cs-2*sqrtf(A)*alpha; break;
         case FILTER_NOTCH: b0_f = 1.0f; b1_f = -2*cs; b2_f = 1.0f; a0_f = 1+alpha; a1_f=-2*cs; a2_f=1-alpha; break;
         case FILTER_ALLPASS: b0_f = 1-alpha; b1_f = -2*cs; b2_f = 1+alpha; a0_f = 1 + alpha; a1_f = -2*cs; a2_f = 1 - alpha; break;
+        case FILTER_ALLPASS1: {
+            // First-order all-pass. H(z) = (a + z^-1)/(1 + a*z^-1),
+            // a = (tan(pi*fc/Fs) - 1)/(tan(pi*fc/Fs) + 1). Flat magnitude,
+            // phase 0 → -180° (-90° at fc). Degenerate biquad (b2 = a2 = 0);
+            // runs unchanged on RP2040 (Q28) and RP2350 (float, TDF2 forced above).
+            float ta = tanf(3.1415926535f * p->freq / sample_rate);
+            float ap = (ta - 1.0f) / (ta + 1.0f);
+            b0_f = ap;   b1_f = 1.0f; b2_f = 0.0f;
+            a0_f = 1.0f; a1_f = ap;   a2_f = 0.0f;
+            break;
+        }
         default: break;
     }
 

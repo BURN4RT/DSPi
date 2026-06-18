@@ -17,8 +17,10 @@ from ..device import OP, Stall
 from ..framework import test
 from ..helpers import bool_roundtrip, nan_rejected
 
-# FilterType enum.
+# FilterType enum (PEQ block).  ALLPASS (7) is the 2nd-order RBJ all-pass;
+# ALLPASS1 (8) is the first-order all-pass.  Crossover types occupy 32..63.
 FLAT, PEAKING, LOWSHELF, HIGHSHELF, LOWPASS, HIGHPASS, NOTCH, ALLPASS = range(8)
+ALLPASS1 = 8
 # EQ GET param selectors.
 P_TYPE, P_FREQ, P_Q, P_GAIN, P_BYPASS = 0, 1, 2, 3, 4
 
@@ -55,12 +57,13 @@ def eq_band_roundtrip(dev, profile, chk):
 
 @test("eq", mutating=True)
 def eq_all_filter_types(dev, profile, chk):
-    """All filter types 0-7 set/read on (ch0,band0); unknown type 8 stored verbatim, no STALL."""
-    for t in range(8):
+    """All PEQ types 0-8 (incl. first-order all-pass) set/read on (ch0,band0); an out-of-range type stored verbatim, no STALL."""
+    for t in range(9):  # 0..8 = FLAT..ALLPASS1
         _set_band(dev, 0, 0, t, 500.0, 0.707, 3.0)
         chk.eq(_get(dev, 0, 0, P_TYPE), t, f"filter type {t}")
-    _set_band(dev, 0, 0, 8, 500.0, 0.707, 3.0)
-    chk.eq(_get(dev, 0, 0, P_TYPE), 8, "unknown type 8 stored verbatim")
+    # A crossover type in a PEQ slot is stored verbatim (flattened only in the audio path).
+    _set_band(dev, 0, 0, 32, 500.0, 0.707, 3.0)
+    chk.eq(_get(dev, 0, 0, P_TYPE), 32, "out-of-range type 32 stored verbatim")
 
 
 @test("eq", mutating=True)

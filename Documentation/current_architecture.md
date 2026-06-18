@@ -406,7 +406,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 ---
 
 ## DSP Processing Engine
-*Last updated: 2026-04-11*
+*Last updated: 2026-06-17*
 
 ### Channel Layout
 
@@ -440,9 +440,13 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 
 ### Biquad Filter
 
-**Types:** Flat (bypass), Peaking, Low Shelf, High Shelf, Low Pass, High Pass
+**Types:** Flat (bypass), Peaking, Low Shelf, High Shelf, Low Pass, High Pass, Notch, All-Pass (2nd-order RBJ), First-Order All-Pass (`FILTER_ALLPASS1`)
 
 **Coefficient computation:** RBJ Audio-EQ-Cookbook formulas for biquad path, Cytomic SVF equations for SVF path (RP2350 only), both in `dsp_compute_coefficients()`
+
+**First-order all-pass (`FILTER_ALLPASS1`, added 2026-06-17):** Flat magnitude at every frequency, phase 0° → -180° (-90° at the corner). Single parameter (`freq`); `Q` and `gain_db` are unused. Implemented as a degenerate TDF2 biquad (`b0 = a, b1 = 1, b2 = 0, a1 = a, a2 = 0` with `a = (tan(pi*fc/Fs) - 1)/(tan(pi*fc/Fs) + 1)`), so no inner-loop or assembly changes; on RP2350 it always uses the biquad path because a true 1st-order section cannot be represented in the 2nd-order SVF.
+
+**Filter type value space (`enum FilterType`):** PEQ types occupy 0–7 plus the first-order all-pass at 8, with 9–31 reserved for future PEQ types; crossover types occupy 32–63 (see [Crossover Filters](#crossover-filters)). `filter_is_peq_type()` (config.h) is the single classifier (any value below `FILTER_XOVER_FIRST`); `is_filter_flat()` uses it to flatten a crossover type that lands in a PEQ band slot. The crossover types were renumbered from the old 8–39 range on 2026-06-17 to open the contiguous PEQ block, which bumped `SLOT_DATA_VERSION` to 18 (pre-V18 presets migrated on load via `remap_filter_type_pre_v18()`) and `WIRE_FORMAT_VERSION` to 13.
 
 **RP2350 biquad (hybrid SVF/biquad):**
 ```c
@@ -544,7 +548,7 @@ PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples =
 ---
 
 ## Crossover Filters
-*Last updated: 2026-06-11*
+*Last updated: 2026-06-17*
 
 ### Purpose
 
@@ -565,11 +569,13 @@ Crossover bands share the band-index space with PEQ for all band-addressing vend
 - 10..19 = reserved (rejected); wide gap so PEQ can grow without moving crossover
 - 20..23 = crossover band 0..3 (`XOVER_BAND_BASE = 20`)
 
-The crossover base was widened from 12 to 20 on 2026-06-04. Because `REQ_GET_EQ_PARAM` previously packed the band into a 4-bit `wValue` field (max 15), its `wValue` layout changed to a 5-bit band field: `(channel << 8) | (band << 3) | param` (param dropped from 4 bits to 3; only 5 values exist). The other three band-addressing commands and the bulk transfer already use an 8-bit band field and were unaffected. The wire-format size, persistence layout, and filter-type enum are all unchanged.
+The crossover base was widened from 12 to 20 on 2026-06-04. Because `REQ_GET_EQ_PARAM` previously packed the band into a 4-bit `wValue` field (max 15), its `wValue` layout changed to a 5-bit band field: `(channel << 8) | (band << 3) | param` (param dropped from 4 bits to 3; only 5 values exist). The other three band-addressing commands and the bulk transfer already use an 8-bit band field and were unaffected. The wire-format size, persistence layout, and filter-type enum were all unchanged by that 2026-06-04 change.
+
+**Filter-type renumber (2026-06-17):** the crossover *type* values (`enum FilterType`, distinct from the band indices above) moved from the old 8–39 range to **32–63** so the PEQ type block could grow contiguously (first-order all-pass added at type 8, 9–31 reserved for future PEQ types). Band-index addressing is unchanged. This bumped `SLOT_DATA_VERSION` to 18 (pre-V18 presets remap their stored type values on load via `remap_filter_type_pre_v18()`) and `WIRE_FORMAT_VERSION` to 13. See `crossover_filters_spec.md` §2 and the FilterType value-space contract comment in `config.h`.
 
 ### Filter families
 
-`FilterType` enum extended at indices 8..39 covering 32 types: LR2/4/6/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. First-order sub-sections (BW1/3/5/7 and LR6, which is `(BW3)²`) always use TDF2 (the Cytomic SVF is fundamentally a 2nd-order topology). Second-order sections use the existing hybrid SVF/biquad selection on RP2350 — SVF below Fs/7.5, TDF2 above — same rule per section that PEQ uses per filter.
+`FilterType` enum, crossover types at indices 32..63 covering 32 types: LR2/4/6/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. First-order sub-sections (BW1/3/5/7 and LR6, which is `(BW3)²`) always use TDF2 (the Cytomic SVF is fundamentally a 2nd-order topology). Second-order sections use the existing hybrid SVF/biquad selection on RP2350 — SVF below Fs/7.5, TDF2 above — same rule per section that PEQ uses per filter.
 
 ### Pipeline insertion
 

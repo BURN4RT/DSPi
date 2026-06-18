@@ -65,7 +65,7 @@ typedef struct {
 #define XOVER_TYPE_COUNT (FILTER_XOVER_LAST - FILTER_XOVER_FIRST + 1)
 
 static const XoverTypeMeta xover_type_table[] = {
-    // FILTER_LR2_LP=8 .. FILTER_LR8_HP=15
+    // FILTER_LR2_LP=32 .. FILTER_LR8_HP=39
     { XOVER_FAMILY_LR,  2, 0, 1 },  // LR2 LP
     { XOVER_FAMILY_LR,  2, 1, 1 },  // LR2 HP
     { XOVER_FAMILY_LR,  4, 0, 2 },  // LR4 LP
@@ -75,7 +75,7 @@ static const XoverTypeMeta xover_type_table[] = {
     { XOVER_FAMILY_LR,  8, 0, 4 },  // LR8 LP
     { XOVER_FAMILY_LR,  8, 1, 4 },  // LR8 HP
 
-    // FILTER_BW1_LP=16 .. FILTER_BW8_HP=31
+    // FILTER_BW1_LP=40 .. FILTER_BW8_HP=55
     { XOVER_FAMILY_BW,  1, 0, 1 },  // BW1 LP
     { XOVER_FAMILY_BW,  1, 1, 1 },  // BW1 HP
     { XOVER_FAMILY_BW,  2, 0, 1 },  // BW2 LP
@@ -93,7 +93,7 @@ static const XoverTypeMeta xover_type_table[] = {
     { XOVER_FAMILY_BW,  8, 0, 4 },  // BW8 LP
     { XOVER_FAMILY_BW,  8, 1, 4 },  // BW8 HP
 
-    // FILTER_BES2_LP=32 .. FILTER_BES8_HP=39
+    // FILTER_BES2_LP=56 .. FILTER_BES8_HP=63
     { XOVER_FAMILY_BES, 2, 0, 1 },  // Bes2 LP
     { XOVER_FAMILY_BES, 2, 1, 1 },  // Bes2 HP
     { XOVER_FAMILY_BES, 4, 0, 2 },  // Bes4 LP

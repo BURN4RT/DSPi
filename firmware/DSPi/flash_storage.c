@@ -88,7 +88,11 @@
 //   V17: I2S input pin + rate appended (i2s_rx_pin, i2s_input_rate;
 //        struct grows by 2 bytes, same per-version CRC range mechanism
 //        as V16).
-#define SLOT_DATA_VERSION       17
+//   V18: FilterType enum renumbered (first-order all-pass at 8, PEQ padding
+//        9..31, crossover types shifted from 8..39 to 32..63). No struct
+//        change — same on-disk size as V17. Pre-V18 slots are migrated on
+//        load by remap_filter_type_pre_v18().
+#define SLOT_DATA_VERSION       18
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -1084,6 +1088,18 @@ static void apply_master_volume_from_mode(const PresetSlot *slot_or_null,
     // Independent mode + runtime: intentionally a no-op (live value survives).
 }
 
+// Translate a filter type value stored by pre-V18 firmware into the current
+// FilterType numbering.  Pre-V18 stored crossover types at 8..39; V18 moved
+// them to 32..63 (putting the new first-order all-pass at 8 and leaving 9..31
+// as PEQ padding).  PEQ types 0..7 are unchanged, and no first-order all-pass
+// existed before V18, so only the old crossover range shifts (+24).  The
+// literals 8/39/24 are the frozen pre-V18 wire values, deliberately NOT the
+// (now-renumbered) FILTER_* names.
+static inline uint8_t remap_filter_type_pre_v18(uint8_t old_type) {
+    if (old_type >= 8 && old_type <= 39) return (uint8_t)(old_type + 24);
+    return old_type;
+}
+
 // Apply a validated PresetSlot to the live DSP state.
 // Physical IO config (output pins/types, I2S MCK/BCK, SPDIF RX pin) and master
 // volume are *not* touched here — callers invoke apply_output_config_from_mode()
@@ -1103,11 +1119,16 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     // dsp_init_default_filters() channel/band fix (or by any path that
     // didn't fully populate the recipe) may have these at zero, which would
     // cause REQ_SET_BAND_BYPASS to misroute writes to slot (0,0).
+    // V18 renumbered the FilterType value space; migrate type values from any
+    // pre-V18 slot as they are loaded so existing presets keep their filters.
+    bool pre_v18 = (slot->version < 18);
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         for (int b = 0; b < MAX_BANDS; b++) {
             filter_recipes[ch][b].bypass = (filter_recipes[ch][b].bypass == 1) ? 1 : 0;
             filter_recipes[ch][b].channel = ch;
             filter_recipes[ch][b].band = b;
+            if (pre_v18)
+                filter_recipes[ch][b].type = remap_filter_type_pre_v18(filter_recipes[ch][b].type);
         }
     }
 
@@ -1289,6 +1310,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
                 xover_recipes[ch][i].channel = (uint8_t)ch;
                 xover_recipes[ch][i].band    = (uint8_t)(XOVER_BAND_BASE + i);
                 xover_recipes[ch][i].bypass  = (xover_recipes[ch][i].bypass == 1) ? 1 : 0;
+                if (pre_v18)
+                    xover_recipes[ch][i].type = remap_filter_type_pre_v18(xover_recipes[ch][i].type);
             }
         }
     } else {
@@ -1330,6 +1353,9 @@ static size_t slot_data_size_for_version(uint8_t version) {
         case 16:
             return SLOT_DATA_SIZE_V16;
         case 17:
+        case 18:
+            // V18 renumbered filter type values only; the on-disk layout
+            // (and CRC byte range) is identical to V17.
             return SLOT_DATA_SIZE_V17;
         default:
             return 0;

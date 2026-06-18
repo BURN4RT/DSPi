@@ -582,37 +582,69 @@ typedef struct {
 } Biquad;
 #endif
 
+// FilterType value-space contract.  These values are persisted in flash
+// (PresetSlot.filter_recipes/.xover_recipes) and sent over USB (WireBandParams,
+// REQ_SET/GET_EQ_PARAM), so NEVER renumber an existing value without bumping
+// SLOT_DATA_VERSION + WIRE_FORMAT_VERSION and providing a migration (see
+// remap_filter_type_pre_v18() in flash_storage.c).  The space is partitioned:
+//
+//     0..7    PEQ types        FILTER_FLAT .. FILTER_ALLPASS
+//     8       FILTER_ALLPASS1  first-order all-pass
+//     9..31   reserved for future PEQ types (the PEQ block is everything
+//             below FILTER_XOVER_FIRST; see filter_is_peq_type())
+//     32..63  crossover types  FILTER_XOVER_FIRST .. FILTER_XOVER_LAST
+//     64..    reserved for future crossover types (they must stay contiguous
+//             from FILTER_XOVER_FIRST; xover_type_table[] is indexed by
+//             (type - FILTER_XOVER_FIRST))
 enum FilterType {
     FILTER_FLAT = 0, FILTER_PEAKING = 1, FILTER_LOWSHELF = 2,
     FILTER_HIGHSHELF = 3, FILTER_LOWPASS = 4, FILTER_HIGHPASS = 5,
     FILTER_NOTCH = 6, FILTER_ALLPASS = 7,
 
-    // Crossover filter types — indices 8..39. See crossover.h /
+    // First-order all-pass: flat magnitude, phase 0 → -180° (-90° at the
+    // corner freq), single parameter (freq); Q and gain are unused.
+    // FILTER_ALLPASS (7) is the second-order RBJ all-pass; this is the 1st-order.
+    FILTER_ALLPASS1 = 8,
+
+    // 9..31 reserved for future PEQ types.
+
+    // Crossover filter types — indices 32..63. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.
     // Each value encodes (family, order, LP/HP); section count per filter is
-    // ceil(order/2) for BW/Bes and order/2 for LR.
-    FILTER_LR2_LP   =  8, FILTER_LR2_HP   =  9,
-    FILTER_LR4_LP   = 10, FILTER_LR4_HP   = 11,
-    FILTER_LR6_LP   = 12, FILTER_LR6_HP   = 13,
-    FILTER_LR8_LP   = 14, FILTER_LR8_HP   = 15,
+    // ceil(order/2) for BW/Bes and order/2 for LR.  MUST stay contiguous from
+    // FILTER_XOVER_FIRST (xover_type_table[] is indexed relative to it).
+    FILTER_LR2_LP   = 32, FILTER_LR2_HP   = 33,
+    FILTER_LR4_LP   = 34, FILTER_LR4_HP   = 35,
+    FILTER_LR6_LP   = 36, FILTER_LR6_HP   = 37,
+    FILTER_LR8_LP   = 38, FILTER_LR8_HP   = 39,
 
-    FILTER_BW1_LP   = 16, FILTER_BW1_HP   = 17,
-    FILTER_BW2_LP   = 18, FILTER_BW2_HP   = 19,
-    FILTER_BW3_LP   = 20, FILTER_BW3_HP   = 21,
-    FILTER_BW4_LP   = 22, FILTER_BW4_HP   = 23,
-    FILTER_BW5_LP   = 24, FILTER_BW5_HP   = 25,
-    FILTER_BW6_LP   = 26, FILTER_BW6_HP   = 27,
-    FILTER_BW7_LP   = 28, FILTER_BW7_HP   = 29,
-    FILTER_BW8_LP   = 30, FILTER_BW8_HP   = 31,
+    FILTER_BW1_LP   = 40, FILTER_BW1_HP   = 41,
+    FILTER_BW2_LP   = 42, FILTER_BW2_HP   = 43,
+    FILTER_BW3_LP   = 44, FILTER_BW3_HP   = 45,
+    FILTER_BW4_LP   = 46, FILTER_BW4_HP   = 47,
+    FILTER_BW5_LP   = 48, FILTER_BW5_HP   = 49,
+    FILTER_BW6_LP   = 50, FILTER_BW6_HP   = 51,
+    FILTER_BW7_LP   = 52, FILTER_BW7_HP   = 53,
+    FILTER_BW8_LP   = 54, FILTER_BW8_HP   = 55,
 
-    FILTER_BES2_LP  = 32, FILTER_BES2_HP  = 33,
-    FILTER_BES4_LP  = 34, FILTER_BES4_HP  = 35,
-    FILTER_BES6_LP  = 36, FILTER_BES6_HP  = 37,
-    FILTER_BES8_LP  = 38, FILTER_BES8_HP  = 39,
+    FILTER_BES2_LP  = 56, FILTER_BES2_HP  = 57,
+    FILTER_BES4_LP  = 58, FILTER_BES4_HP  = 59,
+    FILTER_BES6_LP  = 60, FILTER_BES6_HP  = 61,
+    FILTER_BES8_LP  = 62, FILTER_BES8_HP  = 63,
 
     FILTER_XOVER_FIRST = FILTER_LR2_LP,
     FILTER_XOVER_LAST  = FILTER_BES8_HP,
 };
+
+// Single source of truth for PEQ-vs-crossover classification: a PEQ type is
+// any value in the PEQ block (everything below the crossover range).  Used by
+// is_filter_flat() (dsp_pipeline.c) to flatten a crossover type that leaks
+// into a PEQ band slot.  Routing PEQ vs crossover bands themselves is by BAND
+// index (XOVER_BAND_BASE), independent of this.
+static inline bool filter_is_peq_type(uint8_t t) { return t < FILTER_XOVER_FIRST; }
+
+_Static_assert(FILTER_ALLPASS  < FILTER_XOVER_FIRST, "core PEQ block must precede the crossover range");
+_Static_assert(FILTER_ALLPASS1 < FILTER_XOVER_FIRST, "first-order all-pass must sit in the PEQ block");
 
 typedef struct __attribute__((packed)) {
     uint8_t channel;

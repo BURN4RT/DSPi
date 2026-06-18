@@ -29,7 +29,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      12   // V12: + i2s_rx_pin / i2s_input_rate in WireInputConfig (same byte size as V11)
+#define WIRE_FORMAT_VERSION      13   // V13: FilterType enum renumbered (1st-order all-pass @8, crossover 32..63); field-interpretation change only, same byte size as V12
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -318,7 +318,8 @@ typedef struct __attribute__((packed)) {
 // added, append its anchor as
 //   #define WIRE_BULK_PARAMS_V{N-1}_SIZE (WIRE_BULK_PARAMS_V{N}_SIZE - sizeof(WireFooConfig))
 // and chain older anchors off the new V{N-1}_SIZE.
-#define WIRE_BULK_PARAMS_V12_SIZE   sizeof(WireBulkParams)
+#define WIRE_BULK_PARAMS_V13_SIZE   sizeof(WireBulkParams)
+#define WIRE_BULK_PARAMS_V12_SIZE   WIRE_BULK_PARAMS_V13_SIZE  /* V13 only renumbers filter type values; no struct change */
 #define WIRE_BULK_PARAMS_V11_SIZE   WIRE_BULK_PARAMS_V12_SIZE  /* V12 fields live in V11's WireInputConfig reserved bytes */
 #define WIRE_BULK_PARAMS_V10_SIZE   (WIRE_BULK_PARAMS_V11_SIZE - sizeof(WireCrossoverConfig))
 #define WIRE_BULK_PARAMS_V9_SIZE    (WIRE_BULK_PARAMS_V10_SIZE - sizeof(WireDacHwMute))

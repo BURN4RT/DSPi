@@ -1,6 +1,6 @@
 # Crossover Filters Specification
 
-*Last updated: 2026-06-04*
+*Last updated: 2026-06-17*
 
 ## Purpose
 
@@ -43,44 +43,52 @@ Crossovers apply only to **output channels**. Master channels (`CH_MASTER_LEFT=0
 
 ## 2. Filter type enum
 
-`FilterType` (defined in `config.h`) is shared between PEQ and crossover. PEQ types occupy indices 0–7 (FLAT, PEAKING, LOWSHELF, HIGHSHELF, LOWPASS, HIGHPASS, NOTCH, ALLPASS). Crossover types start at 8.
+`FilterType` (defined in `config.h`) is shared between PEQ and crossover. The value space is partitioned (see the "FilterType value-space contract" comment in `config.h`):
+
+- **0–7** core PEQ types: FLAT, PEAKING, LOWSHELF, HIGHSHELF, LOWPASS, HIGHPASS, NOTCH, ALLPASS (the second-order RBJ all-pass).
+- **8** `FILTER_ALLPASS1` — first-order all-pass (a PEQ type). Flat magnitude, phase 0° → -180° (-90° at the corner freq); single parameter (`freq`), `Q` and `gain_db` unused.
+- **9–31** reserved for future PEQ types.
+- **32–63** crossover types (table below).
+- **64+** reserved for future crossover types; they must stay contiguous from `FILTER_XOVER_FIRST` because `xover_type_table[]` is indexed by `type - FILTER_XOVER_FIRST`.
+
+> **Renumbering note (2026-06-17):** crossover types were shifted from the old 8–39 range to **32–63** to open a contiguous PEQ block (first-order all-pass added at 8, padding to 31). This is a breaking change to stored and wire type values: firmware bumped `SLOT_DATA_VERSION` to **18** (pre-V18 presets have their type values migrated on load) and `WIRE_FORMAT_VERSION` to **13**. A host must match its firmware version.
 
 | Value | Symbol | Family | Order | Shape | Sections |
 |---|---|---|---|---|---|
-| 8 | `FILTER_LR2_LP` | Linkwitz-Riley | 2 | LP | 1 |
-| 9 | `FILTER_LR2_HP` | Linkwitz-Riley | 2 | HP | 1 |
-| 10 | `FILTER_LR4_LP` | Linkwitz-Riley | 4 | LP | 2 |
-| 11 | `FILTER_LR4_HP` | Linkwitz-Riley | 4 | HP | 2 |
-| 12 | `FILTER_LR6_LP` | Linkwitz-Riley | 6 | LP | 4 (2 first-order + 2 biquads) |
-| 13 | `FILTER_LR6_HP` | Linkwitz-Riley | 6 | HP | 4 |
-| 14 | `FILTER_LR8_LP` | Linkwitz-Riley | 8 | LP | 4 |
-| 15 | `FILTER_LR8_HP` | Linkwitz-Riley | 8 | HP | 4 |
-| 16 | `FILTER_BW1_LP` | Butterworth | 1 | LP | 1 (1st-order) |
-| 17 | `FILTER_BW1_HP` | Butterworth | 1 | HP | 1 (1st-order) |
-| 18 | `FILTER_BW2_LP` | Butterworth | 2 | LP | 1 |
-| 19 | `FILTER_BW2_HP` | Butterworth | 2 | HP | 1 |
-| 20 | `FILTER_BW3_LP` | Butterworth | 3 | LP | 2 (1st-order + biquad) |
-| 21 | `FILTER_BW3_HP` | Butterworth | 3 | HP | 2 |
-| 22 | `FILTER_BW4_LP` | Butterworth | 4 | LP | 2 |
-| 23 | `FILTER_BW4_HP` | Butterworth | 4 | HP | 2 |
-| 24 | `FILTER_BW5_LP` | Butterworth | 5 | LP | 3 (1st-order + 2 biquads) |
-| 25 | `FILTER_BW5_HP` | Butterworth | 5 | HP | 3 |
-| 26 | `FILTER_BW6_LP` | Butterworth | 6 | LP | 3 |
-| 27 | `FILTER_BW6_HP` | Butterworth | 6 | HP | 3 |
-| 28 | `FILTER_BW7_LP` | Butterworth | 7 | LP | 4 (1st-order + 3 biquads) |
-| 29 | `FILTER_BW7_HP` | Butterworth | 7 | HP | 4 |
-| 30 | `FILTER_BW8_LP` | Butterworth | 8 | LP | 4 |
-| 31 | `FILTER_BW8_HP` | Butterworth | 8 | HP | 4 |
-| 32 | `FILTER_BES2_LP` | Bessel | 2 | LP | 1 |
-| 33 | `FILTER_BES2_HP` | Bessel | 2 | HP | 1 |
-| 34 | `FILTER_BES4_LP` | Bessel | 4 | LP | 2 |
-| 35 | `FILTER_BES4_HP` | Bessel | 4 | HP | 2 |
-| 36 | `FILTER_BES6_LP` | Bessel | 6 | LP | 3 |
-| 37 | `FILTER_BES6_HP` | Bessel | 6 | HP | 3 |
-| 38 | `FILTER_BES8_LP` | Bessel | 8 | LP | 4 |
-| 39 | `FILTER_BES8_HP` | Bessel | 8 | HP | 4 |
+| 32 | `FILTER_LR2_LP` | Linkwitz-Riley | 2 | LP | 1 |
+| 33 | `FILTER_LR2_HP` | Linkwitz-Riley | 2 | HP | 1 |
+| 34 | `FILTER_LR4_LP` | Linkwitz-Riley | 4 | LP | 2 |
+| 35 | `FILTER_LR4_HP` | Linkwitz-Riley | 4 | HP | 2 |
+| 36 | `FILTER_LR6_LP` | Linkwitz-Riley | 6 | LP | 4 (2 first-order + 2 biquads) |
+| 37 | `FILTER_LR6_HP` | Linkwitz-Riley | 6 | HP | 4 |
+| 38 | `FILTER_LR8_LP` | Linkwitz-Riley | 8 | LP | 4 |
+| 39 | `FILTER_LR8_HP` | Linkwitz-Riley | 8 | HP | 4 |
+| 40 | `FILTER_BW1_LP` | Butterworth | 1 | LP | 1 (1st-order) |
+| 41 | `FILTER_BW1_HP` | Butterworth | 1 | HP | 1 (1st-order) |
+| 42 | `FILTER_BW2_LP` | Butterworth | 2 | LP | 1 |
+| 43 | `FILTER_BW2_HP` | Butterworth | 2 | HP | 1 |
+| 44 | `FILTER_BW3_LP` | Butterworth | 3 | LP | 2 (1st-order + biquad) |
+| 45 | `FILTER_BW3_HP` | Butterworth | 3 | HP | 2 |
+| 46 | `FILTER_BW4_LP` | Butterworth | 4 | LP | 2 |
+| 47 | `FILTER_BW4_HP` | Butterworth | 4 | HP | 2 |
+| 48 | `FILTER_BW5_LP` | Butterworth | 5 | LP | 3 (1st-order + 2 biquads) |
+| 49 | `FILTER_BW5_HP` | Butterworth | 5 | HP | 3 |
+| 50 | `FILTER_BW6_LP` | Butterworth | 6 | LP | 3 |
+| 51 | `FILTER_BW6_HP` | Butterworth | 6 | HP | 3 |
+| 52 | `FILTER_BW7_LP` | Butterworth | 7 | LP | 4 (1st-order + 3 biquads) |
+| 53 | `FILTER_BW7_HP` | Butterworth | 7 | HP | 4 |
+| 54 | `FILTER_BW8_LP` | Butterworth | 8 | LP | 4 |
+| 55 | `FILTER_BW8_HP` | Butterworth | 8 | HP | 4 |
+| 56 | `FILTER_BES2_LP` | Bessel | 2 | LP | 1 |
+| 57 | `FILTER_BES2_HP` | Bessel | 2 | HP | 1 |
+| 58 | `FILTER_BES4_LP` | Bessel | 4 | LP | 2 |
+| 59 | `FILTER_BES4_HP` | Bessel | 4 | HP | 2 |
+| 60 | `FILTER_BES6_LP` | Bessel | 6 | LP | 3 |
+| 61 | `FILTER_BES6_HP` | Bessel | 6 | HP | 3 |
+| 62 | `FILTER_BES8_LP` | Bessel | 8 | LP | 4 |
+| 63 | `FILTER_BES8_HP` | Bessel | 8 | HP | 4 |
 
-`FILTER_XOVER_FIRST` = 8, `FILTER_XOVER_LAST` = 39 (32 crossover filter types total). Any type outside this range written into a crossover band slot (bands 20–23) is treated as bypassed; the recipe round-trips the value so the app can detect the mismatch.
+`FILTER_XOVER_FIRST` = 32, `FILTER_XOVER_LAST` = 63 (32 crossover filter types total). Any type outside this range written into a crossover band slot (bands 20–23) is treated as bypassed; the recipe round-trips the value so the app can detect the mismatch.
 
 ### Filter response conventions
 
@@ -457,7 +465,7 @@ Two paths:
 
 - Hide crossover controls for master channels (CH_MASTER_LEFT / CH_MASTER_RIGHT).
 - Hide bands 10–19 from the band picker (they're reserved).
-- "Filter type" picker for crossover bands shows only the 32 crossover values (indices 8..39). PEQ bands should show only PEQ values (0..7).
+- "Filter type" picker for crossover bands shows only the 32 crossover values (indices 32..63). PEQ bands should show only PEQ values (0..8, where 8 is the first-order all-pass).
 - When loading a preset, the app can detect crossover state by checking `xover_recipes[ch][i].type != FILTER_FLAT && xover_recipes[ch][i].bypass != 1` for each band.
 
 ---

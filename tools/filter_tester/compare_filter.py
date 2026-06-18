@@ -137,6 +137,21 @@ def rbj_coefficients(filter_type, fc, Q, gain_db, Fs):
         a0 = 1 + alpha
         a1 = -2 * cs
         a2 = 1 - alpha
+    elif ft in ('allpass1', 'allpass1q28'):
+        # First-order all-pass REFERENCE, derived independently of the
+        # firmware's compact a=(t-1)/(t+1) form: bilinear-transform the analog
+        # prototype  H(s) = (1 - s/Wc)/(1 + s/Wc)  with frequency prewarping
+        # (Wc = k*tan(pi*fc/Fs), k = 2*Fs) so the -90 deg point lands exactly
+        # at fc.  Substituting s = k*(1 - z^-1)/(1 + z^-1) and clearing the
+        # shared (1 + z^-1) factor gives a 1st-order section (b2 = a2 = 0).
+        k = 2.0 * Fs
+        Wc = k * np.tan(np.pi * fc / Fs)
+        b0 = Wc - k
+        b1 = Wc + k
+        b2 = 0.0
+        a0 = Wc + k
+        a1 = Wc - k
+        a2 = 0.0
     else:
         raise ValueError(f"Unknown filter type: {filter_type}")
     return (b0, b1, b2, a0, a1, a2)
