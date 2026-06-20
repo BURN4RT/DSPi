@@ -572,6 +572,7 @@ typedef struct {
     uint32_t svf_type;                         // FilterType enum for inner loop specialization
 
     bool use_svf;                              // true = SVF path, false = biquad path
+    bool svf_first_order;                      // true = one-pole SVF inner loop (1st-order types)
     bool bypass;
 } Biquad;
 #else
@@ -590,7 +591,8 @@ typedef struct {
 //
 //     0..7    PEQ types        FILTER_FLAT .. FILTER_ALLPASS
 //     8       FILTER_ALLPASS1  first-order all-pass
-//     9..31   reserved for future PEQ types (the PEQ block is everything
+//     9..10   FILTER_LOWSHELF1, FILTER_HIGHSHELF1  first-order shelves
+//     11..31  reserved for future PEQ types (the PEQ block is everything
 //             below FILTER_XOVER_FIRST; see filter_is_peq_type())
 //     32..63  crossover types  FILTER_XOVER_FIRST .. FILTER_XOVER_LAST
 //     64..    reserved for future crossover types (they must stay contiguous
@@ -606,7 +608,15 @@ enum FilterType {
     // FILTER_ALLPASS (7) is the second-order RBJ all-pass; this is the 1st-order.
     FILTER_ALLPASS1 = 8,
 
-    // 9..31 reserved for future PEQ types.
+    // First-order shelving filters: gentle 6 dB/oct shelf, monotonic (no Q),
+    // single corner freq + gain.  Like ALLPASS1 these are genuine 1st-order
+    // sections; on RP2350 they follow the hybrid SVF/biquad path (one-pole SVF
+    // below Fs/7.5, degenerate biquad above), on RP2040 a Q28 degenerate biquad.
+    // Q is unused.  First-order shelves prewarp g by A (not sqrt(A) like the
+    // 2nd-order shelves).
+    FILTER_LOWSHELF1 = 9, FILTER_HIGHSHELF1 = 10,
+
+    // 11..31 reserved for future PEQ types.
 
     // Crossover filter types — indices 32..63. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.
@@ -645,6 +655,7 @@ static inline bool filter_is_peq_type(uint8_t t) { return t < FILTER_XOVER_FIRST
 
 _Static_assert(FILTER_ALLPASS  < FILTER_XOVER_FIRST, "core PEQ block must precede the crossover range");
 _Static_assert(FILTER_ALLPASS1 < FILTER_XOVER_FIRST, "first-order all-pass must sit in the PEQ block");
+_Static_assert(FILTER_HIGHSHELF1 < FILTER_XOVER_FIRST, "first-order shelves must sit in the PEQ block");
 
 typedef struct __attribute__((packed)) {
     uint8_t channel;

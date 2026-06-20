@@ -47,7 +47,8 @@ Crossovers apply only to **output channels**. Master channels (`CH_MASTER_LEFT=0
 
 - **0–7** core PEQ types: FLAT, PEAKING, LOWSHELF, HIGHSHELF, LOWPASS, HIGHPASS, NOTCH, ALLPASS (the second-order RBJ all-pass).
 - **8** `FILTER_ALLPASS1` — first-order all-pass (a PEQ type). Flat magnitude, phase 0° → -180° (-90° at the corner freq); single parameter (`freq`), `Q` and `gain_db` unused.
-- **9–31** reserved for future PEQ types.
+- **9–10** `FILTER_LOWSHELF1`, `FILTER_HIGHSHELF1` — first-order shelves (PEQ types, added 2026-06-20). Gentle 6 dB/oct shelf, monotonic, no `Q`; parameters `freq` + `gain_db`.
+- **11–31** reserved for future PEQ types.
 - **32–63** crossover types (table below).
 - **64+** reserved for future crossover types; they must stay contiguous from `FILTER_XOVER_FIRST` because `xover_type_table[]` is indexed by `type - FILTER_XOVER_FIRST`.
 
@@ -465,7 +466,7 @@ Two paths:
 
 - Hide crossover controls for master channels (CH_MASTER_LEFT / CH_MASTER_RIGHT).
 - Hide bands 10–19 from the band picker (they're reserved).
-- "Filter type" picker for crossover bands shows only the 32 crossover values (indices 32..63). PEQ bands should show only PEQ values (0..8, where 8 is the first-order all-pass).
+- "Filter type" picker for crossover bands shows only the 32 crossover values (indices 32..63). PEQ bands should show only PEQ values (0..10, where 8 is the first-order all-pass and 9..10 are the first-order shelves).
 - When loading a preset, the app can detect crossover state by checking `xover_recipes[ch][i].type != FILTER_FLAT && xover_recipes[ch][i].bypass != 1` for each band.
 
 ---

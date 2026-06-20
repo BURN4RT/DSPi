@@ -241,6 +241,7 @@ static void biquad_assign_2nd_order_rp2350(Biquad *bq,
         bq->s1 = 0.0f; bq->s2 = 0.0f;
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
+    bq->svf_first_order = false;   // 2nd-order section uses the 2-pole SVF path
 
     if (bq->use_svf) {
         // Cytomic SVF (TPT). For a 2nd-order section with prewarped pole
@@ -306,15 +307,42 @@ static void biquad_assign_2nd_order_rp2350(Biquad *bq,
 
 static void biquad_assign_1st_order_rp2350(Biquad *bq,
                                            float sigma_real,
-                                           bool is_hp, float Fs) {
+                                           bool is_hp, float Fs, float fc) {
     // First-order section: pole at -sigma_real (already denormalised).
-    // Always TDF2 — SVF is 2nd-order only.
-    if (bq->use_svf) {
-        // Switching from SVF → biquad: clear SVF state.
+    // Follows the same hybrid rule as the 2nd-order path: one-pole SVF below
+    // Fs/7.5, degenerate TDF2 biquad above.  Section state is cleared when the
+    // topology changes (matching the 2nd-order convention).
+    bool was_svf = bq->use_svf;
+    bq->use_svf = (fc < (Fs / 7.5f));
+    if (was_svf != bq->use_svf) {
+        bq->s1 = 0.0f; bq->s2 = 0.0f;
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
-    bq->use_svf = false;
 
+    if (bq->use_svf) {
+        // One-pole TPT SVF.  g = sigma_real/(2*Fs) is the prewarped one-pole
+        // gain (same direct form as the 2nd-order section; avoids an atan->tan
+        // round-trip), yielding a pole identical to the biquad form.  The
+        // 1/(1+g) reciprocal is folded into sva1 so the loop is multiply-only.
+        float g    = sigma_real / (2.0f * Fs);
+        float sva1 = 1.0f / (1.0f + g);
+        bq->sva1 = sva1;
+        bq->sva2 = g * sva1;
+        bq->sva3 = 0.0f;
+        if (is_hp) {
+            bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 1.0f;   // out = in - lp
+            bq->svf_type = FILTER_HIGHPASS;
+        } else {
+            bq->svm0 = 0.0f; bq->svm1 = 1.0f; bq->svm2 = 0.0f;   // out = lp
+            bq->svf_type = FILTER_LOWPASS;
+        }
+        bq->svf_first_order = true;
+        bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;
+        bq->bypass = false;
+        return;
+    }
+
+    bq->svf_first_order = false;
     float K  = 2.0f * Fs;
     float A0 = K + sigma_real;
     float A1 = sigma_real - K;
@@ -423,7 +451,8 @@ static void section_emit_2nd_order(Biquad *bq, float sigma_n, float omega_n,
 }
 
 static void section_emit_1st_order(Biquad *bq, float sigma_n,
-                                   float omega_a, bool is_hp, float Fs) {
+                                   float omega_a, bool is_hp, float Fs,
+                                   float fc) {
     if (is_hp && sigma_n > 0.0f) {
         // LP→HP on a real-pole 1st-order: pole at -σ_n → pole at -1/σ_n.
         // For Butterworth (σ_n = 1) the reciprocal is identity, so this is
@@ -434,8 +463,9 @@ static void section_emit_1st_order(Biquad *bq, float sigma_n,
     }
     float sigma = sigma_n * omega_a;
 #if PICO_RP2350
-    biquad_assign_1st_order_rp2350(bq, sigma, is_hp, Fs);
+    biquad_assign_1st_order_rp2350(bq, sigma, is_hp, Fs, fc);
 #else
+    (void)fc;
     biquad_assign_1st_order_rp2040(bq, sigma, is_hp, Fs);
 #endif
 }
@@ -453,7 +483,7 @@ static void design_butterworth(XoverFilter *band,
     if (order & 1u) {
         // Real pole at σ_n = 1 (Butterworth N has its real pole on the unit
         // circle at -1).
-        section_emit_1st_order(&band->sections[idx++], 1.0f, omega_a, is_hp, Fs);
+        section_emit_1st_order(&band->sections[idx++], 1.0f, omega_a, is_hp, Fs, fc);
     }
     uint8_t pairs = order / 2;
     for (uint8_t p = 0; p < pairs; p++) {
@@ -499,7 +529,7 @@ static void design_linkwitz_riley(XoverFilter *band,
     // ---- Emit BW_N's sections (1st-order first, then biquads) ----
     if (has_1st) {
         // Butterworth real pole at σ_n = 1.
-        section_emit_1st_order(&band->sections[idx++], 1.0f, omega_a, is_hp, Fs);
+        section_emit_1st_order(&band->sections[idx++], 1.0f, omega_a, is_hp, Fs, fc);
     }
     for (uint8_t p = 0; p < pairs; p++) {
         AnalogPolePair pole;
@@ -564,6 +594,7 @@ void xover_design_filter(const EqParamPacket *recipe,
     float old_s1[MAX_XOVER_BAND_SECTIONS], old_s2[MAX_XOVER_BAND_SECTIONS];
     float old_ic1[MAX_XOVER_BAND_SECTIONS], old_ic2[MAX_XOVER_BAND_SECTIONS];
     bool  old_svf[MAX_XOVER_BAND_SECTIONS];
+    bool  old_first_order[MAX_XOVER_BAND_SECTIONS];
 #else
     int32_t old_s1[MAX_XOVER_BAND_SECTIONS], old_s2[MAX_XOVER_BAND_SECTIONS];
 #endif
@@ -576,6 +607,7 @@ void xover_design_filter(const EqParamPacket *recipe,
         old_ic1[i] = band->sections[i].svic1eq;
         old_ic2[i] = band->sections[i].svic2eq;
         old_svf[i] = band->sections[i].use_svf;
+        old_first_order[i] = band->sections[i].svf_first_order;
 #endif
     }
 
@@ -621,13 +653,14 @@ void xover_design_filter(const EqParamPacket *recipe,
         band->bypass = false;
         // Restore surviving sections' state (the passthrough reset above
         // zeroed it). A section that was bypassed, dropped out of the new
-        // cascade, or changed SVF/TDF2 path stays zeroed, matching the PEQ
-        // path-change convention.
+        // cascade, or changed topology (SVF/TDF2 path, or 1st/2nd-order via
+        // svf_first_order) stays zeroed, matching the PEQ path-change convention.
         uint8_t keep = (band->num_sections < old_active)
                        ? band->num_sections : old_active;
         for (uint8_t i = 0; i < keep; i++) {
 #if PICO_RP2350
-            if (band->sections[i].use_svf != old_svf[i]) continue;
+            if (band->sections[i].use_svf != old_svf[i] ||
+                band->sections[i].svf_first_order != old_first_order[i]) continue;
             band->sections[i].svic1eq = old_ic1[i];
             band->sections[i].svic2eq = old_ic2[i];
 #endif
@@ -712,6 +745,18 @@ static inline void apply_section_block(Biquad * __restrict bq,
         float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
         float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
         float *sp = samples;
+
+        if (bq->svf_first_order) {
+            // One-pole TPT SVF (1st-order crossover section): multiply-only.
+            for (uint32_t i = 0; i < count; i++) {
+                float in = *sp;
+                float v1 = a2 * in + a1 * ic1eq;
+                ic1eq = 2.0f * v1 - ic1eq;
+                *sp++ = m0 * in + m1 * v1 + m2 * (in - v1);
+            }
+            bq->svic1eq = ic1eq;
+            return;
+        }
 
         switch (bq->svf_type) {
             case FILTER_LOWPASS:

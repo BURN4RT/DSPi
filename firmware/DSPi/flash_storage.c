@@ -92,7 +92,10 @@
 //        9..31, crossover types shifted from 8..39 to 32..63). No struct
 //        change — same on-disk size as V17. Pre-V18 slots are migrated on
 //        load by remap_filter_type_pre_v18().
-#define SLOT_DATA_VERSION       18
+//   V19: First-order shelf PEQ types added (FILTER_LOWSHELF1=9,
+//        FILTER_HIGHSHELF1=10). New enum values only; no struct change, no
+//        renumber, no migration — same on-disk size as V17/V18.
+#define SLOT_DATA_VERSION       19
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -1354,8 +1357,10 @@ static size_t slot_data_size_for_version(uint8_t version) {
             return SLOT_DATA_SIZE_V16;
         case 17:
         case 18:
-            // V18 renumbered filter type values only; the on-disk layout
-            // (and CRC byte range) is identical to V17.
+        case 19:
+            // V18 renumbered filter type values; V19 added first-order shelf
+            // enum values.  On-disk layout (and CRC byte range) is identical
+            // to V17 in all three.
             return SLOT_DATA_SIZE_V17;
         default:
             return 0;

@@ -22,7 +22,9 @@ static inline bool is_filter_flat(const EqParamPacket *p) {
     // Peaking/shelf with ~0dB gain is effectively flat
     if (p->type == FILTER_PEAKING ||
         p->type == FILTER_LOWSHELF ||
-        p->type == FILTER_HIGHSHELF) {
+        p->type == FILTER_HIGHSHELF ||
+        p->type == FILTER_LOWSHELF1 ||
+        p->type == FILTER_HIGHSHELF1) {
         if (fabsf(p->gain_db) < 0.01f) return true;
     }
     return false;
@@ -83,6 +85,7 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
         bq->sva1 = 0.0f; bq->sva2 = 0.0f; bq->sva3 = 0.0f;
         bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 0.0f;
         bq->use_svf = false;
+        bq->svf_first_order = false;
 #else
         bq->b0 = 1 << FILTER_SHIFT; bq->b1 = 0; bq->b2 = 0; bq->a1 = 0; bq->a2 = 0;
 #endif
@@ -102,17 +105,49 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
 #if PICO_RP2350
     // SVF/biquad crossover decision + state reset on path change
     bool was_svf = bq->use_svf;
+    bool was_first_order = bq->svf_first_order;
     bq->use_svf = (p->freq < (sample_rate / 7.5f));
-    // The first-order all-pass is a genuine 1st-order section; it cannot be
-    // represented in the 2nd-order SVF topology, so always run it through the
-    // TDF2 biquad path (b2 = a2 = 0), at every frequency.
-    if (p->type == FILTER_ALLPASS1) bq->use_svf = false;
-    if (was_svf != bq->use_svf) {
+    // First-order types (all-pass, low/high shelf) are genuine 1st-order
+    // sections.  They can't use the 2nd-order SVF, but they DO follow the same
+    // hybrid rule: a one-pole SVF below Fs/7.5 (svf_first_order) and a
+    // degenerate TDF2 biquad above.
+    const bool is_first_order = (p->type == FILTER_ALLPASS1 ||
+                                 p->type == FILTER_LOWSHELF1 ||
+                                 p->type == FILTER_HIGHSHELF1);
+    bq->svf_first_order = bq->use_svf && is_first_order;
+    if (was_svf != bq->use_svf || was_first_order != bq->svf_first_order) {
         bq->s1 = 0.0f; bq->s2 = 0.0f;
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
 
     if (bq->use_svf) {
+        if (bq->svf_first_order) {
+            // One-pole TPT SVF (1st-order types).  The 1/(1+g) reciprocal is
+            // folded into sva1 so the inner loop is multiply-only; svic2eq is
+            // unused (kept 0).  lp = v1, hp = in - v1.
+            float g = tanf(3.1415926535f * p->freq / sample_rate);
+            float svm0_f = 0.0f, svm1_f = 0.0f, svm2_f = 0.0f;
+            switch (p->type) {
+                case FILTER_ALLPASS1:   // out = 2*lp - in
+                    svm0_f = 0.0f; svm1_f = 1.0f; svm2_f = -1.0f; break;
+                case FILTER_LOWSHELF1:  // 1st-order shelf prewarps by A, not sqrt(A)
+                    g = g / A;
+                    svm0_f = 1.0f; svm1_f = A * A - 1.0f; svm2_f = 0.0f; break;
+                case FILTER_HIGHSHELF1:
+                    g = g * A;
+                    svm0_f = 1.0f; svm1_f = 0.0f; svm2_f = A * A - 1.0f; break;
+                default: break;
+            }
+            float sva1_f = 1.0f / (1.0f + g);
+            float sva2_f = g * sva1_f;
+            bq->sva1 = sva1_f; bq->sva2 = sva2_f; bq->sva3 = 0.0f;
+            bq->svm0 = svm0_f; bq->svm1 = svm1_f; bq->svm2 = svm2_f;
+            bq->svf_type = p->type;
+            // Fallback biquad coeffs (unused in SVF path, keep sane)
+            bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;
+            return;
+        }
+
         // SVF coefficients (Simper, "SvfLinearTrapAllOutputs", Cytomic 2021)
         // Shelf k = 1/Q matches RBJ Audio-EQ-Cookbook response exactly.
         float g = tanf(3.1415926535f * p->freq / sample_rate);
@@ -186,6 +221,19 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
             float ap = (ta - 1.0f) / (ta + 1.0f);
             b0_f = ap;   b1_f = 1.0f; b2_f = 0.0f;
             a0_f = 1.0f; a1_f = ap;   a2_f = 0.0f;
+            break;
+        }
+        case FILTER_LOWSHELF1: {
+            // First-order low shelf (degenerate biquad, b2 = a2 = 0): DC gain
+            // A^2, unity at Nyquist.  RBJ-equivalent 1st-order form.
+            b0_f = (A * sn) + 1.0f + cs; b1_f = (A * sn) - 1.0f - cs; b2_f = 0.0f;
+            a0_f = (sn / A) + 1.0f + cs; a1_f = (sn / A) - 1.0f - cs; a2_f = 0.0f;
+            break;
+        }
+        case FILTER_HIGHSHELF1: {
+            // First-order high shelf: unity at DC, gain A^2 at Nyquist.
+            b0_f = sn + A + (A * cs); b1_f = sn - A - (A * cs); b2_f = 0.0f;
+            a0_f = sn + (1.0f / A) + (cs / A); a1_f = sn - (1.0f / A) - (cs / A); a2_f = 0.0f;
             break;
         }
         default: break;
@@ -294,12 +342,19 @@ float dsp_process_channel(Biquad * __restrict biquads, float input, uint8_t chan
         if (bq->bypass) continue;
 
         if (bq->use_svf) {
-            float v3 = sample - bq->svic2eq;
-            float v1 = bq->sva1 * bq->svic1eq + bq->sva2 * v3;
-            float v2 = bq->svic2eq + bq->sva2 * bq->svic1eq + bq->sva3 * v3;
-            bq->svic1eq = 2.0f * v1 - bq->svic1eq;
-            bq->svic2eq = 2.0f * v2 - bq->svic2eq;
-            sample = bq->svm0 * sample + bq->svm1 * v1 + bq->svm2 * v2;
+            if (bq->svf_first_order) {
+                // One-pole TPT SVF (1st-order). lp = v1, hp = sample - v1.
+                float v1 = bq->sva2 * sample + bq->sva1 * bq->svic1eq;
+                bq->svic1eq = 2.0f * v1 - bq->svic1eq;
+                sample = bq->svm0 * sample + bq->svm1 * v1 + bq->svm2 * (sample - v1);
+            } else {
+                float v3 = sample - bq->svic2eq;
+                float v1 = bq->sva1 * bq->svic1eq + bq->sva2 * v3;
+                float v2 = bq->svic2eq + bq->sva2 * bq->svic1eq + bq->sva3 * v3;
+                bq->svic1eq = 2.0f * v1 - bq->svic1eq;
+                bq->svic2eq = 2.0f * v2 - bq->svic2eq;
+                sample = bq->svm0 * sample + bq->svm1 * v1 + bq->svm2 * v2;
+            }
         } else {
             float out = bq->b0 * sample + bq->s1;
             bq->s1 = bq->b1 * sample - bq->a1 * out + bq->s2;
@@ -325,6 +380,18 @@ void dsp_process_channel_block(Biquad * __restrict biquads, float * __restrict s
             float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
             float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
             float *sp = samples;
+
+            if (bq->svf_first_order) {
+                // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
+                for (uint32_t i = 0; i < count; i++) {
+                    float in = *sp;
+                    float v1 = a2 * in + a1 * ic1eq;
+                    ic1eq = 2.0f * v1 - ic1eq;
+                    *sp++ = m0 * in + m1 * v1 + m2 * (in - v1);
+                }
+                bq->svic1eq = ic1eq;
+                continue;
+            }
 
             // Per-type specialization: eliminates zero-multiplies in inner loop
             switch (bq->svf_type) {

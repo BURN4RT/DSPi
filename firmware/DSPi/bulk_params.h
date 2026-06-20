@@ -29,7 +29,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      13   // V13: FilterType enum renumbered (1st-order all-pass @8, crossover 32..63); field-interpretation change only, same byte size as V12
+#define WIRE_FORMAT_VERSION      14   // V14: first-order shelf PEQ types (LOWSHELF1=9, HIGHSHELF1=10); new enum values only, same byte layout as V13
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs

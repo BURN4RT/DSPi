@@ -440,20 +440,20 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 
 ### Biquad Filter
 
-**Types:** Flat (bypass), Peaking, Low Shelf, High Shelf, Low Pass, High Pass, Notch, All-Pass (2nd-order RBJ), First-Order All-Pass (`FILTER_ALLPASS1`)
+**Types:** Flat (bypass), Peaking, Low Shelf, High Shelf, Low Pass, High Pass, Notch, All-Pass (2nd-order RBJ), First-Order All-Pass (`FILTER_ALLPASS1`), First-Order Low Shelf (`FILTER_LOWSHELF1`), First-Order High Shelf (`FILTER_HIGHSHELF1`)
 
 **Coefficient computation:** RBJ Audio-EQ-Cookbook formulas for biquad path, Cytomic SVF equations for SVF path (RP2350 only), both in `dsp_compute_coefficients()`
 
-**First-order all-pass (`FILTER_ALLPASS1`, added 2026-06-17):** Flat magnitude at every frequency, phase 0° → -180° (-90° at the corner). Single parameter (`freq`); `Q` and `gain_db` are unused. Implemented as a degenerate TDF2 biquad (`b0 = a, b1 = 1, b2 = 0, a1 = a, a2 = 0` with `a = (tan(pi*fc/Fs) - 1)/(tan(pi*fc/Fs) + 1)`), so no inner-loop or assembly changes; on RP2350 it always uses the biquad path because a true 1st-order section cannot be represented in the 2nd-order SVF.
+**First-order types (`FILTER_ALLPASS1`, added 2026-06-17; `FILTER_LOWSHELF1` / `FILTER_HIGHSHELF1`, added 2026-06-20):** Genuine 1st-order sections. The all-pass has flat magnitude with phase 0° → -180° (-90° at the corner), single parameter `freq` (`Q`/`gain_db` unused). The shelves are gentle 6 dB/oct shelves (monotonic, no `Q`); the first-order shelf prewarps `g` by `A` (not `sqrt(A)` like the 2nd-order shelves). On RP2350 these follow the **same hybrid rule as every other type** (changed 2026-06-20): a one-pole TPT SVF below `Fs/7.5` (`bq->svf_first_order`), a degenerate TDF2 biquad (`b2 = a2 = 0`) above. The one-pole SVF folds the `1/(1+g)` reciprocal into a coefficient so its inner loop is multiply-only. On RP2040 (no SVF) they always run as a Q28 degenerate biquad through the existing assembly kernel. Both realizations produce the identical RBJ-cookbook response, verified across the `Fs/7.5` boundary by `tools/filter_tester`.
 
-**Filter type value space (`enum FilterType`):** PEQ types occupy 0–7 plus the first-order all-pass at 8, with 9–31 reserved for future PEQ types; crossover types occupy 32–63 (see [Crossover Filters](#crossover-filters)). `filter_is_peq_type()` (config.h) is the single classifier (any value below `FILTER_XOVER_FIRST`); `is_filter_flat()` uses it to flatten a crossover type that lands in a PEQ band slot. The crossover types were renumbered from the old 8–39 range on 2026-06-17 to open the contiguous PEQ block, which bumped `SLOT_DATA_VERSION` to 18 (pre-V18 presets migrated on load via `remap_filter_type_pre_v18()`) and `WIRE_FORMAT_VERSION` to 13.
+**Filter type value space (`enum FilterType`):** PEQ types occupy 0–7 plus the first-order all-pass at 8 and the first-order low/high shelves at 9–10 (added 2026-06-20), with 11–31 reserved for future PEQ types; crossover types occupy 32–63 (see [Crossover Filters](#crossover-filters)). `filter_is_peq_type()` (config.h) is the single classifier (any value below `FILTER_XOVER_FIRST`); `is_filter_flat()` uses it to flatten a crossover type that lands in a PEQ band slot. The crossover types were renumbered from the old 8–39 range on 2026-06-17 to open the contiguous PEQ block, which bumped `SLOT_DATA_VERSION` to 18 (pre-V18 presets migrated on load via `remap_filter_type_pre_v18()`) and `WIRE_FORMAT_VERSION` to 13. Adding the first-order shelves (new enum values only — no renumber, no on-disk layout change, no migration) bumped `SLOT_DATA_VERSION` to 19 and `WIRE_FORMAT_VERSION` to 14.
 
 **RP2350 biquad (hybrid SVF/biquad):**
 ```c
 { float b0, b1, b2, a1, a2; float s1, s2;
   float sva1, sva2, sva3; float svm0, svm1, svm2;
   float svic1eq, svic2eq; uint32_t svf_type;
-  bool use_svf; bool bypass; }
+  bool use_svf; bool svf_first_order; bool bypass; }
 ```
 Single-precision throughout. Per-band SVF or TDF2 biquad path selected at coefficient computation time. See [Hybrid SVF/Biquad Filtering](#hybrid-svfbiquad-filtering-rp2350) for details.
 
@@ -464,7 +464,7 @@ Single-precision throughout. Per-band SVF or TDF2 biquad path selected at coeffi
 Q28 fixed-point. Both per-sample and block-based biquad processing implemented in hand-optimized ARM assembly (`dsp_process_rp2040.S`). Block-based `dsp_process_channel_block()` keeps s1/s2 state in high registers across the entire sample loop, shares operand decompositions across multiply groups, and uses r12 for intermediate saves — eliminating per-sample struct access, function call overhead, and redundant decompositions vs the C `fast_mul_q28()` version.
 
 ### Hybrid SVF/Biquad Filtering (RP2350)
-*Last updated: 2026-03-02*
+*Last updated: 2026-06-20*
 
 The RP2350 uses a hybrid filter architecture that selects between a State Variable Filter (SVF) and a Transposed Direct Form II (TDF2) biquad on a per-band basis. This provides better numerical stability at low frequencies (where single-precision biquad pole quantization is worst) while retaining the efficiency of biquads at higher frequencies.
 
@@ -491,7 +491,9 @@ Where `g = tan(pi * freq / Fs)` and `A = 10^(gain_dB/40)`.
 - **Peaking:** output = in + m1*v1 (m0=1, m2=0 folded)
 - **Shelf (default):** output = m0*in + m1*v1 + m2*v2 (general form)
 
-**State reset:** When a band crosses the SVF/biquad boundary (e.g. due to sample rate change), both biquad state (`s1`, `s2`) and SVF state (`svic1eq`, `svic2eq`) are reset to zero to prevent transients.
+**First-order (one-pole) SVF (added 2026-06-20):** First-order types (`FILTER_ALLPASS1`, `FILTER_LOWSHELF1`, `FILTER_HIGHSHELF1`, and the crossover BW1 / odd-order 1st-order sections) cannot use the 2nd-order SVF, so below `Fs/7.5` they run a one-pole TPT integrator instead: `v1 = sva2*in + sva1*ic1; ic1 = 2*v1 - ic1`, output `m0*in + m1*v1 + m2*(in - v1)` (lp = v1, hp = in - v1). The `1/(1+g)` reciprocal is folded into `sva1` (with `sva2 = g*sva1`) so the loop is multiply-only; only `svic1eq` is used. The path is gated by `bq->svf_first_order`. Above `Fs/7.5` these run a degenerate TDF2 biquad, exactly as the 2nd-order types switch to biquad. This makes first-order types follow the identical hybrid rule as every other type (previously they were forced to TDF2 at every frequency).
+
+**State reset:** When a band changes filter topology — crossing the SVF/biquad boundary (e.g. due to sample rate change) or switching between the one-pole and 2nd-order SVF (`bq->svf_first_order` flips) — both biquad state (`s1`, `s2`) and SVF state (`svic1eq`, `svic2eq`) are reset to zero to prevent transients.
 
 **Input validation:** Frequency clamped to [10 Hz, 0.45×Fs], Q clamped to [0.1, 20].
 
@@ -548,7 +550,7 @@ PDM sub gets automatic alignment compensation: +SUB_ALIGN_SAMPLES (128 samples =
 ---
 
 ## Crossover Filters
-*Last updated: 2026-06-17*
+*Last updated: 2026-06-20*
 
 ### Purpose
 
@@ -575,7 +577,7 @@ The crossover base was widened from 12 to 20 on 2026-06-04. Because `REQ_GET_EQ_
 
 ### Filter families
 
-`FilterType` enum, crossover types at indices 32..63 covering 32 types: LR2/4/6/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. First-order sub-sections (BW1/3/5/7 and LR6, which is `(BW3)²`) always use TDF2 (the Cytomic SVF is fundamentally a 2nd-order topology). Second-order sections use the existing hybrid SVF/biquad selection on RP2350 — SVF below Fs/7.5, TDF2 above — same rule per section that PEQ uses per filter.
+`FilterType` enum, crossover types at indices 32..63 covering 32 types: LR2/4/6/8 × LP/HP, BW1..BW8 × LP/HP, Bes2/4/6/8 × LP/HP. Per-band section count derived from filter order. As of 2026-06-20 first-order sub-sections (BW1/3/5/7 and LR6, which is `(BW3)²`) follow the same per-section hybrid rule as the 2nd-order sections: a one-pole TPT SVF below Fs/7.5 (`bq->svf_first_order`) and a degenerate TDF2 biquad above. (Previously they were forced to TDF2 at every frequency, since the Cytomic SVF is fundamentally a 2nd-order topology; the one-pole TPT integrator added 2026-06-20 covers the 1st-order case.) Second-order sections use SVF below Fs/7.5, TDF2 above — the same rule per section that PEQ uses per filter.
 
 ### Pipeline insertion
 

@@ -29,4 +29,5 @@ __pycache__/
 !README.md
 !Documentation/current_architecture.md
 !Documentation/Roadmap.md
+!Documentation/commands.md
 !Documentation/Features/*.md
