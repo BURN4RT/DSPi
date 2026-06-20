@@ -17,6 +17,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 - [DSP Features](#dsp-features)
   - [Matrix Mixer](#matrix-mixer)
   - [Parametric Equalization](#parametric-equalization)
+  - [Crossover Filters](#crossover-filters)
   - [Loudness Compensation](#loudness-compensation)
   - [Headphone Crossfeed](#headphone-crossfeed)
   - [Volume Leveller](#volume-leveller)
@@ -44,7 +45,8 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 *   **24-bit S/PDIF or I2S Outputs:** Up to four independent stereo output slots (8 channels on RP2350, 4 channels on RP2040). Each slot can be switched at runtime between S/PDIF and I2S, enabling direct connection to any standard DAC. I2S slots share a common BCK/LRCLK and can optionally produce a 128×/256× master clock.
 *   **Per-Channel Preamp:** Independent gain control for each USB input channel (L/R), applied as PASS 1 of the DSP pipeline before any other processing.
 *   **Matrix Mixer:** Route either or both USB input channels to any output with independent gain and phase invert per crosspoint. 2x9 on RP2350, 2x5 on RP2040.
-*   **Parametric Equalization:** Up to 10 PEQ bands per channel with 6 filter types. 110 total filter bands on RP2350, 70 on RP2040. RP2350 uses a hybrid SVF/biquad architecture for superior low-frequency accuracy.
+*   **Parametric Equalization:** Up to 10 PEQ bands per channel with 11 filter types (peaking, low/high shelf, low/high pass, notch, all-pass, plus gentle first-order shelf and all-pass variants). 110 total filter bands on RP2350, 70 on RP2040. RP2350 uses a hybrid SVF/biquad architecture for superior low-frequency accuracy.
+*   **Active Crossovers:** Up to 4 dedicated crossover filters per output channel: Linkwitz-Riley, Butterworth, and Bessel low/high-pass up to 8th order (48 dB/oct), for multi-way speaker and subwoofer integration.
 *   **Volume Leveller:** RMS-based, stereo-linked, soft-knee upward compressor that lifts quieter content toward a target level without ever amplifying loud passages. Optional 10 ms lookahead, configurable speed and max-gain ceiling, with a -6 dBFS gain-reduction safety limiter.
 *   **Loudness Compensation:** Volume-dependent EQ based on the ISO 226:2003 equal-loudness contour standard. Automatically boosts bass and treble at low listening levels to maintain perceived tonal balance.
 *   **Headphone Crossfeed:** BS2B-based crossfeed with interaural time delay (ITD) reduces unnatural stereo separation for headphone listening. Three classic presets plus fully custom parameters.
@@ -149,7 +151,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 1.  **Input (USB):** 16-bit or 24-bit PCM stereo audio at 44.1, 48, or 96 kHz. Bit depth is selected via USB alt setting; sample rate via the USB Audio Class rate-set request.
 2.  **Input (S/PDIF):** 24-bit PCM stereo audio at 44.1 or 48kHz. Channel status bits and LG SoundSync are decoded. LG Soundsync volume and mute status is optionally used to control the DSPi user volume and output mute.
 3.  **Per-Channel Preamp (PASS 1):** Independent gain control for the USB Left and Right input channels in dB. Applied at the very start of the DSP chain so its setting affects all downstream processing.
-4.  **Master EQ (PASS 2):** Up to 10 bands of parametric EQ per channel (Left/Right). Supports peaking, low shelf, high shelf, low pass, and high pass filter types.
+4.  **Master EQ (PASS 2):** Up to 10 bands of parametric EQ per channel (Left/Right). Supports all PEQ filter types (see [Parametric Equalization](#parametric-equalization)).
 5.  **Volume Leveller (PASS 2.5):** Optional feedforward, stereo-linked, single-band RMS compressor with soft-knee upward compression — quieter content is boosted toward a target level while content above the threshold passes through untouched. Configurable speed, max-gain ceiling, and noise gate. Optional 10 ms lookahead. A -6 dBFS gain-reduction safety limiter prevents output overshoots.
 6.  **Headphone Crossfeed (PASS 3):** Optional BS2B crossfeed that mixes a filtered, delayed portion of each channel into the opposite channel. Uses a complementary filter design with interaural time delay (ITD) via an all-pass filter. Three presets (Default, Chu Moy, Jan Meier) plus custom frequency and feed level. ITD can be independently toggled. Master peak metering taps into this stage.
 7.  **Loudness Compensation:** Optional ISO 226:2003 equal-loudness EQ that adapts to the current volume level. At low volumes, bass and treble are boosted to compensate for the ear's reduced sensitivity. Configurable reference SPL and intensity. Driven by the USB host volume position so it remains correct regardless of master-volume attenuation downstream.
@@ -278,18 +280,25 @@ When the PDM subwoofer is active, Core 1 is fully dedicated to the delta-sigma m
 
 ### Parametric Equalization
 
-Each filter band supports 6 types:
+Each band can be set to any of these 11 types. Every type uses a corner/center **frequency**; **Q** and **gain** apply only where listed (other types ignore them).
 
-| Type | Description |
-|------|-------------|
-| Flat | Bypass (no processing) |
-| Peaking | Parametric bell filter |
-| Low Shelf | Low-frequency shelf |
-| High Shelf | High-frequency shelf |
-| Low Pass | Low-pass filter |
-| High Pass | High-pass filter |
+| Type | Order | Parameters | Description |
+|------|-------|------------|-------------|
+| Flat | - | - | Bypass; the band does nothing (auto-skipped for zero CPU) |
+| Peaking | 2nd | freq, Q, gain | Parametric bell; boost or cut centered on freq, width set by Q |
+| Low Shelf | 2nd | freq, Q, gain | Boost/cut everything below freq; Q sets the transition slope |
+| High Shelf | 2nd | freq, Q, gain | Boost/cut everything above freq; Q sets the transition slope |
+| Low Pass | 2nd | freq, Q | 12 dB/oct rolloff above freq; Q sets corner resonance |
+| High Pass | 2nd | freq, Q | 12 dB/oct rolloff below freq; Q sets corner resonance |
+| Notch | 2nd | freq, Q | Deep, narrow null at freq; Q sets width |
+| All-Pass | 2nd | freq, Q | Flat magnitude; rotates phase 0 to -360 deg (phase / group-delay tool) |
+| First-Order All-Pass | 1st | freq | Flat magnitude; rotates phase 0 to -180 deg (-90 deg at freq) |
+| First-Order Low Shelf | 1st | freq, gain | Gentle 6 dB/oct low shelf; monotonic, no Q or overshoot |
+| First-Order High Shelf | 1st | freq, gain | Gentle 6 dB/oct high shelf; monotonic, no Q or overshoot |
 
-On RP2040, all filters use biquad IIR (Transposed Direct Form II) with Q28 fixed-point arithmetic. On RP2350, the firmware uses a hybrid SVF/biquad architecture: filters below Fs/7.5 (~6.4 kHz at 48 kHz) use the Cytomic SVF (linear trapezoid) topology for superior numerical accuracy at low frequencies, while higher frequencies use traditional TDF2 biquad. All filters have configurable frequency, Q factor, and gain. Flat filters are automatically bypassed for zero CPU overhead.
+Frequency ranges from 10 Hz to 0.45xFs; Q from 0.1 to 20. First-order types are single-pole (6 dB/oct) and have no resonance.
+
+On RP2040, all filters use biquad IIR (Transposed Direct Form II) with Q28 fixed-point arithmetic. On RP2350, the firmware uses a hybrid SVF/biquad architecture: filters below Fs/7.5 (~6.4 kHz at 48 kHz) use the Cytomic SVF (linear trapezoid) topology for superior numerical accuracy at low frequencies, while higher frequencies use traditional TDF2 biquad. Flat bands (and zero-gain peaking/shelf bands) are automatically bypassed for zero CPU overhead.
 
 **Channel Layout:**
 
@@ -310,6 +319,18 @@ On RP2040, all filters use biquad IIR (Transposed Direct Form II) with Q28 fixed
 | Master Right | 1 | 10 |
 | Output 1-4 (S/PDIF) | 2-5 | 10 each |
 | Output 5 (PDM Sub) | 6 | 10 |
+
+### Crossover Filters
+
+In addition to the parametric bands above, every output channel has up to 4 dedicated crossover filter bands for building active multi-way speaker and subwoofer systems. Crossover filters are low-pass or high-pass only and are tuned by corner frequency alone (Q and gain are not used). Three families are available:
+
+| Family | Orders | Slopes | Character |
+|--------|--------|--------|-----------|
+| Linkwitz-Riley (LR) | 2, 4, 6, 8 | 12 / 24 / 36 / 48 dB/oct | -6 dB at the corner; an LP and HP pair at the same frequency sum to flat magnitude. LR4 (24 dB/oct) is the de-facto studio and hi-fi standard. |
+| Butterworth (BW) | 1-8 | 6 / 12 / 18 / 24 / 30 / 36 / 42 / 48 dB/oct | -3 dB at the corner; maximally flat passband. BW1 is a gentle 6 dB/oct first-order slope. |
+| Bessel (BES) | 2, 4, 6, 8 | 12 / 24 / 36 / 48 dB/oct | Maximally flat group delay for the best transient response and phase behavior. |
+
+Each crossover filter is built from a cascade of up to four biquad sections. On RP2350 the same hybrid rule applies per section (sections below Fs/7.5 use the Cytomic SVF for low-frequency accuracy). Crossover bands exist on output channels only, separate from and in addition to that channel's 10 parametric bands. A typical 2-way active speaker drives one output through a high-pass crossover (tweeter/mid) and another through a low-pass (woofer); a subwoofer output usually takes a low-pass.
 
 ### Loudness Compensation
 
