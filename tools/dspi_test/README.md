@@ -93,7 +93,7 @@ python3 -m tools.dspi_test.audio --probe
 python3 -m tools.dspi_test.run --audio --group audio
 ```
 
-What it checks (milestone 1):
+What it checks:
 
 - **`loopback_integrity`** — flat path: signal reaches USBrx at unity gain, low noise
   floor and THD, and near bit-exact reproduction.
@@ -101,6 +101,12 @@ What it checks (milestone 1):
   shelves) on the target output and asserts the measured magnitude response matches the
   RBJ reference within 0.7 dB, spanning both sides of the RP2350 SVF/biquad boundary.
 - **`loopback_allpass_phase`** — first-order all-pass: flat magnitude and correct phase shape.
+- **`xo_*`** — sets each crossover type (Linkwitz-Riley, Butterworth, Bessel; orders 1-8;
+  LP and HP) on a crossover band and asserts the measured magnitude response matches the
+  scipy reference (mirrors `tools/filter_tester/test_crossover.py`) within 1 dB over the
+  measurable region.
+- **`xo_lr4_complementary_sum`** — LR4 LP+HP measured in one capture sum to flat magnitude
+  (the defining Linkwitz-Riley property).
 
 Routing to the USBrx-connected S/PDIF slot is **auto-probed** once per session. macOS
 prompts for microphone access for the USBrx input on first run. Devices are matched by

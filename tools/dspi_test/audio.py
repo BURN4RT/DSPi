@@ -150,7 +150,7 @@ def make_tone(fs, freq=1000.0, dur_s=0.5, amp=0.4):
 # ---------------------------------------------------------------------------
 
 def play_record(excitation, fs, out_dev, in_dev,
-                in_channels=2, out_channels=2, tail_s=TAIL_S):
+                in_channels=2, out_channels=2, tail_s=TAIL_S, max_retries=3):
     """Play `excitation` on out_dev while recording in_channels from in_dev.
 
     `excitation` is mono [N] (duplicated across out_channels) or [N, out_channels].
@@ -167,35 +167,49 @@ def play_record(excitation, fs, out_dev, in_dev,
     if exc.ndim == 1:
         exc = np.column_stack([exc] * out_channels)
     n = exc.shape[0]
-    pos = {"i": 0}
-    rec_frames = []
 
-    def _out_cb(outdata, frames, time_info, status):  # noqa: ARG001
-        i0 = pos["i"]
-        chunk = exc[i0:i0 + frames]
-        m = chunk.shape[0]
-        if m:
-            outdata[:m] = chunk
-        if m < frames:
-            outdata[m:] = 0.0           # feed silence once the excitation is done
-        pos["i"] = i0 + frames
+    # Retry on an xrun: opening/closing two cross-device streams repeatedly can
+    # make CoreAudio drop buffers (input overflow / output underflow), which
+    # corrupts a capture. `latency="high"` makes that rare; a retry catches the
+    # stragglers so a long test run stays reliable.
+    last = np.zeros((0, in_channels), dtype=np.float32)
+    for _attempt in range(max_retries + 1):
+        pos = {"i": 0}
+        rec_frames = []
+        glitch = {"bad": False}
 
-    def _in_cb(indata, frames, time_info, status):  # noqa: ARG001
-        rec_frames.append(indata.copy())
+        def _out_cb(outdata, frames, time_info, status):  # noqa: ARG001
+            if status.output_underflow:
+                glitch["bad"] = True
+            i0 = pos["i"]
+            chunk = exc[i0:i0 + frames]
+            m = chunk.shape[0]
+            if m:
+                outdata[:m] = chunk
+            if m < frames:
+                outdata[m:] = 0.0       # feed silence once the excitation is done
+            pos["i"] = i0 + frames
 
-    instream = sd.InputStream(samplerate=fs, device=in_dev, channels=in_channels,
-                              dtype="float32", callback=_in_cb)
-    outstream = sd.OutputStream(samplerate=fs, device=out_dev, channels=out_channels,
-                                dtype="float32", callback=_out_cb)
-    instream.start()                    # capture first so we never miss the onset
-    outstream.start()
-    sd.sleep(int((n / fs + tail_s) * 1000.0))
-    outstream.stop(); instream.stop()
-    outstream.close(); instream.close()
+        def _in_cb(indata, frames, time_info, status):  # noqa: ARG001
+            if status.input_overflow:
+                glitch["bad"] = True
+            rec_frames.append(indata.copy())
 
-    if not rec_frames:
-        return np.zeros((0, in_channels), dtype=np.float32)
-    return np.concatenate(rec_frames, axis=0)
+        instream = sd.InputStream(samplerate=fs, device=in_dev, channels=in_channels,
+                                  dtype="float32", latency="high", callback=_in_cb)
+        outstream = sd.OutputStream(samplerate=fs, device=out_dev, channels=out_channels,
+                                    dtype="float32", latency="high", callback=_out_cb)
+        instream.start()                # capture first so we never miss the onset
+        outstream.start()
+        sd.sleep(int((n / fs + tail_s) * 1000.0))
+        outstream.stop(); instream.stop()
+        outstream.close(); instream.close()
+
+        last = np.concatenate(rec_frames, axis=0) if rec_frames else last
+        if not glitch["bad"] and last.shape[0] > 0:
+            return last
+        sd.sleep(120)                   # settle, then retry
+    return last
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +282,35 @@ def measure_transfer(out_dev, in_dev, in_channel, fs, freqs,
     mag_at = np.interp(freqs, fbins, mag)
     phase_at = np.degrees(np.interp(freqs, fbins, phase))
     return mag_at, phase_at, strength
+
+
+def measure_complex_2ch(out_dev, in_dev, fs, freqs, dur_s=1.0, f1=20.0, f2=None, amp=0.4):
+    """Play one sweep, capture both input channels, and return (H0, H1, strength)
+    as complex transfer functions at `freqs`. Both channels are aligned with a
+    SHARED lag (recovered from L+R, which is broadband), so their RELATIVE phase
+    is valid for summing — e.g. the Linkwitz-Riley LP+HP complementary-sum test.
+    A common path delay / polarity is shared by both and cancels in |H0 + H1|.
+    """
+    _require()
+    f2 = f2 if f2 is not None else fs * 0.45
+    sweep = make_sweep(fs, dur_s, f1, f2, amp)
+    pad = np.zeros(int(PAD_S * fs), np.float32)
+    cap = play_record(np.concatenate([pad, sweep, pad]), fs, out_dev, in_dev)
+    if cap.shape[0] == 0:
+        raise AudioUnavailable("no audio captured (USBrx delivered no frames)")
+    lag, strength = _xcorr_lag(cap[:, 0].astype(np.float64) + cap[:, 1].astype(np.float64), sweep)
+    X = np.fft.rfft(sweep)
+    fbins = np.fft.rfftfreq(len(sweep), 1.0 / fs)
+    freqs = np.asarray(freqs, np.float64)
+
+    def _h_at(ch):
+        seg = cap[lag:lag + len(sweep), ch]
+        if len(seg) < len(sweep):
+            seg = np.concatenate([seg, np.zeros(len(sweep) - len(seg), np.float32)])
+        H = np.fft.rfft(seg) / (X + 1e-12)
+        return np.interp(freqs, fbins, H.real) + 1j * np.interp(freqs, fbins, H.imag)
+
+    return _h_at(0), _h_at(1), strength
 
 
 def measure_tone(out_dev, in_dev, in_channel, fs, freq=1000.0, dur_s=0.5, amp=0.4):

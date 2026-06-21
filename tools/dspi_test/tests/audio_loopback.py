@@ -128,6 +128,8 @@ def _config_slot(dev, profile, slot, flatten_all=False):
         for ch in (ch_l, ch_r):
             for b in range(profile.band_ceiling):
                 _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
+            for b in range(20, 24):          # crossover bands (output channels)
+                _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
     dev.wait_ready()
     return ch_l, ch_r
 
@@ -276,3 +278,135 @@ def _make_peq_test(name, rbj_name, fc, q, gain):
 # Register one test per PEQ config (distinct names for per-config reporting).
 for _name, _rbj, _fc, _q, _gain in PEQ_CONFIGS:
     globals()[f"peq_{_name}"] = _make_peq_test(_name, _rbj, _fc, _q, _gain)
+
+
+# --- Crossover (XO) frequency response (Phase 1) ----------------------------
+
+XO_MAG_TOL_DB = 1.0          # steeper slopes are more sensitive than mild PEQ
+XO_MAG_FLOOR_DB = -60.0      # only compare where |H| is reliably measurable
+XO_BAND = 20                 # first crossover band (bands 20..23, output channels)
+XO_BASE = 32                 # FILTER_XOVER_FIRST = FILTER_LR2_LP
+
+# Representative spread: families × orders × LP/HP, fc straddling Fs/7.5 (~6400 Hz).
+# (name, family, order, is_hp, fc)
+XO_CONFIGS = [
+    ("lr2_lp",  "lr",  2, False,  500.0),
+    ("lr4_lp",  "lr",  4, False,  800.0),
+    ("lr4_hp",  "lr",  4, True,   800.0),
+    ("lr8_lp",  "lr",  8, False, 2000.0),
+    ("lr8_hp",  "lr",  8, True,  9000.0),
+    ("bw1_lp",  "bw",  1, False,  200.0),
+    ("bw1_hp",  "bw",  1, True,   200.0),
+    ("bw4_lp",  "bw",  4, False, 1000.0),
+    ("bw4_hp",  "bw",  4, True,  9000.0),
+    ("bw8_lp",  "bw",  8, False, 2000.0),
+    ("bes2_lp", "bes", 2, False,  500.0),
+    ("bes4_hp", "bes", 4, True,  1000.0),
+    ("bes8_lp", "bes", 8, False, 3000.0),
+]
+
+
+def _xo_enum(family, order, is_hp):
+    """Firmware FilterType value for a crossover type (config.h, 32..63).
+    Mirrors the contiguous enum: LR2/4/6/8, BW1..8, BES2/4/6/8, each LP then HP."""
+    if family == "lr":
+        base = XO_BASE + 2 * (2, 4, 6, 8).index(order)
+    elif family == "bw":
+        base = XO_BASE + 8 + 2 * (order - 1)
+    elif family == "bes":
+        base = XO_BASE + 24 + 2 * (2, 4, 6, 8).index(order)
+    else:
+        raise ValueError(family)
+    return base + (1 if is_hp else 0)
+
+
+def _xo_reference(family, order, is_hp, fc, fs, freqs):
+    """Ground-truth complex H from scipy (same convention as
+    tools/filter_tester/test_crossover.py: Butterworth/Bessel direct, LR = BW^2)."""
+    try:
+        import scipy.signal as sig
+    except ImportError:
+        raise Skip("scipy not installed (pip install scipy)")
+    btype = "highpass" if is_hp else "lowpass"
+    if family == "bw":
+        sos = sig.butter(order, fc, btype=btype, output="sos", fs=fs)
+    elif family == "bes":
+        sos = sig.bessel(order, fc, btype=btype, output="sos", fs=fs, norm="mag")
+    elif family == "lr":
+        bw = sig.butter(order // 2, fc, btype=btype, output="sos", fs=fs)
+        sos = np.vstack([bw, bw])
+    else:
+        raise ValueError(family)
+    _, H = sig.sosfreqz(sos, worN=2.0 * np.pi * np.asarray(freqs) / fs)
+    return H
+
+
+def _make_xo_test(name, family, order, is_hp, fc):
+    def fn(dev, profile, chk):
+        rig = _get_rig(dev, profile)
+        ftype = _xo_enum(family, order, is_hp)
+        try:
+            _set_band(dev, rig["ch_l"], 0, FLAT, 1000.0, 0.707, 0.0)   # clear any leftover PEQ band
+            _set_band(dev, rig["ch_l"], XO_BAND, ftype, fc, 0.707, 0.0)
+            dev.wait_ready()
+            freqs = _test_freqs(rig["fs"])
+            mag, _ph, _st = audio.measure_transfer(
+                rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+            exp = 20.0 * np.log10(np.abs(_xo_reference(family, order, is_hp, fc, rig["fs"], freqs)) + 1e-30)
+            band = exp > XO_MAG_FLOOR_DB     # compare only the measurable region
+            # Presence by passband level, not correlation: a high-pass legitimately
+            # cuts most of the sweep's energy, so corr is low even on a clean capture.
+            present = float(np.max(mag[band])) if band.any() else -200.0
+            chk.ok(present > -20.0, f"{name}: signal reaches passband ({present:.1f} dB)")
+            err = float(np.max(np.abs(mag[band] - exp[band]))) if band.any() else 0.0
+            chk.ok(err < XO_MAG_TOL_DB,
+                   f"{name} fc={fc:g}: max |mag err| {err:.3f} dB < {XO_MAG_TOL_DB} "
+                   f"(in the >{XO_MAG_FLOOR_DB:g} dB region)")
+            chk.note(f"{name}: max_mag_err={err:.3f}dB passband={present:.2f}dB")
+        finally:
+            _set_band(dev, rig["ch_l"], XO_BAND, FLAT, 1000.0, 0.707, 0.0)
+            dev.wait_ready()
+    fn.__name__ = f"xo_{name}"
+    fn.__doc__ = (f"Crossover {name} fc={fc:g}: measured FR matches the scipy "
+                  f"{family.upper()}{order} reference.")
+    return test("audio", mutating=True)(fn)
+
+
+for _c in XO_CONFIGS:
+    globals()[f"xo_{_c[0]}"] = _make_xo_test(*_c)
+
+
+@test("audio", mutating=True)
+def xo_lr4_complementary_sum(dev, profile, chk):
+    """Linkwitz-Riley LP+HP at the same fc sum to flat magnitude (the LR property).
+
+    Measures both legs in ONE capture (shared time reference): USB L is routed to
+    both target outputs, LR4 LP on the left channel, LR4 HP on the right, and
+    |H_LP + H_HP| must be ~0 dB across the band. (LR4 is even-order, so the legs
+    are in phase; the path's common delay/polarity cancels in the sum.)
+    """
+    rig = _get_rig(dev, profile)
+    fc = 1000.0
+    out_l, out_r, ch_l, ch_r = _slot_indices(rig["slot"])
+    try:
+        for out in range(profile.num_output_channels):   # USB L -> both target outputs only
+            _route(dev, 0, out, 0)
+            _route(dev, 1, out, 0)
+        _route(dev, 0, out_l, 1, 0.0)
+        _route(dev, 0, out_r, 1, 0.0)
+        _set_band(dev, ch_l, 0, FLAT, 1000.0, 0.707, 0.0)   # clear leftover PEQ on both legs
+        _set_band(dev, ch_r, 0, FLAT, 1000.0, 0.707, 0.0)
+        _set_band(dev, ch_l, XO_BAND, _xo_enum("lr", 4, False), fc, 0.707, 0.0)  # LP
+        _set_band(dev, ch_r, XO_BAND, _xo_enum("lr", 4, True),  fc, 0.707, 0.0)  # HP
+        dev.wait_ready()
+        freqs = _test_freqs(rig["fs"])
+        h_lp, h_hp, strength = audio.measure_complex_2ch(rig["out"], rig["in"], rig["fs"], freqs, amp=0.4)
+        chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
+        summ_db = 20.0 * np.log10(np.abs(h_lp + h_hp) + 1e-30)
+        err = float(np.max(np.abs(summ_db)))
+        chk.ok(err < 1.0, f"LR4 LP+HP sum flat: max |deviation from 0 dB| {err:.3f} dB < 1.0")
+        chk.note(f"lr4_sum: max|sum-0dB|={err:.3f}dB corr={strength:.2f}")
+    finally:
+        _set_band(dev, ch_l, XO_BAND, FLAT, 1000.0, 0.707, 0.0)
+        _set_band(dev, ch_r, XO_BAND, FLAT, 1000.0, 0.707, 0.0)
+        dev.wait_ready()
