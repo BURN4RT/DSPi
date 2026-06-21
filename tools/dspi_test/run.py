@@ -6,6 +6,13 @@ run.py — entry point for the DSPi control-plane QA suite.
     ./tools/dspi_test/run.py        [options]
 
 Options:
+    --all                   Run the COMPLETE suite: the audio-loopback group plus
+                            the flash and factory-reset tests (i.e. --audio
+                            --allow-flash --allow-factory-reset). One command, no
+                            other knowledge needed; the audio group runs first so
+                            its auto-probe sees a pristine device.
+    --audio                 Include the hardware audio-loopback group (needs the
+                            USBrx rig + sounddevice; excluded by default).
     --group G[,G...]        Run only these test groups (default: all).
     --list                  List registered tests and exit (no device needed if
                             modules import; still imports the package).
@@ -46,6 +53,9 @@ def main(argv=None):
     ap.add_argument("--audio", action="store_true",
                     help="include the hardware audio-loopback group (needs the USBrx "
                          "rig + sounddevice; excluded by default)")
+    ap.add_argument("--all", action="store_true",
+                    help="run the COMPLETE suite: audio-loopback group + flash tests "
+                         "+ factory reset (= --audio --allow-flash --allow-factory-reset)")
     ap.add_argument("--flash-cap", type=int, default=None)
     ap.add_argument("--stress", type=int, default=0)
     ap.add_argument("--report", default=None)
@@ -53,6 +63,12 @@ def main(argv=None):
     ap.add_argument("--no-restore", action="store_true")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
+
+    # --all is the one-flag "complete suite": run everything, no other knowledge needed.
+    if args.all:
+        args.audio = True
+        args.allow_flash = True
+        args.allow_factory_reset = True
 
     _import_tests()
     from .framework import REGISTRY, Runner, catalog_markdown
@@ -65,6 +81,11 @@ def main(argv=None):
     # explicit --group selection names it.
     if groups is None and not args.audio:
         cases = [tc for tc in cases if tc.group != "audio"]
+
+    # Run the audio loopback group FIRST when present: its auto-probe needs a
+    # pristine device, so it must run before the control-plane tests mutate state
+    # (especially factory reset). Stable sort keeps every other group's order.
+    cases.sort(key=lambda tc: 0 if tc.group == "audio" else 1)
 
     if args.catalog:
         with open(args.catalog, "w") as f:

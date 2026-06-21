@@ -27,6 +27,12 @@ app. Run from the repo root so `config.h` opcode parsing works.
 ## Run
 
 ```bash
+# COMPLETE SUITE — run everything in one command (audio loopback + flash +
+# factory reset). This is the one to use if you just want "run all the tests".
+# The audio group runs first so its auto-probe sees a pristine device. Needs the
+# USBrx rig + sounddevice for the audio part (those tests SKIP, never fail, if absent):
+python3 -m tools.dspi_test.run --all
+
 # Full non-flash run (safe, fast, no flash wear):
 python3 -m tools.dspi_test.run
 
@@ -54,6 +60,7 @@ Exit code is `0` only if there are no `FAIL`/`ERROR` results.
 
 | Flag | Effect |
 |---|---|
+| `--all` | **Complete suite:** audio loopback + flash + factory reset, in one command (= `--audio --allow-flash --allow-factory-reset`). Audio runs first. |
 | `--group G[,G...]` | Run only these groups (default: all except `audio`). |
 | `--audio` | Include the hardware audio-loopback group (needs USBrx + sounddevice). |
 | `--allow-flash` | Enable flash-writing tests (capped at `--flash-cap`, default 30 erases). |

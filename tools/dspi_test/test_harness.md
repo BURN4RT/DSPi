@@ -205,18 +205,41 @@ Until granted, captures come back as silence and the audio tests will report "no
 
 All commands are run from the repo root.
 
+**Just want to run everything?** This one command is the complete suite — it runs the
+audio-loopback group **and** the flash and factory-reset tests, and needs no other
+knowledge:
+
+```bash
+python3 -m tools.dspi_test.run --all
+```
+
+`--all` is exactly `--audio --allow-flash --allow-factory-reset`, and it runs the **audio
+group first** so its auto-probe sees a pristine device (before the control-plane tests
+change device state). If the USBrx rig or the audio libraries are missing, the audio tests
+**skip** (they never fail the run). A full pass looks like:
+
+```
+RESULT: 131/133 PASS · 0 FAIL · 0 ERROR · 2 SKIP
+```
+
+(The two skips are by design: the "enter bootloader" test is policy-excluded so it cannot
+end your session, and one preset test stops once the flash-erase budget is reached — raise
+it with `--flash-cap N` if you want that one too.)
+
+Other ways to run it:
+
 ```bash
 # Control-plane suite only (safe, fast, no special hardware):
 python3 -m tools.dspi_test.run
 
-# Include the audio loopback group (needs the USBrx rig + audio deps):
+# Include the audio loopback group only (no flash / no factory reset):
 python3 -m tools.dspi_test.run --audio
 
 # Run ONLY the audio group:
 python3 -m tools.dspi_test.run --group audio
 
-# Write reports while running everything incl. audio:
-python3 -m tools.dspi_test.run --audio --report report.md --json report.json
+# Complete suite + reports:
+python3 -m tools.dspi_test.run --all --report report.md --json report.json
 ```
 
 ### Bring-up / first-light checks
@@ -251,6 +274,7 @@ and restores the device to exactly the state it was in before the run.
 
 | Flag | What it does |
 |---|---|
+| `--all` | **Complete suite in one command:** audio loopback + flash + factory reset (= `--audio --allow-flash --allow-factory-reset`). Audio runs first. |
 | `--audio` | Include the `audio` loopback group (excluded by default). |
 | `--group G[,G...]` | Run only these groups, e.g. `--group audio` or `--group eq,volume`. |
 | `--list` | List registered tests and exit (no device needed). Add `--audio` to also list audio tests. |
@@ -283,6 +307,8 @@ Understanding this makes every test and parameter obvious.
 1. **Auto-probe (once per run).** The harness plays a tone on each S/PDIF slot in turn
    (isolating one at a time) and watches which one reaches the USBrx. That slot becomes
    the "target" for the rest of the run. This is why you can wire to any S/PDIF output.
+   The audio group always runs **before** the control-plane tests, so this probe happens
+   on a pristine device (this is why `--all` works in a single command).
 
 2. **Configure a clean path.** For the target slot the harness sets: input source = USB,
    master/user volume and preamp = 0 dB, the output enabled and set to S/PDIF, the USB
