@@ -43,6 +43,9 @@ def main(argv=None):
                     help="write the test catalog (from metadata) and exit")
     ap.add_argument("--allow-flash", action="store_true")
     ap.add_argument("--allow-factory-reset", action="store_true")
+    ap.add_argument("--audio", action="store_true",
+                    help="include the hardware audio-loopback group (needs the USBrx "
+                         "rig + sounddevice; excluded by default)")
     ap.add_argument("--flash-cap", type=int, default=None)
     ap.add_argument("--stress", type=int, default=0)
     ap.add_argument("--report", default=None)
@@ -57,6 +60,11 @@ def main(argv=None):
 
     groups = set(g.strip() for g in args.group.split(",")) if args.group else None
     cases = [tc for tc in REGISTRY if (groups is None or tc.group in groups)]
+    # The "audio" hardware-loopback group is opt-in (needs the USBrx rig +
+    # sounddevice): excluded from a default run unless --audio is given or an
+    # explicit --group selection names it.
+    if groups is None and not args.audio:
+        cases = [tc for tc in cases if tc.group != "audio"]
 
     if args.catalog:
         with open(args.catalog, "w") as f:
@@ -97,7 +105,8 @@ def main(argv=None):
     print(f"Running {len(cases)} tests"
           + (f" in groups {sorted(groups)}" if groups else "")
           + (" | flash ENABLED" if args.allow_flash else " | flash disabled")
-          + (" | factory-reset ENABLED" if args.allow_factory_reset else "") + "\n")
+          + (" | factory-reset ENABLED" if args.allow_factory_reset else "")
+          + (" | audio ENABLED" if args.audio else "") + "\n")
 
     print("Capturing pre-suite snapshot...")
     snap = lifecycle.capture(dev, profile)

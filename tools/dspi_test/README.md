@@ -5,10 +5,12 @@ command over USB and asserts the device never crashes, hangs, stalls
 unexpectedly, or returns wrong/out-of-range results. This is the standardized
 firmware-stability gate.
 
-It is **control-plane only**: it verifies command round-trips, parameter ranges,
-validation behavior (STALL / in-band error / silent no-op / clamp), flash
-persistence, cross-feature state, and device liveness. It does **not** measure
-audio (there is no USB capture endpoint on the device).
+It is **control-plane only by default**: it verifies command round-trips, parameter
+ranges, validation behavior (STALL / in-band error / silent no-op / clamp), flash
+persistence, cross-feature state, and device liveness. The device has no USB capture
+endpoint, so the core suite does not measure audio. An **optional hardware
+audio-loopback group** (`--audio`) adds real signal measurement when a Weeb Labs USBrx
+is wired to DSPi's S/PDIF output; see [Audio loopback](#audio-loopback-optional).
 
 ## Requirements
 
@@ -48,7 +50,8 @@ Exit code is `0` only if there are no `FAIL`/`ERROR` results.
 
 | Flag | Effect |
 |---|---|
-| `--group G[,G...]` | Run only these groups (default: all). |
+| `--group G[,G...]` | Run only these groups (default: all except `audio`). |
+| `--audio` | Include the hardware audio-loopback group (needs USBrx + sounddevice). |
 | `--allow-flash` | Enable flash-writing tests (capped at `--flash-cap`, default 30 erases). |
 | `--allow-factory-reset` | Enable the one-shot factory-reset test. |
 | `--flash-cap N` | Hard cap on flash erase cycles for the run. |
@@ -61,7 +64,48 @@ Exit code is `0` only if there are no `FAIL`/`ERROR` results.
 ## Groups
 
 `identity` · `eq` · `dynamics` · `outputs` · `volume` · `inputs` · `diagnostics`
-· `presets` · `crosscut` · `stress`
+· `presets` · `crosscut` · `stress` · `audio` (opt-in, `--audio`)
+
+## Audio loopback (optional)
+
+The `audio` group is the one part of the suite that measures **real audio**. It plays a
+signal out the DSPi USB audio output, lets the DSP process it, captures DSPi's S/PDIF
+output from a **Weeb Labs USBrx** (a USB audio input wired to the S/PDIF out), and
+verifies the measured result against the firmware's filter math
+(`tools/filter_tester/compare_filter.py`). The chain is single-clock and digital, so the
+capture is a fixed-latency bit-exact copy of DSPi's output.
+
+It is excluded from the default run. Enable with `--audio` (or `--group audio`), and
+install the extra deps:
+
+```
+pip install sounddevice numpy scipy     # macOS also: brew install portaudio
+```
+
+Then:
+
+```bash
+# Bring-up: enumerate host audio devices, then a raw loopback tone + level/THD/noise:
+python3 -m tools.dspi_test.audio --list
+python3 -m tools.dspi_test.audio --probe
+
+# Run the loopback suite (integrity baseline + PEQ frequency response):
+python3 -m tools.dspi_test.run --audio --group audio
+```
+
+What it checks (milestone 1):
+
+- **`loopback_integrity`** — flat path: signal reaches USBrx at unity gain, low noise
+  floor and THD, and near bit-exact reproduction.
+- **`peq_*`** — sets each PEQ type (peaking, shelves, low/high pass, notch, first-order
+  shelves) on the target output and asserts the measured magnitude response matches the
+  RBJ reference within 0.7 dB, spanning both sides of the RP2350 SVF/biquad boundary.
+- **`loopback_allpass_phase`** — first-order all-pass: flat magnitude and correct phase shape.
+
+Routing to the USBrx-connected S/PDIF slot is **auto-probed** once per session. macOS
+prompts for microphone access for the USBrx input on first run. Devices are matched by
+name substring (`DSPi` output, `USBrx` input); adjust in `audio.py` if your OS names them
+differently.
 
 ## How it stays safe
 
