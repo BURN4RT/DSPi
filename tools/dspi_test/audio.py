@@ -313,6 +313,30 @@ def measure_complex_2ch(out_dev, in_dev, fs, freqs, dur_s=1.0, f1=20.0, f2=None,
     return _h_at(0), _h_at(1), strength
 
 
+def measure_interchannel_lag(out_dev, in_dev, fs, dur_s=0.3, amp=0.4):
+    """Play a sweep, capture both channels in one go, and return (lag, strength)
+    where lag = samples that channel 0 is delayed relative to channel 1 (by
+    cross-correlation). Measuring both legs in ONE capture cancels per-capture
+    stream-start jitter, so this reliably reads a per-output delay difference.
+    """
+    _require()
+    sweep = make_sweep(fs, dur_s, 30.0, fs * 0.45, amp)
+    pad = np.zeros(int(PAD_S * fs), np.float32)
+    cap = play_record(np.concatenate([pad, sweep, pad]), fs, out_dev, in_dev)
+    if cap.shape[0] == 0:
+        raise AudioUnavailable("no audio captured (USBrx delivered no frames)")
+    a = cap[:, 0].astype(np.float64)
+    b = cap[:, 1].astype(np.float64)
+    if _sp_correlate is not None:
+        corr = _sp_correlate(a, b, mode="full", method="fft")
+    else:  # slow fallback
+        corr = np.correlate(a, b, mode="full")
+    lags = np.arange(-(len(b) - 1), len(a))
+    k = int(np.argmax(np.abs(corr)))
+    strength = float(np.abs(corr[k]) / (np.linalg.norm(a) * np.linalg.norm(b) + 1e-20))
+    return int(lags[k]), strength
+
+
 def measure_tone(out_dev, in_dev, in_channel, fs, freq=1000.0, dur_s=0.5, amp=0.4):
     """Play a sine, capture it, return (level_dbfs, thd_pct, strength)."""
     _require()

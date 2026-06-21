@@ -410,3 +410,147 @@ def xo_lr4_complementary_sum(dev, profile, chk):
         _set_band(dev, ch_l, XO_BAND, FLAT, 1000.0, 0.707, 0.0)
         _set_band(dev, ch_r, XO_BAND, FLAT, 1000.0, 0.707, 0.0)
         dev.wait_ready()
+
+
+# --- Phase 2: output-stage controls -----------------------------------------
+
+LEVEL_TOL_DB = 0.5
+MUTE_FLOOR_DBFS = -80.0
+
+
+def _flatten_chain(dev, ch):
+    """Flatten the PEQ band and crossover band the other tests use, so a level /
+    delay / polarity measurement sees a unity filter chain on this channel."""
+    _set_band(dev, ch, 0, FLAT, 1000.0, 0.707, 0.0)
+    _set_band(dev, ch, XO_BAND, FLAT, 1000.0, 0.707, 0.0)
+
+
+def _tone_level(dev, rig, freq=1000.0, amp=0.4):
+    lvl, _thd, _st = audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], freq, amp=amp)
+    return lvl
+
+
+@test("audio", mutating=True)
+def output_gain_level(dev, profile, chk):
+    """Per-output gain: measured level tracks the set dB."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(rig["slot"])[0]
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        dev.set_f32(OP.SET_OUTPUT_GAIN, 0.0, wvalue=out_l); dev.wait_ready()
+        base = _tone_level(dev, rig)
+        for g in (-6.0, -3.0, 3.0):
+            dev.set_f32(OP.SET_OUTPUT_GAIN, g, wvalue=out_l); dev.wait_ready()
+            chk.approx(_tone_level(dev, rig) - base, g, LEVEL_TOL_DB, f"output gain {g:+g} dB -> level delta")
+        chk.note(f"output_gain base={base:.2f}dBFS")
+    finally:
+        dev.set_f32(OP.SET_OUTPUT_GAIN, 0.0, wvalue=out_l); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def output_mute_silences(dev, profile, chk):
+    """Per-output mute drops the output to silence; unmute restores it."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(rig["slot"])[0]
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        base = _tone_level(dev, rig)
+        chk.ok(base > -20.0, f"signal present before mute ({base:.1f} dBFS)")
+        dev.set_u8(OP.SET_OUTPUT_MUTE, 1, wvalue=out_l); dev.wait_ready()
+        muted = _tone_level(dev, rig)
+        chk.ok(muted < MUTE_FLOOR_DBFS, f"muted output is silent ({muted:.1f} dBFS)")
+        dev.set_u8(OP.SET_OUTPUT_MUTE, 0, wvalue=out_l); dev.wait_ready()
+        chk.approx(_tone_level(dev, rig), base, LEVEL_TOL_DB, "unmute restores level")
+        chk.note(f"mute: base={base:.1f} muted={muted:.1f} dBFS")
+    finally:
+        dev.set_u8(OP.SET_OUTPUT_MUTE, 0, wvalue=out_l); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def level_controls(dev, profile, chk):
+    """Master volume, user volume, and per-input preamp each scale level by the set dB."""
+    rig = _get_rig(dev, profile)
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        base = _tone_level(dev, rig)
+        for op, label in ((OP.SET_MASTER_VOLUME, "master volume"),
+                          (OP.SET_USER_VOLUME, "user volume")):
+            dev.set_f32(op, -6.0); dev.wait_ready()
+            chk.approx(_tone_level(dev, rig) - base, -6.0, LEVEL_TOL_DB, f"{label} -6 dB")
+            dev.set_f32(op, 0.0); dev.wait_ready()
+        dev.set_f32(OP.SET_PREAMP_CH, -6.0, wvalue=0); dev.wait_ready()  # input 0 feeds the captured leg
+        chk.approx(_tone_level(dev, rig) - base, -6.0, LEVEL_TOL_DB, "preamp ch0 -6 dB")
+        dev.set_f32(OP.SET_PREAMP_CH, 0.0, wvalue=0); dev.wait_ready()
+        chk.note(f"level_controls base={base:.2f}dBFS")
+    finally:
+        dev.set_f32(OP.SET_MASTER_VOLUME, 0.0)
+        dev.set_f32(OP.SET_USER_VOLUME, 0.0)
+        dev.set_f32(OP.SET_PREAMP_CH, 0.0, wvalue=0)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def matrix_routing(dev, profile, chk):
+    """Matrix crosspoint enable: a routed input reaches the output; unrouted is silent."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(rig["slot"])[0]
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        base = _tone_level(dev, rig)
+        chk.ok(base > -20.0, f"routed crosspoint passes ({base:.1f} dBFS)")
+        _route(dev, 0, out_l, 0); dev.wait_ready()
+        off = _tone_level(dev, rig)
+        chk.ok(off < MUTE_FLOOR_DBFS, f"unrouted crosspoint is silent ({off:.1f} dBFS)")
+        _route(dev, 0, out_l, 1, 0.0); dev.wait_ready()
+        chk.approx(_tone_level(dev, rig), base, LEVEL_TOL_DB, "re-route restores level")
+        chk.note(f"routing: on={base:.1f} off={off:.1f} dBFS")
+    finally:
+        _route(dev, 0, out_l, 1, 0.0); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def matrix_phase_invert(dev, profile, chk):
+    """Matrix phase-invert flips output polarity (the fitted path-gain sign flips)."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(rig["slot"])[0]
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        _route(dev, 0, out_l, 1, 0.0, 0); dev.wait_ready()
+        _r, scale_n = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
+        _route(dev, 0, out_l, 1, 0.0, 1); dev.wait_ready()
+        _r, scale_i = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
+        chk.ok(scale_n * scale_i < 0,
+               f"phase-invert flips polarity (scale {scale_n:+.3f} -> {scale_i:+.3f})")
+        chk.note(f"phase_invert: scale normal={scale_n:+.3f} inverted={scale_i:+.3f}")
+    finally:
+        _route(dev, 0, out_l, 1, 0.0, 0); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def output_delay(dev, profile, chk):
+    """Per-output delay shifts that output by the set sample count (vs an undelayed leg)."""
+    rig = _get_rig(dev, profile)
+    out_l, out_r, ch_l, ch_r = _slot_indices(rig["slot"])
+    delay_ms = 5.0
+    expect = round(delay_ms * rig["fs"] / 1000.0)   # 240 samples @ 48 kHz
+    try:
+        _flatten_chain(dev, ch_l); _flatten_chain(dev, ch_r)
+        for out in range(profile.num_output_channels):   # USB L -> both legs only
+            _route(dev, 0, out, 0)
+            _route(dev, 1, out, 0)
+        _route(dev, 0, out_l, 1, 0.0)
+        _route(dev, 0, out_r, 1, 0.0)
+        dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
+        dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_r)
+        dev.wait_ready()
+        lag_base, _ = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+        dev.set_f32(OP.SET_OUTPUT_DELAY, delay_ms, wvalue=out_l); dev.wait_ready()
+        lag_delayed, _ = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+        delta = lag_delayed - lag_base
+        chk.approx(delta, expect, 2,
+                   f"output delay {delay_ms:g} ms = {expect} samples (measured {delta})")
+        chk.note(f"output_delay: lag_base={lag_base} lag_delayed={lag_delayed} delta={delta} expect={expect}")
+    finally:
+        dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
+        dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_r)
+        dev.wait_ready()

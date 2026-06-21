@@ -107,6 +107,10 @@ What it checks:
   measurable region.
 - **`xo_lr4_complementary_sum`** — LR4 LP+HP measured in one capture sum to flat magnitude
   (the defining Linkwitz-Riley property).
+- **output controls** — `output_gain_level` (level tracks set dB), `output_mute_silences`
+  (mute -> silence), `level_controls` (master volume / user volume / preamp scale by the set
+  dB), `matrix_routing` (crosspoint enable), `matrix_phase_invert` (polarity flips), and
+  `output_delay` (a per-output delay shifts that leg by exactly the set sample count).
 
 Routing to the USBrx-connected S/PDIF slot is **auto-probed** once per session. macOS
 prompts for microphone access for the USBrx input on first run. Devices are matched by
