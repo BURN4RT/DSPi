@@ -111,6 +111,10 @@ What it checks:
   (mute -> silence), `level_controls` (master volume / user volume / preamp scale by the set
   dB), `matrix_routing` (crosspoint enable), `matrix_phase_invert` (polarity flips), and
   `output_delay` (a per-output delay shifts that leg by exactly the set sample count).
+- **alignment** — `slot_lr_alignment` (the slot's L/R are sample-aligned) and that this
+  survives pipeline-reset operations: `alignment_after_input_switch` (USB->S/PDIF->USB) and
+  `alignment_after_output_type_switch` (S/PDIF->I2S->S/PDIF). Note: one stereo USBrx sees one
+  slot, so this checks INTRA-slot L/R; full inter-slot alignment needs multichannel capture.
 
 Routing to the USBrx-connected S/PDIF slot is **auto-probed** once per session. macOS
 prompts for microphone access for the USBrx input on first run. Devices are matched by

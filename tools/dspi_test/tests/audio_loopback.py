@@ -554,3 +554,70 @@ def output_delay(dev, profile, chk):
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_r)
         dev.wait_ready()
+
+
+# --- Phase 3: alignment / latency stability ---------------------------------
+#
+# A single stereo USBrx captures ONE S/PDIF slot, so this verifies INTRA-slot
+# L/R sample alignment and that it survives the pipeline-reset operations the
+# firmware's "output slot alignment is inviolable" guarantee covers. Full
+# INTER-slot alignment (the 4 S/PDIF + I2S + PDM relative to each other) needs
+# multichannel / second-receiver capture and is out of scope for this rig.
+
+ALIGN_TOL_SAMPLES = 1
+INPUT_SPDIF = 1
+TYPE_SPDIF, TYPE_I2S = 0, 1
+
+
+def _lr_lag(dev, profile, rig):
+    """(lag, strength) for the slot's L vs R, with the rig's standard 1:1
+    routing restored and the chain flat. Identical signal feeds both legs, so
+    lag ~ 0 and strength ~ 1 when L and R are sample-aligned."""
+    _config_slot(dev, profile, rig["slot"])
+    _flatten_chain(dev, rig["ch_l"])
+    _flatten_chain(dev, rig["ch_r"])
+    dev.wait_ready()
+    return audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+
+
+@test("audio", mutating=True)
+def slot_lr_alignment(dev, profile, chk):
+    """The captured S/PDIF slot's L and R channels are sample-aligned."""
+    rig = _get_rig(dev, profile)
+    lag, strength = _lr_lag(dev, profile, rig)
+    chk.ok(strength > 0.5, f"L/R present & correlated (corr {strength:.2f})")
+    chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R aligned: lag {lag} samples (<= {ALIGN_TOL_SAMPLES})")
+    chk.note(f"slot_lr_alignment: lag={lag} corr={strength:.2f}")
+
+
+@test("audio", mutating=True)
+def alignment_after_input_switch(dev, profile, chk):
+    """Input-source switch (USB -> S/PDIF -> USB) preserves L/R sample alignment."""
+    rig = _get_rig(dev, profile)
+    try:
+        dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_SPDIF); dev.wait_ready()
+        dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_USB); dev.wait_ready()
+        lag, strength = _lr_lag(dev, profile, rig)
+        chk.ok(strength > 0.5, f"signal restored after input switch (corr {strength:.2f})")
+        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
+        chk.note(f"after_input_switch: lag={lag} corr={strength:.2f}")
+    finally:
+        dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_USB); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def alignment_after_output_type_switch(dev, profile, chk):
+    """Output-type switch (S/PDIF -> I2S -> S/PDIF) on the slot preserves L/R alignment."""
+    rig = _get_rig(dev, profile)
+    slot = rig["slot"]
+    try:
+        st = dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_I2S << 8) | slot); dev.wait_ready()
+        if st != 0:
+            raise Skip(f"output-type switch to I2S unavailable (status {st})")
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+        lag, strength = _lr_lag(dev, profile, rig)
+        chk.ok(strength > 0.5, f"signal restored after type switch (corr {strength:.2f})")
+        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
+        chk.note(f"after_type_switch: lag={lag} corr={strength:.2f}")
+    finally:
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
