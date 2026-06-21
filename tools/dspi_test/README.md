@@ -115,6 +115,11 @@ What it checks:
   survives pipeline-reset operations: `alignment_after_input_switch` (USB->S/PDIF->USB) and
   `alignment_after_output_type_switch` (S/PDIF->I2S->S/PDIF). Note: one stereo USBrx sees one
   slot, so this checks INTRA-slot L/R; full inter-slot alignment needs multichannel capture.
+- **full chain / dynamics** — `multiband_eq` (stacked PEQ bands = sum of their responses),
+  `loudness_shape` (loudness boosts bass/treble at low volume), `crossfeed_bleed` (one channel
+  bleeds an attenuated copy into the opposite), `leveller_boost` (a quiet signal is lifted
+  within the max-gain ceiling), and `output_clip_limit` (driving past 0 dBFS clamps at full
+  scale and raises THD instead of wrapping).
 
 Routing to the USBrx-connected S/PDIF slot is **auto-probed** once per session. macOS
 prompts for microphone access for the USBrx input on first run. Devices are matched by

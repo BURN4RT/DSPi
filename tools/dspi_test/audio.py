@@ -355,6 +355,33 @@ def measure_tone(out_dev, in_dev, in_channel, fs, freq=1000.0, dur_s=0.5, amp=0.
     return level, thd, strength
 
 
+def measure_tone_2ch(out_dev, in_dev, fs, freq=1000.0, dur_s=0.8, amp=0.4, left_only=False):
+    """Play a tone (on the LEFT output only if left_only, else both) and capture
+    both input channels. Returns (level0_dbfs, level1_dbfs, thd0_pct) measured on
+    the STEADY TAIL of the aligned tone (so a settling effect like the leveller
+    is read at steady state, and a delayed bleed like crossfeed is still in-window).
+    """
+    _require()
+    tone = make_tone(fs, freq, dur_s, amp)
+    pad = np.zeros(int(PAD_S * fs), np.float32)
+    sig = np.concatenate([pad, tone, pad])
+    exc = np.column_stack([sig, np.zeros_like(sig) if left_only else sig])
+    cap = play_record(exc, fs, out_dev, in_dev)
+    if cap.shape[0] == 0:
+        return -200.0, -200.0, 100.0
+    lag, _ = _xcorr_lag(cap[:, 0], tone)          # ch0 always carries the (left) tone
+    lo, hi = int(0.30 * len(tone)), int(0.95 * len(tone))   # steady tail of the tone
+
+    def seg(ch):
+        s = cap[lag:lag + len(tone), ch]
+        if len(s) < len(tone):
+            s = np.concatenate([s, np.zeros(len(tone) - len(s), np.float32)])
+        return s[lo:hi]
+
+    s0, s1 = seg(0), seg(1)
+    return dbfs(s0), dbfs(s1), _thd_pct(s0, fs, freq)
+
+
 def _thd_pct(x, fs, f0, n_harm=6):
     win = np.hanning(len(x))
     X = np.abs(np.fft.rfft(x * win))

@@ -621,3 +621,125 @@ def alignment_after_output_type_switch(dev, profile, chk):
         chk.note(f"after_type_switch: lag={lag} corr={strength:.2f}")
     finally:
         dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+
+
+# --- Phase 4: full chain / dynamics -----------------------------------------
+
+def _flatten_master(dev, profile):
+    """Flatten the master-bus EQ (channels 0/1) so loudness/crossfeed/leveller
+    (which sit on the master bus) are measured against a flat baseline."""
+    for ch in (0, 1):
+        for b in range(profile.band_ceiling):
+            _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
+
+
+@test("audio", mutating=True)
+def multiband_eq(dev, profile, chk):
+    """Several simultaneous PEQ bands compose to the sum (in dB) of their responses."""
+    rig = _get_rig(dev, profile)
+    cfgs = [(0, "lowshelf", 150.0, 0.707, 6.0),
+            (1, "peaking", 1000.0, 2.0, -6.0),
+            (2, "highshelf", 6000.0, 0.707, 4.0)]
+    try:
+        for b in range(profile.band_ceiling):
+            _set_band(dev, rig["ch_l"], b, FLAT, 1000.0, 0.707, 0.0)
+        _set_band(dev, rig["ch_l"], XO_BAND, FLAT, 1000.0, 0.707, 0.0)
+        for (b, t, fc, q, g) in cfgs:
+            _set_band(dev, rig["ch_l"], b, TYPE[t], fc, q, g)
+        dev.wait_ready()
+        freqs = _test_freqs(rig["fs"])
+        mag, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.25)
+        exp = np.zeros_like(freqs, dtype=float)
+        for (b, t, fc, q, g) in cfgs:
+            em, _ = _expected(t, fc, q, g, rig["fs"], freqs)
+            exp = exp + em
+        err = float(np.max(np.abs(mag - exp)))
+        chk.ok(err < 0.7, f"3-band EQ FR matches sum-of-bands: max err {err:.3f} dB")
+        chk.note(f"multiband_eq: max_err={err:.3f}dB")
+    finally:
+        for b in range(profile.band_ceiling):
+            _set_band(dev, rig["ch_l"], b, FLAT, 1000.0, 0.707, 0.0)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def loudness_shape(dev, profile, chk):
+    """Loudness compensation at low volume boosts bass and treble vs the mid band."""
+    rig = _get_rig(dev, profile)
+    try:
+        _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
+        dev.set_f32(OP.SET_USER_VOLUME, -40.0)
+        dev.set_u8(OP.SET_LOUDNESS, 0); dev.wait_ready()
+        freqs = _test_freqs(rig["fs"])
+        off, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+        dev.set_u8(OP.SET_LOUDNESS, 1); dev.wait_ready()
+        on, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+        diff = on - off
+        mid = diff[int(np.argmin(np.abs(freqs - 1000.0)))]
+        lf = diff[int(np.argmin(np.abs(freqs - 60.0)))] - mid
+        hf = diff[int(np.argmin(np.abs(freqs - 12000.0)))] - mid
+        chk.ok(lf > 2.0, f"loudness boosts bass at low volume (+{lf:.1f} dB @60Hz vs mid)")
+        chk.ok(hf > 1.0, f"loudness boosts treble (+{hf:.1f} dB @12kHz vs mid)")
+        chk.note(f"loudness_shape: LF +{lf:.1f} HF +{hf:.1f} dB vs mid @ -40 dB vol")
+    finally:
+        dev.set_u8(OP.SET_LOUDNESS, 0); dev.set_f32(OP.SET_USER_VOLUME, 0.0); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def crossfeed_bleed(dev, profile, chk):
+    """Crossfeed mixes a (filtered, attenuated) copy of one channel into the opposite."""
+    rig = _get_rig(dev, profile)
+    try:
+        _config_slot(dev, profile, rig["slot"])
+        _flatten_chain(dev, rig["ch_l"]); _flatten_chain(dev, rig["ch_r"]); _flatten_master(dev, profile)
+        dev.set_u8(OP.SET_CROSSFEED, 0); dev.wait_ready()
+        l_off, r_off, _ = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True)
+        dev.set_u8(OP.SET_CROSSFEED, 1); dev.wait_ready()
+        l_on, r_on, _ = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True)
+        chk.ok(r_off < -50.0, f"crossfeed off: opposite channel silent ({r_off:.1f} dBFS)")
+        chk.ok(r_on > r_off + 15.0, f"crossfeed on: bleed into opposite channel ({r_off:.1f} -> {r_on:.1f} dBFS)")
+        chk.ok(r_on < l_on - 1.0, f"bleed attenuated vs direct (R {r_on:.1f} < L {l_on:.1f} dBFS)")
+        chk.note(f"crossfeed: off R={r_off:.1f} on R={r_on:.1f} direct L={l_on:.1f} dBFS")
+    finally:
+        dev.set_u8(OP.SET_CROSSFEED, 0); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def leveller_boost(dev, profile, chk):
+    """The leveller lifts a sustained quiet signal, bounded by the max-gain ceiling."""
+    rig = _get_rig(dev, profile)
+    try:
+        _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
+        dev.set_u8(OP.SET_LEVELLER_ENABLE, 0); dev.wait_ready()
+        off, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05)
+        dev.set_f32(OP.SET_LEVELLER_AMOUNT, 100.0)
+        dev.set_f32(OP.SET_LEVELLER_MAX_GAIN, 12.0)
+        dev.set_u8(OP.SET_LEVELLER_SPEED, 2)
+        dev.set_u8(OP.SET_LEVELLER_ENABLE, 1); dev.wait_ready()
+        on, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05)
+        boost = on - off
+        chk.ok(boost > 3.0, f"leveller lifts quiet signal (+{boost:.1f} dB)")
+        chk.ok(boost <= 13.0, f"boost within max-gain ceiling (+{boost:.1f} dB <= ~12)")
+        chk.note(f"leveller: quiet off={off:.1f} on={on:.1f} boost=+{boost:.1f} dB")
+    finally:
+        dev.set_u8(OP.SET_LEVELLER_ENABLE, 0)
+        dev.set_f32(OP.SET_LEVELLER_AMOUNT, 0.0)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def output_clip_limit(dev, profile, chk):
+    """Driving the output past 0 dBFS clamps at full scale (no wrap) and raises THD."""
+    rig = _get_rig(dev, profile)
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        lvl0, thd0, _ = audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], 1000.0, amp=0.5)
+        _set_band(dev, rig["ch_l"], 0, TYPE["peaking"], 1000.0, 1.0, 12.0)  # +12 dB pushes past full scale
+        dev.wait_ready()
+        lvl1, thd1, _ = audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], 1000.0, amp=0.5)
+        chk.ok(lvl1 > lvl0 + 3.0, f"+12 dB boost takes effect ({lvl0:.1f} -> {lvl1:.1f} dBFS)")
+        chk.ok(lvl1 < 0.5, f"output clamped at full scale, not wrapped ({lvl1:.2f} dBFS)")
+        chk.ok(thd1 > thd0 + 1.0, f"clipping raises THD ({thd0:.3f}% -> {thd1:.3f}%)")
+        chk.note(f"clip: clean {lvl0:.1f}dBFS/{thd0:.3f}% clipped {lvl1:.1f}dBFS/{thd1:.3f}%")
+    finally:
+        _set_band(dev, rig["ch_l"], 0, FLAT, 1000.0, 0.707, 0.0); dev.wait_ready()
