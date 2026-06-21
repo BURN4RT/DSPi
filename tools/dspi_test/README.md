@@ -12,6 +12,10 @@ endpoint, so the core suite does not measure audio. An **optional hardware
 audio-loopback group** (`--audio`) adds real signal measurement when a Weeb Labs USBrx
 is wired to DSPi's S/PDIF output; see [Audio loopback](#audio-loopback-optional).
 
+> **New here?** [`test_harness.md`](test_harness.md) is the full, explain-everything guide
+> to the audio-loopback rig: hardware, wiring, the USBrx, setup, every test and parameter,
+> and troubleshooting. This README is the quick-start.
+
 ## Requirements
 
 ```

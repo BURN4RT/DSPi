@@ -31,3 +31,4 @@ __pycache__/
 !Documentation/Roadmap.md
 !Documentation/commands.md
 !Documentation/Features/*.md
+!tools/dspi_test/test_harness.md
