@@ -32,6 +32,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
   - [USB Control Protocol](#usb-control-protocol)
   - [System Telemetry](#reqgetstatus-0x50---system-telemetry)
   - [Data Structures](#data-structures)
+  - [USB Audio Loopback Capture (DSPI_LOOPBACK)](#usb-audio-loopback-capture-dspi_loopback)
 - [Building from Source](#building-from-source)
 - [Detailed Specifications](#detailed-specifications)
 - [License](#license)
@@ -643,6 +644,86 @@ Output GPIO pins can be reassigned at runtime without reflashing. This is useful
 *   Returns the current GPIO pin number for that output
 
 Pin assignments are stored in each preset and can optionally be included during preset save/load (controlled via `REQ_PRESET_SET_INCLUDE_PINS`).
+
+### USB Audio Loopback Capture (DSPI_LOOPBACK)
+
+A build-flag-gated capture path for bench measurement and automated verification. When the firmware is compiled with `DSPI_LOOPBACK`, the device exposes a second USB Audio Class 1 function that streams **output slot 0** back to the host as a recording input, so a host tool can play a signal into DSPi and record exactly what slot 0 produced. This folds the capability of the standalone Weeb Labs USBrx (an external S/PDIF-to-USB recorder) into DSPi itself, removing the second board and the S/PDIF jumper from the loopback rig. The feature is excluded from release builds; a production device never exposes the capture endpoint.
+
+**Building**
+
+The loopback build lives in dedicated build directories so release artifacts are unaffected:
+
+```bash
+# Configure once (from the repo root):
+cmake -S firmware -B build-rp2040-loopback -DPICO_PLATFORM=rp2040       -DPICO_BOARD=pico  -DDSPI_LOOPBACK=ON
+cmake -S firmware -B build-rp2350-loopback -DPICO_PLATFORM=rp2350-arm-s -DPICO_BOARD=pico2 -DDSPI_LOOPBACK=ON
+
+# Build, then flash build-<plat>-loopback/DSPi/DSPi.uf2:
+cmake --build build-rp2040-loopback -j
+cmake --build build-rp2350-loopback -j
+```
+
+`DSPI_LOOPBACK` is a CMake `option` (default `OFF`); enabling it adds `loopback.c` to the target and defines the `DSPI_LOOPBACK` macro that gates every firmware change. With the flag off, the build is byte-for-byte identical to the normal firmware.
+
+**USB topology**
+
+The capture is a self-contained UAC1 audio function appended after the vendor interface, so the existing interfaces (0 Audio Control, 1 Audio Streaming, 2 Vendor) keep their numbers. The configuration descriptor grows from 207 to 309 bytes.
+
+| Element | Value |
+|---|---|
+| Interface 3 | Capture Audio Control (own IAD grouping interfaces 3 + 4) |
+| Interface 4 | Capture Audio Streaming (alt 0 zero-bandwidth, alt 1 streaming) |
+| Endpoint | `0x81` isochronous, asynchronous IN, `bInterval` 1 |
+| `wMaxPacketSize` | 384 bytes (64 stereo frames of headroom) |
+| Format | Type I PCM, 2 channels, 24-bit, 44.1 / 48 kHz |
+| Terminals | Input terminal ID 4 (internal: slot 0) feeds Output terminal ID 5 (USB streaming) |
+
+The host sees one USB device with both a playback output and a 2-channel capture input. On macOS these appear as two Core Audio entries that share the name "Weeb Labs DSPi" (one with output channels, one with input channels). The Microsoft OS 2.0 / WinUSB descriptors are unchanged: their Function Subset still scopes WinUSB to the vendor interface only, so adding the capture function does not disturb driverless vendor-interface binding on Windows.
+
+**Capture data path**
+
+```
+output slot 0 (audio_pipeline.c, post-DSP, pre-encode)
+  -> loopback_push_slot0() -> SPSC ring (1024 frames, ~8 KB, .bss)
+      -> rate-matching servo (fill_audio_packet, per USB frame)
+          -> iso async IN endpoint 0x81 -> USB host
+```
+
+*   **Tap.** A single call in `process_input_block()` reads slot 0's finished, interleaved 24-bit samples from `audio_buf[0]` immediately before the buffer is handed to the output DMA. It runs after all DSP (EQ, crossover, matrix, gain, delay, mute) and before the output encoder, so it captures exactly what slot 0 sends out whether slot 0 is configured as S/PDIF or I2S. The tap is read-only: it copies samples out and never writes back, so it cannot perturb the firmware's inter-slot output alignment.
+*   **Ring.** A single-producer / single-consumer ring of 1024 interleaved stereo frames (two `int32` per frame, ~8 KB in `.bss`). The producer is the audio pipeline; the consumer is the USB transfer-complete callback. Both run in core-0 thread context, so plain volatile head/tail indices are sufficient. On overflow (host not draining) the producer drops frames and the servo re-primes.
+
+**Rate-matching servo**
+
+The capture IN endpoint is asynchronous to the host's USB frame (SOF) clock in every input mode: with USB input, DSPi is the feedback master on its own crystal; with S/PDIF or I2S input, the output runs on the external source clock. A rate-matching servo therefore varies the packet size each USB frame (implicit feedback), with no resampling:
+
+```
+frames_this_frame = nominal + correction
+  nominal    = audio_state.freq / 1000          (samples per 1 ms USB frame)
+  correction = clamp(KP * (ring_fill - target), +/- MAX_CORR)
+```
+
+A fractional-sample accumulator carries the remainder across frames so non-integer rates (44.1 kHz) stay exact. The stream primes to the target fill level before sending audio and emits silence on underrun.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TARGET_FILL_FRAMES` | 256 | Ring set-point (~5.3 ms @ 48 kHz) |
+| `SERVO_KP` | 0.008 | Proportional gain (samples/frame per frame of fill error) |
+| `SERVO_MAX_CORR` | 2.0 | Correction clamp (samples/frame) |
+| `RING_FRAMES` | 1024 | Ring capacity (~21 ms @ 48 kHz) |
+
+**Driver registration**
+
+The capture function uses a dedicated custom UAC1 class driver (`loopback.c`), registered alongside the playback driver. With `DSPI_LOOPBACK` defined, `usbd_app_driver_get_cb()` returns both drivers. Because both audio-control interfaces match the same class / subclass / alt-setting, each driver's `open()` is scoped by interface number: the playback driver claims interface 0 only and the loopback driver claims interface 3 only, so neither hijacks the other's function. All capture control requests (SET / GET_INTERFACE, the endpoint sampling-frequency control) and the isochronous transfers route to the loopback driver.
+
+**Resource cost**
+
+The capture ring and buffers add roughly 8.7 KB of BSS on both platforms (RP2040 129436 to 138120 bytes; RP2350 237404 to 246092 bytes). Because the firmware is built `copy_to_ram`, this BSS competes with the program image in RAM; the RP2040 loopback build has about 6 KB of headroom, which is acceptable for a debug build and is part of why the feature is excluded from release. Capture rates are capped at DSPi's operating range (44.1 / 48 kHz), which also keeps the extra isochronous endpoint within the RP2040 USB controller's DPRAM budget.
+
+**Host usage**
+
+Any class-compliant recording tool can open the DSPi capture input. The repository's verification harness drives it directly: `python3 -m tools.dspi_test.run --group audio` plays signals into DSPi, records slot 0 from the capture, and checks the measured response against the firmware's filter math. See `tools/dspi_test/test_harness.md` for the full rig guide and `Documentation/current_architecture.md` ("USB Audio Loopback Capture") for additional firmware detail.
+
+**Files:** `firmware/DSPi/loopback.c` / `loopback.h` (ring, driver, servo), with `DSPI_LOOPBACK`-gated additions in `usb_descriptors.c` / `.h` (descriptor block), `usb_audio.c` (driver registration and interface scoping), `audio_pipeline.c` (the slot-0 tap), and `CMakeLists.txt` (the build option).
 
 ---
 
