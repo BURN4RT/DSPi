@@ -20,6 +20,7 @@
 #include "leveller.h"
 #include "flash_storage.h"
 #include "pdm_generator.h"
+#include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
@@ -913,6 +914,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     global_status.peaks[1] = (uint16_t)(peak_mr >> 13);
     if (peak_ml > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << CH_MASTER_LEFT);
     if (peak_mr > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << CH_MASTER_RIGHT);
+#endif
+
+#ifdef DSPI_LOOPBACK
+    // Loopback capture tap (debug build): copy slot 0's finalized, interleaved
+    // 24-bit output into the capture ring just before the buffer is handed to
+    // the output DMA.  By here slot 0 is fully written for every pipeline
+    // variant (RP2350 dual/single-core, RP2040 dual/single-core), including the
+    // silence (memset) branch.  Read-only — does not perturb inter-slot phase.
+    if (audio_buf[0]) {
+        loopback_push_slot0((const int32_t *)audio_buf[0]->buffer->bytes, sample_count);
+    }
 #endif
 
     // Return all buffers

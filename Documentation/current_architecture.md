@@ -405,6 +405,89 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 
 ---
 
+## USB Audio Loopback Capture (DSPI_LOOPBACK)
+*Last updated: 2026-06-24*
+
+A **debug/verification-only** feature, compiled in only when the `DSPI_LOOPBACK`
+build flag is defined. It folds the standalone `~/USBrx` S/PDIF-to-USB recorder's
+capability into DSPi itself: a USB audio **capture** (recording) endpoint that
+streams **output slot 0** back to the host, so the loopback rig no longer needs a
+second board or an S/PDIF cable. Excluded entirely from release builds.
+
+### Build flag
+`option(DSPI_LOOPBACK ... OFF)` in `firmware/DSPi/CMakeLists.txt`. When ON it adds
+`loopback.c` to the target, marks it `-O3`, and defines `DSPI_LOOPBACK`. All
+firmware changes are `#ifdef DSPI_LOOPBACK`-gated, so the normal `build-rp2040` /
+`build-rp2350` outputs are byte-for-byte unchanged. Use **dedicated** build dirs:
+
+```
+cmake -S firmware -B build-rp2040-loopback -DPICO_PLATFORM=rp2040 -DPICO_BOARD=pico  -DDSPI_LOOPBACK=ON
+cmake -S firmware -B build-rp2350-loopback -DPICO_PLATFORM=rp2350-arm-s -DPICO_BOARD=pico2 -DDSPI_LOOPBACK=ON
+```
+
+### USB topology
+A **second, self-contained UAC1 audio function** is appended after the vendor
+interface (existing interfaces 0/1/2 are unchanged):
+
+- IAD grouping **interface 3** (capture AudioControl) + **interface 4** (capture
+  AudioStreaming). `ITF_NUM_TOTAL` becomes 5.
+- Input terminal (internal, ID 4) → output terminal (USB streaming, ID 5).
+- AS alt 0 zero-bandwidth, alt 1 with one **isochronous async IN endpoint `0x81`**.
+- Format: 2-channel, 24-bit PCM, discrete rates 44.1/48 kHz (DSPi's operating
+  range), `wMaxPacketSize` = 384 B (`LOOPBACK_EP_IN_SIZE`).
+- The MS OS 2.0 / WinUSB descriptors are untouched — their Function Subset still
+  scopes WinUSB to the vendor interface (2).
+
+### Data path
+```
+slot-0 final 24-bit samples (audio_pipeline.c, before give_audio_buffer)
+  -> loopback_push_slot0() -> SPSC ring (1024 frames, .bss, ~8 KB)
+      -> rate-matching servo (fill_audio_packet, per USB frame, in xfer_cb)
+          -> iso async IN EP 0x81 -> USB host
+```
+- **Tap:** a single call before slot 0's buffer is handed to the output DMA, in
+  `process_input_block()`. It reads the already-finalized
+  `audio_buf[0]->buffer->bytes` (24-bit sign-extended `int32` interleaved L/R) for
+  every pipeline variant (RP2350 dual/single-core, RP2040 dual/single-core),
+  including the silence branch. **Read-only** — it copies out and never writes
+  back, so it cannot perturb inter-slot output alignment.
+- **Servo:** the capture IN endpoint is asynchronous to the host SOF clock in
+  every input mode (USB input is feedback-master on DSPi's crystal; S/PDIF/I2S
+  input runs on the external clock), so each USB frame sends a feed-forward count
+  (`audio_state.freq / 1000` stereo frames) plus a clamped proportional
+  correction toward `TARGET_FILL_FRAMES` = 256 (~5.3 ms), with a fractional-sample
+  accumulator. Primes to target before streaming; underrun emits silence and
+  re-primes. Ported from USBrx, reading the internal ring instead of a S/PDIF FIFO.
+
+### Driver registration
+The capture driver (`loopback_uac1_driver`, in `loopback.c`) is registered
+alongside the playback driver: `usbd_app_driver_get_cb()` returns a 2-element
+array under `DSPI_LOOPBACK`. Because both audio-control interfaces match
+`class==AUDIO && subclass==CONTROL && alt==0`, the playback driver's `open()` is
+scoped to `bInterfaceNumber == ITF_NUM_AUDIO_CONTROL` (gated) and the capture
+driver to `ITF_NUM_LOOPBACK_AC`, so neither hijacks the other's function.
+
+### Host side (deferred)
+The capture appears on the **DSPi composite device** (DSPi's VID/PID), not as a
+separate "USBrx" device — on macOS, one Core Audio device named "DSPi" exposes
+both output and input channels. The loopback harness
+(`tools/dspi_test/audio.py`, `USBRX_IN_NAME`) must point its input at "DSPi"; that
+host-side change is **not yet made**.
+
+### Files
+`loopback.c` / `loopback.h` (ring + driver + servo), `usb_descriptors.c` / `.h`
+(gated capture descriptor block + interface/length macros), `usb_audio.c` (driver
+registration + interface guard), `audio_pipeline.c` (slot-0 tap), `CMakeLists.txt`
+(flag).
+
+### Memory / platform note
+The capture ring + buffers add **~8.7 KB BSS** on both platforms (measured: RP2040
+BSS 129436 → 138120; RP2350 237404 → 246092). RP2040 is RAM-tight in this build
+(~6 KB headroom under `copy_to_ram`); RP2350 has ample margin. Behavior is
+identical on both platforms.
+
+---
+
 ## DSP Processing Engine
 *Last updated: 2026-06-17*
 
@@ -1337,7 +1420,14 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## Memory Layout
-*Last updated: 2026-06-11 (added I2S RX DMA rings; BSS re-measured)*
+*Last updated: 2026-06-24 (noted DSPI_LOOPBACK debug-build BSS delta)*
+
+> **DSPI_LOOPBACK debug build (2026-06-24).** The numbers below describe the
+> normal (release) build. The optional `DSPI_LOOPBACK` build adds ~8.7 KB BSS on
+> both platforms (a 1024-frame capture ring + a 384 B packet buffer + small
+> state). On RP2040 this leaves the `copy_to_ram` image with only ~6 KB of RAM
+> headroom — acceptable for a debug build but not for release. See
+> "USB Audio Loopback Capture (DSPI_LOOPBACK)".
 
 > **Static consumer pools (2026-05-31).** The per-output-slot consumer buffer pool
 > is now a single statically-allocated (BSS) pool per slot, **shared by the slot's

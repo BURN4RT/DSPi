@@ -16,8 +16,8 @@ version.
 1. [What the harness is](#1-what-the-harness-is)
 2. [The two test planes: control vs audio](#2-the-two-test-planes-control-vs-audio)
 3. [What you need (hardware)](#3-what-you-need-hardware)
-4. [Wiring the loopback rig](#4-wiring-the-loopback-rig)
-5. [The USBrx capture device](#5-the-usbrx-capture-device)
+4. [Flashing the loopback firmware](#4-flashing-the-loopback-firmware)
+5. [The DSPi loopback capture](#5-the-dspi-loopback-capture)
 6. [Software setup](#6-software-setup)
 7. [Running the tests](#7-running-the-tests)
 8. [Command-line options](#8-command-line-options)
@@ -44,10 +44,10 @@ There are two kinds of checks:
 - **Control-plane checks** (the original suite): send every USB "vendor command" to the
   device and confirm it accepts/rejects values correctly and never crashes. These need
   only the DSPi plugged in.
-- **Audio-loopback checks** (the new functionality this guide is about): actually *play
+- **Audio-loopback checks** (the functionality this guide is about): actually *play
   audio* into the DSPi, let its DSP process it, capture the result, and verify the sound
-  matches what the firmware's math says it should be. These need the extra capture rig
-  described below.
+  matches what the firmware's math says it should be. These need DSPi flashed with the
+  `DSPI_LOOPBACK` firmware build, which adds a USB capture input (described below).
 
 ---
 
@@ -56,7 +56,7 @@ There are two kinds of checks:
 | | Control plane | Audio loopback |
 |---|---|---|
 | What it proves | Commands round-trip, ranges validated, device stays alive | The DSP actually does the right thing to the audio |
-| Hardware | DSPi only | DSPi **+ Weeb Labs USBrx** wired to a DSPi S/PDIF output |
+| Hardware | DSPi only | DSPi flashed with the **DSPI_LOOPBACK** build (no extra hardware) |
 | Python deps | `pyusb` | `pyusb` + `sounddevice` + `numpy` + `scipy` |
 | Test group | everything except `audio` | the `audio` group |
 | Runs by default? | yes | **no** — opt in with `--audio` |
@@ -68,105 +68,90 @@ dependencies; on a machine without them it simply **skips** (it never fails the 
 
 ## 3. What you need (hardware)
 
-1. **A DSPi.** This is the device under test: a USB sound card with an on-board DSP that
-   outputs S/PDIF (and/or I2S) plus a PDM subwoofer channel.
+1. **A DSPi** flashed with the **`DSPI_LOOPBACK` firmware build**. It is both the device
+   under test and the capture device: a USB sound card with an on-board DSP, where the
+   loopback build adds a USB audio *input* that streams **output slot 0** back to the host
+   (after all DSP). The normal/release firmware has no capture endpoint, so the audio group
+   needs this special build (see [section 4](#4-flashing-the-loopback-firmware)).
    - Repo: <https://github.com/WeebLabs/DSPi>
-   - It shows up to the computer as a USB audio device named **"Weeb Labs DSPi"** and as a
-     USB vendor-control device with USB ID `2E8B:FEAA`.
-2. **A Weeb Labs USBrx.** This is the capture device: it receives an S/PDIF signal and
-   re-presents it to the computer as a USB audio *input* (like a microphone), so the host
-   can record what the DSPi sent out.
-   - Repo: <https://github.com/WeebLabs/USBrx>
-   - It shows up as a USB audio input named **"Weeb Labs USBrx"** (24-bit, 2-channel).
-3. **Two USB cables** (one per device) into the same computer.
-4. **Two jumper wires** to connect a DSPi S/PDIF output to the USBrx S/PDIF input (see
-   next section).
+   - With the loopback build it shows up as **"Weeb Labs DSPi"** in *both* directions — an
+     output (playback) and a 2-channel 24-bit input (capture) — plus a USB vendor-control
+     device with USB ID `2E8B:FEAA`.
+2. **One USB cable** into the computer.
 
-> The harness matches the two devices **by name** ("DSPi" for output, "USBrx" for input),
-> so you do not need to know device indices. If your OS names them differently, see
-> [parameters](#11-every-tunable-parameter).
+> No second board and no wiring are required: the capture is internal to DSPi (output slot 0
+> is tapped in firmware). The harness matches the device **by name** ("DSPi" for both the
+> output and the capture, disambiguated by direction), so you do not need device indices. If
+> your OS names it differently, see [parameters](#11-every-tunable-parameter).
 
 ---
 
-## 4. Wiring the loopback rig
+## 4. Flashing the loopback firmware
 
-The signal path the tests exercise is:
-
-```
-   your computer                 DSPi                          USBrx              your computer
-  ┌──────────────┐   USB     ┌──────────────┐   S/PDIF     ┌──────────────┐   USB   ┌──────────────┐
-  │  test script │ ───────►  │  USB-audio   │ ──wire────►  │  S/PDIF RX    │ ──────► │  records the │
-  │ plays a sweep│  (audio   │  in → DSP →  │  (GPIO to    │  → USB-audio  │ (audio  │  captured    │
-  │              │   out)    │  S/PDIF out  │   GPIO)      │  in (24-bit)  │   in)   │  audio       │
-  └──────────────┘           └──────────────┘              └──────────────┘         └──────────────┘
-```
-
-Make the single hardware connection:
-
-| From: DSPi S/PDIF output GPIO | To: USBrx S/PDIF input GPIO |
-|---|---|
-| any S/PDIF output pin (default **GP6** = slot 0; also GP7/8/9 on RP2350) | **GP15** |
-| **GND** | **GND** (common ground is required) |
-
-Notes for beginners:
-
-- DSPi drives S/PDIF as a **3.3 V logic-level** square-wave signal straight off a GPIO
-  pin, and the USBrx reads it on a GPIO. So a **direct jumper wire** (GPIO → GP15) plus a
-  **shared ground** is all you need on the bench. You do not need a coax/optical S/PDIF
-  transceiver for testing.
-- You can wire to **any** of the DSPi S/PDIF outputs. The harness **auto-detects** which
-  one the USBrx is on (it plays a tone on each and watches which one shows up). The
-  default GPIO for the first S/PDIF output (slot 0) is **GP6**.
-- Keep the wire short. It is a fast digital signal.
-
----
-
-## 5. The USBrx capture device
-
-The USBrx is what makes audio testing possible — the DSPi has no audio *input* back to
-the computer, so without USBrx the harness could only check commands, not sound.
-
-- **What it is:** a Raspberry Pi Pico (RP2040) running the firmware at
-  <https://github.com/WeebLabs/USBrx>. It decodes incoming S/PDIF and streams it to the
-  host as a standard USB Audio Class 1 input: **Type-I PCM, 2 channels, 24-bit, 44.1 /
-  48 / 88.2 / 96 kHz**.
-- **S/PDIF decoding** is done by the `pico_spdif_rx` PIO library
-  (<https://github.com/elehobica/pico_spdif_rx>), included as a submodule.
-- **S/PDIF input pin:** GP15 (`SPDIF_DATA_PIN` in `src/main.c`).
-
-### Building and flashing the USBrx (one-time)
-
-You only do this once, to put the firmware on the Pico. From a terminal:
+The audio group needs DSPi running the **`DSPI_LOOPBACK`** build. This is a debug build,
+kept in its own build dirs so normal release builds are unaffected. From the repo root:
 
 ```bash
-git clone --recurse-submodules https://github.com/WeebLabs/USBrx.git
-cd USBrx
-# The repo pins its own pico-sdk; if you cloned without --recurse-submodules:
-git submodule update --init --recursive
-mkdir build && cd build
-cmake ..
-make -j
+# Configure dedicated loopback build dirs (once):
+cmake -S firmware -B build-rp2040-loopback -DPICO_PLATFORM=rp2040 -DPICO_BOARD=pico  -DDSPI_LOOPBACK=ON
+cmake -S firmware -B build-rp2350-loopback -DPICO_PLATFORM=rp2350-arm-s -DPICO_BOARD=pico2 -DDSPI_LOOPBACK=ON
+
+# Build (pick your platform):
+cmake --build build-rp2040-loopback -j     # RP2040
+cmake --build build-rp2350-loopback -j     # RP2350
 ```
 
-This produces `usbrx.uf2` in the build directory. To flash it: hold the Pico's **BOOTSEL**
-button while plugging it in (it appears as a USB drive), then copy `usbrx.uf2` onto that
-drive. The Pico reboots and enumerates as **"Weeb Labs USBrx"**. See the USBrx repo's own
-[README](https://github.com/WeebLabs/USBrx) for the latest details.
+Flash the resulting `build-<plat>-loopback/DSPi/DSPi.uf2`: hold **BOOTSEL** while plugging
+DSPi in (it appears as a USB drive), then copy the UF2 onto it. DSPi reboots and now
+enumerates with **both** a playback output and a 2-channel capture input, both named
+"Weeb Labs DSPi".
+
+> The loopback feature is gated behind the `DSPI_LOOPBACK` flag and is excluded from normal
+> release builds, so a production DSPi will not expose the capture input. See
+> `Documentation/current_architecture.md` ("USB Audio Loopback Capture") for the firmware
+> details.
+
+The signal path the tests exercise is entirely internal — no S/PDIF cable:
+
+```
+   your computer                       DSPi (DSPI_LOOPBACK build)                 your computer
+  ┌──────────────┐   USB         ┌────────────────────────────────┐   USB       ┌──────────────┐
+  │  test script │ ──────────►   │ USB-audio in → DSP → slot 0     │ ──────────► │  records the │
+  │ plays a sweep│  (audio out)  │ tapped after DSP → USB capture  │  (audio in) │  captured    │
+  │              │               │                                 │             │  audio       │
+  └──────────────┘               └────────────────────────────────┘             └──────────────┘
+```
+
+---
+
+## 5. The DSPi loopback capture
+
+The loopback capture is what makes audio testing possible — it gives the host a way to
+record what DSPi produced. In the `DSPI_LOOPBACK` build it is **built into DSPi itself**.
+
+- **What it is:** a second USB Audio Class 1 function on DSPi that streams **output slot 0**
+  back to the host as **Type-I PCM, 2 channels, 24-bit, 44.1 / 48 kHz** on an isochronous IN
+  endpoint. (Earlier revisions of this rig used a separate "Weeb Labs USBrx" board wired to a
+  DSPi S/PDIF output; that is no longer needed.)
+- **Where it taps:** output slot 0's finished samples, read *after* all DSP (EQ, crossover,
+  matrix, gain, delay, mute) and *before* the output encoder. So it captures exactly what
+  slot 0 sends out, whether slot 0 is configured as S/PDIF or I2S.
+- **Read-only:** the tap copies slot 0's samples; it never modifies them, so it cannot
+  disturb the firmware's inter-slot output alignment.
 
 ### Clock note (why the measurement is so accurate)
 
-DSPi is the timing master. The host's playback to DSPi is rate-locked to DSPi by USB
-audio feedback, and the USBrx is locked to DSPi's S/PDIF. So everything runs on **one
-clock** and the captured samples are a fixed-latency, bit-exact copy of DSPi's output.
-That is why the magnitude measurements land within ~0.00 dB of the math.
+DSPi is the timing master. The host's playback to DSPi is rate-locked to DSPi by USB audio
+feedback, and the capture is slaved to DSPi's output rate via a small rate-matching servo. So
+everything runs on **one clock** and the captured samples are a fixed-latency, near bit-exact
+copy of slot 0. That is why the magnitude measurements land within ~0.00 dB of the math.
 
-### One known quirk: polarity
+### Polarity
 
-The `pico_spdif_rx` decoder reconstructs audio that is **polarity-inverted** relative to
-what DSPi sent (a property of how that decoder handles S/PDIF line polarity; it is *not* a
-bug in DSPi or in the test code). The harness is deliberately **polarity-agnostic**:
-magnitude checks ignore sign, and phase checks remove a constant offset, so the inversion
-never causes a false failure.
+Unlike the old S/PDIF-receiver rig (whose decoder inverted polarity), the integrated capture
+is a **direct digital copy** of slot 0, so it is **not** polarity-inverted. The harness is
+polarity-agnostic regardless: magnitude checks ignore sign, phase checks remove a constant
+offset, and the phase-invert test only checks that the sign *flips* — so either polarity passes.
 
 ---
 
@@ -193,7 +178,7 @@ pip install sounddevice numpy scipy
 
 ### macOS microphone permission
 
-macOS treats any USB audio **input** (including the USBrx) as a microphone. The **first
+macOS treats any USB audio **input** (including the DSPi capture) as a microphone. The **first
 time** you run an audio test, macOS will prompt to allow your terminal app to access the
 microphone — **allow it**. If you miss the prompt, enable it under
 *System Settings → Privacy & Security → Microphone* for your terminal/Python, then re-run.
@@ -215,8 +200,8 @@ python3 -m tools.dspi_test.run --all
 
 `--all` is exactly `--audio --allow-flash --allow-factory-reset`, and it runs the **audio
 group first** so its auto-probe sees a pristine device (before the control-plane tests
-change device state). If the USBrx rig or the audio libraries are missing, the audio tests
-**skip** (they never fail the run). A full pass looks like:
+change device state). If the loopback firmware or the audio libraries are missing, the audio
+tests **skip** (they never fail the run). A full pass looks like:
 
 ```
 RESULT: 131/133 PASS · 0 FAIL · 0 ERROR · 2 SKIP
@@ -247,16 +232,17 @@ python3 -m tools.dspi_test.run --all --report report.md --json report.json
 Before running the suite, sanity-check the rig with the standalone audio tool:
 
 ```bash
-# 1. List every audio device the computer sees (confirm DSPi + USBrx appear):
+# 1. List every audio device the computer sees (confirm DSPi appears as both
+#    an output and an input):
 python3 -m tools.dspi_test.audio --list
 
-# 2. Play a 1 kHz tone out the DSPi and read it back from the USBrx,
-#    printing level / THD / noise (a quick "is the wire connected?" test):
+# 2. Play a 1 kHz tone out the DSPi and read it back from the DSPi capture,
+#    printing level / THD / noise (a quick capture sanity check):
 python3 -m tools.dspi_test.audio --probe
 ```
 
-If `--list` does not show both **"Weeb Labs DSPi"** (an output) and **"Weeb Labs USBrx"**
-(an input), fix that first (cables, drivers, firmware) before running the suite.
+If `--list` does not show **"Weeb Labs DSPi"** as both an output **and** an input, fix that
+first (cable, drivers, the `DSPI_LOOPBACK` firmware) before running the suite.
 
 A normal full audio run ends with something like:
 
@@ -292,9 +278,9 @@ and restores the device to exactly the state it was in before the run.
 | `--list` | Enumerate host audio devices. |
 | `--probe` | Play a 1 kHz tone to the DSPi and read it back; print level/THD/noise. |
 | `--out-name` | Substring to match the DSPi output device (default `DSPi`). |
-| `--in-name` | Substring to match the USBrx input device (default `USBrx`). |
+| `--in-name` | Substring to match the DSPi capture input device (default `DSPi`). |
 | `--fs` | Sample rate in Hz (default 48000). |
-| `--channel` | Which USBrx channel to read (0 = left, 1 = right). |
+| `--channel` | Which slot-0 channel to read (0 = left, 1 = right). |
 
 Exit code is `0` only if there were no failures or errors.
 
@@ -305,8 +291,9 @@ Exit code is `0` only if there were no failures or errors.
 Understanding this makes every test and parameter obvious.
 
 1. **Auto-probe (once per run).** The harness plays a tone on each S/PDIF slot in turn
-   (isolating one at a time) and watches which one reaches the USBrx. That slot becomes
-   the "target" for the rest of the run. This is why you can wire to any S/PDIF output.
+   (isolating one at a time) and watches which one reaches the capture. With the integrated
+   tap this is always slot 0; the probe confirms it empirically. That slot becomes the
+   "target" for the rest of the run.
    The audio group always runs **before** the control-plane tests, so this probe happens
    on a pristine device (this is why `--all` works in a single command).
 
@@ -316,8 +303,8 @@ Understanding this makes every test and parameter obvious.
    thing on purpose, the path is unity.
 
 3. **Play, capture, align.** A test plays an excitation (a logarithmic sine **sweep** for
-   frequency response, or a steady **tone** for levels) out the DSPi and records the USBrx
-   at the same time using two independent audio streams. Because the chain is single-clock,
+   frequency response, or a steady **tone** for levels) out the DSPi and records the DSPi
+   capture at the same time using two independent audio streams. Because the chain is single-clock,
    the recording is just a delayed copy; the harness finds that delay by **cross-correlation**
    and lines the recording up with what it played.
 
@@ -384,7 +371,7 @@ matched the expectation within the listed tolerance.
 
 > These verify **intra-slot** L/R alignment and that the firmware's pipeline-reset
 > operations preserve it. Verifying alignment *between different slots* (the firmware's
-> full guarantee) needs a multi-channel capture and is out of scope for one stereo USBrx.
+> full guarantee) needs a multi-channel capture and is out of scope for one stereo capture.
 
 ### Full chain / dynamics
 
@@ -431,14 +418,14 @@ trade-off. Values shown are the defaults.
 | Constant / arg | Default | Meaning |
 |---|---|---|
 | `DSPI_OUT_NAME` | `"DSPi"` | Substring used to find the DSPi output device by name. |
-| `USBRX_IN_NAME` | `"USBrx"` | Substring used to find the USBrx input device by name. |
+| `DSPI_IN_NAME` | `"DSPi"` | Substring used to find the DSPi capture input device by name. |
 | `DEFAULT_FS` | `48000` | Default sample rate. |
 | `PAD_S` | `0.10` | Leading/trailing silence (seconds) around each excitation. |
 | `TAIL_S` | `0.40` | Extra recording time after playback, to capture path latency + decay. |
 | `play_record(..., max_retries=3)` | `3` | If a capture has an audio dropout (xrun), retry up to this many times. |
 
 If your OS shows the devices under different names, change `DSPI_OUT_NAME` /
-`USBRX_IN_NAME` (or pass `--out-name` / `--in-name` to the `audio` tool).
+`DSPI_IN_NAME` (or pass `--out-name` / `--in-name` to the `audio` tool).
 
 ---
 
@@ -449,8 +436,9 @@ If your OS shows the devices under different names, change `DSPI_OUT_NAME` /
   (e.g. `peq_peaking_lo: max_mag_err=0.000dB`). These appear in the "Notes & observations"
   section of the Markdown report (`--report`). Tiny margins (≈0.00 dB) are normal and
   expected for the digital path.
-- **SKIP** on an audio test means the rig or deps were missing (e.g. no USBrx, sounddevice
-  not installed, or microphone permission not granted) — not a failure.
+- **SKIP** on an audio test means the capture or deps were missing (e.g. DSPi not on the
+  `DSPI_LOOPBACK` build, sounddevice not installed, or microphone permission not granted) —
+  not a failure.
 - After every run the harness prints whether it restored the device to its pre-run state
   ("live state restored byte-for-byte").
 
@@ -460,10 +448,10 @@ If your OS shows the devices under different names, change `DSPI_OUT_NAME` /
 
 | Symptom | Likely cause / fix |
 |---|---|
-| Audio tests all **SKIP** | Missing deps (`pip install sounddevice numpy scipy`) or the USBrx/DSPi not found by name. Run `python3 -m tools.dspi_test.audio --list`. |
-| `--list` shows DSPi but **no USBrx** | USBrx not plugged in, not flashed, or named differently. Re-flash it; or set `--in-name` to a matching substring. |
-| Captures are **silent** / "no signal" / probe shows very low level | (1) macOS microphone permission not granted — allow it and retry. (2) The S/PDIF wire or ground is not connected. (3) Wrong DSPi output pin — but the harness auto-probes all slots, so usually it is the wire/ground or permission. |
-| `no S/PDIF slot reached USBrx` | The wire from a DSPi S/PDIF output GPIO to USBrx **GP15** (and a common GND) is missing or on the wrong pin. |
+| Audio tests all **SKIP** | Missing deps (`pip install sounddevice numpy scipy`) or the DSPi output/capture not found by name. Run `python3 -m tools.dspi_test.audio --list`. |
+| `--list` shows the DSPi output but **no DSPi input** | DSPi is not running the `DSPI_LOOPBACK` build (release firmware has no capture endpoint). Re-flash with the loopback UF2; or set `--in-name` to a matching substring. |
+| Captures are **silent** / "no signal" / probe shows very low level | (1) macOS microphone permission not granted — allow it and retry. (2) Bare `--probe` does not configure routing — use the suite (which sets input=USB and routes to slot 0), or route USB → slot 0 first. |
+| `no output slot reached the DSPi capture` | DSPi input source is not USB, or output slot 0 is muted/unrouted. The suite configures these; check you are not relying on the bare `--probe`. |
 | Results are **erratic / low correlation** | An audio dropout (xrun). The harness already retries; if it persists, close other audio apps, or increase `play_record(max_retries=...)`. |
 | Magnitude off by a constant on **every** XO/PEQ test | A leftover filter on a band the test does not flatten, or the path is not unity (check master/user volume, preamp). The tests flatten the chain themselves, so this usually means a custom change. |
 | `pip install` refused ("externally managed") | Use a venv, `--user`, or `--break-system-packages` (see [setup](#6-software-setup)). |
@@ -473,16 +461,20 @@ If your OS shows the devices under different names, change `DSPI_OUT_NAME` /
 
 ## 14. Scope and limits
 
-What the single-stereo-USBrx rig **can** verify (and does): per-band PEQ and crossover
+What the single-stereo-capture rig **can** verify (and does): per-band PEQ and crossover
 frequency response, all-pass phase, output gain/mute/volume/preamp/routing/phase/delay,
 intra-slot L/R alignment and its stability across pipeline resets, multiband EQ, loudness,
-crossfeed, leveller, and clipping behavior.
+crossfeed, leveller, and clipping behavior. Because the tap is before the output encoder,
+slot 0 is captured whether it is configured as S/PDIF or I2S.
 
 What it **cannot** verify with this rig:
 
 - **Inter-slot alignment** between the different S/PDIF slots / I2S / PDM (the firmware's
   full alignment guarantee) — needs a multi-channel digital capture or a second receiver.
-- **I2S and PDM outputs** — the USBrx only receives S/PDIF.
+- **Other output slots and the PDM sub** — the capture taps only slot 0; slots 1-3 and PDM
+  are not captured.
+- **The S/PDIF / I2S hardware encoders themselves** — the tap is the pre-encode sample
+  stream, so it validates the DSP, not the line-coding of those outputs.
 - **Sample-rate sweeps** — the suite runs at 48 kHz by design.
 
 ---
@@ -494,7 +486,7 @@ What it **cannot** verify with this rig:
 - It writes **no flash** — every change is to live RAM state.
 - Each test restores what it changed, and the runner takes a **full snapshot before the
   run and restores it after**, confirming "live state restored byte-for-byte".
-- The test signals are digital, captured by the USBrx; nothing is played on speakers.
+- The test signals are digital, captured internally by DSPi; nothing is played on speakers.
 
 ---
 
@@ -515,6 +507,6 @@ What it **cannot** verify with this rig:
 
 ---
 
-*Related repos:* [DSPi](https://github.com/WeebLabs/DSPi) ·
-[USBrx](https://github.com/WeebLabs/USBrx) ·
-[pico_spdif_rx](https://github.com/elehobica/pico_spdif_rx)
+*Related repos:* [DSPi](https://github.com/WeebLabs/DSPi)
+(the [USBrx](https://github.com/WeebLabs/USBrx) external recorder is superseded by the
+built-in `DSPI_LOOPBACK` capture).

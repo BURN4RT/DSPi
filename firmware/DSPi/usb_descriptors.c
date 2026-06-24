@@ -105,7 +105,16 @@ static const tusb_desc_device_t device_descriptor = {
 // notification EP, and handle all class/vendor requests in control_xfer_cb().
 // ----------------------------------------------------------------------------
 
+#ifdef DSPI_LOOPBACK
+// Loopback capture function appended at the end of the array (debug build):
+//   IAD(8) + AC std(9) + AC CS header(9) + input term(12) + output term(9)
+//   + AS std alt0(9) + AS std alt1(9) + AS CS general(7) + format type I(14)
+//   + iso IN EP(9) + CS iso EP(7) = 102 bytes.
+#define LOOPBACK_DESC_LEN 102
+#define CONFIG_TOTAL_LEN  (207 + LOOPBACK_DESC_LEN)
+#else
 #define CONFIG_TOTAL_LEN 207
+#endif
 #define AC_CS_TOTAL_LEN  40   // CS AC: header(9) + input(12) + FU(10) + output(9)
 
 #define OFFSET_ALT1_DATA_EP 108
@@ -117,7 +126,7 @@ static const tusb_desc_device_t device_descriptor = {
 // Sample rate little-endian expansion
 #define RATE_LE(r) ((r) & 0xFF), (((r) >> 8) & 0xFF), (((r) >> 16) & 0xFF)
 
-const uint8_t usb_config_descriptor[CONFIG_TOTAL_LEN] = {
+const uint8_t usb_config_descriptor[] = {
     // --- 0: Config descriptor ---------------------------------------------
     9,                                  // bLength
     TUSB_DESC_CONFIGURATION,            // bDescriptorType
@@ -343,7 +352,136 @@ const uint8_t usb_config_descriptor[CONFIG_TOTAL_LEN] = {
     TUSB_XFER_BULK,                     // bmAttributes (0x02)
     U16_TO_U8S_LE(NOTIFY_EP_MAX_PKT),   // wMaxPacketSize (64 — FS bulk max)
     NOTIFY_EP_INTERVAL_MS,              // bInterval (ignored for bulk on FS)
+
+#ifdef DSPI_LOOPBACK
+    // ========================================================================
+    // 207: LOOPBACK CAPTURE FUNCTION (debug build only) — 102 bytes
+    //
+    // A second, self-contained UAC1 audio function with its own IAD grouping
+    // interfaces 3 (AudioControl) + 4 (AudioStreaming).  Streams output slot 0
+    // as 2-ch 24-bit PCM on isochronous async IN endpoint 0x81.  The driver
+    // lives in loopback.c (registered alongside the playback driver via
+    // usbd_app_driver_get_cb()).  Excluded entirely from release builds.
+    // ========================================================================
+
+    // --- IAD grouping capture AC + AS (8) ---
+    8,
+    TUSB_DESC_INTERFACE_ASSOCIATION,
+    ITF_NUM_LOOPBACK_AC,                // bFirstInterface
+    0x02,                               // bInterfaceCount (AC + AS)
+    TUSB_CLASS_AUDIO,                   // bFunctionClass
+    AUDIO_SUBCLASS_CONTROL,             // bFunctionSubClass
+    0x00,                               // bFunctionProtocol (UAC1)
+    0x00,                               // iFunction
+
+    // --- Capture AC std interface (itf 3, 0 EPs) ---
+    9,
+    TUSB_DESC_INTERFACE,
+    ITF_NUM_LOOPBACK_AC,                // bInterfaceNumber
+    0x00,                               // bAlternateSetting
+    0x00,                               // bNumEndpoints
+    TUSB_CLASS_AUDIO,
+    AUDIO_SUBCLASS_CONTROL,
+    0x00,                               // bInterfaceProtocol (UAC1)
+    0x00,                               // iInterface
+
+    // --- Capture AC CS header (wTotalLength = header9+input12+output9 = 30) ---
+    9,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AC_INTERFACE_HEADER,
+    U16_TO_U8S_LE(0x0100),              // bcdADC (UAC1.0)
+    U16_TO_U8S_LE(30),                  // wTotalLength (CS AC header+input+output)
+    0x01,                               // bInCollection
+    ITF_NUM_LOOPBACK_AS,                // baInterfaceNr[0]
+
+    // --- Capture AC CS input terminal (ID 4, internal: output slot 0) ---
+    12,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AC_INTERFACE_INPUT_TERMINAL,
+    LOOPBACK_INPUT_TERMINAL_ID,         // bTerminalID
+    U16_TO_U8S_LE(0x0201),              // wTerminalType = microphone (generic capture source)
+    0x00,                               // bAssocTerminal
+    0x02,                               // bNrChannels
+    U16_TO_U8S_LE(0x0003),              // wChannelConfig (L|R)
+    0x00,                               // iChannelNames
+    0x00,                               // iTerminal
+
+    // --- Capture AC CS output terminal (ID 5, USB streaming) ---
+    9,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AC_INTERFACE_OUTPUT_TERMINAL,
+    LOOPBACK_OUTPUT_TERMINAL_ID,        // bTerminalID
+    U16_TO_U8S_LE(AUDIO_TERM_TYPE_USB_STREAMING),  // wTerminalType (0x0101)
+    0x00,                               // bAssocTerminal
+    LOOPBACK_INPUT_TERMINAL_ID,         // bSourceID
+    0x00,                               // iTerminal
+
+    // --- Capture AS std interface alt 0 (zero-bw) ---
+    9,
+    TUSB_DESC_INTERFACE,
+    ITF_NUM_LOOPBACK_AS,
+    0x00,                               // bAlternateSetting
+    0x00,                               // bNumEndpoints
+    TUSB_CLASS_AUDIO,
+    AUDIO_SUBCLASS_STREAMING,
+    0x00,
+    0x00,
+
+    // --- Capture AS std interface alt 1 (1 iso IN EP) ---
+    9,
+    TUSB_DESC_INTERFACE,
+    ITF_NUM_LOOPBACK_AS,
+    0x01,                               // bAlternateSetting
+    0x01,                               // bNumEndpoints
+    TUSB_CLASS_AUDIO,
+    AUDIO_SUBCLASS_STREAMING,
+    0x00,
+    0x00,
+
+    // --- Capture AS CS general (bTerminalLink = output terminal) ---
+    7,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AS_INTERFACE_AS_GENERAL,
+    LOOPBACK_OUTPUT_TERMINAL_ID,        // bTerminalLink
+    0x01,                               // bDelay
+    U16_TO_U8S_LE(0x0001),              // wFormatTag = PCM
+
+    // --- Capture AS CS format type I (24-bit, 2 discrete rates 44.1/48) ---
+    14,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AS_INTERFACE_FORMAT_TYPE,
+    0x01,                               // bFormatType = TYPE_I
+    LOOPBACK_N_CHANNELS,                // bNrChannels = 2
+    LOOPBACK_BYTES_PER_SAMPLE,          // bSubframeSize = 3
+    24,                                 // bBitResolution
+    0x02,                               // bSamFreqType (2 discrete)
+    RATE_LE(44100),
+    RATE_LE(48000),
+
+    // --- Capture std iso IN EP 0x81 (iso, async) ---
+    9,
+    TUSB_DESC_ENDPOINT,
+    LOOPBACK_IN_ENDPOINT,               // bEndpointAddress
+    0x05,                               // bmAttributes: iso, async, data
+    U16_TO_U8S_LE(LOOPBACK_EP_IN_SIZE), // wMaxPacketSize
+    0x01,                               // bInterval = 1
+    0x00,                               // bRefresh
+    0x00,                               // bSynchAddress (none)
+
+    // --- Capture CS iso data EP (sampling freq control) ---
+    7,
+    TUSB_DESC_CS_ENDPOINT,
+    AUDIO_CS_EP_SUBTYPE_GENERAL,
+    0x01,                               // bmAttributes: sampling freq control
+    0x00,                               // bLockDelayUnits
+    U16_TO_U8S_LE(0x0000),              // wLockDelay
+#endif // DSPI_LOOPBACK
 };
+
+// Catch any miscount in the packed descriptor table at compile time (the array
+// is inferred-size; CONFIG_TOTAL_LEN drives wTotalLength + usb_config_descriptor_len).
+_Static_assert(sizeof(usb_config_descriptor) == CONFIG_TOTAL_LEN,
+               "usb_config_descriptor byte count must equal CONFIG_TOTAL_LEN");
 
 const uint16_t usb_config_descriptor_len = CONFIG_TOTAL_LEN;
 

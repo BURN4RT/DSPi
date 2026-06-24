@@ -12,7 +12,7 @@ Options:
                             other knowledge needed; the audio group runs first so
                             its auto-probe sees a pristine device.
     --audio                 Include the hardware audio-loopback group (needs the
-                            USBrx rig + sounddevice; excluded by default).
+                            DSPI_LOOPBACK firmware + sounddevice; excluded by default).
     --group G[,G...]        Run only these test groups (default: all).
     --list                  List registered tests and exit (no device needed if
                             modules import; still imports the package).
@@ -51,8 +51,8 @@ def main(argv=None):
     ap.add_argument("--allow-flash", action="store_true")
     ap.add_argument("--allow-factory-reset", action="store_true")
     ap.add_argument("--audio", action="store_true",
-                    help="include the hardware audio-loopback group (needs the USBrx "
-                         "rig + sounddevice; excluded by default)")
+                    help="include the hardware audio-loopback group (needs the "
+                         "DSPI_LOOPBACK firmware + sounddevice; excluded by default)")
     ap.add_argument("--all", action="store_true",
                     help="run the COMPLETE suite: audio-loopback group + flash tests "
                          "+ factory reset (= --audio --allow-flash --allow-factory-reset)")
@@ -76,9 +76,9 @@ def main(argv=None):
 
     groups = set(g.strip() for g in args.group.split(",")) if args.group else None
     cases = [tc for tc in REGISTRY if (groups is None or tc.group in groups)]
-    # The "audio" hardware-loopback group is opt-in (needs the USBrx rig +
-    # sounddevice): excluded from a default run unless --audio is given or an
-    # explicit --group selection names it.
+    # The "audio" hardware-loopback group is opt-in (needs the DSPI_LOOPBACK
+    # firmware + sounddevice): excluded from a default run unless --audio is given
+    # or an explicit --group selection names it.
     if groups is None and not args.audio:
         cases = [tc for tc in cases if tc.group != "audio"]
 

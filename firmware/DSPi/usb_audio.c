@@ -50,6 +50,7 @@
 #include "vendor_commands.h"
 #include "audio_input.h"
 #include "lg_sound_sync.h"
+#include "loopback.h"   // DSPI_LOOPBACK capture driver (self-guarded; empty otherwise)
 
 #include <stddef.h>  // offsetof
 
@@ -744,8 +745,21 @@ static const usbd_class_driver_t uac1_driver = {
 // here makes TinyUSB dispatch all interface/endpoint events for our AC+AS
 // interfaces through our callbacks.
 usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
+#ifdef DSPI_LOOPBACK
+    // Debug build: register the loopback capture driver alongside the playback
+    // driver.  TinyUSB iterates the returned array, so both driver structs must
+    // be contiguous; loopback_uac1_driver is defined in another TU and is not a
+    // constant initializer, so the array is filled at call time (this runs once
+    // during tud_init() and the static storage outlives the device).
+    static usbd_class_driver_t drivers[2];
+    drivers[0] = uac1_driver;
+    drivers[1] = loopback_uac1_driver;
+    *driver_count = 2;
+    return drivers;
+#else
     *driver_count = 1;
     return &uac1_driver;
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -801,6 +815,13 @@ static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *it
     TU_VERIFY(itf_desc->bInterfaceClass == TUSB_CLASS_AUDIO);
     TU_VERIFY(itf_desc->bInterfaceSubClass == AUDIO_SUBCLASS_CONTROL);
     TU_VERIFY(itf_desc->bAlternateSetting == 0);
+#ifdef DSPI_LOOPBACK
+    // With the loopback capture function present there is a SECOND audio-control
+    // interface (ITF_NUM_LOOPBACK_AC).  Scope this driver to the playback AC
+    // interface so it doesn't claim — and hijack — the capture function; the
+    // loopback driver claims ITF_NUM_LOOPBACK_AC.
+    TU_VERIFY(itf_desc->bInterfaceNumber == ITF_NUM_AUDIO_CONTROL);
+#endif
 
     uac1.ac_itf = itf_desc->bInterfaceNumber;
 

@@ -2,15 +2,22 @@
 audio.py — host-side audio measurement engine for the DSPi loopback rig.
 
 Plays a signal out the DSPi USB audio OUTPUT (host -> DSPi USB input), lets the
-DSP process it, and captures DSPi's S/PDIF output via the Weeb Labs USBrx USB
-audio INPUT, then extracts level / noise / THD and the filter frequency response.
+DSP process it, and captures DSPi's output slot 0 via DSPi's own USB audio INPUT
+(the DSPI_LOOPBACK capture interface), then extracts level / noise / THD and the
+filter frequency response.
+
+The capture is integrated into DSPi itself (the DSPI_LOOPBACK firmware build):
+output slot 0 is tapped after all DSP and streamed back on a USB capture
+endpoint, so no external recorder or S/PDIF wiring is involved. DSPi appears as
+one USB device exposing both an OUTPUT (playback) and an INPUT (capture); macOS
+presents these as two Core Audio entries that share the name "DSPi".
 
 The chain is single-clock: DSPi is the master, host playback is rate-slaved to
-DSPi via the USB Audio feedback endpoint, and USBrx is slaved to DSPi's S/PDIF.
-So the capture is a fixed-latency, bit-exact copy of DSPi's output; the latency
-is recovered by cross-correlation, with no resampling. Because the whole path is
-digital, measurement SNR is ~24-bit (~140 dB), so a single sweep gives a very
-clean transfer function.
+DSPi via the USB Audio feedback endpoint, and the capture is slaved to DSPi's
+output rate. So the capture is a fixed-latency, near bit-exact copy of slot 0;
+the latency is recovered by cross-correlation, with no resampling. Because the
+whole path is digital, measurement SNR is ~24-bit (~140 dB), so a single sweep
+gives a very clean transfer function.
 
 This module is the only place that touches PortAudio. It is import-safe even
 when sounddevice/numpy are missing: the optional deps are probed at call time and
@@ -43,10 +50,14 @@ except Exception:  # scipy optional; fall back to an FFT cross-correlation
     _sp_correlate = None
 
 
-# Default host-device name substrings (case-insensitive). Override via the
-# functions' arguments if your OS names them differently.
+# Default host-device name substrings (case-insensitive). The DSPI_LOOPBACK
+# build exposes capture on the SAME USB device as playback, so both default to
+# "DSPi"; direction filtering (output vs input channels) disambiguates the two
+# Core Audio entries. Override via the functions' arguments if your OS names
+# them differently. (USBRX_IN_NAME kept as a back-compat alias.)
 DSPI_OUT_NAME = "DSPi"
-USBRX_IN_NAME = "USBrx"
+DSPI_IN_NAME = "DSPi"
+USBRX_IN_NAME = DSPI_IN_NAME
 
 DEFAULT_FS = 48000
 PAD_S = 0.10          # leading/trailing silence around an excitation
@@ -83,8 +94,8 @@ def list_devices() -> str:
     return "\n".join(lines)
 
 
-def find_devices(out_name: str = DSPI_OUT_NAME, in_name: str = USBRX_IN_NAME):
-    """Locate the DSPi output and USBrx input by name substring.
+def find_devices(out_name: str = DSPI_OUT_NAME, in_name: str = DSPI_IN_NAME):
+    """Locate the DSPi output and the DSPi capture input by name substring.
 
     Returns (out_index, in_index, info_dict). Raises AudioUnavailable (with the
     available device list) if either is missing, so callers can SKIP.
@@ -267,7 +278,7 @@ def measure_transfer(out_dev, in_dev, in_channel, fs, freqs,
 
     cap = play_record(exc, fs, out_dev, in_dev)
     if cap.shape[0] == 0:
-        raise AudioUnavailable("no audio captured (USBrx delivered no frames)")
+        raise AudioUnavailable("no audio captured (DSPi capture delivered no frames)")
     y = cap[:, in_channel] if cap.ndim > 1 else cap
     seg, strength = align(y, sweep)
 
@@ -297,7 +308,7 @@ def measure_complex_2ch(out_dev, in_dev, fs, freqs, dur_s=1.0, f1=20.0, f2=None,
     pad = np.zeros(int(PAD_S * fs), np.float32)
     cap = play_record(np.concatenate([pad, sweep, pad]), fs, out_dev, in_dev)
     if cap.shape[0] == 0:
-        raise AudioUnavailable("no audio captured (USBrx delivered no frames)")
+        raise AudioUnavailable("no audio captured (DSPi capture delivered no frames)")
     lag, strength = _xcorr_lag(cap[:, 0].astype(np.float64) + cap[:, 1].astype(np.float64), sweep)
     X = np.fft.rfft(sweep)
     fbins = np.fft.rfftfreq(len(sweep), 1.0 / fs)
@@ -324,7 +335,7 @@ def measure_interchannel_lag(out_dev, in_dev, fs, dur_s=0.3, amp=0.4):
     pad = np.zeros(int(PAD_S * fs), np.float32)
     cap = play_record(np.concatenate([pad, sweep, pad]), fs, out_dev, in_dev)
     if cap.shape[0] == 0:
-        raise AudioUnavailable("no audio captured (USBrx delivered no frames)")
+        raise AudioUnavailable("no audio captured (DSPi capture delivered no frames)")
     a = cap[:, 0].astype(np.float64)
     b = cap[:, 1].astype(np.float64)
     if _sp_correlate is not None:
@@ -442,11 +453,11 @@ def _main(argv=None):
                                  description="DSPi loopback audio bring-up tool")
     ap.add_argument("--list", action="store_true", help="enumerate host audio devices")
     ap.add_argument("--probe", action="store_true",
-                    help="play a 1 kHz tone out DSPi, read it back from USBrx")
+                    help="play a 1 kHz tone out DSPi, read it back from DSPi's capture input")
     ap.add_argument("--out-name", default=DSPI_OUT_NAME)
-    ap.add_argument("--in-name", default=USBRX_IN_NAME)
+    ap.add_argument("--in-name", default=DSPI_IN_NAME)
     ap.add_argument("--fs", type=int, default=DEFAULT_FS)
-    ap.add_argument("--channel", type=int, default=0, help="USBrx capture channel (0=L,1=R)")
+    ap.add_argument("--channel", type=int, default=0, help="slot-0 capture channel (0=L,1=R)")
     args = ap.parse_args(argv)
 
     try:
@@ -467,11 +478,11 @@ def _main(argv=None):
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     print(f"\nDSPi output : [{out_i}] {info['out']['name']}")
-    print(f"USBrx input : [{in_i}] {info['in']['name']}")
+    print(f"DSPi capture: [{in_i}] {info['in']['name']}")
     print(f"Sample rate : {args.fs} Hz   capture channel: {args.channel}\n")
 
     print("NOTE: this plays a tone to DSPi but does not configure DSPi routing —")
-    print("      route USB -> the USBrx-connected output first, or use the test suite.\n")
+    print("      route USB -> output slot 0 first, or use the test suite.\n")
 
     level, thd, strength = measure_tone(out_i, in_i, args.channel, args.fs, 1000.0)
     noise = measure_noise(out_i, in_i, args.channel, args.fs)
@@ -479,9 +490,9 @@ def _main(argv=None):
           f"corr {strength:4.2f}")
     print(f"noise floor: {noise:7.2f} dBFS")
     if strength < 0.2:
-        print("\n  ⚠ weak correlation — no signal reaching USBrx. Check cabling, "
-              "DSPi input source (USB), output enable/routing, and that the tone "
-              "is routed to the USBrx-connected slot.")
+        print("\n  ⚠ weak correlation — no signal reaching the DSPi capture. Check "
+              "DSPi input source (USB), output slot 0 enable/routing, and that the "
+              "tone is routed to output slot 0.")
     return 0
 
 

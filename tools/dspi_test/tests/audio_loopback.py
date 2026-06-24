@@ -3,17 +3,20 @@ audio_loopback.py — hardware-in-the-loop output & filter tests (group "audio")
 
 Unlike the rest of the suite (control-plane only), these tests measure real
 audio: a host signal is played out the DSPi USB audio output, processed by the
-DSP, captured back from the Weeb Labs USBrx (wired to DSPi's S/PDIF output as a
-USB audio input), and the measured result is compared against the firmware's
-filter math (tools/filter_tester/compare_filter.py).
+DSP, and captured back from DSPi's own USB capture input (the DSPI_LOOPBACK
+firmware build, which taps output slot 0 after all DSP), and the measured result
+is compared against the firmware's filter math
+(tools/filter_tester/compare_filter.py).
 
 Gating: this group is EXCLUDED from the default run; enable with `--audio`
-(or `--group audio`). It needs the loopback rig plus `sounddevice`+`numpy`+`scipy`
-(`pip install sounddevice numpy scipy`). If the deps or devices are absent the
-tests SKIP (never hard-fail).
+(or `--group audio`). It needs the DSPI_LOOPBACK firmware plus
+`sounddevice`+`numpy`+`scipy` (`pip install sounddevice numpy scipy`). If the
+deps or the capture interface are absent the tests SKIP (never hard-fail).
 
-Routing to the USBrx-connected output slot is auto-probed once per session.
-State is mutated freely; the suite's pre-suite snapshot is restored at the end.
+The capture is hardwired to output slot 0, so the target slot is slot 0; it is
+still auto-probed once per session (the probe empirically confirms which slot
+reaches the capture). State is mutated freely; the suite's pre-suite snapshot is
+restored at the end.
 """
 
 from __future__ import annotations
@@ -135,10 +138,12 @@ def _config_slot(dev, profile, slot, flatten_all=False):
 
 
 def _autoprobe_slot(dev, profile, out_dev, in_dev, fs):
-    """Find which S/PDIF slot the USBrx receives. Each slot is probed in
-    ISOLATION (USB routed to only that slot, all others muted), so only the
-    physically-connected slot shows signal — otherwise an earlier-routed slot
-    keeps carrying audio and every later probe would falsely succeed."""
+    """Find which output slot the DSPi capture receives. With the DSPI_LOOPBACK
+    tap this is always slot 0, but each slot is still probed in ISOLATION (USB
+    routed to only that slot, all others muted) so the result is confirmed
+    empirically: only the slot the capture taps shows signal — otherwise an
+    earlier-routed slot keeps carrying audio and every later probe would falsely
+    succeed."""
     for k in range(profile.num_spdif):     # enable all S/PDIF outputs once
         ol, orr = 2 * k, 2 * k + 1
         dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(0 << 8) | k)
@@ -154,7 +159,7 @@ def _autoprobe_slot(dev, profile, out_dev, in_dev, fs):
         if strength > CORR_MIN and level > best_lvl:
             best, best_lvl = slot, level
     if best is None:
-        raise Skip("no S/PDIF slot reached USBrx — check cabling / output routing")
+        raise Skip("no output slot reached the DSPi capture — check input source (USB) / slot-0 routing")
     return best
 
 
@@ -209,7 +214,7 @@ def _test_freqs(fs):
 
 @test("audio", mutating=True)
 def loopback_integrity(dev, profile, chk):
-    """Flat path: signal reaches USBrx at unity, low noise/THD, near bit-exact."""
+    """Flat path: signal reaches the DSPi capture at unity, low noise/THD, near bit-exact."""
     rig = _get_rig(dev, profile)
     chk.note(f"out='{rig['out_name']}' in='{rig['in_name']}' slot={rig['slot']} "
              f"ch_l={rig['ch_l']} fs={rig['fs']}")
@@ -219,7 +224,7 @@ def loopback_integrity(dev, profile, chk):
     amp = 0.4
     level, thd, strength = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
                                               rig["fs"], 1000.0, amp=amp)
-    chk.ok(strength > CORR_MIN, f"tone reaches USBrx (corr {strength:.2f})")
+    chk.ok(strength > CORR_MIN, f"tone reaches DSPi capture (corr {strength:.2f})")
     exp_level = 20.0 * np.log10(amp / np.sqrt(2.0))
     chk.approx(level, exp_level, 1.0, f"tone level ~{exp_level:.1f} dBFS")
     chk.ok(thd < 0.1, f"THD {thd:.4f}% < 0.1%")
@@ -558,7 +563,7 @@ def output_delay(dev, profile, chk):
 
 # --- Phase 3: alignment / latency stability ---------------------------------
 #
-# A single stereo USBrx captures ONE S/PDIF slot, so this verifies INTRA-slot
+# The DSPi capture taps ONE output slot (slot 0), so this verifies INTRA-slot
 # L/R sample alignment and that it survives the pipeline-reset operations the
 # firmware's "output slot alignment is inviolable" guarantee covers. Full
 # INTER-slot alignment (the 4 S/PDIF + I2S + PDM relative to each other) needs

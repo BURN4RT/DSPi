@@ -60,6 +60,17 @@ if (PICO_PLATFORM STREQUAL "rp2040")
     target_sources(DSPi PRIVATE dsp_process_rp2040.S)
 endif()
 
+# DSPI_LOOPBACK (debug/verification only): fold a USB audio CAPTURE function
+# into DSPi that streams output slot 0 back to the host (replaces the external
+# USBrx recorder).  Configure dedicated build dirs with -DDSPI_LOOPBACK=ON;
+# normal build dirs leave it OFF so release artifacts are unaffected.
+option(DSPI_LOOPBACK "Build the USB audio loopback capture (output slot 0 -> host)" OFF)
+if (DSPI_LOOPBACK)
+    target_sources(DSPi PRIVATE loopback.c loopback.h)
+    set_source_files_properties(loopback.c PROPERTIES COMPILE_FLAGS "-O3")
+    target_compile_definitions(DSPi PRIVATE DSPI_LOOPBACK)
+endif()
+
 if (PICO_PLATFORM STREQUAL "rp2040")
     # RP2040: SPDIF RX on PIO1 SM2 (SM0=PDM; SM1 free since MCK moved to
     # CLK_GPOUT). I2S RX reuses the same SM when SPDIF RX is inactive.

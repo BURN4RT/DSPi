@@ -68,7 +68,16 @@
 #define ITF_NUM_AUDIO_CONTROL   0
 #define ITF_NUM_AUDIO_STREAMING 1
 #define ITF_NUM_VENDOR          2
+#ifdef DSPI_LOOPBACK
+// Loopback capture function (debug build only): a second, self-contained UAC1
+// audio function appended after the vendor interface.  Existing interface
+// numbers 0/1/2 are unchanged so normal-build descriptors are unaffected.
+#define ITF_NUM_LOOPBACK_AC     3   // capture AudioControl
+#define ITF_NUM_LOOPBACK_AS     4   // capture AudioStreaming
+#define ITF_NUM_TOTAL           5
+#else
 #define ITF_NUM_TOTAL           3
+#endif
 
 // ----------------------------------------------------------------------------
 // UAC1 ENTITY IDs
@@ -77,6 +86,29 @@
 #define UAC1_INPUT_TERMINAL_ID   1
 #define UAC1_FEATURE_UNIT_ID     2
 #define UAC1_OUTPUT_TERMINAL_ID  3
+
+// ----------------------------------------------------------------------------
+// LOOPBACK CAPTURE FUNCTION (DSPI_LOOPBACK, debug build only)
+//
+// A second UAC1 audio function exposing output slot 0 as a 2-ch 24-bit
+// isochronous IN (recording) endpoint.  Rates are capped at DSPi's operating
+// range (44.1/48 kHz) which also keeps the RP2040 USB DPRAM budget small.
+// ----------------------------------------------------------------------------
+#ifdef DSPI_LOOPBACK
+#define LOOPBACK_IN_ENDPOINT        0x81U  // isochronous async IN (capture)
+
+#define LOOPBACK_N_CHANNELS         2
+#define LOOPBACK_BYTES_PER_SAMPLE   3      // 24-bit
+#define LOOPBACK_BYTES_PER_FRAME    (LOOPBACK_N_CHANNELS * LOOPBACK_BYTES_PER_SAMPLE)  // 6
+// Servo never emits more than this per USB frame; sizes the iso IN EP buffer.
+// 64 frames @ 48 kHz is comfortable headroom over the ~48-50/frame nominal.
+#define LOOPBACK_MAX_FRAMES_PER_PACKET  64
+#define LOOPBACK_EP_IN_SIZE         (LOOPBACK_MAX_FRAMES_PER_PACKET * LOOPBACK_BYTES_PER_FRAME)  // 384
+
+// Capture-function entity IDs (distinct from the playback function's 1/2/3).
+#define LOOPBACK_INPUT_TERMINAL_ID   4   // internal: output slot 0
+#define LOOPBACK_OUTPUT_TERMINAL_ID  5   // USB streaming
+#endif
 
 // ----------------------------------------------------------------------------
 // UAC1 REQUEST OPCODES (not exposed by TinyUSB — UAC2 constants are UAC2-only)
