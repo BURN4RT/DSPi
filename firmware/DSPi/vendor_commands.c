@@ -606,9 +606,22 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
                     wxp.enabled = pkt.enabled ? 1 : 0;
                     wxp.phase_invert = pkt.phase_invert ? 1 : 0;
                     wxp.gain_db = pkt.gain_db;
-                    uint16_t off = (uint16_t)(offsetof(WireBulkParams, crosspoints)
-                        + ((uint16_t)pkt.input * WIRE_MAX_OUTPUT_CHANNELS + pkt.output)
-                          * sizeof(WireCrosspoint));
+                    // Base inputs 0/1 → WireBulkParams.crosspoints; inputs 2..7
+                    // (RP2350) → the appended WireInputExtConfig tail.
+                    uint16_t off;
+#if PICO_RP2350
+                    if (pkt.input >= WIRE_MAX_INPUT_CHANNELS) {
+                        uint16_t e = (uint16_t)pkt.input - WIRE_MAX_INPUT_CHANNELS;
+                        off = (uint16_t)(offsetof(WireBulkParams, input_ext.crosspoints)
+                            + ((uint16_t)(e * WIRE_MAX_OUTPUT_CHANNELS + pkt.output))
+                              * sizeof(WireCrosspoint));
+                    } else
+#endif
+                    {
+                        off = (uint16_t)(offsetof(WireBulkParams, crosspoints)
+                            + ((uint16_t)pkt.input * WIRE_MAX_OUTPUT_CHANNELS + pkt.output)
+                              * sizeof(WireCrosspoint));
+                    }
                     notify_param_write(off, sizeof(WireCrosspoint), &wxp);
                 }
             }

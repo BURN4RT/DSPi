@@ -95,7 +95,19 @@
 //   V19: First-order shelf PEQ types added (FILTER_LOWSHELF1=9,
 //        FILTER_HIGHSHELF1=10). New enum values only; no struct change, no
 //        renumber, no migration — same on-disk size as V17/V18.
-#define SLOT_DATA_VERSION       19
+//   V20: RP2350 8-channel USB input — matrix crosspoints + preamp for input
+//        channels 2..7 appended (matrix_crosspoints_ext, preamp_db_ext) as a
+//        tail section.  Pre-V20 slots predate it and load with inputs 2..7
+//        defaulted (disabled / 0 dB); the per-version CRC range mechanism
+//        handles the size difference.  On RP2040 the ext section is compiled
+//        out, so a V20 slot is byte-identical to V19 (a bare version-tag bump).
+#define SLOT_DATA_VERSION       20
+
+// Input channels stored INLINE in the base slot layout (USB L/R).  Inputs 2..7
+// (RP2350 8-channel USB) live in the appended V20 ext section so the base
+// layout — and every field after it — keeps a stable on-disk offset.  This is
+// deliberately decoupled from NUM_INPUT_CHANNELS (which is 8 on RP2350).
+#define SLOT_BASE_INPUT_CHANNELS  2
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -265,8 +277,8 @@ typedef struct __attribute__((packed)) {
     uint8_t padding4;
     float crossfeed_custom_fc;
     float crossfeed_custom_feed_db;
-    // Matrix mixer (V5)
-    FlashMatrixCrosspoint matrix_crosspoints[NUM_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
+    // Matrix mixer (V5) — base inputs 0/1 only; inputs 2..7 in the V20 ext tail.
+    FlashMatrixCrosspoint matrix_crosspoints[SLOT_BASE_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
     FlashOutputChannel matrix_outputs[NUM_OUTPUT_CHANNELS];
     // Pin configuration (V6) — always stored, conditionally loaded
     uint8_t output_pins[NUM_PIN_OUTPUTS];
@@ -287,8 +299,9 @@ typedef struct __attribute__((packed)) {
     float   leveller_amount;
     float   leveller_max_gain_db;
     float   leveller_gate_threshold_db;
-    // Per-channel preamp + Master volume (V12)
-    float   preamp_db_per_ch[NUM_INPUT_CHANNELS];  // Per-input-channel preamp (dB)
+    // Per-channel preamp + Master volume (V12) — base inputs 0/1 only;
+    // inputs 2..7 preamp lives in the V20 ext tail (preamp_db_ext).
+    float   preamp_db_per_ch[SLOT_BASE_INPUT_CHANNELS];  // Per-input-channel preamp (dB)
     float   master_volume_db;                       // Device master volume (-128 mute, -127..0 dB)
     // Input source selection (V13) + SPDIF RX pin
     //
@@ -344,7 +357,31 @@ typedef struct __attribute__((packed)) {
     // missing-field case never decodes a bogus 44.1 kHz from a zero byte.
     uint8_t i2s_rx_pin;
     uint8_t i2s_input_rate;
+
+#if PICO_RP2350
+    // Extended input channels (V20+): matrix crosspoints + preamp for inputs
+    // 2..7 (RP2350 8-channel USB input).  Appended tail so the base layout and
+    // every preceding field keep a stable offset; pre-V20 slots lack this
+    // section and load with inputs 2..7 defaulted (disabled / 0 dB), gated on
+    // version >= 20 in apply_slot_to_live().  Compiled out on RP2040, so its
+    // PresetSlot stays byte-identical to V19.
+    FlashMatrixCrosspoint matrix_crosspoints_ext[NUM_INPUT_CHANNELS - SLOT_BASE_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
+    float                 preamp_db_ext[NUM_INPUT_CHANNELS - SLOT_BASE_INPUT_CHANNELS];
+#endif
 } PresetSlot;
+
+// V20 ext section size (0 on RP2040 where it is compiled out).
+#if PICO_RP2350
+#define SLOT_EXT_INPUT_BYTES \
+    (sizeof(((PresetSlot *)0)->matrix_crosspoints_ext) + \
+     sizeof(((PresetSlot *)0)->preamp_db_ext))
+#else
+#define SLOT_EXT_INPUT_BYTES  0
+#endif
+
+// The whole slot (including the V20 ext tail) must fit one flash sector.
+_Static_assert(sizeof(PresetSlot) <= FLASH_SECTOR_SIZE,
+               "PresetSlot must fit within a single flash sector");
 
 // --- Legacy single-sector format (for migration) ---
 typedef struct __attribute__((packed)) {
@@ -370,7 +407,7 @@ typedef struct __attribute__((packed)) {
     uint8_t padding4;
     float crossfeed_custom_fc;
     float crossfeed_custom_feed_db;
-    FlashMatrixCrosspoint matrix_crosspoints[NUM_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
+    FlashMatrixCrosspoint matrix_crosspoints[SLOT_BASE_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
     FlashOutputChannel matrix_outputs[NUM_OUTPUT_CHANNELS];
     uint8_t output_pins[NUM_PIN_OUTPUTS];
     uint8_t pin_padding[8 - NUM_PIN_OUTPUTS];
@@ -960,14 +997,26 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->crossfeed_custom_fc = crossfeed_config.custom_fc;
     slot->crossfeed_custom_feed_db = crossfeed_config.custom_feed_db;
 
-    // Matrix mixer
-    for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
+    // Matrix mixer — inputs 0/1 inline (base), inputs 2..7 in the V20 ext tail.
+    for (int in = 0; in < NUM_INPUT_CHANNELS && in < SLOT_BASE_INPUT_CHANNELS; in++) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             slot->matrix_crosspoints[in][out].enabled = matrix_mixer.crosspoints[in][out].enabled;
             slot->matrix_crosspoints[in][out].phase_invert = matrix_mixer.crosspoints[in][out].phase_invert;
             slot->matrix_crosspoints[in][out].gain_db = matrix_mixer.crosspoints[in][out].gain_db;
         }
     }
+#if PICO_RP2350
+    // Inputs 2..7: matrix crosspoints + preamp into the V20 ext tail.
+    for (int in = SLOT_BASE_INPUT_CHANNELS; in < NUM_INPUT_CHANNELS; in++) {
+        int e = in - SLOT_BASE_INPUT_CHANNELS;
+        for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
+            slot->matrix_crosspoints_ext[e][out].enabled = matrix_mixer.crosspoints[in][out].enabled;
+            slot->matrix_crosspoints_ext[e][out].phase_invert = matrix_mixer.crosspoints[in][out].phase_invert;
+            slot->matrix_crosspoints_ext[e][out].gain_db = matrix_mixer.crosspoints[in][out].gain_db;
+        }
+        slot->preamp_db_ext[e] = global_preamp_db[in];
+    }
+#endif
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
         slot->matrix_outputs[out].enabled = matrix_mixer.outputs[out].enabled;
         slot->matrix_outputs[out].mute = matrix_mixer.outputs[out].mute;
@@ -1011,8 +1060,10 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->leveller_max_gain_db = leveller_config.max_gain_db;
     slot->leveller_gate_threshold_db = leveller_config.gate_threshold_db;
 
-    // Per-channel preamp + Master volume (V12)
-    for (int i = 0; i < NUM_INPUT_CHANNELS; i++)
+    // Per-channel preamp + Master volume (V12) — base inputs 0/1 inline;
+    // inputs 2..7 preamp goes to the V20 ext tail (filled with the matrix ext
+    // above).
+    for (int i = 0; i < NUM_INPUT_CHANNELS && i < SLOT_BASE_INPUT_CHANNELS; i++)
         slot->preamp_db_per_ch[i] = global_preamp_db[i];
     slot->master_volume_db = master_volume_db;
 
@@ -1135,16 +1186,17 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         }
     }
 
-    // Preamp — V12+ has per-channel values, older versions use single legacy field
+    // Preamp — V12+ has per-channel values (base inputs 0/1), older versions
+    // use a single legacy field.  Inputs 2..7 come from the V20 ext tail below.
     if (slot->version >= 12) {
-        for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+        for (int i = 0; i < NUM_INPUT_CHANNELS && i < SLOT_BASE_INPUT_CHANNELS; i++) {
             global_preamp_db[i] = slot->preamp_db_per_ch[i];
             float linear = db_to_linear(slot->preamp_db_per_ch[i]);
             global_preamp_mul[i] = (int32_t)(linear * (float)(1 << 28));
             global_preamp_linear[i] = linear;
         }
     } else {
-        // Legacy: apply single preamp_db to all channels
+        // Legacy: apply single preamp_db to all channels (live array is [8])
         for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
             global_preamp_db[i] = slot->preamp_db;
             float linear = db_to_linear(slot->preamp_db);
@@ -1184,8 +1236,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     crossfeed_config.custom_feed_db = slot->crossfeed_custom_feed_db;
     crossfeed_update_pending = true;
 
-    // Matrix mixer
-    for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
+    // Matrix mixer — base inputs 0/1.
+    for (int in = 0; in < NUM_INPUT_CHANNELS && in < SLOT_BASE_INPUT_CHANNELS; in++) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             matrix_mixer.crosspoints[in][out].enabled = slot->matrix_crosspoints[in][out].enabled;
             matrix_mixer.crosspoints[in][out].phase_invert = slot->matrix_crosspoints[in][out].phase_invert;
@@ -1193,6 +1245,36 @@ static void apply_slot_to_live(const PresetSlot *slot) {
             matrix_mixer.crosspoints[in][out].gain_linear = db_to_linear(slot->matrix_crosspoints[in][out].gain_db);
         }
     }
+#if PICO_RP2350
+    // Inputs 2..7: from the V20 ext tail if present, else defaulted to
+    // disabled / 0 dB so loading an older preset can't leave stale 8-channel
+    // routing behind.  matrix_crosspoints_ext / preamp_db_ext are only read
+    // when have_ext (the bytes are valid).
+    {
+        bool have_ext = (slot->version >= 20);
+        for (int in = SLOT_BASE_INPUT_CHANNELS; in < NUM_INPUT_CHANNELS; in++) {
+            int e = in - SLOT_BASE_INPUT_CHANNELS;
+            for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
+                uint8_t en = 0, pol = 0;
+                float gdb = 0.0f;
+                if (have_ext) {
+                    en  = slot->matrix_crosspoints_ext[e][out].enabled;
+                    pol = slot->matrix_crosspoints_ext[e][out].phase_invert;
+                    gdb = slot->matrix_crosspoints_ext[e][out].gain_db;
+                }
+                matrix_mixer.crosspoints[in][out].enabled = en;
+                matrix_mixer.crosspoints[in][out].phase_invert = pol;
+                matrix_mixer.crosspoints[in][out].gain_db = gdb;
+                matrix_mixer.crosspoints[in][out].gain_linear = db_to_linear(gdb);
+            }
+            float db = have_ext ? slot->preamp_db_ext[e] : 0.0f;
+            float linear = db_to_linear(db);
+            global_preamp_db[in]     = db;
+            global_preamp_mul[in]    = (int32_t)(linear * (float)(1 << 28));
+            global_preamp_linear[in] = linear;
+        }
+    }
+#endif
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
         matrix_mixer.outputs[out].enabled = slot->matrix_outputs[out].enabled;
         matrix_mixer.outputs[out].mute = slot->matrix_outputs[out].mute;
@@ -1330,8 +1412,12 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // Per-version data section lengths.  Fields are only ever appended, so each
 // older version's size is the next version's size minus its appended tail
 // (see comment on SLOT_DATA_VERSION above).
-#define SLOT_DATA_SIZE_V17 \
+#define SLOT_DATA_SIZE_V20 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
+
+// V17/18/19 predate the V20 ext input section (matrix + preamp for inputs
+// 2..7).  On RP2040 SLOT_EXT_INPUT_BYTES == 0, so V20 == V17 there.
+#define SLOT_DATA_SIZE_V17  (SLOT_DATA_SIZE_V20 - SLOT_EXT_INPUT_BYTES)
 
 // V16 predates the 2 appended I2S input bytes.
 #define SLOT_DATA_SIZE_V16  (SLOT_DATA_SIZE_V17 - 2)
@@ -1362,6 +1448,10 @@ static size_t slot_data_size_for_version(uint8_t version) {
             // enum values.  On-disk layout (and CRC byte range) is identical
             // to V17 in all three.
             return SLOT_DATA_SIZE_V17;
+        case 20:
+            // V20 appends the ext input section (RP2350; zero-size on RP2040,
+            // so V20 == V17 there).
+            return SLOT_DATA_SIZE_V20;
         default:
             return 0;
     }
@@ -1743,8 +1833,10 @@ static bool migrate_legacy(void) {
 
     // V12: per-channel preamp + master volume.  Pre-V12 behavior applied
     // slot->preamp_db (the legacy single value) to every input channel —
-    // replicate that here so V12 apply gates see consistent values.
-    for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+    // replicate that here so V12 apply gates see consistent values.  Only the
+    // base inputs 0/1 are stored inline; the V20 ext preamp (inputs 2..7) is
+    // already 0 dB from the slot_buf memset, which is the correct default.
+    for (int i = 0; i < SLOT_BASE_INPUT_CHANNELS; i++) {
         slot_buf.preamp_db_per_ch[i] = slot_buf.preamp_db;
     }
     // Master volume slot field is dormant when the directory is in

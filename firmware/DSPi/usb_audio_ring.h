@@ -31,10 +31,18 @@
 #define USB_RING_SLOTS      4
 #define USB_RING_SLOT_MASK  (USB_RING_SLOTS - 1)
 
-// Maximum payload per slot.  Must accommodate the largest possible USB
-// audio packet: (96kHz/1000 + 1) * 2ch * 3bytes = 582 bytes.
-// The +1 accounts for feedback jitter (host may send 97 samples per frame).
+// Maximum payload per slot.  Must accommodate the largest possible USB audio
+// packet, i.e. be >= AUDIO_EP_MAX_PKT (usb_descriptors.h) since the iso OUT EP
+// is armed for that many bytes.
+//   RP2040 (stereo only): (96kHz/1000 + 1) * 2ch * 3B = 582.
+//   RP2350 (+ 8-channel alt): (48kHz/1000 + 1) * 8ch * 2B = 784, rounded to 788.
+// The +1 frame accounts for feedback jitter.  Kept in lockstep with
+// AUDIO_EP_MAX_PKT (which is platform-conditional for the same reason).
+#if PICO_RP2350
+#define USB_RING_MAX_PKT    788
+#else
 #define USB_RING_MAX_PKT    582
+#endif
 
 // ---------------------------------------------------------------------------
 // Slot and ring structures

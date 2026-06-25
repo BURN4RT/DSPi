@@ -30,7 +30,9 @@
 // Bump on descriptor-affecting changes so Windows re-reads instead of using
 // its cached descriptor.  0x0200 → 0x0201 for notification EP max-packet
 // bump (8 → 64 bytes) introduced with the v2 notification protocol.
-#define USB_BCD_DEVICE  0x0201
+// 0x0201 → 0x0202 for the RP2350 8-channel input alt (alt 3) + widened input
+// terminal/feature unit + larger iso OUT max-packet.
+#define USB_BCD_DEVICE  0x0202
 
 // ----------------------------------------------------------------------------
 // ENDPOINT ADDRESSES
@@ -38,7 +40,16 @@
 
 #define AUDIO_OUT_ENDPOINT  0x01U
 #define AUDIO_IN_ENDPOINT   0x82U
+#if PICO_RP2350
+// RP2350 also serves an 8-channel/48 kHz/16-bit alt (3): 48 frames × 8 ch ×
+// 2 B = 768 B, + 1 jitter frame (16 B) = 784, rounded up to a 4-byte-aligned
+// 788.  This single value sizes the iso OUT EP for all alts (the EP buffer is
+// allocated once at the max), the receive scratch buffer, and the USB ring
+// slot.  Comfortably under the 1023-byte full-speed isochronous ceiling.
+#define AUDIO_EP_MAX_PKT    788U
+#else
 #define AUDIO_EP_MAX_PKT    582U   // Sized for 24-bit stereo 96 kHz + 1 jitter sample
+#endif
 
 // Bulk IN endpoint on the vendor interface — device→host notifications
 // (master volume changes, future knob events, etc.).
@@ -146,9 +157,9 @@ extern const uint16_t usb_config_descriptor_len;
 // Alt-setting endpoint descriptor pointers — resolved at link time so the
 // UAC1 class driver can call usbd_edpt_iso_activate() without re-walking the
 // config on every SET_INTERFACE.  Indexed [alt-1]: [0] = alt 1 (16-bit),
-// [1] = alt 2 (24-bit).
-extern const uint8_t *const usb_audio_data_ep_desc[2];
-extern const uint8_t *const usb_audio_fb_ep_desc[2];
+// [1] = alt 2 (24-bit), and on RP2350 [2] = alt 3 (8-channel 16-bit).
+extern const uint8_t *const usb_audio_data_ep_desc[];
+extern const uint8_t *const usb_audio_fb_ep_desc[];
 
 // MS OS 2.0 descriptor set (178 bytes).  Returned to the host on a vendor
 // SETUP request bRequest=MS_VENDOR_CODE wIndex=7 to advertise WinUSB binding

@@ -501,7 +501,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     for (int slot = 0; slot < NUM_SPDIF_INSTANCES; slot++) {
         if (current_types[slot] == target_types[slot]) continue;
         for (int side = 0; side < 2; side++) {
-            int ch = NUM_INPUT_CHANNELS + slot * 2 + side;
+            int ch = NUM_MASTER_CHANNELS + slot * 2 + side;
             char old_default[PRESET_NAME_LEN];
             char new_default[PRESET_NAME_LEN];
             get_default_channel_name(ch, active_input_source, current_types, old_default);
@@ -2368,7 +2368,7 @@ int main(void) {
                 // persisted on REQ_PRESET_SAVE.
                 {
                     extern uint8_t output_types[];
-                    for (int ch = 0; ch < NUM_INPUT_CHANNELS; ch++) {
+                    for (int ch = 0; ch < NUM_MASTER_CHANNELS; ch++) {
                         char old_default[PRESET_NAME_LEN];
                         char new_default[PRESET_NAME_LEN];
                         get_default_channel_name(ch, old_source, output_types, old_default);

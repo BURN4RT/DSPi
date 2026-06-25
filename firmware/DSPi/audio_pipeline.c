@@ -60,6 +60,18 @@ int32_t buf_out[NUM_OUTPUT_CHANNELS][192];
 // Shared input buffers — file scope for pipeline access
 #if PICO_RP2350
 float buf_l[192], buf_r[192];
+// Extra USB input channels 2..7 for the 8-channel USB input mode.  See
+// audio_pipeline.h: written only by the 8ch deinterleave, read by the matrix
+// only when 8-channel USB is the active source.
+float buf_in_ext[NUM_INPUT_CHANNELS - NUM_MASTER_CHANNELS][192];
+// Per-input buffer pointer table so the generalized matrix can index input
+// channel k uniformly (0/1 -> buf_l/buf_r, 2..7 -> buf_in_ext).  Address
+// constants of file-scope arrays -> valid static initializer.
+float *const input_bufs[NUM_INPUT_CHANNELS] = {
+    buf_l, buf_r,
+    buf_in_ext[0], buf_in_ext[1], buf_in_ext[2],
+    buf_in_ext[3], buf_in_ext[4], buf_in_ext[5],
+};
 #else
 int32_t buf_l[192], buf_r[192];
 #endif
@@ -256,6 +268,18 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
     bool is_bypassed = bypass_master_eq;
 
+    // 8-channel USB input mode: inputs 0..NUM_INPUT_CHANNELS-1 each carry
+    // independent audio straight into the matrix, so the inherently-stereo
+    // master chain (loudness, Master EQ, leveller, crossfeed, master-peak
+    // metering) is bypassed.  Every other source (stereo USB, S/PDIF, I2S)
+    // keeps the full stereo chain and routes only inputs 0/1.  n_active_inputs
+    // gates the matrix's input iteration so buf_in_ext (inputs 2..7) is read
+    // ONLY in true 8-channel mode — stale samples can never leak into stereo,
+    // S/PDIF, or I2S output.
+    bool eight_ch = (active_input_source == INPUT_SOURCE_USB &&
+                     usb_input_channels > NUM_MASTER_CHANNELS);
+    int n_active_inputs = eight_ch ? NUM_INPUT_CHANNELS : NUM_MASTER_CHANNELS;
+
     // Snapshot loudness state for this packet
     bool loud_on = loudness_enabled;
     const LoudnessCoeffs *loud_coeffs = current_loudness_coeffs;
@@ -265,8 +289,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // Pre-compute PDM scale factor
     const float pdm_scale = (float)(1 << 28);
 
-    // Loudness compensation (SVF shelf filters)
-    if (loud_on && loud_coeffs) {
+    // Loudness compensation (SVF shelf filters); stereo-only, skip in 8ch mode
+    if (!eight_ch && loud_on && loud_coeffs) {
         for (uint32_t i = 0; i < sample_count; i++) {
             float raw_left = buf_l[i];
             float raw_right = buf_r[i];
@@ -298,7 +322,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     }
 
     // ========== PASS 2: Master EQ (Block-Based) ==========
-    if (!is_bypassed) {
+    if (!eight_ch && !is_bypassed) {
         if (!channel_bypassed[CH_MASTER_LEFT]) {
             dsp_process_channel_block(filters[CH_MASTER_LEFT], buf_l, sample_count, CH_MASTER_LEFT);
         }
@@ -308,53 +332,74 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     }
 
     // ========== PASS 2.5: Volume Leveller ==========
-    if (!leveller_bypassed) {
+    if (!eight_ch && !leveller_bypassed) {
         leveller_process_block(&leveller_state, &leveller_coeffs,
                                (const LevellerConfig *)&leveller_config,
                                buf_l, buf_r, sample_count);
     }
 
     // ========== PASS 3: Crossfeed + Master Peaks ==========
-    bool do_crossfeed = !crossfeed_bypassed;
+    // Stereo-only; in 8-channel mode the inputs go straight to the matrix and
+    // master-peak metering is not reported (documented limitation).
+    if (!eight_ch) {
+        bool do_crossfeed = !crossfeed_bypassed;
 
-    // Crossfeed is sample-by-sample (internal state), combined with peak tracking
-    for (uint32_t i = 0; i < sample_count; i++) {
-        float ml = buf_l[i], mr = buf_r[i];
-        float abs_ml = fabsf(ml); if (abs_ml > peak_ml) peak_ml = abs_ml;
-        float abs_mr = fabsf(mr); if (abs_mr > peak_mr) peak_mr = abs_mr;
-        if (do_crossfeed) {
-            crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
-            buf_l[i] = ml; buf_r[i] = mr;
+        // Crossfeed is sample-by-sample (internal state), combined with peak tracking
+        for (uint32_t i = 0; i < sample_count; i++) {
+            float ml = buf_l[i], mr = buf_r[i];
+            float abs_ml = fabsf(ml); if (abs_ml > peak_ml) peak_ml = abs_ml;
+            float abs_mr = fabsf(mr); if (abs_mr > peak_mr) peak_mr = abs_mr;
+            if (do_crossfeed) {
+                crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
+                buf_l[i] = ml; buf_r[i] = mr;
+            }
         }
     }
 
     // ========== PASS 4: Matrix Mixing (block-based, output-major) ==========
-    // Snapshot crosspoint coefficients and process one output at a time
+    // Generalized over n_active_inputs (NUM_MASTER_CHANNELS for stereo / S/PDIF
+    // / I2S, NUM_INPUT_CHANNELS for 8-channel USB).  For each output, snapshot
+    // the active (input buffer, signed gain) pairs ONCE — then run the sample
+    // loop.  Inputs are gated by n_active_inputs, not by crosspoint enables, so
+    // buf_in_ext (inputs 2..7) is read only in true 8-channel mode.  Every
+    // output uses the same sample_count and per-sample index, so inter-output
+    // sample alignment is preserved exactly (CLAUDE.md hard rule).
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
+        float *dst = buf_out[out];
         if (!matrix_mixer.outputs[out].enabled) {
-            memset(buf_out[out], 0, sample_count * sizeof(float));
+            memset(dst, 0, sample_count * sizeof(float));
             continue;
         }
 
-        // Load crosspoint config once per output (not per sample)
-        float gain_l = 0.0f, gain_r = 0.0f;
-        MatrixCrosspoint *xp_l = &matrix_mixer.crosspoints[0][out];
-        MatrixCrosspoint *xp_r = &matrix_mixer.crosspoints[1][out];
-        if (xp_l->enabled) gain_l = xp_l->phase_invert ? -xp_l->gain_linear : xp_l->gain_linear;
-        if (xp_r->enabled) gain_r = xp_r->phase_invert ? -xp_r->gain_linear : xp_r->gain_linear;
+        // Snapshot active crosspoints for this output (once, not per sample)
+        const float *src[NUM_INPUT_CHANNELS];
+        float        gain[NUM_INPUT_CHANNELS];
+        int n = 0;
+        for (int in = 0; in < n_active_inputs; in++) {
+            MatrixCrosspoint *xp = &matrix_mixer.crosspoints[in][out];
+            if (!xp->enabled) continue;
+            float g = xp->phase_invert ? -xp->gain_linear : xp->gain_linear;
+            if (g == 0.0f) continue;
+            src[n]  = input_bufs[in];
+            gain[n] = g;
+            n++;
+        }
 
-        float *dst = buf_out[out];
-        if (gain_l != 0.0f && gain_r != 0.0f) {
-            for (uint32_t i = 0; i < sample_count; i++)
-                dst[i] = buf_l[i] * gain_l + buf_r[i] * gain_r;
-        } else if (gain_l != 0.0f) {
-            for (uint32_t i = 0; i < sample_count; i++)
-                dst[i] = buf_l[i] * gain_l;
-        } else if (gain_r != 0.0f) {
-            for (uint32_t i = 0; i < sample_count; i++)
-                dst[i] = buf_r[i] * gain_r;
-        } else {
+        if (n == 0) {
             memset(dst, 0, sample_count * sizeof(float));
+            continue;
+        }
+
+        // First active input writes; remaining inputs accumulate.
+        const float *s0 = src[0];
+        float g0 = gain[0];
+        for (uint32_t i = 0; i < sample_count; i++)
+            dst[i] = s0[i] * g0;
+        for (int k = 1; k < n; k++) {
+            const float *sk = src[k];
+            float gk = gain[k];
+            for (uint32_t i = 0; i < sample_count; i++)
+                dst[i] += sk[i] * gk;
         }
     }
 

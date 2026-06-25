@@ -99,11 +99,60 @@ static const tusb_desc_device_t device_descriptor = {
 // 200  Std interrupt EP IN 0x83 (notifications, 4 ms)  (7 bytes)
 // 207  total
 //
+// The offsets above are the RP2040 (stereo-only) layout.  On RP2350 the
+// Feature Unit grows by 6 bytes (8 logical channels instead of 2) and an
+// 8-channel AS alt 3 block (52 bytes) is inserted before the vendor
+// interface, so every offset from the Feature Unit onward shifts; the
+// OFFSET_ALT*_* / CONFIG_TOTAL_LEN macros compute the correct values per
+// platform and the _Static_assert below verifies the byte count.  RP2350
+// total = 265 (+58).
+//
 // The vendor interface sits OUTSIDE the AC+AS IAD — it is its own USB
 // function.  TinyUSB's process_set_config() will call our driver's open()
 // a second time with this interface descriptor; we claim it, open the
 // notification EP, and handle all class/vendor requests in control_xfer_cb().
 // ----------------------------------------------------------------------------
+
+// ---- UAC1 input-channel configuration (platform-dependent) --------------
+// RP2350 advertises an 8-channel input alt (3) in addition to the stereo alts
+// (1/2); RP2040 is stereo-only.  The Input Terminal and Feature Unit declare
+// the channel SUPERSET so a host that keys its channel count off the terminal
+// exposes all formats (see Documentation/Features/usb_8ch_input_spec.md for
+// the host-compatibility note).  The Input Terminal descriptor itself is a
+// fixed 12 bytes regardless of channel count; only the Feature Unit grows
+// (one bmaControls byte per logical channel).
+#if PICO_RP2350
+#define UAC1_IN_CHANNELS     8
+#define UAC1_CHANNEL_CONFIG  0x063F   // 7.1: FL FR FC LFE BL BR SL SR
+#else
+#define UAC1_IN_CHANNELS     2
+#define UAC1_CHANNEL_CONFIG  0x0003   // FRONT_LEFT | FRONT_RIGHT
+#endif
+
+// Feature Unit length = 7 fixed bytes + bControlSize(1) × (1 master + N ch).
+#define UAC1_FU_LEN      (7 + (1 + UAC1_IN_CHANNELS))
+// CS AC total = header(9) + input terminal(12) + feature unit + output(9).
+#define AC_CS_TOTAL_LEN  (9 + 12 + UAC1_FU_LEN + 9)
+
+// One stereo AS alt block (3 discrete rates) = std(9) + general(7)
+// + format-type-I(17) + iso OUT(9) + CS iso(7) + iso feedback(9) = 58.
+#define AS_STEREO_ALT_LEN  (9 + 7 + 17 + 9 + 7 + 9)
+#if PICO_RP2350
+// 8-channel alt (3): format-type-I carries a single rate so it is 11 bytes
+// (8 + 1×3) instead of 17.  Block = std(9)+general(7)+fmt(11)+OUT(9)+CS(7)+FB(9).
+#define AS_ALT3_LEN        (9 + 7 + 11 + 9 + 7 + 9)
+#else
+#define AS_ALT3_LEN        0
+#endif
+
+// Base config length (everything except the optional loopback function):
+//   config(9) + IAD(8) + AC std(9) + AC CS header(9) + input(12) + FU
+//   + output(9) + AS alt0(9) + 2×stereo-alt + alt3 + vendor(9) + notify(7).
+#define CONFIG_BASE_LEN  (9 + 8 + 9 + 9 + 12 + UAC1_FU_LEN + 9 \
+                          + 9 \
+                          + 2 * AS_STEREO_ALT_LEN \
+                          + AS_ALT3_LEN \
+                          + 9 + 7)
 
 #ifdef DSPI_LOOPBACK
 // Loopback capture function appended at the end of the array (debug build):
@@ -111,17 +160,25 @@ static const tusb_desc_device_t device_descriptor = {
 //   + AS std alt0(9) + AS std alt1(9) + AS CS general(7) + format type I(14)
 //   + iso IN EP(9) + CS iso EP(7) = 102 bytes.
 #define LOOPBACK_DESC_LEN 102
-#define CONFIG_TOTAL_LEN  (207 + LOOPBACK_DESC_LEN)
+#define CONFIG_TOTAL_LEN  (CONFIG_BASE_LEN + LOOPBACK_DESC_LEN)
 #else
-#define CONFIG_TOTAL_LEN 207
+#define CONFIG_TOTAL_LEN  CONFIG_BASE_LEN
 #endif
-#define AC_CS_TOTAL_LEN  40   // CS AC: header(9) + input(12) + FU(10) + output(9)
 
-#define OFFSET_ALT1_DATA_EP 108
-#define OFFSET_ALT1_FB_EP   124
-#define OFFSET_ALT2_DATA_EP 166
-#define OFFSET_ALT2_FB_EP   182
-#define OFFSET_NOTIFY_EP    200   // Std interrupt EP descriptor, 7 bytes
+// Per-alt EP descriptor offsets, computed so they self-adjust to UAC1_FU_LEN
+// and the optional alt3 block.  The _Static_assert on the array byte count
+// (below) catches any arithmetic slip at compile time.
+#define OFFSET_AS_ALT1      (9 + 8 + 9 + 9 + 12 + UAC1_FU_LEN + 9 + 9)  // after AS alt0
+#define OFFSET_ALT1_DATA_EP (OFFSET_AS_ALT1 + 9 + 7 + 17)
+#define OFFSET_ALT1_FB_EP   (OFFSET_ALT1_DATA_EP + 9 + 7)
+#define OFFSET_AS_ALT2      (OFFSET_AS_ALT1 + AS_STEREO_ALT_LEN)
+#define OFFSET_ALT2_DATA_EP (OFFSET_AS_ALT2 + 9 + 7 + 17)
+#define OFFSET_ALT2_FB_EP   (OFFSET_ALT2_DATA_EP + 9 + 7)
+#if PICO_RP2350
+#define OFFSET_AS_ALT3      (OFFSET_AS_ALT2 + AS_STEREO_ALT_LEN)
+#define OFFSET_ALT3_DATA_EP (OFFSET_AS_ALT3 + 9 + 7 + 11)
+#define OFFSET_ALT3_FB_EP   (OFFSET_ALT3_DATA_EP + 9 + 7)
+#endif
 
 // Sample rate little-endian expansion
 #define RATE_LE(r) ((r) & 0xFF), (((r) >> 8) & 0xFF), (((r) >> 16) & 0xFF)
@@ -176,21 +233,25 @@ const uint8_t usb_config_descriptor[] = {
     UAC1_INPUT_TERMINAL_ID,             // bTerminalID
     U16_TO_U8S_LE(AUDIO_TERM_TYPE_USB_STREAMING),  // wTerminalType (0x0101)
     0x00,                               // bAssocTerminal
-    0x02,                               // bNrChannels
-    U16_TO_U8S_LE(0x0003),              // wChannelConfig (L|R)
+    UAC1_IN_CHANNELS,                   // bNrChannels (8 on RP2350, else 2)
+    U16_TO_U8S_LE(UAC1_CHANNEL_CONFIG), // wChannelConfig (7.1 on RP2350, else L|R)
     0x00,                               // iChannelNames
     0x00,                               // iTerminal
 
-    // --- 47: AC CS feature unit (ID 2, master mute+volume, 2 logical ch) -
-    10,                                 // bLength (7 + (2+1)*1)
+    // --- 47: AC CS feature unit (ID 2, master mute+volume) --------------
+    // bmaControls = 1 master entry + one per logical channel (UAC1_IN_CHANNELS);
+    // per-channel controls are all 0 (none).  bLength tracks UAC1_FU_LEN.
+    UAC1_FU_LEN,                        // bLength (7 + 1 master + N channels)
     TUSB_DESC_CS_INTERFACE,             // bDescriptorType
     AUDIO_CS_AC_INTERFACE_FEATURE_UNIT, // bDescriptorSubtype (0x06)
     UAC1_FEATURE_UNIT_ID,               // bUnitID
     UAC1_INPUT_TERMINAL_ID,             // bSourceID
     0x01,                               // bControlSize
     0x03,                               // bmaControls[0] master: MUTE|VOLUME
-    0x00,                               // bmaControls[1] ch 1
-    0x00,                               // bmaControls[2] ch 2
+    0x00, 0x00,                         // bmaControls ch 1, ch 2
+#if PICO_RP2350
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // bmaControls ch 3..8 (8-channel mode)
+#endif
     0x00,                               // iFeature
 
     // --- 57: AC CS output terminal (ID 3, speaker) -----------------------
@@ -334,6 +395,73 @@ const uint8_t usb_config_descriptor[] = {
     0x02,
     0x00,
 
+#if PICO_RP2350
+    // ====================================================================
+    // AS alt 3 — 8-channel / 48 kHz / 16-bit (RP2350 only).  Same OUT/feedback
+    // EP addresses as alts 1/2 (the EP buffer is allocated once at the max
+    // packet size); links to Input Terminal ID 1.  Offsets are computed by the
+    // OFFSET_ALT3_* macros above.
+    // ====================================================================
+
+    // --- AS std interface alt 3 -----------------------------------------
+    9,
+    TUSB_DESC_INTERFACE,
+    ITF_NUM_AUDIO_STREAMING,
+    0x03,                               // bAlternateSetting
+    0x02,                               // bNumEndpoints (data OUT + feedback IN)
+    TUSB_CLASS_AUDIO,
+    AUDIO_SUBCLASS_STREAMING,
+    0x00,
+    0x00,
+
+    // --- AS CS general alt 3 --------------------------------------------
+    7,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AS_INTERFACE_AS_GENERAL,
+    UAC1_INPUT_TERMINAL_ID,             // bTerminalLink
+    0x01,                               // bDelay
+    U16_TO_U8S_LE(0x0001),              // wFormatTag = PCM
+
+    // --- AS CS format type I alt 3 (8ch, 16-bit, single rate 48 kHz) ----
+    11,
+    TUSB_DESC_CS_INTERFACE,
+    AUDIO_CS_AS_INTERFACE_FORMAT_TYPE,
+    0x01,                               // bFormatType = TYPE_I
+    0x08,                               // bNrChannels = 8
+    0x02,                               // bSubFrameSize = 2 (16-bit)
+    16,                                 // bBitResolution
+    0x01,                               // bSamFreqType (1 discrete)
+    RATE_LE(48000),
+
+    // --- Std iso EP OUT 0x01, alt 3 -------------------------------------
+    9,
+    TUSB_DESC_ENDPOINT,
+    AUDIO_OUT_ENDPOINT,
+    0x05,                               // bmAttributes: iso, async
+    U16_TO_U8S_LE(AUDIO_EP_MAX_PKT),    // 788 on RP2350
+    0x01,                               // bInterval
+    0x00,                               // bRefresh
+    AUDIO_IN_ENDPOINT,                  // bSynchAddress (feedback EP)
+
+    // --- CS iso data EP alt 3 -------------------------------------------
+    7,
+    TUSB_DESC_CS_ENDPOINT,
+    AUDIO_CS_EP_SUBTYPE_GENERAL,
+    0x01,                               // bmAttributes: sampling freq control
+    0x00,                               // bLockDelayUnits
+    U16_TO_U8S_LE(0x0000),              // wLockDelay
+
+    // --- Std iso feedback EP IN 0x82, alt 3 -----------------------------
+    9,
+    TUSB_DESC_ENDPOINT,
+    AUDIO_IN_ENDPOINT,
+    0x11,                               // bmAttributes: iso, feedback
+    U16_TO_U8S_LE(3),
+    0x01,                               // bInterval
+    0x02,                               // bRefresh (2^2 = 4 ms)
+    0x00,                               // bSynchAddress
+#endif // PICO_RP2350
+
     // --- 191: Vendor std itf 2 (class 0xFF, 1 EP) -----------------------
     9,                                  // bLength
     TUSB_DESC_INTERFACE,
@@ -355,7 +483,9 @@ const uint8_t usb_config_descriptor[] = {
 
 #ifdef DSPI_LOOPBACK
     // ========================================================================
-    // 207: LOOPBACK CAPTURE FUNCTION (debug build only) — 102 bytes
+    // LOOPBACK CAPTURE FUNCTION (debug build only) — 102 bytes, appended after
+    // the notify EP (starts at offset 207 on RP2040, 265 on RP2350 which adds
+    // the 8-channel alt 3 + widened feature unit).
     //
     // A second, self-contained UAC1 audio function with its own IAD grouping
     // interfaces 3 (AudioControl) + 4 (AudioStreaming).  Streams output slot 0
@@ -485,14 +615,21 @@ _Static_assert(sizeof(usb_config_descriptor) == CONFIG_TOTAL_LEN,
 
 const uint16_t usb_config_descriptor_len = CONFIG_TOTAL_LEN;
 
-// Per-alt EP descriptor pointers consumed by the UAC1 class driver.
-const uint8_t *const usb_audio_data_ep_desc[2] = {
+// Per-alt EP descriptor pointers consumed by the UAC1 class driver, indexed
+// [alt-1].  RP2350 adds alt 3 (8-channel) at index [2].
+const uint8_t *const usb_audio_data_ep_desc[] = {
     &usb_config_descriptor[OFFSET_ALT1_DATA_EP],
     &usb_config_descriptor[OFFSET_ALT2_DATA_EP],
+#if PICO_RP2350
+    &usb_config_descriptor[OFFSET_ALT3_DATA_EP],
+#endif
 };
-const uint8_t *const usb_audio_fb_ep_desc[2] = {
+const uint8_t *const usb_audio_fb_ep_desc[] = {
     &usb_config_descriptor[OFFSET_ALT1_FB_EP],
     &usb_config_descriptor[OFFSET_ALT2_FB_EP],
+#if PICO_RP2350
+    &usb_config_descriptor[OFFSET_ALT3_FB_EP],
+#endif
 };
 
 // ----------------------------------------------------------------------------

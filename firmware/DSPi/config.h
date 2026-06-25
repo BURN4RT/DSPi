@@ -445,6 +445,14 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define NUM_OUTPUT_CHANNELS  5
 #define NUM_CHANNELS     7
 #endif
+// Master / input-bus channels at the head of the NUM_CHANNELS layout
+// (CH_MASTER_LEFT=0, CH_MASTER_RIGHT=1).  Output channels begin at index
+// NUM_MASTER_CHANNELS (== CH_OUT_1).  This is the channel-naming / output-slot
+// offset and is ALWAYS 2 — it is distinct from NUM_INPUT_CHANNELS, which is the
+// USB input-channel count (8 on RP2350 in 8-channel USB mode).  Several call
+// sites historically used NUM_INPUT_CHANNELS for this offset back when the two
+// happened to both equal 2; they now use NUM_MASTER_CHANNELS.
+#define NUM_MASTER_CHANNELS  2
 #define MAX_BANDS        12
 
 // Crossover filter bands per channel. Crossover bands live at wire band
@@ -475,7 +483,18 @@ extern volatile uint32_t nominal_feedback_10_14;
 #endif
 
 // Matrix Mixer Configuration
-#define NUM_INPUT_CHANNELS   2   // USB L/R (expandable to 4 for S/PDIF input)
+//
+// RP2350 supports an optional 8-channel USB input mode (AudioStreaming alt
+// setting 3, 48 kHz / 16-bit, fixed): inputs 0/1 remain the stereo USB L/R bus
+// (used by every other input source and the stereo master chain), inputs 2-7
+// are the extra USB channels routed through the widened matrix mixer.  RP2040
+// stays stereo-only; it has only 2 SPDIF instances (4 output channels) and
+// cannot emit 8 discrete channels.
+#if PICO_RP2350
+#define NUM_INPUT_CHANNELS   8   // 8-channel USB mode; stereo sources use 0/1
+#else
+#define NUM_INPUT_CHANNELS   2   // USB L/R
+#endif
 
 // Core 1 Operating Mode
 typedef enum {
@@ -552,7 +571,7 @@ typedef struct {
 
 // Matrix Route Packet (for vendor commands)
 typedef struct __attribute__((packed)) {
-    uint8_t input;          // 0-1 (USB L/R)
+    uint8_t input;          // 0-1 (USB L/R); 0-7 on RP2350 8-channel USB mode
     uint8_t output;         // 0-8
     uint8_t enabled;        // 0 or 1
     uint8_t phase_invert;   // 0 or 1

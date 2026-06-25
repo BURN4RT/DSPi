@@ -39,6 +39,12 @@ _Static_assert(sizeof(WireInputConfig) == 16,
                "must not change (V12 and V11 payloads are byte-identical)");
 _Static_assert(sizeof(WireLgSoundSync) == sizeof(LgSoundSyncStatus),
                "WireLgSoundSync and LgSoundSyncStatus must have identical layout");
+// V15 tail section sizing — keep the documented byte count honest and ensure
+// the grown packet still fits the (shared) transfer buffer.
+_Static_assert(sizeof(WireInputExtConfig) == 464,
+               "WireInputExtConfig must be 464 bytes (6×9 crosspoints + 6 preamp + 8 pad)");
+_Static_assert(sizeof(WireBulkParams) <= WIRE_BULK_BUF_SIZE,
+               "WireBulkParams must fit in the bulk transfer buffer");
 
 // External variables (defined in usb_audio.c)
 extern volatile float global_preamp_db[NUM_INPUT_CHANNELS];
@@ -124,14 +130,27 @@ void bulk_params_collect(WireBulkParams *out) {
         out->delays.delay_ms[i] = channel_delays_ms[i];
     }
 
-    // Matrix crosspoints
-    for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
+    // Matrix crosspoints — inputs 0/1 in the base section.
+    for (int in = 0; in < NUM_INPUT_CHANNELS && in < WIRE_MAX_INPUT_CHANNELS; in++) {
         for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
             out->crosspoints[in][o].enabled = matrix_mixer.crosspoints[in][o].enabled;
             out->crosspoints[in][o].phase_invert = matrix_mixer.crosspoints[in][o].phase_invert;
             out->crosspoints[in][o].gain_db = matrix_mixer.crosspoints[in][o].gain_db;
         }
     }
+#if PICO_RP2350
+    // Inputs 2..7 in the appended V15 ext section (offsets of every preceding
+    // section stay stable).  preamp_db[] for those inputs goes here too.
+    for (int in = WIRE_MAX_INPUT_CHANNELS; in < NUM_INPUT_CHANNELS; in++) {
+        int e = in - WIRE_MAX_INPUT_CHANNELS;
+        for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
+            out->input_ext.crosspoints[e][o].enabled = matrix_mixer.crosspoints[in][o].enabled;
+            out->input_ext.crosspoints[e][o].phase_invert = matrix_mixer.crosspoints[in][o].phase_invert;
+            out->input_ext.crosspoints[e][o].gain_db = matrix_mixer.crosspoints[in][o].gain_db;
+        }
+        out->input_ext.preamp_db[e] = global_preamp_db[in];
+    }
+#endif
 
     // Matrix outputs
     for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
@@ -286,18 +305,22 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // tail).  When you add a new section, also add a new V{N}_SIZE
     // anchor in bulk_params.h and use it for that section's gate here.
     if (in->header.payload_length < WIRE_BULK_PARAMS_MIN_SIZE ||
-        in->header.payload_length > WIRE_BULK_PARAMS_V11_SIZE)
+        in->header.payload_length > WIRE_BULK_PARAMS_V15_SIZE)
         return -4;
 
     // Bracket the wholesale state rewrite.  Per-field writes are suppressed
     // and one BULK_INVALIDATED(source=BULK_SET) is emitted at notify_end_bulk().
     notify_begin_bulk(PARAM_SRC_BULK_SET);
 
-    // Global params — preamp from legacy field first (overridden by V6+ per-channel below)
+    // Global params — preamp from the legacy single field (channel 0) first,
+    // overridden by the V6+ per-channel section below.  Capped at the base
+    // input channels: inputs 2..7 (RP2350) are owned solely by the V15 ext
+    // section, so a pre-V15 host that doesn't carry them must leave them
+    // untouched — same invariant the matrix-crosspoint path preserves.
     {
         float db = in->global.preamp_gain_db;
         float linear = db_to_linear(db);
-        for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+        for (int i = 0; i < NUM_INPUT_CHANNELS && i < WIRE_MAX_INPUT_CHANNELS; i++) {
             global_preamp_db[i]      = db;
             global_preamp_mul[i]     = (int32_t)(linear * (float)(1 << 28));
             global_preamp_linear[i]  = linear;
@@ -333,8 +356,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         channel_delays_ms[i] = in->delays.delay_ms[i];
     }
 
-    // Matrix crosspoints
-    for (int inp = 0; inp < NUM_INPUT_CHANNELS; inp++) {
+    // Matrix crosspoints — inputs 0/1 from the base section.  Inputs 2..7
+    // (RP2350) come from the V15 ext section below, gated on payload size so a
+    // legacy host can't clobber channels it doesn't know exist.
+    for (int inp = 0; inp < NUM_INPUT_CHANNELS && inp < WIRE_MAX_INPUT_CHANNELS; inp++) {
         for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
             matrix_mixer.crosspoints[inp][o].enabled = in->crosspoints[inp][o].enabled;
             matrix_mixer.crosspoints[inp][o].phase_invert = in->crosspoints[inp][o].phase_invert;
@@ -608,6 +633,31 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         // after this returns; that path rebuilds every crossover section
         // alongside the PEQ filters.
     }
+
+#if PICO_RP2350
+    // Extended input channels (V15+): matrix crosspoints + preamp for inputs
+    // 2..7.  V<15 payloads (or any payload shorter than the V15 size) leave
+    // inputs 2..7 untouched — an older host can't intend to clobber channels it
+    // doesn't know exist.  Compiled out on RP2040 (no inputs 2..7).
+    if (in->header.format_version >= 15 &&
+        in->header.payload_length >= WIRE_BULK_PARAMS_V15_SIZE) {
+        for (int inp = WIRE_MAX_INPUT_CHANNELS; inp < NUM_INPUT_CHANNELS; inp++) {
+            int e = inp - WIRE_MAX_INPUT_CHANNELS;
+            for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
+                const WireCrosspoint *wc = &in->input_ext.crosspoints[e][o];
+                matrix_mixer.crosspoints[inp][o].enabled = wc->enabled;
+                matrix_mixer.crosspoints[inp][o].phase_invert = wc->phase_invert;
+                matrix_mixer.crosspoints[inp][o].gain_db = wc->gain_db;
+                matrix_mixer.crosspoints[inp][o].gain_linear = db_to_linear(wc->gain_db);
+            }
+            float db = in->input_ext.preamp_db[e];
+            float linear = db_to_linear(db);
+            global_preamp_db[inp]     = db;
+            global_preamp_mul[inp]    = (int32_t)(linear * (float)(1 << 28));
+            global_preamp_linear[inp] = linear;
+        }
+    }
+#endif
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).
     notify_end_bulk();

@@ -250,7 +250,7 @@ void get_default_channel_name(int ch, uint8_t input_source,
     memset(buf, 0, PRESET_NAME_LEN);
     if (ch < 0 || ch >= NUM_CHANNELS) return;
 
-    if (ch < NUM_INPUT_CHANNELS) {
+    if (ch < NUM_MASTER_CHANNELS) {
         const char *prefix;
         switch (input_source) {
             case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
@@ -267,8 +267,8 @@ void get_default_channel_name(int ch, uint8_t input_source,
         return;
     }
 
-    int slot_idx = (ch - NUM_INPUT_CHANNELS) / 2;
-    int side     = (ch - NUM_INPUT_CHANNELS) % 2;
+    int slot_idx = (ch - NUM_MASTER_CHANNELS) / 2;
+    int side     = (ch - NUM_MASTER_CHANNELS) % 2;
     uint8_t type = (output_types && slot_idx < NUM_SPDIF_INSTANCES)
                        ? output_types[slot_idx]
                        : OUTPUT_TYPE_SPDIF;
@@ -291,9 +291,19 @@ void update_preamp(uint8_t ch, float db) {
     float linear = powf(10.0f, db / 20.0f);
     global_preamp_mul[ch]    = (int32_t)(linear * (float)(1 << 28));
     global_preamp_linear[ch] = linear;
-    notify_param_write(
-        (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float)),
-        sizeof(float), &db);
+    // Base inputs 0/1 live in the WirePreampConfig section; inputs 2..7 (RP2350)
+    // are in the appended WireInputExtConfig tail.
+    uint16_t off;
+#if PICO_RP2350
+    if (ch >= WIRE_MAX_INPUT_CHANNELS) {
+        off = (uint16_t)(offsetof(WireBulkParams, input_ext.preamp_db)
+                         + (ch - WIRE_MAX_INPUT_CHANNELS) * sizeof(float));
+    } else
+#endif
+    {
+        off = (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float));
+    }
+    notify_param_write(off, sizeof(float), &db);
 }
 
 // Update the device-side master volume from a dB value.
@@ -391,6 +401,11 @@ volatile uint64_t start_time_us = 0;
 volatile bool sync_started = false;
 static volatile uint64_t last_packet_time_us = 0;
 static volatile uint8_t usb_input_bit_depth = 16;
+// Active USB input channel count: 2 for the stereo alts (1/2), 8 for the
+// RP2350-only 8-channel alt (3).  Read by the audio pipeline to select the
+// 8-channel matrix path and bypass the stereo master chain.  Always 2 on
+// RP2040 (no 8-channel alt is advertised).
+volatile uint8_t usb_input_channels = 2;
 #define AUDIO_GAP_THRESHOLD_US 50000  // 50ms - reset sync if packets stop this long
 
 // Consumer fill for instance 0 — used by watermark monitoring only
@@ -489,8 +504,19 @@ void audio_set_volume(int16_t volume) {
 static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint16_t data_len) {
     // USB format snapshot
     const uint8_t bit_depth = usb_input_bit_depth;  // snapshot once — avoid double-read of volatile
-    uint32_t bytes_per_frame = (bit_depth == 24) ? 6 : 4;
+    const uint8_t channels  = usb_input_channels;   // 2 (stereo alts) or 8 (RP2350 alt 3)
+    // 8-channel mode is always 16-bit; stereo alts are 16- or 24-bit.
+    uint32_t bytes_per_frame = (channels > NUM_MASTER_CHANNELS)
+                                   ? (uint32_t)channels * 2
+                                   : (bit_depth == 24) ? 6 : 4;
     uint32_t sample_count = data_len / bytes_per_frame;
+    // Clamp to the fixed decode-buffer depth.  The iso OUT EP is armed for
+    // AUDIO_EP_MAX_PKT (788 on RP2350 to fit 8-channel frames); a conformant
+    // host never sends more than ~1 ms of audio per frame (<=97 stereo / 49
+    // eight-channel samples), but a non-conformant host or USB anomaly could
+    // deliver a larger transfer.  Without this guard a 16-bit stereo packet of
+    // 788 B would decode 197 samples and overrun buf_l/buf_r[192].
+    if (sample_count > AUDIO_BUFFER_SAMPLES) sample_count = AUDIO_BUFFER_SAMPLES;
 
     // USB-specific gap detection + sync tracking
     // NOTE: USB packet gap detection has moved to _as_audio_packet() (ISR
@@ -513,7 +539,26 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     // PASS 1: USB byte decode → buf_l/buf_r + preamp
 #if PICO_RP2350
     {
-        if (bit_depth == 24) {
+        if (channels > NUM_MASTER_CHANNELS) {
+            // 8-channel USB input (48 kHz / 16-bit).  Frame layout is
+            // c0,c1,...,c7 interleaved; channels 0/1 land in buf_l/buf_r (the
+            // shared stereo bus), channels 2..7 in buf_in_ext.  Per-channel
+            // preamp applied here; the stereo master chain is bypassed
+            // downstream (see process_input_block's eight_ch path).
+            const int16_t *in = (const int16_t *)data;
+            const float inv_32768 = 1.0f / 32768.0f;
+            float gain[NUM_INPUT_CHANNELS];
+            for (int c = 0; c < NUM_INPUT_CHANNELS; c++)
+                gain[c] = inv_32768 * global_preamp_linear[c];
+            for (uint32_t i = 0; i < sample_count; i++) {
+                const int16_t *frame = &in[i * NUM_INPUT_CHANNELS];
+                buf_l[i] = (float)frame[0] * gain[0];
+                buf_r[i] = (float)frame[1] * gain[1];
+                for (int c = NUM_MASTER_CHANNELS; c < NUM_INPUT_CHANNELS; c++)
+                    buf_in_ext[c - NUM_MASTER_CHANNELS][i] =
+                        (float)frame[c] * gain[c];
+            }
+        } else if (bit_depth == 24) {
             //     input 32 bit word to 24 bit output packing
             //        in0     in1      in2
             //     +-------+-------+-------+
@@ -907,7 +952,11 @@ static inline void uac1_arm_feedback(uint8_t rhport) {
 
 // Open isochronous endpoints for the specified alt (1 or 2).
 static bool uac1_open_stream_eps(uint8_t rhport, uint8_t alt) {
+#if PICO_RP2350
+    if (alt < 1 || alt > 3) return false;   // alt 3 = 8-channel input
+#else
     if (alt != 1 && alt != 2) return false;
+#endif
 
     const uint8_t *data_ep = usb_audio_data_ep_desc[alt - 1];
     const uint8_t *fb_ep   = usb_audio_fb_ep_desc[alt - 1];
@@ -1032,7 +1081,11 @@ static void uac1_close_stream_eps(uint8_t rhport) {
 
 // Apply a new AS alt setting (0, 1, or 2). Mirrors the old as_set_alternate().
 static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
+#if PICO_RP2350
+    if (alt > 3) return false;   // alt 3 = 8-channel input (RP2350 only)
+#else
     if (alt > 2) return false;
+#endif
 
     uint32_t prev_alt = usb_audio_alt_set;
 
@@ -1041,25 +1094,41 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
     // pause in the stream and a risk of DCD state desync — bail early.
     if (alt == prev_alt) return true;
 
-    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;
+    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;  // alt 3 is 16-bit
+    uint8_t  new_channels  = (alt == 3) ? NUM_INPUT_CHANNELS : NUM_MASTER_CHANNELS;
     bool     bit_depth_changed = (new_bit_depth != usb_input_bit_depth);
-    // Any active→active transition (e.g. alt 1↔alt 2) needs the same
-    // mute/drain/feedback-reset treatment as a cold start (alt 0→>0).
-    // Otherwise stale consumer-pool audio plays out across the switch and
-    // a drifted feedback value is handed back to the host the instant the
-    // feedback EP re-arms, producing an audible click.
-    bool need_resync = (alt > 0) && (prev_alt == 0 || bit_depth_changed);
+    bool     channels_changed  = (new_channels != usb_input_channels);
+    bool     format_changed    = bit_depth_changed || channels_changed;
+    // Any active→active transition (e.g. alt 1↔alt 2, or a channel-count
+    // change) needs the same mute/drain/feedback-reset treatment as a cold
+    // start (alt 0→>0).  Otherwise stale consumer-pool audio plays out across
+    // the switch and a drifted feedback value is handed back to the host the
+    // instant the feedback EP re-arms, producing an audible click.
+    bool need_resync = (alt > 0) && (prev_alt == 0 || format_changed);
 
     usb_audio_alt_set = alt;
     uac1.cur_alt = alt;
     usb_input_bit_depth = new_bit_depth;
+    usb_input_channels  = new_channels;
 
-    // If the bit depth is changing, any packets still queued in the ring were
-    // encoded under the old format. Decoding them with the new bytes/frame
-    // assumption would misread sample counts and channel layout. Flush them.
-    if (bit_depth_changed) {
+    // If the format (bit depth or channel count) is changing, any packets still
+    // queued in the ring were encoded under the old layout. Decoding them with
+    // the new bytes/frame assumption would misread sample counts and channel
+    // layout. Flush them.
+    if (format_changed) {
         usb_audio_flush_ring();
     }
+
+#if PICO_RP2350
+    // The 8-channel alt advertises 48 kHz only.  Force it so the main loop
+    // re-derives filters/delays (via the existing rate-change machinery, which
+    // preserves output-slot alignment) if the host had been at 44.1/96 kHz.
+    if (alt == 3 && audio_state.freq != 48000u) {
+        audio_state.freq = 48000u;
+        pending_rate = 48000u;
+        rate_change_pending = true;
+    }
+#endif
 
     bool active = (alt > 0);
     audio_spdif_set_starvation_monitoring(active);
@@ -1292,9 +1361,18 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                 // Accepting arbitrary values used to commit audio_state.freq
                 // to garbage that perform_rate_change() would silently
                 // coerce to 44100 — GET_CUR would then lie to the host.
-                bool rate_ok = (new_freq == 44100u ||
-                                new_freq == 48000u ||
-                                new_freq == 96000u);
+                bool rate_ok;
+#if PICO_RP2350
+                if (usb_input_channels > NUM_MASTER_CHANNELS) {
+                    // 8-channel alt (3) advertises a single rate: 48 kHz.
+                    rate_ok = (new_freq == 48000u);
+                } else
+#endif
+                {
+                    rate_ok = (new_freq == 44100u ||
+                               new_freq == 48000u ||
+                               new_freq == 96000u);
+                }
                 if (!rate_ok) {
                     // Stall EP0 — per UAC1, unsupported control values
                     // must be rejected rather than silently clamped.

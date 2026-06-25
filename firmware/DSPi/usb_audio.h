@@ -31,10 +31,16 @@ extern volatile int32_t channel_gain_mul[3];
 extern volatile float channel_gain_linear[3];
 extern volatile bool channel_mute[3];
 
-// Per-input-channel preamp gain (indexed by input channel: 0=USB L, 1=USB R)
+// Per-input-channel preamp gain (indexed by input channel: 0=USB L, 1=USB R,
+// 2..7 = extra channels in RP2350 8-channel USB mode)
 extern volatile float global_preamp_db[NUM_INPUT_CHANNELS];
 extern volatile int32_t global_preamp_mul[NUM_INPUT_CHANNELS];
 extern volatile float global_preamp_linear[NUM_INPUT_CHANNELS];
+
+// Active USB input channel count: 2 (stereo alts 1/2) or 8 (RP2350 alt 3).
+// The audio pipeline reads this to select the 8-channel matrix path and bypass
+// the stereo master chain.  Always 2 on RP2040.
+extern volatile uint8_t usb_input_channels;
 
 // Master volume — device-side ceiling on all output (does not affect DSP stages)
 extern volatile float master_volume_db;
