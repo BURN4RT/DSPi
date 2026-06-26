@@ -697,8 +697,14 @@ Kernel reuses the existing per-section TDF2 (RP2040) and SVF/TDF2 (RP2350) inner
 `xover_design_filter()` snapshots each section's filter state (`s1`/`s2`, `svic1eq`/`svic2eq`) before the passthrough reset and restores it for sections that survive the redesign, so live edits (dragging fc, changing order) do not zero the cascade's memory and click. State is reset only when a section's SVF/TDF2 path changes, when the section drops out of the new cascade, or when the band toggles bypass; this matches the PEQ convention in `dsp_compute_coefficients()`.
 
 ### Interaction with global EQ bypass
+*Last updated: 2026-06-26*
 
-`REQ_SET_BYPASS` (`bypass_master_eq`) intentionally does NOT bypass the crossover stage on either platform: crossover filters are speaker-protection critical (a tweeter high-pass must survive a global "EQ off" toggle). Only per-band bypass and the channel-level fast path disable crossover processing.
+`REQ_SET_BYPASS` (`bypass_master_eq`) scopes to the **input/master PEQ only**. In the unified channel model the input channels carry the "master EQ" (the pre-matrix per-channel PEQ), so the global bypass gates the input-EQ pass (`!is_bypassed && !channel_bypassed[k]`) and nothing else. It does NOT bypass per-output PEQ and does NOT bypass crossover.
+
+- Per-output PEQ is gated by its own `channel_bypassed[eq_ch]` fast-path flag only, independent of `bypass_master_eq`, on both platforms.
+- Crossover is never gated by the global bypass on either platform: crossover filters are speaker-protection critical (a tweeter high-pass must survive a global "EQ off" toggle). Only per-band bypass and the channel-level fast path disable crossover processing.
+
+Previously the RP2040 path also folded `is_bypassed` into its per-output PEQ gates (Core 0 dual/single-core output loops in `audio_pipeline.c` and the Core 1 EQ-worker output loop in `pdm_generator.c`), so a global bypass silently dropped output EQ on RP2040 but not RP2350. That gate was removed so both platforms now match: global bypass affects input/master EQ only.
 
 ### Band-field normalization (critical correctness invariant)
 

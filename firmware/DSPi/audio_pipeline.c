@@ -770,7 +770,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
-                if (!is_bypassed && !channel_bypassed[eq_ch])
+                if (!channel_bypassed[eq_ch])
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
             }
             // Per-sample vol ramp; step==0 in steady state → constant-gain path.
@@ -861,7 +861,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
-                if (!is_bypassed && !channel_bypassed[eq_ch])
+                if (!channel_bypassed[eq_ch])
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
             }
             float matrix_gain_f = matrix_mixer.outputs[out].gain_linear;

@@ -578,7 +578,6 @@ static void __not_in_flash_func(eq_worker_loop)() {
         uint32_t sample_count = core1_eq_work.sample_count;
         int32_t vol_mul_start_q15 = core1_eq_work.vol_mul_start;
         int32_t vol_mul_step_q15  = core1_eq_work.vol_mul_step;
-        bool is_bypassed = bypass_master_eq;
 
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;
@@ -590,7 +589,7 @@ static void __not_in_flash_func(eq_worker_loop)() {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
-                if (!is_bypassed && !channel_bypassed[eq_ch]) {
+                if (!channel_bypassed[eq_ch]) {
                     dsp_process_channel_block(filters[eq_ch], buf_out[out], sample_count, eq_ch);
                 }
             }
