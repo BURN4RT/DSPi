@@ -423,42 +423,70 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define FEATURE_VOLUME_CONTROL 2u
 #define ENDPOINT_FREQ_CONTROL 1u
 
-// Channel Definitions
-#define CH_MASTER_LEFT   0
-#define CH_MASTER_RIGHT  1
-#define CH_OUT_1         2   // S/PDIF 1 L
-#define CH_OUT_2         3   // S/PDIF 1 R
-#define CH_OUT_3         4   // S/PDIF 2 L
-#define CH_OUT_4         5   // S/PDIF 2 R
+// ----------------------------------------------------------------------------
+// Channel Model
+//
+// The device has NUM_INPUT_CHANNELS input channels and NUM_OUTPUT_CHANNELS
+// output channels.  There is NO separate "master" channel: the input channels
+// ARE the pre-matrix per-channel processing — what used to be "master EQ" on the
+// 2 stereo inputs, generalized to N inputs.  All DSP channels (inputs then
+// outputs) share one NUM_CHANNELS-wide index space used by filters[], recipes,
+// names, delays, metering, etc.:
+//
+//   index: [ 0 .. NUM_INPUT_CHANNELS-1 ] [ NUM_INPUT_CHANNELS .. NUM_CHANNELS-1 ]
+//   role:  [          inputs           ] [              outputs                ]
+//
+//   Inputs : per-channel PEQ + metering, NO crossover.
+//   Outputs: per-channel PEQ + crossover + gain/delay/mute.
+//
+// NUM_INPUT_CHANNELS is the platform MAX; the *active* input count follows the
+// USB alt setting (2/4/6/8 on RP2350) — see usb_input_channels.  RP2040 is
+// stereo-only.
+// ----------------------------------------------------------------------------
 #if PICO_RP2350
-// RP2350: 11 channels (2 master + 8 SPDIF + 1 PDM)
-#define CH_OUT_5         6   // S/PDIF 3 L
-#define CH_OUT_6         7   // S/PDIF 3 R
-#define CH_OUT_7         8   // S/PDIF 4 L
-#define CH_OUT_8         9   // S/PDIF 4 R
-#define CH_OUT_9_PDM     10  // PDM sub
-#define NUM_OUTPUT_CHANNELS  9
-#define NUM_CHANNELS     11
+#define NUM_INPUT_CHANNELS   8   // max; active = 2/4/6/8 by USB alt
+#define NUM_OUTPUT_CHANNELS  9   // 8 S/PDIF + 1 PDM
 #else
-// RP2040: 7 channels (2 master + 4 SPDIF + 1 PDM)
-#define CH_OUT_5_PDM     6   // PDM sub
-#define NUM_OUTPUT_CHANNELS  5
-#define NUM_CHANNELS     7
+#define NUM_INPUT_CHANNELS   2   // USB L/R
+#define NUM_OUTPUT_CHANNELS  5   // 4 S/PDIF + 1 PDM
 #endif
-// Master / input-bus channels at the head of the NUM_CHANNELS layout
-// (CH_MASTER_LEFT=0, CH_MASTER_RIGHT=1).  Output channels begin at index
-// NUM_MASTER_CHANNELS (== CH_OUT_1).  This is the channel-naming / output-slot
-// offset and is ALWAYS 2 — it is distinct from NUM_INPUT_CHANNELS, which is the
-// USB input-channel count (8 on RP2350 in 8-channel USB mode).  Several call
-// sites historically used NUM_INPUT_CHANNELS for this offset back when the two
-// happened to both equal 2; they now use NUM_MASTER_CHANNELS.
-#define NUM_MASTER_CHANNELS  2
+
+// Active input count for non-multichannel sources (stereo USB / S/PDIF / I2S).
+// Inputs at index >= NUM_STEREO_INPUTS carry audio only in a multichannel USB
+// alt (4/6/8).  Used as the stereo/multichannel threshold and the size of the
+// extra-input buffers.
+#define NUM_STEREO_INPUTS    2
+
+#define NUM_CHANNELS  (NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS)
+
+// Output channel indices begin right after the inputs.  CH_OUT_1 = first output
+// (S/PDIF 1 L); CH_OUT_SUB = last output (PDM sub).
+#define CH_OUT_1     (NUM_INPUT_CHANNELS + 0)   // S/PDIF 1 L
+#define CH_OUT_2     (NUM_INPUT_CHANNELS + 1)   // S/PDIF 1 R
+#define CH_OUT_3     (NUM_INPUT_CHANNELS + 2)   // S/PDIF 2 L
+#define CH_OUT_4     (NUM_INPUT_CHANNELS + 3)   // S/PDIF 2 R
+#if PICO_RP2350
+#define CH_OUT_5     (NUM_INPUT_CHANNELS + 4)   // S/PDIF 3 L
+#define CH_OUT_6     (NUM_INPUT_CHANNELS + 5)   // S/PDIF 3 R
+#define CH_OUT_7     (NUM_INPUT_CHANNELS + 6)   // S/PDIF 4 L
+#define CH_OUT_8     (NUM_INPUT_CHANNELS + 7)   // S/PDIF 4 R
+#define CH_OUT_9_PDM (NUM_INPUT_CHANNELS + 8)   // PDM sub
+#else
+#define CH_OUT_5_PDM (NUM_INPUT_CHANNELS + 4)   // PDM sub
+#endif
+#define CH_OUT_SUB   (NUM_CHANNELS - 1)         // PDM sub (last output)
+
+// Legacy aliases
+#define CH_OUT_LEFT      CH_OUT_1
+#define CH_OUT_RIGHT     CH_OUT_2
+
 #define MAX_BANDS        12
 
-// Crossover filter bands per channel. Crossover bands live at wire band
+// Crossover filter bands per OUTPUT channel. Crossover bands live at wire band
 // indices [XOVER_BAND_BASE .. XOVER_BAND_BASE + MAX_XOVER_BANDS - 1]
 // (i.e. 20..23) for vendor command addressing; see
-// Documentation/Features/crossover_filters_spec.md.
+// Documentation/Features/crossover_filters_spec.md.  Input channels have no
+// crossover (their xover rows are unused).
 //
 // MAX_BANDS (12) is the PEQ storage depth; only bands 0..9 are active today.
 // XOVER_BAND_BASE is deliberately set well above MAX_BANDS so the indices
@@ -472,29 +500,6 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define XOVER_BAND_BASE   20
 #define MAX_XOVER_BANDS   4
 #define TOTAL_BAND_INDICES (XOVER_BAND_BASE + MAX_XOVER_BANDS)  // 24
-
-// Legacy aliases for backward compatibility
-#define CH_OUT_LEFT      CH_OUT_1
-#define CH_OUT_RIGHT     CH_OUT_2
-#if PICO_RP2350
-#define CH_OUT_SUB       CH_OUT_9_PDM
-#else
-#define CH_OUT_SUB       CH_OUT_5_PDM
-#endif
-
-// Matrix Mixer Configuration
-//
-// RP2350 supports an optional 8-channel USB input mode (AudioStreaming alt
-// setting 3, 48 kHz / 16-bit, fixed): inputs 0/1 remain the stereo USB L/R bus
-// (used by every other input source and the stereo master chain), inputs 2-7
-// are the extra USB channels routed through the widened matrix mixer.  RP2040
-// stays stereo-only; it has only 2 SPDIF instances (4 output channels) and
-// cannot emit 8 discrete channels.
-#if PICO_RP2350
-#define NUM_INPUT_CHANNELS   8   // 8-channel USB mode; stereo sources use 0/1
-#else
-#define NUM_INPUT_CHANNELS   2   // USB L/R
-#endif
 
 // Core 1 Operating Mode
 typedef enum {
@@ -690,7 +695,8 @@ typedef struct {
     uint16_t peaks[NUM_CHANNELS];
     uint8_t cpu0_load;
     uint8_t cpu1_load;
-    uint16_t clip_flags;         // Per-channel clip latch bitmask (sticky, cleared by REQ_CLEAR_CLIPS)
+    uint32_t clip_flags;         // Per-channel clip latch bitmask (sticky, cleared by REQ_CLEAR_CLIPS).
+                                 // 32-bit: NUM_CHANNELS can exceed 16 (17 on RP2350: 8 in + 9 out).
 } SystemStatusPacket;
 
 // ----------------------------------------------------------------------------

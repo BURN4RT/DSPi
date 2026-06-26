@@ -21,16 +21,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Fixed maximums for the wire format (sized for the largest platform)
-#define WIRE_MAX_CHANNELS        11   // RP2350 max
-#define WIRE_MAX_OUTPUT_CHANNELS  9   // RP2350 max
-#define WIRE_MAX_INPUT_CHANNELS   2   // Base matrix/preamp inputs (USB L/R) — both platforms
-#define WIRE_EXT_INPUT_CHANNELS   6   // Extra inputs 2..7 (RP2350 8-channel USB), in the V15 tail
+// Fixed maximums for the wire format (sized for the largest platform).
+// Channel index space: [ inputs 0..WIRE_MAX_INPUT_CHANNELS-1 ][ outputs ... ],
+// matching the firmware NUM_CHANNELS layout.
+#define WIRE_MAX_INPUT_CHANNELS   8   // RP2350 max input channels
+#define WIRE_MAX_OUTPUT_CHANNELS  9   // RP2350 max output channels
+#define WIRE_MAX_CHANNELS        17   // inputs + outputs (RP2350 max)
 #define WIRE_MAX_BANDS           12   // Same on both
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      15   // V15: appended WireInputExtConfig (matrix + preamp for input channels 2..7, RP2350 8-channel USB input). V14: first-order shelf PEQ types; V14-and-earlier byte layout is unchanged (tail-append).
+#define WIRE_FORMAT_VERSION      16   // V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -43,9 +44,9 @@
 typedef struct __attribute__((packed)) {
     uint8_t  format_version;         // WIRE_FORMAT_VERSION
     uint8_t  platform_id;            // WIRE_PLATFORM_RP2040 or _RP2350
-    uint8_t  num_channels;           // Actual channel count (7 or 11)
+    uint8_t  num_channels;           // Actual channel count (7 or 17)
     uint8_t  num_output_channels;    // Actual output count (5 or 9)
-    uint8_t  num_input_channels;     // Always 2
+    uint8_t  num_input_channels;     // Actual input count (2 or 8)
     uint8_t  max_bands;              // Bands per channel in this payload (12)
     uint16_t payload_length;         // Total packet size including header
     uint16_t fw_version_major;       // Firmware version
@@ -88,11 +89,11 @@ typedef struct __attribute__((packed)) {
 } WireLegacyChannels;                // 16 bytes
 
 // ============================================================================
-// Section 5: Per-Channel Delays (44 bytes, fixed at WIRE_MAX_CHANNELS)
+// Section 5: Per-Channel Delays (fixed at WIRE_MAX_CHANNELS)
 // ============================================================================
 typedef struct __attribute__((packed)) {
     float    delay_ms[WIRE_MAX_CHANNELS];  // ms, zero-padded beyond num_channels
-} WireChannelDelays;                 // 44 bytes
+} WireChannelDelays;                 // 68 bytes (17 channels)
 
 // ============================================================================
 // Section 6: Matrix Crosspoint (8 bytes each)
@@ -139,11 +140,11 @@ typedef struct __attribute__((packed)) {
 } WireBandParams;                    // 16 bytes
 
 // ============================================================================
-// Section 10: Channel Names (352 bytes)
+// Section 10: Channel Names (544 bytes)
 // ============================================================================
 typedef struct __attribute__((packed)) {
     char names[WIRE_MAX_CHANNELS][WIRE_NAME_LEN];
-} WireChannelNames;                  // 352 bytes
+} WireChannelNames;                  // 544 bytes (17 × 32)
 
 // ============================================================================
 // Section 11: I2S Configuration (16 bytes) — V3+
@@ -171,12 +172,11 @@ typedef struct __attribute__((packed)) {
 } WireLevellerConfig;                // 16 bytes
 
 // ============================================================================
-// Section 13: Per-Channel Preamp Configuration (16 bytes) — V6+
+// Section 13: Per-Channel Preamp Configuration (32 bytes)
 // ============================================================================
 typedef struct __attribute__((packed)) {
-    float    preamp_db[WIRE_MAX_INPUT_CHANNELS]; // Per-input-channel preamp (dB), 0=L, 1=R
-    uint8_t  reserved[8];                        // Pad to 16 bytes (future input channels)
-} WirePreampConfig;                              // 16 bytes
+    float    preamp_db[WIRE_MAX_INPUT_CHANNELS]; // Per-input-channel preamp (dB), 0..7
+} WirePreampConfig;                              // 32 bytes (8 inputs)
 
 // ============================================================================
 // Section 14: Master Volume (16 bytes) — V6+
@@ -279,94 +279,46 @@ typedef struct __attribute__((packed)) {
 #define WIRE_MAX_XOVER_BANDS  4   // == MAX_XOVER_BANDS
 
 typedef struct __attribute__((packed)) {
-    WireBandParams bands[WIRE_MAX_CHANNELS][WIRE_MAX_XOVER_BANDS];  // 11 × 4 × 16 = 704
-} WireCrossoverConfig;                                              // 704 bytes
-
-// ============================================================================
-// Section 20: Extended Input Channels (464 bytes) — V15+
-// ============================================================================
-//
-// Matrix crosspoints and per-channel preamp for input channels 2..7 — the
-// extra USB channels in the RP2350 8-channel input mode.  Appended as a TAIL
-// section so the offsets of every preceding section stay stable: the base
-// `crosspoints[WIRE_MAX_INPUT_CHANNELS][...]` and `WirePreampConfig.preamp_db`
-// (inputs 0/1) keep their layout, and a host that stops parsing at the V14 tail
-// is unaffected.  Inputs 0/1 are NEVER duplicated here.
-//
-// Row-major, mirroring the base crosspoint block: ext input 0 (= input 2)
-// outputs 0..8, then ext input 1 (= input 3), etc.  On RP2040 (stereo only)
-// this section is present but zero-filled; the device reports
-// num_input_channels = 2 and skips it on apply.
-typedef struct __attribute__((packed)) {
-    WireCrosspoint crosspoints[WIRE_EXT_INPUT_CHANNELS][WIRE_MAX_OUTPUT_CHANNELS]; // 6×9×8 = 432
-    float          preamp_db[WIRE_EXT_INPUT_CHANNELS];                              // 24
-    uint8_t        reserved[8];                                                     // pad / future
-} WireInputExtConfig;                                                               // 464 bytes
+    WireBandParams bands[WIRE_MAX_CHANNELS][WIRE_MAX_XOVER_BANDS];  // 17 × 4 × 16 = 1088
+} WireCrossoverConfig;                                              // 1088 bytes (input rows unused)
 
 // ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
-    WireHeader          header;                                          //   16
-    WireGlobalParams    global;                                          //   16
-    WireCrossfeedParams crossfeed;                                       //   16
-    WireLegacyChannels  legacy;                                          //   16
-    WireChannelDelays   delays;                                          //   44
-    WireCrosspoint      crosspoints[WIRE_MAX_INPUT_CHANNELS][WIRE_MAX_OUTPUT_CHANNELS];  // 144
+    WireHeader          header;          //   16
+    WireGlobalParams    global;          //   16
+    WireCrossfeedParams crossfeed;       //   16
+    WireLegacyChannels  legacy;          //   16
+    WireChannelDelays   delays;          //   68  (17 channels)
+    WireCrosspoint      crosspoints[WIRE_MAX_INPUT_CHANNELS][WIRE_MAX_OUTPUT_CHANNELS];  // 576 (8×9)
     WireOutputChannel   outputs[WIRE_MAX_OUTPUT_CHANNELS];               //  108
-    WirePinConfig       pins;                                             //    8
-    WireBandParams      eq[WIRE_MAX_CHANNELS][WIRE_MAX_BANDS];           // 2112
-    WireChannelNames    channel_names;                                    //  352
-    WireI2SConfig       i2s_config;                                       //   16
-    WireLevellerConfig  leveller;                                          //   16
-    WirePreampConfig    preamp;                                            //   16
-    WireMasterVolume    master_volume;                                     //   16
-    WireInputConfig     input_config;                                      //   16
-    WireLgSoundSync     lg_sound_sync;                                     //   16
-    WireUserVolume      user_volume;                                       //   16
-    WireDacHwMute       dac_hw_mute;                                       //   16
-    WireCrossoverConfig crossovers;                                        //  704
-    WireInputExtConfig  input_ext;                                         //  464  (V15+)
-} WireBulkParams;                    // Total: 4128 bytes (V15); 3664 through V14
+    WirePinConfig       pins;            //    8
+    WireBandParams      eq[WIRE_MAX_CHANNELS][WIRE_MAX_BANDS];           // 3264 (17×12)
+    WireChannelNames    channel_names;   //  544  (17 channels)
+    WireI2SConfig       i2s_config;      //   16
+    WireLevellerConfig  leveller;        //   16
+    WirePreampConfig    preamp;          //   32  (8 inputs)
+    WireMasterVolume    master_volume;   //   16
+    WireInputConfig     input_config;    //   16
+    WireLgSoundSync     lg_sound_sync;   //   16
+    WireUserVolume      user_volume;     //   16
+    WireDacHwMute       dac_hw_mute;     //   16
+    WireCrossoverConfig crossovers;      // 1088 (17×4; input rows unused)
+} WireBulkParams;                        // Total: 5864 bytes (V16)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
-// Per-version size anchors.  CRITICAL: legacy section gates inside
-// bulk_params_apply() compare payload_length against THESE constants, NOT
-// against sizeof(WireBulkParams) — the latter is the size of the CURRENT
-// (V11) layout, which would silently lock out V10-and-older payloads from
-// the very feature they own (DAC hardware mute for V10, etc.).  Each entry
-// below is computed by subtracting the tail sections added after that
-// version, starting from the current sizeof().  When a new version is
-// added, append its anchor as
-//   #define WIRE_BULK_PARAMS_V{N-1}_SIZE (WIRE_BULK_PARAMS_V{N}_SIZE - sizeof(WireFooConfig))
-// and chain older anchors off the new V{N-1}_SIZE.
-#define WIRE_BULK_PARAMS_V15_SIZE   sizeof(WireBulkParams)
-#define WIRE_BULK_PARAMS_V14_SIZE   (WIRE_BULK_PARAMS_V15_SIZE - sizeof(WireInputExtConfig))  /* V15 appends WireInputExtConfig */
-#define WIRE_BULK_PARAMS_V13_SIZE   WIRE_BULK_PARAMS_V14_SIZE  /* V14 only adds first-order shelf type values; no struct change */
-#define WIRE_BULK_PARAMS_V12_SIZE   WIRE_BULK_PARAMS_V13_SIZE  /* V13 only renumbers filter type values; no struct change */
-#define WIRE_BULK_PARAMS_V11_SIZE   WIRE_BULK_PARAMS_V12_SIZE  /* V12 fields live in V11's WireInputConfig reserved bytes */
-#define WIRE_BULK_PARAMS_V10_SIZE   (WIRE_BULK_PARAMS_V11_SIZE - sizeof(WireCrossoverConfig))
-#define WIRE_BULK_PARAMS_V9_SIZE    (WIRE_BULK_PARAMS_V10_SIZE - sizeof(WireDacHwMute))
-#define WIRE_BULK_PARAMS_V8_SIZE    (WIRE_BULK_PARAMS_V9_SIZE  - sizeof(WireUserVolume))
-#define WIRE_BULK_PARAMS_V7_SIZE    (WIRE_BULK_PARAMS_V8_SIZE  - sizeof(WireLgSoundSync))
-#define WIRE_BULK_PARAMS_V6_SIZE    (WIRE_BULK_PARAMS_V7_SIZE  - sizeof(WireInputConfig))
-#define WIRE_BULK_PARAMS_V5_SIZE    (WIRE_BULK_PARAMS_V6_SIZE  \
-                                     - sizeof(WirePreampConfig) \
-                                     - sizeof(WireMasterVolume))
-#define WIRE_BULK_PARAMS_V4_SIZE    WIRE_BULK_PARAMS_V5_SIZE   /* V4/V5 differ only in field interpretation */
-#define WIRE_BULK_PARAMS_V3_SIZE    (WIRE_BULK_PARAMS_V4_SIZE - sizeof(WireLevellerConfig))
-#define WIRE_BULK_PARAMS_V2_SIZE    (WIRE_BULK_PARAMS_V3_SIZE - sizeof(WireI2SConfig))
-
-// Smallest bulk SET payload accepted — corresponds to V2.  Kept in lockstep
-// with the size-compat chain inside bulk_params_apply().  The dispatcher
-// gate (vendor_commands.c REQ_SET_ALL_PARAMS branch) and the apply path's
-// lower bound must agree on this number.
-#define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_V2_SIZE
+// Backward compatibility is intentionally broken at V16 (unified channel model).
+// Only the current full-size V16 layout is accepted — there are no legacy size
+// anchors or per-section version gates; every section is always present.
+// bulk_params_apply() rejects any payload whose format_version != V16 or whose
+// length != sizeof(WireBulkParams).
+#define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
 // Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
-// V15 (with WireInputExtConfig) is 4128 bytes, just over 4096, so this doubled
-// to 8192.  Shared by both platforms (the wire format is platform-independent).
+// V16 is 5864 bytes (17-channel EQ/names/crossover); 8192 is the next power of 2.
+// Shared by both platforms (the wire format is platform-independent).
 #define WIRE_BULK_BUF_SIZE     8192
 
 // Collect current live DSP state into wire format

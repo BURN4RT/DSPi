@@ -40,8 +40,12 @@
 // Packet: [ver=2, evt=0x04, flags=0, seq, slot, 0, 0, 0]
 #define NOTIFY_EVT_PRESET_LOADED     0x04
 
+// v2 input-format event: the active USB input channel count changed (host
+// switched the USB alt / format).  The app re-lays-out its mixer/sidebar.
+// Packet: [ver=2, evt=0x05, flags=0, seq, channels, 0, 0, 0]
+#define NOTIFY_EVT_INPUT_FORMAT      0x05
+
 // Reserved for future use.
-// 0x05 — error / overflow report
 // 0x06 — batched PARAM_CHANGED (see spec §10.5)
 
 // v2 protocol version byte (first byte of every v2 packet)
@@ -105,6 +109,8 @@ void notify_push_master_volume_v1(float db);
 // Push discrete v2 events.
 void notify_push_preset_loaded(uint8_t slot);
 void notify_push_bulk_invalidated(ParamSource src);
+// Active USB input channel count changed (2/4/6/8) — host switched the alt.
+void notify_push_input_format(uint8_t channels);
 
 // Drain interface used by usb_audio.c.
 //

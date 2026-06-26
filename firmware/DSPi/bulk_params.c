@@ -39,10 +39,6 @@ _Static_assert(sizeof(WireInputConfig) == 16,
                "must not change (V12 and V11 payloads are byte-identical)");
 _Static_assert(sizeof(WireLgSoundSync) == sizeof(LgSoundSyncStatus),
                "WireLgSoundSync and LgSoundSyncStatus must have identical layout");
-// V15 tail section sizing — keep the documented byte count honest and ensure
-// the grown packet still fits the (shared) transfer buffer.
-_Static_assert(sizeof(WireInputExtConfig) == 464,
-               "WireInputExtConfig must be 464 bytes (6×9 crosspoints + 6 preamp + 8 pad)");
 _Static_assert(sizeof(WireBulkParams) <= WIRE_BULK_BUF_SIZE,
                "WireBulkParams must fit in the bulk transfer buffer");
 
@@ -130,27 +126,14 @@ void bulk_params_collect(WireBulkParams *out) {
         out->delays.delay_ms[i] = channel_delays_ms[i];
     }
 
-    // Matrix crosspoints — inputs 0/1 in the base section.
-    for (int in = 0; in < NUM_INPUT_CHANNELS && in < WIRE_MAX_INPUT_CHANNELS; in++) {
+    // Matrix crosspoints — inputs 0..N_in-1, direct (row-major).
+    for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
         for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
             out->crosspoints[in][o].enabled = matrix_mixer.crosspoints[in][o].enabled;
             out->crosspoints[in][o].phase_invert = matrix_mixer.crosspoints[in][o].phase_invert;
             out->crosspoints[in][o].gain_db = matrix_mixer.crosspoints[in][o].gain_db;
         }
     }
-#if PICO_RP2350
-    // Inputs 2..7 in the appended V15 ext section (offsets of every preceding
-    // section stay stable).  preamp_db[] for those inputs goes here too.
-    for (int in = WIRE_MAX_INPUT_CHANNELS; in < NUM_INPUT_CHANNELS; in++) {
-        int e = in - WIRE_MAX_INPUT_CHANNELS;
-        for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
-            out->input_ext.crosspoints[e][o].enabled = matrix_mixer.crosspoints[in][o].enabled;
-            out->input_ext.crosspoints[e][o].phase_invert = matrix_mixer.crosspoints[in][o].phase_invert;
-            out->input_ext.crosspoints[e][o].gain_db = matrix_mixer.crosspoints[in][o].gain_db;
-        }
-        out->input_ext.preamp_db[e] = global_preamp_db[in];
-    }
-#endif
 
     // Matrix outputs
     for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
@@ -278,11 +261,6 @@ void bulk_params_collect(WireBulkParams *out) {
 // ============================================================================
 
 int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
-    // Validate header (accept V2-V7 for backward compat)
-    // V2: no I2S/leveller/preamp/master.  V3-V5: no preamp/master.  V6: preamp+master.  V7: +input source.
-    if (in->header.format_version < 2 || in->header.format_version > WIRE_FORMAT_VERSION)
-        return -1;
-
 #if PICO_RP2350
     if (in->header.platform_id != WIRE_PLATFORM_RP2350)
         return -2;
@@ -293,34 +271,27 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 
     if (in->header.num_channels != NUM_CHANNELS)
         return -3;
+    if (in->header.num_input_channels != NUM_INPUT_CHANNELS)
+        return -3;
     if (in->header.num_output_channels != NUM_OUTPUT_CHANNELS)
         return -3;
-    // Per-version payload size anchors are defined in bulk_params.h. Each
-    // legacy-section gate below MUST compare against its own version's
-    // anchor — NOT against sizeof(WireBulkParams), which grows whenever a
-    // new section is appended and would silently exclude older payloads
-    // from sections they actually carry (e.g. before this rebase, V10
-    // DAC-hw-mute was gated on sizeof(WireBulkParams), so adding V11
-    // crossover would have made V10 payloads stop applying their DAC
-    // tail).  When you add a new section, also add a new V{N}_SIZE
-    // anchor in bulk_params.h and use it for that section's gate here.
-    if (in->header.payload_length < WIRE_BULK_PARAMS_MIN_SIZE ||
-        in->header.payload_length > WIRE_BULK_PARAMS_V15_SIZE)
+    // Backward compatibility is intentionally broken at V16: accept ONLY the
+    // current full-size layout.  Every section is then guaranteed present, so
+    // the apply path below is unconditional (no per-version gates).
+    if (in->header.format_version != WIRE_FORMAT_VERSION ||
+        in->header.payload_length != sizeof(WireBulkParams))
         return -4;
 
     // Bracket the wholesale state rewrite.  Per-field writes are suppressed
     // and one BULK_INVALIDATED(source=BULK_SET) is emitted at notify_end_bulk().
     notify_begin_bulk(PARAM_SRC_BULK_SET);
 
-    // Global params — preamp from the legacy single field (channel 0) first,
-    // overridden by the V6+ per-channel section below.  Capped at the base
-    // input channels: inputs 2..7 (RP2350) are owned solely by the V15 ext
-    // section, so a pre-V15 host that doesn't carry them must leave them
-    // untouched — same invariant the matrix-crosspoint path preserves.
+    // Global params — preamp from the legacy single field (a baseline applied to
+    // all inputs); overridden by the per-channel preamp section below.
     {
         float db = in->global.preamp_gain_db;
         float linear = db_to_linear(db);
-        for (int i = 0; i < NUM_INPUT_CHANNELS && i < WIRE_MAX_INPUT_CHANNELS; i++) {
+        for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
             global_preamp_db[i]      = db;
             global_preamp_mul[i]     = (int32_t)(linear * (float)(1 << 28));
             global_preamp_linear[i]  = linear;
@@ -356,10 +327,8 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         channel_delays_ms[i] = in->delays.delay_ms[i];
     }
 
-    // Matrix crosspoints — inputs 0/1 from the base section.  Inputs 2..7
-    // (RP2350) come from the V15 ext section below, gated on payload size so a
-    // legacy host can't clobber channels it doesn't know exist.
-    for (int inp = 0; inp < NUM_INPUT_CHANNELS && inp < WIRE_MAX_INPUT_CHANNELS; inp++) {
+    // Matrix crosspoints — inputs 0..N_in-1, direct.
+    for (int inp = 0; inp < NUM_INPUT_CHANNELS; inp++) {
         for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
             matrix_mixer.crosspoints[inp][o].enabled = in->crosspoints[inp][o].enabled;
             matrix_mixer.crosspoints[inp][o].phase_invert = in->crosspoints[inp][o].phase_invert;
@@ -399,12 +368,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             output_pins[i] = valid ? pin : default_pins[i];
         }
 
-        // SPDIF RX pin: apply on the same gate as output pins (V7+
-        // payloads only; V6 and earlier have no input_config section).
-        // If valid AND it changed, fire the hot-swap when SPDIF input
-        // is currently active so the running RX library picks up the
-        // new GPIO without requiring a vendor-command round trip.
-        if (in->header.format_version >= 7) {
+        // SPDIF RX pin: if valid AND changed, fire the hot-swap when SPDIF
+        // input is currently active so the running RX library picks up the
+        // new GPIO without a vendor-command round trip.
+        {
             uint8_t pin = in->input_config.spdif_rx_pin;
             bool valid = (pin > 0) && (pin <= 29) && (pin != 12) &&
                          !(pin >= 23 && pin <= 25);
@@ -420,10 +387,8 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             }
         }
 
-        // I2S RX data pin: same gate and hot-swap pattern (V12+ payloads;
-        // older payloads have zeroed reserved bytes here, rejected by the
-        // pin > 0 check anyway).
-        if (in->header.format_version >= 12) {
+        // I2S RX data pin: same hot-swap pattern.
+        {
             uint8_t pin = in->input_config.i2s_rx_pin;
             bool valid = (pin > 0) && (pin <= 29) && (pin != 12) &&
                          !(pin >= 23 && pin <= 25);
@@ -460,12 +425,8 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         channel_names[ch][PRESET_NAME_LEN - 1] = '\0';  // Enforce NUL termination
     }
 
-    // I2S configuration (V3+ payloads — V2 payloads skip this).  Gate uses
-    // V5 anchor because the V3/V4/V5 in-place reinterpretation of
-    // mck_multiplier doesn't change the section's byte position; any
-    // payload claiming >= V3 with the full V5 tail can apply this block.
-    if (in->header.format_version >= 3 &&
-        in->header.payload_length >= WIRE_BULK_PARAMS_V5_SIZE) {
+    // I2S configuration.
+    {
         extern uint8_t output_types[];
         extern uint8_t i2s_bck_pin;
         extern uint8_t i2s_mck_pin;
@@ -489,57 +450,42 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             i2s_mck_enabled = (in->i2s_config.mck_enabled != 0);
         }
 
-        if (in->header.format_version >= 5) {
-            // V5+: 0=128x, 1=256x
-            i2s_mck_multiplier = (in->i2s_config.mck_multiplier == 1) ? 256 : 128;
-        } else {
-            // V3-V4: raw value (128 or 0 for 256)
-            i2s_mck_multiplier = (in->i2s_config.mck_multiplier == 0) ? 256 : in->i2s_config.mck_multiplier;
-        }
+        // mck_multiplier encoding: 0 = 128×, 1 = 256×.
+        i2s_mck_multiplier = (in->i2s_config.mck_multiplier == 1) ? 256 : 128;
     }
 
-    // Volume Leveller (V4+ payloads only)
-    if (in->header.format_version >= 4) {
+    // Volume Leveller
+    {
         leveller_config.enabled = (in->leveller.enabled != 0);
         leveller_config.speed = in->leveller.speed;
         leveller_config.lookahead = (in->leveller.lookahead != 0);
         leveller_config.amount = in->leveller.amount;
         leveller_config.max_gain_db = in->leveller.max_gain_db;
         leveller_config.gate_threshold_db = in->leveller.gate_threshold_db;
-    } else {
-        // V2/V3 payload: apply defaults
-        leveller_config.enabled = LEVELLER_DEFAULT_ENABLED;
-        leveller_config.amount = LEVELLER_DEFAULT_AMOUNT;
-        leveller_config.speed = LEVELLER_DEFAULT_SPEED;
-        leveller_config.max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB;
-        leveller_config.lookahead = LEVELLER_DEFAULT_LOOKAHEAD;
-        leveller_config.gate_threshold_db = LEVELLER_DEFAULT_GATE_DB;
     }
     leveller_update_pending = true;
     leveller_reset_pending = true;
 
-    // Per-channel preamp (V6+ payloads — overrides the legacy single value set above)
-    if (in->header.format_version >= 6) {
-        for (int i = 0; i < NUM_INPUT_CHANNELS && i < WIRE_MAX_INPUT_CHANNELS; i++) {
-            float db = in->preamp.preamp_db[i];
-            float linear = db_to_linear(db);
-            global_preamp_db[i]      = db;
-            global_preamp_mul[i]     = (int32_t)(linear * (float)(1 << 28));
-            global_preamp_linear[i]  = linear;
-        }
+    // Per-channel preamp — overrides the legacy single value set above.
+    for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+        float db = in->preamp.preamp_db[i];
+        float linear = db_to_linear(db);
+        global_preamp_db[i]      = db;
+        global_preamp_mul[i]     = (int32_t)(linear * (float)(1 << 28));
+        global_preamp_linear[i]  = linear;
     }
 
-    // Master volume (V6+ payloads — bulk params always applies, ignores directory flag).
+    // Master volume (bulk params always applies, ignoring the directory flag).
     // Delegated to update_master_volume() for consistent clamping and to emit
     // a device→host notification via interrupt EP 0x83.
-    if (in->header.format_version >= 6) {
+    {
         float db = in->master_volume.master_volume_db;
         if (!isfinite(db)) db = MASTER_VOL_MAX_DB;
         update_master_volume(db);
     }
 
-    // Input source (V7+ payloads)
-    if (in->header.format_version >= 7) {
+    // Input source
+    {
         uint8_t src = in->input_config.input_source;
         if (input_source_valid(src) && src != active_input_source) {
             pending_input_source = src;
@@ -548,13 +494,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         }
     }
 
-    // I2S input rate (V12+ payloads).  Store only; the bulk_params_pending
-    // handler in main.c owns triggering a deferred rate change after it
-    // restarts the input, and an input-source switch picks the rate up on
-    // its own.
-    if (in->header.format_version >= 12) {
-        i2s_input_rate = i2s_rate_decode(in->input_config.i2s_input_rate);
-    }
+    // I2S input rate.  Store only; the bulk_params_pending handler in main.c
+    // owns triggering a deferred rate change after it restarts the input, and
+    // an input-source switch picks the rate up on its own.
+    i2s_input_rate = i2s_rate_decode(in->input_config.i2s_input_rate);
 
     // LG Sound Sync (V8+ payloads).  Only `enabled` is honored — the
     // other three fields are runtime observations the host cannot push.
@@ -562,27 +505,14 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // disable, streak reset on enable) fire correctly; the PARAM_CHANGED
     // notification it emits is suppressed by the bulk bracket and
     // replaced by a single BULK_INVALIDATED at end.
-    //
-    // Defense-in-depth size check: the version gate alone is not enough
-    // — a sender could legally claim format_version=8 with a payload
-    // length short of the V8 size, in which case in->lg_sound_sync would
-    // straddle the end of the actually-transferred bytes and we'd read
-    // bulk_param_buf garbage from a prior transfer.  Today the dispatcher
-    // gates wLength == sizeof(WireBulkParams), but that's one refactor
-    // away from being relaxed (e.g. for forward-compat smaller V8s),
-    // so guard here too.  Keeps the apply contract self-defending.
-    if (in->header.format_version >= 8 &&
-        in->header.payload_length >= WIRE_BULK_PARAMS_V8_SIZE) {
-        lg_sound_sync_set_enabled(in->lg_sound_sync.enabled != 0);
-    }
+    lg_sound_sync_set_enabled(in->lg_sound_sync.enabled != 0);
 
     // User volume + mute (V9+ payloads).  Routed through update_user_volume()
     // so the same clamp/encode/apply funnel runs as on REQ_SET_USER_VOLUME
     // (vol_mul + loudness coefficient pointer move together, LG cache is
     // invalidated).  user_mute is a plain bool so the apply is just a
     // store + notify_param_write, suppressed by the bulk bracket.
-    if (in->header.format_version >= 9 &&
-        in->header.payload_length >= WIRE_BULK_PARAMS_V9_SIZE) {
+    {
         update_user_volume(in->user_volume.user_volume_db);
         user_mute = (in->user_volume.user_mute != 0);
         uint8_t mv = user_mute ? 1 : 0;
@@ -598,8 +528,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // matches every other section that "best-effort applies" what it
     // can.  Bulk SETs that include a dac_hw_mute section that fails
     // validation leave the previous config in place.
-    if (in->header.format_version >= 10 &&
-        in->header.payload_length >= WIRE_BULK_PARAMS_V10_SIZE) {
+    {
         DacHwMuteConfig hw;
         _Static_assert(sizeof(hw) == sizeof(in->dac_hw_mute),
                        "WireDacHwMute and DacHwMuteConfig must match");
@@ -607,57 +536,23 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         (void)dac_hw_mute_set_config(&hw);
     }
 
-    // Crossover bands (V11+).  V<11 payloads leave current crossover state
-    // untouched — an older host couldn't possibly intend to clobber a
-    // feature it doesn't know exists.  Output rows applied; master rows
-    // skipped (crossover is output-channel-only).  Band-field is always
-    // overwritten with the wire index `XOVER_BAND_BASE + i` so a stale local
-    // index in the payload cannot trigger the live-edit misrouting bug
-    // described in crossover_filters_spec.md.
-    if (in->header.format_version >= 11 &&
-        in->header.payload_length >= WIRE_BULK_PARAMS_V11_SIZE) {
-        for (int ch = 0; ch < NUM_CHANNELS; ch++) {
-            if (ch < CH_OUT_1) continue;   // Master rows: skip
-            for (int b = 0; b < MAX_XOVER_BANDS; b++) {
-                const WireBandParams *wb = &in->crossovers.bands[ch][b];
-                xover_recipes[ch][b].channel = (uint8_t)ch;
-                xover_recipes[ch][b].band    = (uint8_t)(XOVER_BAND_BASE + b);
-                xover_recipes[ch][b].type    = wb->type;
-                xover_recipes[ch][b].bypass  = (wb->bypass == 1) ? 1 : 0;
-                xover_recipes[ch][b].freq    = wb->freq;
-                xover_recipes[ch][b].Q       = wb->q;
-                xover_recipes[ch][b].gain_db = wb->gain_db;
-            }
-        }
-        // Caller is responsible for invoking dsp_recalculate_all_filters()
-        // after this returns; that path rebuilds every crossover section
-        // alongside the PEQ filters.
-    }
-
-#if PICO_RP2350
-    // Extended input channels (V15+): matrix crosspoints + preamp for inputs
-    // 2..7.  V<15 payloads (or any payload shorter than the V15 size) leave
-    // inputs 2..7 untouched — an older host can't intend to clobber channels it
-    // doesn't know exist.  Compiled out on RP2040 (no inputs 2..7).
-    if (in->header.format_version >= 15 &&
-        in->header.payload_length >= WIRE_BULK_PARAMS_V15_SIZE) {
-        for (int inp = WIRE_MAX_INPUT_CHANNELS; inp < NUM_INPUT_CHANNELS; inp++) {
-            int e = inp - WIRE_MAX_INPUT_CHANNELS;
-            for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
-                const WireCrosspoint *wc = &in->input_ext.crosspoints[e][o];
-                matrix_mixer.crosspoints[inp][o].enabled = wc->enabled;
-                matrix_mixer.crosspoints[inp][o].phase_invert = wc->phase_invert;
-                matrix_mixer.crosspoints[inp][o].gain_db = wc->gain_db;
-                matrix_mixer.crosspoints[inp][o].gain_linear = db_to_linear(wc->gain_db);
-            }
-            float db = in->input_ext.preamp_db[e];
-            float linear = db_to_linear(db);
-            global_preamp_db[inp]     = db;
-            global_preamp_mul[inp]    = (int32_t)(linear * (float)(1 << 28));
-            global_preamp_linear[inp] = linear;
+    // Crossover bands.  Output rows applied; input rows skipped (crossover is
+    // output-channel-only).  Band-field is always overwritten with the wire
+    // index `XOVER_BAND_BASE + i` so a stale local index in the payload cannot
+    // trigger the live-edit misrouting bug described in crossover_filters_spec.md.
+    for (int ch = CH_OUT_1; ch < NUM_CHANNELS; ch++) {
+        for (int b = 0; b < MAX_XOVER_BANDS; b++) {
+            const WireBandParams *wb = &in->crossovers.bands[ch][b];
+            xover_recipes[ch][b].channel = (uint8_t)ch;
+            xover_recipes[ch][b].band    = (uint8_t)(XOVER_BAND_BASE + b);
+            xover_recipes[ch][b].type    = wb->type;
+            xover_recipes[ch][b].bypass  = (wb->bypass == 1) ? 1 : 0;
+            xover_recipes[ch][b].freq    = wb->freq;
+            xover_recipes[ch][b].Q       = wb->q;
+            xover_recipes[ch][b].gain_db = wb->gain_db;
         }
     }
-#endif
+    // Caller invokes dsp_recalculate_all_filters() after this returns.
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).
     notify_end_bulk();

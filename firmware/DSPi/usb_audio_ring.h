@@ -50,7 +50,11 @@
 
 typedef struct {
     uint16_t data_len;                  // Actual byte count this packet
-    uint8_t  data[USB_RING_MAX_PKT];   // Raw USB audio payload
+    // 4-byte aligned: the 24-bit USB deinterleave casts `data` to uint32_t* and
+    // the compiler may emit `ldrd`, which faults on a non-word-aligned address.
+    // Without this, `data` lands at offset 2 (after data_len) and is only
+    // 2-byte aligned, hard-faulting on the first 24-bit stereo packet.
+    uint8_t  data[USB_RING_MAX_PKT] __attribute__((aligned(4)));  // Raw USB audio payload
 } usb_audio_slot_t;
 
 typedef struct {

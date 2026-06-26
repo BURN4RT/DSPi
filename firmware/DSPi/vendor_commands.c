@@ -606,22 +606,10 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
                     wxp.enabled = pkt.enabled ? 1 : 0;
                     wxp.phase_invert = pkt.phase_invert ? 1 : 0;
                     wxp.gain_db = pkt.gain_db;
-                    // Base inputs 0/1 → WireBulkParams.crosspoints; inputs 2..7
-                    // (RP2350) → the appended WireInputExtConfig tail.
-                    uint16_t off;
-#if PICO_RP2350
-                    if (pkt.input >= WIRE_MAX_INPUT_CHANNELS) {
-                        uint16_t e = (uint16_t)pkt.input - WIRE_MAX_INPUT_CHANNELS;
-                        off = (uint16_t)(offsetof(WireBulkParams, input_ext.crosspoints)
-                            + ((uint16_t)(e * WIRE_MAX_OUTPUT_CHANNELS + pkt.output))
-                              * sizeof(WireCrosspoint));
-                    } else
-#endif
-                    {
-                        off = (uint16_t)(offsetof(WireBulkParams, crosspoints)
-                            + ((uint16_t)pkt.input * WIRE_MAX_OUTPUT_CHANNELS + pkt.output)
-                              * sizeof(WireCrosspoint));
-                    }
+                    // crosspoints[input][output], row-major (direct, 8 inputs).
+                    uint16_t off = (uint16_t)(offsetof(WireBulkParams, crosspoints)
+                        + ((uint16_t)pkt.input * WIRE_MAX_OUTPUT_CHANNELS + pkt.output)
+                          * sizeof(WireCrosspoint));
                     notify_param_write(off, sizeof(WireCrosspoint), &wxp);
                 }
             }
@@ -1098,23 +1086,34 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 
             case REQ_GET_STATUS: {
                 if (setup->wValue == 9) {
-                    // Combined status: all peaks + CPU load + clip flags
-                    // RP2350: 26 bytes (11 peaks × 2 + 2 CPU + 2 clip)
-                    // RP2040: 18 bytes (7 peaks × 2 + 2 CPU + 2 clip)
+                    // Combined status: all peaks + CPU load + clip flags (32-bit)
+                    // + live active-input-channel count.  Layout:
+                    //   peaks[NUM_CHANNELS]×2, cpu0, cpu1, clip_flags(4),
+                    //   active_input_channels(1).
+                    // RP2350: 17×2 + 2 + 4 + 1 = 41 B.  RP2040: 7×2 + 7 = 21 B.
                     for (int i = 0; i < NUM_CHANNELS; i++) {
                         resp_buf[i*2]     = global_status.peaks[i] & 0xFF;
                         resp_buf[i*2 + 1] = global_status.peaks[i] >> 8;
                     }
-                    resp_buf[NUM_CHANNELS * 2]     = global_status.cpu0_load;
-                    resp_buf[NUM_CHANNELS * 2 + 1] = global_status.cpu1_load;
-                    resp_buf[NUM_CHANNELS * 2 + 2] = global_status.clip_flags & 0xFF;
-                    resp_buf[NUM_CHANNELS * 2 + 3] = global_status.clip_flags >> 8;
-                    vendor_send_response(resp_buf, NUM_CHANNELS * 2 + 4);
+                    int off = NUM_CHANNELS * 2;
+                    resp_buf[off + 0] = global_status.cpu0_load;
+                    resp_buf[off + 1] = global_status.cpu1_load;
+                    resp_buf[off + 2] = (uint8_t)(global_status.clip_flags & 0xFF);
+                    resp_buf[off + 3] = (uint8_t)((global_status.clip_flags >> 8) & 0xFF);
+                    resp_buf[off + 4] = (uint8_t)((global_status.clip_flags >> 16) & 0xFF);
+                    resp_buf[off + 5] = (uint8_t)((global_status.clip_flags >> 24) & 0xFF);
+                    resp_buf[off + 6] = usb_input_channels;   // live active input count (2/4/6/8)
+                    vendor_send_response(resp_buf, off + 7);
                     return true;
                 }
 
                 uint32_t resp = 0;
                 switch (setup->wValue) {
+                    // Legacy packed-peak registers: raw channel-indexed peaks[0..4].
+                    // Under the unified channel model these low indices are INPUT
+                    // channels (0/1 = stereo bus; 2..4 = extra inputs on RP2350),
+                    // not outputs.  Use wValue==9 (combined status) for the full,
+                    // unambiguous per-channel peak array — that is the canonical view.
                     case 0: resp = (uint32_t)global_status.peaks[0] | ((uint32_t)global_status.peaks[1] << 16); break;
                     case 1: resp = (uint32_t)global_status.peaks[2] | ((uint32_t)global_status.peaks[3] << 16); break;
                     case 2: resp = (uint32_t)global_status.peaks[4] | ((uint32_t)global_status.cpu0_load << 16) | ((uint32_t)global_status.cpu1_load << 24); break;
@@ -1137,6 +1136,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     case 20: resp = audio_spdif_get_dma_starvations_instance(2); break;  // SPDIF instance 2
                     case 21: resp = audio_spdif_get_dma_starvations_instance(3); break;  // SPDIF instance 3
                     case 22: resp = usb_audio_ring_overrun_count(); break;  // USB audio ring overruns
+                    case 23: resp = usb_input_channels; break;  // live active input channel count (2/4/6/8)
                 }
                 usb_start_tiny_control_in_transfer(resp, 4);
                 return true;
@@ -1412,10 +1412,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_CLEAR_CLIPS: {
-                // Read-then-clear: return the clip flags that were set, then reset
-                uint16_t flags = global_status.clip_flags;
+                // Read-then-clear: return the 32-bit clip flags that were set, then reset
+                uint32_t flags = global_status.clip_flags;
                 global_status.clip_flags = 0;
-                usb_start_tiny_control_in_transfer(flags, 2);
+                usb_start_tiny_control_in_transfer(flags, 4);
                 return true;
             }
 
@@ -2099,13 +2099,11 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
         if (req->bRequest == REQ_SET_ALL_PARAMS &&
             req->wLength >= WIRE_BULK_PARAMS_MIN_SIZE &&
             req->wLength <= sizeof(WireBulkParams)) {
-            // Large bulk SET — tud_control_xfer handles EP0 chunking.
-            // Range gate (not strict equality) so older hosts keep working
-            // across wire-format bumps: a V8 host sending wLength=v8_size
-            // (now smaller than sizeof(WireBulkParams) after V9 added
-            // WireUserVolume) still lands here.  bulk_params_apply()'s own
-            // header.format_version + payload_length checks decide which
-            // sections are honored — see bulk_params.c apply path.
+            // Large bulk SET — tud_control_xfer handles EP0 chunking.  At V16
+            // compatibility is broken, so WIRE_BULK_PARAMS_MIN_SIZE ==
+            // sizeof(WireBulkParams) and this gate is effectively strict
+            // equality: only a full current-version payload is accepted here.
+            // bulk_params_apply() re-checks format_version + payload_length.
             return tud_control_xfer(rhport, req, bulk_param_buf, req->wLength);
         }
 

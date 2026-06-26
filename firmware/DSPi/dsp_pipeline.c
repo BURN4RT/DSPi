@@ -47,15 +47,9 @@ uint32_t delay_write_idx = 0;
 int32_t channel_delay_samples[NUM_DELAY_CHANNELS] = {0};
 bool any_delay_active = false;
 
-uint8_t channel_band_counts[NUM_CHANNELS] = {
-#if PICO_RP2350
-    // Master L, Master R, Out1-9 (11 channels total)
-    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
-#else
-    // RP2040: 7 channels (2 master + 4 SPDIF + 1 PDM)
-    10, 10, 10, 10, 10, 10, 10
-#endif
-};
+// Every channel (inputs + outputs) has 10 active PEQ bands.  Range-designator
+// init keeps this correct as NUM_CHANNELS changes (17 on RP2350, 7 on RP2040).
+uint8_t channel_band_counts[NUM_CHANNELS] = {[0 ... NUM_CHANNELS-1] = 10};
 
 #if !PICO_RP2350
 DSP_TIME_CRITICAL int32_t fast_mul_q28(int32_t a, int32_t b) {

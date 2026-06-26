@@ -30,7 +30,7 @@ extern float buf_out[NUM_OUTPUT_CHANNELS][192];
 // the 8-channel deinterleave path; read by the matrix only when 8-channel USB
 // input is the active source, so stale contents can never leak into stereo,
 // S/PDIF, or I2S processing.
-extern float buf_in_ext[NUM_INPUT_CHANNELS - NUM_MASTER_CHANNELS][192];
+extern float buf_in_ext[NUM_INPUT_CHANNELS - NUM_STEREO_INPUTS][192];
 #else
 extern int32_t buf_l[192], buf_r[192];
 extern int32_t buf_out[NUM_OUTPUT_CHANNELS][192];

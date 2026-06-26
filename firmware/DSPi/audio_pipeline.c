@@ -57,16 +57,14 @@ float buf_out[NUM_OUTPUT_CHANNELS][192];
 int32_t buf_out[NUM_OUTPUT_CHANNELS][192];
 #endif
 
-// Shared input buffers — file scope for pipeline access
+// Shared input buffers — file scope for pipeline access.  `input_bufs[]` lets
+// the per-input EQ + metering and the matrix address any input channel
+// uniformly (input k -> input_bufs[k]).  Inputs 0/1 are the stereo bus
+// (buf_l/buf_r, shared by every source); higher inputs carry audio only in a
+// multichannel USB alt.
 #if PICO_RP2350
 float buf_l[192], buf_r[192];
-// Extra USB input channels 2..7 for the 8-channel USB input mode.  See
-// audio_pipeline.h: written only by the 8ch deinterleave, read by the matrix
-// only when 8-channel USB is the active source.
-float buf_in_ext[NUM_INPUT_CHANNELS - NUM_MASTER_CHANNELS][192];
-// Per-input buffer pointer table so the generalized matrix can index input
-// channel k uniformly (0/1 -> buf_l/buf_r, 2..7 -> buf_in_ext).  Address
-// constants of file-scope arrays -> valid static initializer.
+float buf_in_ext[NUM_INPUT_CHANNELS - NUM_STEREO_INPUTS][192];   // inputs 2..7
 float *const input_bufs[NUM_INPUT_CHANNELS] = {
     buf_l, buf_r,
     buf_in_ext[0], buf_in_ext[1], buf_in_ext[2],
@@ -74,6 +72,7 @@ float *const input_bufs[NUM_INPUT_CHANNELS] = {
 };
 #else
 int32_t buf_l[192], buf_r[192];
+int32_t *const input_bufs[NUM_INPUT_CHANNELS] = { buf_l, buf_r };
 #endif
 
 // Budget-based CPU load metering (Core 0)
@@ -268,29 +267,27 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
     bool is_bypassed = bypass_master_eq;
 
-    // 8-channel USB input mode: inputs 0..NUM_INPUT_CHANNELS-1 each carry
-    // independent audio straight into the matrix, so the inherently-stereo
-    // master chain (loudness, Master EQ, leveller, crossfeed, master-peak
-    // metering) is bypassed.  Every other source (stereo USB, S/PDIF, I2S)
-    // keeps the full stereo chain and routes only inputs 0/1.  n_active_inputs
-    // gates the matrix's input iteration so buf_in_ext (inputs 2..7) is read
-    // ONLY in true 8-channel mode — stale samples can never leak into stereo,
-    // S/PDIF, or I2S output.
-    bool eight_ch = (active_input_source == INPUT_SOURCE_USB &&
-                     usb_input_channels > NUM_MASTER_CHANNELS);
-    int n_active_inputs = eight_ch ? NUM_INPUT_CHANNELS : NUM_MASTER_CHANNELS;
+    // Active input count for this packet: the USB alt's channel count (2/4/6/8)
+    // when USB is the source, else the stereo pair (S/PDIF / I2S).  In
+    // multichannel mode (>2 inputs) the inherently-stereo chain — loudness,
+    // leveller, crossfeed — is bypassed; each input gets only its own PEQ, then
+    // the matrix.  The matrix iterates n_active_inputs, so buf_in_ext (inputs
+    // 2..7) is read ONLY when those inputs are actually active; stale samples
+    // can never leak into stereo / S/PDIF / I2S output.
+    int n_active_inputs = (active_input_source == INPUT_SOURCE_USB)
+                              ? usb_input_channels : NUM_STEREO_INPUTS;
+    if (n_active_inputs > NUM_INPUT_CHANNELS) n_active_inputs = NUM_INPUT_CHANNELS;
+    bool multichannel = (n_active_inputs > NUM_STEREO_INPUTS);
 
     // Snapshot loudness state for this packet
     bool loud_on = loudness_enabled;
     const LoudnessCoeffs *loud_coeffs = current_loudness_coeffs;
 
-    float peak_ml = 0, peak_mr = 0;
-
     // Pre-compute PDM scale factor
     const float pdm_scale = (float)(1 << 28);
 
-    // Loudness compensation (SVF shelf filters); stereo-only, skip in 8ch mode
-    if (!eight_ch && loud_on && loud_coeffs) {
+    // Loudness compensation (SVF shelf filters); stereo-only, skip in multichannel
+    if (!multichannel && loud_on && loud_coeffs) {
         for (uint32_t i = 0; i < sample_count; i++) {
             float raw_left = buf_l[i];
             float raw_right = buf_r[i];
@@ -321,49 +318,50 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     }
 
-    // ========== PASS 2: Master EQ (Block-Based) ==========
-    if (!eight_ch && !is_bypassed) {
-        if (!channel_bypassed[CH_MASTER_LEFT]) {
-            dsp_process_channel_block(filters[CH_MASTER_LEFT], buf_l, sample_count, CH_MASTER_LEFT);
+    // ========== PASS 2: Per-Input EQ + Metering ==========
+    // Each active input channel gets its own PEQ (the generalized "master EQ"),
+    // then a post-EQ peak/clip meter into global_status.  Runs only for active
+    // inputs (n_active_inputs); inputs above that are zeroed so the host shows
+    // no stale activity.
+    for (int k = 0; k < n_active_inputs; k++) {
+        float *ibuf = input_bufs[k];
+        if (!is_bypassed && !channel_bypassed[k]) {
+            dsp_process_channel_block(filters[k], ibuf, sample_count, k);
         }
-        if (!channel_bypassed[CH_MASTER_RIGHT]) {
-            dsp_process_channel_block(filters[CH_MASTER_RIGHT], buf_r, sample_count, CH_MASTER_RIGHT);
+        float pk = 0.0f;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            float a = fabsf(ibuf[i]); if (a > pk) pk = a;
         }
+        global_status.peaks[k] = (uint16_t)(fminf(1.0f, pk) * 32767.0f);
+        if (pk > CLIP_THRESH_F) global_status.clip_flags |= (1u << k);
     }
+    for (int k = n_active_inputs; k < NUM_INPUT_CHANNELS; k++)
+        global_status.peaks[k] = 0;
 
-    // ========== PASS 2.5: Volume Leveller ==========
-    if (!eight_ch && !leveller_bypassed) {
+    // ========== PASS 2.5: Volume Leveller ========== (stereo-only)
+    if (!multichannel && !leveller_bypassed) {
         leveller_process_block(&leveller_state, &leveller_coeffs,
                                (const LevellerConfig *)&leveller_config,
                                buf_l, buf_r, sample_count);
     }
 
-    // ========== PASS 3: Crossfeed + Master Peaks ==========
-    // Stereo-only; in 8-channel mode the inputs go straight to the matrix and
-    // master-peak metering is not reported (documented limitation).
-    if (!eight_ch) {
-        bool do_crossfeed = !crossfeed_bypassed;
-
-        // Crossfeed is sample-by-sample (internal state), combined with peak tracking
+    // ========== PASS 3: Crossfeed ========== (stereo-only)
+    if (!multichannel && !crossfeed_bypassed) {
         for (uint32_t i = 0; i < sample_count; i++) {
             float ml = buf_l[i], mr = buf_r[i];
-            float abs_ml = fabsf(ml); if (abs_ml > peak_ml) peak_ml = abs_ml;
-            float abs_mr = fabsf(mr); if (abs_mr > peak_mr) peak_mr = abs_mr;
-            if (do_crossfeed) {
-                crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
-                buf_l[i] = ml; buf_r[i] = mr;
-            }
+            crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
+            buf_l[i] = ml; buf_r[i] = mr;
         }
     }
 
     // ========== PASS 4: Matrix Mixing (block-based, output-major) ==========
-    // Generalized over n_active_inputs (NUM_MASTER_CHANNELS for stereo / S/PDIF
-    // / I2S, NUM_INPUT_CHANNELS for 8-channel USB).  For each output, snapshot
-    // the active (input buffer, signed gain) pairs ONCE — then run the sample
-    // loop.  Inputs are gated by n_active_inputs, not by crosspoint enables, so
-    // buf_in_ext (inputs 2..7) is read only in true 8-channel mode.  Every
-    // output uses the same sample_count and per-sample index, so inter-output
-    // sample alignment is preserved exactly (CLAUDE.md hard rule).
+    // Generalized over n_active_inputs (2 for stereo / S/PDIF / I2S, 4/6/8 for
+    // multichannel USB).  For each output, snapshot the active (input buffer,
+    // signed gain) pairs ONCE — then run the sample loop.  Inputs are gated by
+    // n_active_inputs, not by crosspoint enables, so buf_in_ext (inputs 2..7) is
+    // read only when those inputs are active.  Every output uses the same
+    // sample_count and per-sample index, so inter-output sample alignment is
+    // preserved exactly (CLAUDE.md hard rule).
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
         float *dst = buf_out[out];
         if (!matrix_mixer.outputs[out].enabled) {
@@ -617,11 +615,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 #endif
     }
 
-    // Write input peaks
-    global_status.peaks[0] = (uint16_t)(fminf(1.0f, peak_ml) * 32767.0f);
-    global_status.peaks[1] = (uint16_t)(fminf(1.0f, peak_mr) * 32767.0f);
-    if (peak_ml > CLIP_THRESH_F) global_status.clip_flags |= (1u << CH_MASTER_LEFT);
-    if (peak_mr > CLIP_THRESH_F) global_status.clip_flags |= (1u << CH_MASTER_RIGHT);
+    // (Per-input peaks/clip are written in PASS 2, above.)
 
 #else
     // ------------------------------------------------------------------------
@@ -661,8 +655,6 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     bool loud_on = loudness_enabled;
     const LoudnessCoeffs *loud_coeffs = current_loudness_coeffs;
 
-    int32_t peak_ml = 0, peak_mr = 0;
-
     // Loudness compensation (per-sample — biquad state coupling)
     if (loud_on && loud_coeffs) {
         for (uint32_t i = 0; i < sample_count; i++) {
@@ -695,12 +687,18 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     }
 
-    // ========== PASS 2: Master EQ (Block-Based) ==========
-    if (!is_bypassed) {
-        if (!channel_bypassed[CH_MASTER_LEFT])
-            dsp_process_channel_block(filters[CH_MASTER_LEFT], buf_l, sample_count, CH_MASTER_LEFT);
-        if (!channel_bypassed[CH_MASTER_RIGHT])
-            dsp_process_channel_block(filters[CH_MASTER_RIGHT], buf_r, sample_count, CH_MASTER_RIGHT);
+    // ========== PASS 2: Per-Input EQ + Metering ========== (RP2040: 2 inputs)
+    for (int k = 0; k < NUM_INPUT_CHANNELS; k++) {
+        int32_t *ibuf = input_bufs[k];
+        if (!is_bypassed && !channel_bypassed[k]) {
+            dsp_process_channel_block(filters[k], ibuf, sample_count, k);
+        }
+        int32_t pk = 0;
+        for (uint32_t i = 0; i < sample_count; i++) {
+            int32_t a = abs(ibuf[i]); if (a > pk) pk = a;
+        }
+        global_status.peaks[k] = (uint16_t)(pk >> 13);
+        if (pk > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << k);
     }
 
     // ========== PASS 2.5: Volume Leveller ==========
@@ -710,12 +708,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                                buf_l, buf_r, sample_count);
     }
 
-    // ========== PASS 3: Crossfeed + Master Peaks ==========
-    for (uint32_t i = 0; i < sample_count; i++) {
-        int32_t ml = buf_l[i], mr = buf_r[i];
-        if (abs(ml) > peak_ml) peak_ml = abs(ml);
-        if (abs(mr) > peak_mr) peak_mr = abs(mr);
-        if (!crossfeed_bypassed) {
+    // ========== PASS 3: Crossfeed ==========
+    if (!crossfeed_bypassed) {
+        for (uint32_t i = 0; i < sample_count; i++) {
+            int32_t ml = buf_l[i], mr = buf_r[i];
             crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
             buf_l[i] = ml; buf_r[i] = mr;
         }
@@ -954,11 +950,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 #endif
     }
 
-    // Write input peaks
-    global_status.peaks[0] = (uint16_t)(peak_ml >> 13);
-    global_status.peaks[1] = (uint16_t)(peak_mr >> 13);
-    if (peak_ml > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << CH_MASTER_LEFT);
-    if (peak_mr > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << CH_MASTER_RIGHT);
+    // (Per-input peaks/clip are written in PASS 2, above.)
 #endif
 
 #ifdef DSPI_LOOPBACK

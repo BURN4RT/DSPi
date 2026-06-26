@@ -32,7 +32,9 @@
 // bump (8 → 64 bytes) introduced with the v2 notification protocol.
 // 0x0201 → 0x0202 for the RP2350 8-channel input alt (alt 3) + widened input
 // terminal/feature unit + larger iso OUT max-packet.
-#define USB_BCD_DEVICE  0x0202
+// 0x0202 → 0x0203 for the 4ch/6ch input alts + the unified channel model
+// (per-input EQ/metering, wire V16 / slot V21).
+#define USB_BCD_DEVICE  0x0203
 
 // ----------------------------------------------------------------------------
 // ENDPOINT ADDRESSES

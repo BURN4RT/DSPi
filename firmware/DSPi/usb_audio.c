@@ -250,25 +250,31 @@ void get_default_channel_name(int ch, uint8_t input_source,
     memset(buf, 0, PRESET_NAME_LEN);
     if (ch < 0 || ch >= NUM_CHANNELS) return;
 
-    if (ch < NUM_MASTER_CHANNELS) {
-        const char *prefix;
-        switch (input_source) {
-            case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
-            case INPUT_SOURCE_I2S:   prefix = "I2S";   break;
-            case INPUT_SOURCE_USB:   /* fallthrough */
-            default:                 prefix = "USB";   break;
+    if (ch < NUM_INPUT_CHANNELS) {
+        // Input channels.  0/1 are the stereo pair (named after the source);
+        // higher inputs exist only in multichannel USB, named "USB N".
+        if (ch < NUM_STEREO_INPUTS) {
+            const char *prefix;
+            switch (input_source) {
+                case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
+                case INPUT_SOURCE_I2S:   prefix = "I2S";   break;
+                case INPUT_SOURCE_USB:   /* fallthrough */
+                default:                 prefix = "USB";   break;
+            }
+            snprintf(buf, PRESET_NAME_LEN, "%s %c", prefix, (ch == 0) ? 'L' : 'R');
+        } else {
+            snprintf(buf, PRESET_NAME_LEN, "USB %d", ch + 1);
         }
-        snprintf(buf, PRESET_NAME_LEN, "%s %c", prefix, (ch == 0) ? 'L' : 'R');
         return;
     }
 
-    if (ch == NUM_CHANNELS - 1) {
+    if (ch == NUM_CHANNELS - 1) {   // PDM sub (last output)
         strncpy(buf, "PDM", PRESET_NAME_LEN - 1);
         return;
     }
 
-    int slot_idx = (ch - NUM_MASTER_CHANNELS) / 2;
-    int side     = (ch - NUM_MASTER_CHANNELS) % 2;
+    int slot_idx = (ch - NUM_INPUT_CHANNELS) / 2;
+    int side     = (ch - NUM_INPUT_CHANNELS) % 2;
     uint8_t type = (output_types && slot_idx < NUM_SPDIF_INSTANCES)
                        ? output_types[slot_idx]
                        : OUTPUT_TYPE_SPDIF;
@@ -291,18 +297,7 @@ void update_preamp(uint8_t ch, float db) {
     float linear = powf(10.0f, db / 20.0f);
     global_preamp_mul[ch]    = (int32_t)(linear * (float)(1 << 28));
     global_preamp_linear[ch] = linear;
-    // Base inputs 0/1 live in the WirePreampConfig section; inputs 2..7 (RP2350)
-    // are in the appended WireInputExtConfig tail.
-    uint16_t off;
-#if PICO_RP2350
-    if (ch >= WIRE_MAX_INPUT_CHANNELS) {
-        off = (uint16_t)(offsetof(WireBulkParams, input_ext.preamp_db)
-                         + (ch - WIRE_MAX_INPUT_CHANNELS) * sizeof(float));
-    } else
-#endif
-    {
-        off = (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float));
-    }
+    uint16_t off = (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float));
     notify_param_write(off, sizeof(float), &db);
 }
 
@@ -401,10 +396,10 @@ volatile uint64_t start_time_us = 0;
 volatile bool sync_started = false;
 static volatile uint64_t last_packet_time_us = 0;
 static volatile uint8_t usb_input_bit_depth = 16;
-// Active USB input channel count: 2 for the stereo alts (1/2), 8 for the
-// RP2350-only 8-channel alt (3).  Read by the audio pipeline to select the
-// 8-channel matrix path and bypass the stereo master chain.  Always 2 on
-// RP2040 (no 8-channel alt is advertised).
+// Active USB input channel count: 2 for the stereo alts (1/2), or 4/6/8 for the
+// RP2350-only multichannel alts (3/4/5).  Read by the audio pipeline to size the
+// per-input EQ + metering and the matrix, and to bypass the stereo master chain
+// in multichannel mode.  Always 2 on RP2040 (no multichannel alts advertised).
 volatile uint8_t usb_input_channels = 2;
 #define AUDIO_GAP_THRESHOLD_US 50000  // 50ms - reset sync if packets stop this long
 
@@ -504,9 +499,9 @@ void audio_set_volume(int16_t volume) {
 static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint16_t data_len) {
     // USB format snapshot
     const uint8_t bit_depth = usb_input_bit_depth;  // snapshot once — avoid double-read of volatile
-    const uint8_t channels  = usb_input_channels;   // 2 (stereo alts) or 8 (RP2350 alt 3)
-    // 8-channel mode is always 16-bit; stereo alts are 16- or 24-bit.
-    uint32_t bytes_per_frame = (channels > NUM_MASTER_CHANNELS)
+    const uint8_t channels  = usb_input_channels;   // 2 (stereo alts) or 4/6/8 (multichannel alts)
+    // Multichannel alts are always 16-bit; stereo alts are 16- or 24-bit.
+    uint32_t bytes_per_frame = (channels > NUM_STEREO_INPUTS)
                                    ? (uint32_t)channels * 2
                                    : (bit_depth == 24) ? 6 : 4;
     uint32_t sample_count = data_len / bytes_per_frame;
@@ -539,23 +534,23 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     // PASS 1: USB byte decode → buf_l/buf_r + preamp
 #if PICO_RP2350
     {
-        if (channels > NUM_MASTER_CHANNELS) {
-            // 8-channel USB input (48 kHz / 16-bit).  Frame layout is
-            // c0,c1,...,c7 interleaved; channels 0/1 land in buf_l/buf_r (the
-            // shared stereo bus), channels 2..7 in buf_in_ext.  Per-channel
-            // preamp applied here; the stereo master chain is bypassed
-            // downstream (see process_input_block's eight_ch path).
+        if (channels > NUM_STEREO_INPUTS) {
+            // Multichannel USB input (4/6/8 ch, 48 kHz / 16-bit).  Frame layout
+            // is c0,c1,...,c(N-1) interleaved (stride = channels); channels 0/1
+            // land in buf_l/buf_r (the shared stereo bus), channels 2..N-1 in
+            // buf_in_ext.  Per-channel preamp applied here; the stereo master
+            // chain is bypassed downstream (process_input_block multichannel).
             const int16_t *in = (const int16_t *)data;
             const float inv_32768 = 1.0f / 32768.0f;
             float gain[NUM_INPUT_CHANNELS];
-            for (int c = 0; c < NUM_INPUT_CHANNELS; c++)
+            for (int c = 0; c < channels; c++)
                 gain[c] = inv_32768 * global_preamp_linear[c];
             for (uint32_t i = 0; i < sample_count; i++) {
-                const int16_t *frame = &in[i * NUM_INPUT_CHANNELS];
+                const int16_t *frame = &in[i * channels];
                 buf_l[i] = (float)frame[0] * gain[0];
                 buf_r[i] = (float)frame[1] * gain[1];
-                for (int c = NUM_MASTER_CHANNELS; c < NUM_INPUT_CHANNELS; c++)
-                    buf_in_ext[c - NUM_MASTER_CHANNELS][i] =
+                for (int c = NUM_STEREO_INPUTS; c < channels; c++)
+                    buf_in_ext[c - NUM_STEREO_INPUTS][i] =
                         (float)frame[c] * gain[c];
             }
         } else if (bit_depth == 24) {
@@ -950,10 +945,10 @@ static inline void uac1_arm_feedback(uint8_t rhport) {
     usbd_edpt_xfer(rhport, AUDIO_IN_ENDPOINT, ep_fb_buf, 3);
 }
 
-// Open isochronous endpoints for the specified alt (1 or 2).
+// Open isochronous endpoints for the specified alt (1..5 on RP2350, 1..2 else).
 static bool uac1_open_stream_eps(uint8_t rhport, uint8_t alt) {
 #if PICO_RP2350
-    if (alt < 1 || alt > 3) return false;   // alt 3 = 8-channel input
+    if (alt < 1 || alt > 5) return false;   // alts 3/4/5 = 4/6/8-channel input
 #else
     if (alt != 1 && alt != 2) return false;
 #endif
@@ -1079,10 +1074,11 @@ static void uac1_close_stream_eps(uint8_t rhport) {
     }
 }
 
-// Apply a new AS alt setting (0, 1, or 2). Mirrors the old as_set_alternate().
+// Apply a new AS alt setting.  Alts: 0 = zero-bw; 1 = 2ch/16; 2 = 2ch/24;
+// and (RP2350 only) 3 = 4ch, 4 = 6ch, 5 = 8ch (all 48 kHz / 16-bit).
 static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
 #if PICO_RP2350
-    if (alt > 3) return false;   // alt 3 = 8-channel input (RP2350 only)
+    if (alt > 5) return false;   // alts 3/4/5 = 4/6/8-channel input (RP2350 only)
 #else
     if (alt > 2) return false;
 #endif
@@ -1094,8 +1090,16 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
     // pause in the stream and a risk of DCD state desync — bail early.
     if (alt == prev_alt) return true;
 
-    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;  // alt 3 is 16-bit
-    uint8_t  new_channels  = (alt == 3) ? NUM_INPUT_CHANNELS : NUM_MASTER_CHANNELS;
+    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;  // only alt 2 is 24-bit
+    uint8_t  new_channels;
+    switch (alt) {
+#if PICO_RP2350
+        case 3:  new_channels = 4; break;
+        case 4:  new_channels = 6; break;
+        case 5:  new_channels = 8; break;
+#endif
+        default: new_channels = NUM_STEREO_INPUTS; break;  // alt 0/1/2 = stereo
+    }
     bool     bit_depth_changed = (new_bit_depth != usb_input_bit_depth);
     bool     channels_changed  = (new_channels != usb_input_channels);
     bool     format_changed    = bit_depth_changed || channels_changed;
@@ -1119,11 +1123,18 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
         usb_audio_flush_ring();
     }
 
+    // Tell the host (DSPi Console) the active input channel count changed so it
+    // can relayout its mixer/sidebar immediately, without waiting for the next
+    // status poll.
+    if (channels_changed) {
+        notify_push_input_format(new_channels);
+    }
+
 #if PICO_RP2350
-    // The 8-channel alt advertises 48 kHz only.  Force it so the main loop
-    // re-derives filters/delays (via the existing rate-change machinery, which
-    // preserves output-slot alignment) if the host had been at 44.1/96 kHz.
-    if (alt == 3 && audio_state.freq != 48000u) {
+    // The multichannel alts (4/6/8) advertise 48 kHz only.  Force it so the main
+    // loop re-derives filters/delays (via the existing rate-change machinery,
+    // which preserves output-slot alignment) if the host had been at 44.1/96.
+    if (new_channels > NUM_STEREO_INPUTS && audio_state.freq != 48000u) {
         audio_state.freq = 48000u;
         pending_rate = 48000u;
         rate_change_pending = true;
@@ -1363,8 +1374,8 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                 // coerce to 44100 — GET_CUR would then lie to the host.
                 bool rate_ok;
 #if PICO_RP2350
-                if (usb_input_channels > NUM_MASTER_CHANNELS) {
-                    // 8-channel alt (3) advertises a single rate: 48 kHz.
+                if (usb_input_channels > NUM_STEREO_INPUTS) {
+                    // Multichannel alts (4/6/8) advertise a single rate: 48 kHz.
                     rate_ok = (new_freq == 48000u);
                 } else
 #endif

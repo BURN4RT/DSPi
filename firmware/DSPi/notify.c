@@ -302,6 +302,23 @@ void notify_push_preset_loaded(uint8_t slot) {
     restore_interrupts(flags);
 }
 
+void notify_push_input_format(uint8_t channels) {
+    uint32_t flags = save_and_disable_interrupts();
+    if (ring_full_locked()) {
+        notify_overflow_count++;
+        notify_drops_count++;
+        restore_interrupts(flags);
+        return;
+    }
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_INPUT_FORMAT,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = channels;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 void notify_push_bulk_invalidated(ParamSource src) {
     uint32_t flags = save_and_disable_interrupts();
 
@@ -422,6 +439,20 @@ uint16_t notify_peek_next(uint8_t *out_buf, uint16_t max_len) {
             if (max_len < 8) return 0;
             out_buf[0] = NOTIFY_V2_VERSION;
             out_buf[1] = NOTIFY_EVT_PRESET_LOADED;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = 0;
+            out_buf[6] = 0;
+            out_buf[7] = 0;
+            return 8;
+        }
+
+        case NOTIFY_EVT_INPUT_FORMAT: {
+            // 8 bytes: active input channel count in byte 4.
+            if (max_len < 8) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_INPUT_FORMAT;
             out_buf[2] = 0;
             out_buf[3] = seq;
             out_buf[4] = e.value[0];

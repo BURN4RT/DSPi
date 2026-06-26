@@ -227,16 +227,18 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 
 **`perform_rate_change()` (main.c):** bracketed with `prepare_pipeline_reset(PRESET_MUTE_SAMPLES)` / `complete_pipeline_reset()`. Without the bracket, the SPDIF `wrap_consumer_take` callback updates the PIO divider lazily on the next buffer-take, so old-rate audio already queued in each consumer pool plays out at the new bit-clock — audible pitch wobble for ~16 ms. `complete_pipeline_reset()` aborts DMA on every enabled slot, drains the consumer pool back to the free list, and restarts all outputs in sync at the new divider. The I2S `audio_i2s_update_all_frequencies()` call inside `perform_rate_change()` still runs for its own divider+clkdiv_restart pass; the subsequent `complete_pipeline_reset()` re-aborts/re-enables idempotently and costs only microseconds.
 
-### 8-Channel USB Input (RP2350)
-*Last updated: 2026-06-24*
+### Multichannel USB Input + Per-Input EQ/Metering (RP2350)
+*Last updated: 2026-06-25*
 
-RP2350 advertises an additional AudioStreaming alternate setting, **alt 3 = 8 channels / 48 kHz / 16-bit (fixed)**, alongside the stereo alts (alt 1 = 16-bit, alt 2 = 24-bit, both 44.1/48/96 kHz). The host selects it like any other device format; picking the 8-channel/48 kHz format activates alt 3. RP2040 is stereo-only — its descriptor is unchanged (no alt 3) because it has only 2 SPDIF instances (4 output channels). Full details: `Documentation/Features/usb_8ch_input_spec.md`.
+**Unified channel model (no "master").** Channels are now `[inputs 0..NUM_INPUT_CHANNELS-1][outputs NUM_INPUT_CHANNELS..]`; `NUM_CHANNELS = NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS` (17 on RP2350, 7 on RP2040). The former "master EQ" was always the EQ on the 2 stereo inputs — it is generalized so **every input channel is a first-class channel with its own 10-band PEQ + peak/clip metering** (no crossover). Output channels keep PEQ + crossover + gain/delay/mute. `CH_OUT_1 = NUM_INPUT_CHANNELS`; the output-slot→channel-index mapping (`CH_OUT_1 + slot`) shifts automatically, so the slot-aligned output path is structurally unchanged. **Input EQ and metering reuse the existing `REQ_SET/GET_EQ_PARAM` (channel = input index) and `REQ_GET_STATUS` (`peaks[]`/`clip_flags`) commands — no new commands.** `clip_flags` is `uint32_t` (17 channels > 16 bits).
 
-**Descriptor.** The single Input Terminal (ID 1) and Feature Unit declare the channel superset (`bNrChannels=8`, `wChannelConfig=0x063F` 7.1) so a host that keys channel count off the terminal exposes all formats; each AS alt carries its own Format Type I `bNrChannels`. The iso OUT EP max-packet rises to **788** (`AUDIO_EP_MAX_PKT`, RP2350) to fit 48×8×2 B + 1 jitter frame; the USB ring slot (`USB_RING_MAX_PKT`) matches. Descriptor offsets and `CONFIG_TOTAL_LEN` (265 on RP2350) are computed arithmetically and verified by a `_Static_assert`.
+**USB formats.** RP2350 advertises AudioStreaming alts **1 = 2ch/16, 2 = 2ch/24** (44.1/48/96 kHz), and **3 = 4ch, 4 = 6ch, 5 = 8ch** (all 48 kHz/16-bit fixed). The host picks the format; the firmware sets the active input count (`usb_input_channels` = 2/4/6/8) in `uac1_apply_alt()`, which forces 48 kHz for multichannel alts (SET_CUR rejects non-48k), flushes the ring, and resyncs. RP2040 is stereo-only (2 SPDIF = 4 output channels). The multichannel alt blocks are emitted by a parameterized `AS_MULTICH_ALT(alt,nch)` macro; descriptor offsets/`CONFIG_TOTAL_LEN` (369 on RP2350) are arithmetic + `_Static_assert`-verified. The single Input Terminal/Feature Unit declare the 8-channel superset (`wChannelConfig=0x063F`); iso OUT max-packet `AUDIO_EP_MAX_PKT=788`.
 
-**Channel count state.** `usb_input_channels` (usb_audio.c) is 2 for the stereo alts, 8 for alt 3 — set by `uac1_apply_alt()`, which treats a channel-count change like a bit-depth change (ring flush + resync cascade) and forces `audio_state.freq = 48000` on entry to alt 3 (the rate is locked; SET_CUR rejects non-48 kHz while alt 3 is active). The pipeline reads `usb_input_channels` to select the 8-channel path.
+**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2; `multichannel = n_active>2` **bypasses the stereo-only chain** (loudness, leveller, crossfeed). The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit. Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
 
-**Decode + pipeline.** `process_audio_packet()` adds an 8ch/16-bit branch that scatters the interleaved frame (`c0..c7`) into `buf_l`/`buf_r` (inputs 0/1) and `buf_in_ext[0..5]` (inputs 2-7), applying per-channel preamp. In `process_input_block()`, 8-channel mode (`eight_ch`) **bypasses the stereo master chain** (loudness, Master EQ, leveller, crossfeed, master-peak metering — all inherently stereo) and routes the 8 inputs straight into the widened matrix; per-output EQ/gain/delay then apply per channel as usual. The matrix iterates `n_active_inputs` (2 for stereo / S/PDIF / I2S, 8 for 8-channel USB), so `buf_in_ext` is read only in true 8-channel mode and stale samples can never leak into other sources. Inter-output sample alignment is preserved bit-for-bit (every output uses the same `sample_count` and per-sample index). Default factory routing is unchanged (stereo pass-through on SPDIF 1); 8-channel routing is configured by the host app via the matrix.
+**Live active-input-count for the host.** The app reads the active count (2/4/6/8) from the `REQ_GET_STATUS` combined packet (a 1-byte `active_input_channels` field, polled with the meters) or the scalar `wValue==23`; the bulk header `num_input_channels` stays the device max (8). A `NOTIFY_EVT_INPUT_FORMAT` (0x05) push event fires on alt change so the app relayouts immediately.
+
+**Persistence (compat-breaking).** Wire `WIRE_FORMAT_VERSION=16` (direct 8-input matrix/preamp + 17-channel EQ; no tail-append/version gates; 5864 B). Flash `SLOT_DATA_VERSION=21` (direct layout; the slot spans **2 flash sectors** on RP2350; 1 on RP2040). No migration — pre-version data loads factory defaults.
 
 ### Notification Endpoint (device→host push)
 *Last updated: 2026-05-17 (added PARAM_SRC_UAC1 = 7 for UAC1 Feature Unit writes)*
@@ -373,8 +375,8 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Stage | Description |
 |-------|-------------|
 | Input conversion | USB int16/24-bit or SPDIF RX 24-bit → float full-scale, per-channel preamp gain (`global_preamp_linear[ch]`) |
-| Loudness | 2 SVF shelf filters (low shelf + high shelf), volume-dependent |
-| Master EQ | Block-based `dsp_process_channel_block()`, 10 bands per channel, hybrid SVF/biquad |
+| Loudness | 2 SVF shelf filters (low shelf + high shelf), volume-dependent (stereo only) |
+| Per-Input EQ + metering | Per active input: block-based `dsp_process_channel_block()`, 10 bands, hybrid SVF/biquad; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor on master L/R with gain-reduction limiter (float throughout) |
 | Crossfeed | BS2B lowpass + allpass (ILD + ITD) |
 | Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase; stereo master chain bypassed in 8-channel mode |
@@ -394,8 +396,8 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 | Stage | Description |
 |-------|-------------|
 | Input conversion | USB int16 → Q28 (`<< 14`), USB/SPDIF RX 24-bit → Q28 (`sample << 6`), per-channel preamp via `fast_mul_q28()` (`global_preamp_mul[ch]`) — block loop to `buf_l[192]`, `buf_r[192]` |
-| Loudness | 2 biquads per-sample via `fast_mul_q28()` (Q28 coefficients, state coupling) |
-| Master EQ | **Block-based** `dsp_process_channel_block()`, 10 bands per channel |
+| Loudness | 2 biquads per-sample via `fast_mul_q28()` (Q28 coefficients, state coupling) (stereo only) |
+| Per-Input EQ + metering | Per active input: **block-based** `dsp_process_channel_block()`, 10 bands; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor on master L/R with gain-reduction limiter (Q28 envelope + float gain) |
 | Crossfeed | BS2B per-sample via `fast_mul_q28()` (Q28 coefficients, stereo coupling) |
 | Matrix mixing | Q15 gains via `fast_mul_q15()` (16-bit partial products), 2 inputs × 5 outputs → `buf_out[5][192]` |
@@ -503,33 +505,32 @@ identical on both platforms.
 *Last updated: 2026-06-17*
 
 ### Channel Layout
+*Last updated: 2026-06-25*
 
-**RP2350 (11 channels):**
+Channels are **inputs first, then outputs** (no "master"): indices `0..NUM_INPUT_CHANNELS-1`
+are input channels (each PEQ + metering, no crossover); `CH_OUT_1 = NUM_INPUT_CHANNELS` begins
+the output channels (PEQ + crossover + gain/delay/mute). Inputs 0/1 are the stereo bus used by
+every source; inputs ≥2 carry audio only in a multichannel USB alt.
 
-| Channel | Index | Description |
-|---------|-------|-------------|
-| CH_MASTER_LEFT | 0 | Master EQ left |
-| CH_MASTER_RIGHT | 1 | Master EQ right |
-| CH_OUT_1 | 2 | S/PDIF 1 Left |
-| CH_OUT_2 | 3 | S/PDIF 1 Right |
-| CH_OUT_3 | 4 | S/PDIF 2 Left |
-| CH_OUT_4 | 5 | S/PDIF 2 Right |
-| CH_OUT_5 | 6 | S/PDIF 3 Left |
-| CH_OUT_6 | 7 | S/PDIF 3 Right |
-| CH_OUT_7 | 8 | S/PDIF 4 Left |
-| CH_OUT_8 | 9 | S/PDIF 4 Right |
-| CH_OUT_9_PDM | 10 | PDM Subwoofer |
-
-**RP2040 (7 channels):**
+**RP2350 (17 channels = 8 inputs + 9 outputs):**
 
 | Channel | Index | Description |
 |---------|-------|-------------|
-| CH_MASTER_LEFT | 0 | Master EQ left |
-| CH_MASTER_RIGHT | 1 | Master EQ right |
+| Input 0 | 0 | USB L (stereo bus) |
+| Input 1 | 1 | USB R (stereo bus) |
+| Input 2..7 | 2..7 | Multichannel USB inputs (FC/LFE/BL/BR/SL/SR) |
+| CH_OUT_1 | 8 | S/PDIF 1 Left |
+| CH_OUT_2..CH_OUT_8 | 9..15 | S/PDIF 1R … S/PDIF 4R |
+| CH_OUT_9_PDM | 16 | PDM Subwoofer |
+
+**RP2040 (7 channels = 2 inputs + 5 outputs):**
+
+| Channel | Index | Description |
+|---------|-------|-------------|
+| Input 0 | 0 | USB L |
+| Input 1 | 1 | USB R |
 | CH_OUT_1 | 2 | S/PDIF 1 Left |
-| CH_OUT_2 | 3 | S/PDIF 1 Right |
-| CH_OUT_3 | 4 | S/PDIF 2 Left |
-| CH_OUT_4 | 5 | S/PDIF 2 Right |
+| CH_OUT_2..CH_OUT_4 | 3..5 | S/PDIF 1R, S/PDIF 2 L/R |
 | CH_OUT_5_PDM | 6 | PDM Subwoofer |
 
 ### Biquad Filter
@@ -655,7 +656,7 @@ A dedicated per-output crossover stage between the matrix mixer (PASS 4) and per
 - 4 crossover bands per channel (`MAX_XOVER_BANDS = 4`).
 - Each band is one user-visible filter; internally a cascade of up to 4 biquad sections.
 - Same `EqParamPacket` wire shape as PEQ; `Q` and `gain_db` fields exist but are ignored for crossover filter types.
-- Crossover applies to output channels only. Storage is uniform across NUM_CHANNELS, but writes to master channels (CH_MASTER_LEFT/RIGHT) are rejected at the vendor handler.
+- Crossover applies to output channels only. Storage is uniform across NUM_CHANNELS, but writes to input channels (`ch < CH_OUT_1`) are rejected at the vendor handler.
 
 ### Band-index addressing
 
@@ -974,7 +975,7 @@ output  = direct + ap_opposite     // Mix with opposite channel's crossfeed
 
 ### Purpose
 
-Automatic volume levelling via a feedforward, stereo-linked, single-band RMS compressor applied to the master L/R channels. Sits in the signal chain after Master EQ and before Crossfeed (PASS 2.5 in the pipeline).
+Automatic volume levelling via a feedforward, stereo-linked, single-band RMS compressor applied to the stereo input L/R (stereo mode only; bypassed in multichannel). Sits in the signal chain after the per-input EQ and before Crossfeed (PASS 2.5 in the pipeline).
 
 ### Algorithm
 
@@ -1000,7 +1001,9 @@ Automatic volume levelling via a feedforward, stereo-linked, single-band RMS com
 ### Signal Chain Position
 
 ```
-USB Input → Per-Ch Preamp → Loudness → Master EQ → Volume Leveller → Crossfeed → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → Delay → Output
+USB Input → Per-Ch Preamp → [stereo only: Loudness] → Per-Input EQ + Metering → [stereo only: Volume Leveller → Crossfeed] → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → Delay → Output
+
+(In multichannel mode the stereo-only stages — loudness, leveller, crossfeed — are bypassed; each active input gets its own PEQ + metering before the matrix.)
                                                      (PASS 2.5)
 ```
 
@@ -1381,12 +1384,15 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Crossover bands (per output) | 4 | 4 |
 | Max crossover sections per band | 4 | 4 |
 | Max biquads (PEQ + crossover worst case) | 70 + 80 = 150 | 110 + 144 = 254 |
-| Matrix inputs (NUM_INPUT_CHANNELS) | 2 (USB L/R) | 8 (USB L/R + 6 in 8-channel mode) |
+| Input channels (NUM_INPUT_CHANNELS) | 2 | 8 (active 2/4/6/8 by alt) |
+| NUM_CHANNELS (inputs + outputs) | 7 | 17 |
+| Per-input EQ + metering | 2 inputs | up to 8 inputs (active count) |
 | Matrix outputs | 5 | 9 |
 | S/PDIF outputs | 2 pairs | 4 pairs |
-| USB input channels | 2 (stereo) | 2 (stereo) or 8 (alt 3, 48 kHz/16-bit) |
-| USB input bit depth | 16-bit or 24-bit (alt setting) | 16-bit/24-bit (stereo) or 16-bit (8-channel) |
-| AS alt settings | 0 (zero-bw), 1 (16-bit), 2 (24-bit) | 0, 1, 2, + 3 (8-channel/48 kHz/16-bit) |
+| USB input channels | 2 (stereo) | 2 / 4 / 6 / 8 |
+| USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
+| AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
+| Wire / slot version | V16 / V21 | V16 / V21 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |

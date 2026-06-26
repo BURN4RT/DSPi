@@ -3,17 +3,19 @@
  *
  * Flash Layout (from end of flash, working backwards):
  *
- *   Sector 0  (-48 KB):  Preset Directory  (metadata, slot names, startup config)
- *   Sector 1  (-44 KB):  Preset Slot 0     (full DSP state snapshot)
- *   Sector 2  (-40 KB):  Preset Slot 1
- *   ...
- *   Sector 10 ( -8 KB):  Preset Slot 9
- *   Sector 11 ( -4 KB):  Legacy sector     (old single-preset format, kept for
- *                                            backward compat / migration)
+ *   Sector 0:            Preset Directory  (metadata, slot names, startup config)
+ *   Sectors 1..:         10 Preset Slots, SLOT_SECTORS each (2 sectors / 8 KB on
+ *                        RP2350, 1 sector / 4 KB on RP2040) — full DSP snapshots
  *
- * Each sector is 4 KB (FLASH_SECTOR_SIZE).  A preset slot stores the complete
- * user-configurable DSP state: EQ bands, preamp, delays, loudness, crossfeed,
- * matrix mixer, channel gains/mutes, and optionally pin assignments.
+ * Region = 1 + 10·SLOT_SECTORS sectors (21 on RP2350, 11 on RP2040).  A V21
+ * slot is ~5.8 KB on RP2350 (17-channel EQ/names/crossover), which exceeds one
+ * 4 KB sector — hence 2 sectors per slot there.  There is NO legacy sector:
+ * the old single-preset format and its migration were removed at V21 (compat
+ * broken intentionally; pre-V21 flash loads factory defaults).
+ *
+ * A preset slot stores the complete user-configurable DSP state: per-channel
+ * EQ bands, preamp, delays, loudness, crossfeed, matrix mixer, crossover,
+ * channel gains/mutes/names, and optionally pin assignments.
  *
  * The directory sector holds a 10-bit occupancy bitmask, 10 x 32-byte slot
  * names, startup configuration (which slot to load on boot), and the index
@@ -55,20 +57,29 @@
 // FLASH GEOMETRY
 // ============================================================================
 
-// Total reservation: 12 sectors (48 KB) at the end of flash.
-// Sector 0 = directory, sectors 1-10 = preset slots, sector 11 = legacy.
-#define PRESET_TOTAL_SECTORS    12
+// Preset region: 1 directory sector + 10 slots × SLOT_SECTORS, at the end of
+// flash.  A slot spans TWO sectors (8 KB) on RP2350 — a V21 PresetSlot (unified
+// 17-channel EQ/names/crossover) is ~5.8 KB and exceeds one 4 KB sector — but
+// only ONE sector on RP2040, whose 7-channel slot stays ~2.3 KB (and whose RAM
+// is too tight for an 8 KB flash scratch buffer).  (The old single-sector
+// "legacy" migration is gone — V21 breaks compatibility intentionally; pre-V21
+// data loads factory defaults.)
+#if PICO_RP2350
+#define SLOT_SECTORS            2   // ~5.8 KB slot
+#else
+#define SLOT_SECTORS            1   // ~2.3 KB slot
+#endif
+#define PRESET_TOTAL_SECTORS    (1 + 10 * SLOT_SECTORS)   // 21 (RP2350) / 11 (RP2040)
 #define PRESET_BASE_OFFSET      (PICO_FLASH_SIZE_BYTES - (PRESET_TOTAL_SECTORS * FLASH_SECTOR_SIZE))
+#define SLOT_BYTES              (SLOT_SECTORS * FLASH_SECTOR_SIZE)   // slot allocation
 
 // Individual sector offsets (byte offset from start of flash)
 #define DIR_SECTOR_OFFSET       (PRESET_BASE_OFFSET)
-#define SLOT_SECTOR_OFFSET(n)   (PRESET_BASE_OFFSET + ((1 + (n)) * FLASH_SECTOR_SIZE))
-#define LEGACY_SECTOR_OFFSET    (PICO_FLASH_SIZE_BYTES - FLASH_SECTOR_SIZE)
+#define SLOT_SECTOR_OFFSET(n)   (PRESET_BASE_OFFSET + (1 + (n) * SLOT_SECTORS) * FLASH_SECTOR_SIZE)
 
 // XIP read pointers (memory-mapped flash)
 #define DIR_ADDR                ((const PresetDirectory *)(XIP_BASE + DIR_SECTOR_OFFSET))
 #define SLOT_ADDR(n)            ((const PresetSlot *)(XIP_BASE + SLOT_SECTOR_OFFSET(n)))
-#define LEGACY_ADDR             ((const LegacyFlashStorage *)(XIP_BASE + LEGACY_SECTOR_OFFSET))
 
 // Magic numbers — each distinct so we can tell sector types apart
 #define DIR_MAGIC               0x44535032  // "DSP2"
@@ -95,19 +106,14 @@
 //   V19: First-order shelf PEQ types added (FILTER_LOWSHELF1=9,
 //        FILTER_HIGHSHELF1=10). New enum values only; no struct change, no
 //        renumber, no migration — same on-disk size as V17/V18.
-//   V20: RP2350 8-channel USB input — matrix crosspoints + preamp for input
-//        channels 2..7 appended (matrix_crosspoints_ext, preamp_db_ext) as a
-//        tail section.  Pre-V20 slots predate it and load with inputs 2..7
-//        defaulted (disabled / 0 dB); the per-version CRC range mechanism
-//        handles the size difference.  On RP2040 the ext section is compiled
-//        out, so a V20 slot is byte-identical to V19 (a bare version-tag bump).
-#define SLOT_DATA_VERSION       20
-
-// Input channels stored INLINE in the base slot layout (USB L/R).  Inputs 2..7
-// (RP2350 8-channel USB) live in the appended V20 ext section so the base
-// layout — and every field after it — keeps a stable on-disk offset.  This is
-// deliberately decoupled from NUM_INPUT_CHANNELS (which is 8 on RP2350).
-#define SLOT_BASE_INPUT_CHANNELS  2
+//   V20: RP2350 8-channel USB input — matrix + preamp for inputs 2..7 (tail).
+//   V21: Unified channel model — inputs are first-class channels (per-input PEQ
+//        + metering, no "master"); NUM_CHANNELS grows (17 on RP2350); matrix +
+//        preamp stored direct (all inputs inline).  Compatibility is broken
+//        intentionally: ONLY V21 slots are accepted; pre-V21 slots fail
+//        validation and load factory defaults (no migration).  The slot now
+//        spans 2 flash sectors (SLOT_BYTES).
+#define SLOT_DATA_VERSION       21
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -277,8 +283,8 @@ typedef struct __attribute__((packed)) {
     uint8_t padding4;
     float crossfeed_custom_fc;
     float crossfeed_custom_feed_db;
-    // Matrix mixer (V5) — base inputs 0/1 only; inputs 2..7 in the V20 ext tail.
-    FlashMatrixCrosspoint matrix_crosspoints[SLOT_BASE_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
+    // Matrix mixer — all inputs, direct (V21).
+    FlashMatrixCrosspoint matrix_crosspoints[NUM_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
     FlashOutputChannel matrix_outputs[NUM_OUTPUT_CHANNELS];
     // Pin configuration (V6) — always stored, conditionally loaded
     uint8_t output_pins[NUM_PIN_OUTPUTS];
@@ -299,9 +305,8 @@ typedef struct __attribute__((packed)) {
     float   leveller_amount;
     float   leveller_max_gain_db;
     float   leveller_gate_threshold_db;
-    // Per-channel preamp + Master volume (V12) — base inputs 0/1 only;
-    // inputs 2..7 preamp lives in the V20 ext tail (preamp_db_ext).
-    float   preamp_db_per_ch[SLOT_BASE_INPUT_CHANNELS];  // Per-input-channel preamp (dB)
+    // Per-channel preamp + Master volume — all inputs, direct (V21).
+    float   preamp_db_per_ch[NUM_INPUT_CHANNELS];  // Per-input-channel preamp (dB)
     float   master_volume_db;                       // Device master volume (-128 mute, -127..0 dB)
     // Input source selection (V13) + SPDIF RX pin
     //
@@ -357,61 +362,15 @@ typedef struct __attribute__((packed)) {
     // missing-field case never decodes a bogus 44.1 kHz from a zero byte.
     uint8_t i2s_rx_pin;
     uint8_t i2s_input_rate;
-
-#if PICO_RP2350
-    // Extended input channels (V20+): matrix crosspoints + preamp for inputs
-    // 2..7 (RP2350 8-channel USB input).  Appended tail so the base layout and
-    // every preceding field keep a stable offset; pre-V20 slots lack this
-    // section and load with inputs 2..7 defaulted (disabled / 0 dB), gated on
-    // version >= 20 in apply_slot_to_live().  Compiled out on RP2040, so its
-    // PresetSlot stays byte-identical to V19.
-    FlashMatrixCrosspoint matrix_crosspoints_ext[NUM_INPUT_CHANNELS - SLOT_BASE_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
-    float                 preamp_db_ext[NUM_INPUT_CHANNELS - SLOT_BASE_INPUT_CHANNELS];
-#endif
 } PresetSlot;
 
-// V20 ext section size (0 on RP2040 where it is compiled out).
-#if PICO_RP2350
-#define SLOT_EXT_INPUT_BYTES \
-    (sizeof(((PresetSlot *)0)->matrix_crosspoints_ext) + \
-     sizeof(((PresetSlot *)0)->preamp_db_ext))
-#else
-#define SLOT_EXT_INPUT_BYTES  0
-#endif
+// The whole slot must fit its 2-sector (8 KB) flash allocation.
+_Static_assert(sizeof(PresetSlot) <= SLOT_BYTES,
+               "PresetSlot must fit within its 2-sector flash allocation");
 
-// The whole slot (including the V20 ext tail) must fit one flash sector.
-_Static_assert(sizeof(PresetSlot) <= FLASH_SECTOR_SIZE,
-               "PresetSlot must fit within a single flash sector");
-
-// --- Legacy single-sector format (for migration) ---
-typedef struct __attribute__((packed)) {
-    uint32_t magic;
-    uint16_t version;
-    uint16_t reserved;
-    uint32_t crc32;
-    EqParamPacket filter_recipes[NUM_CHANNELS][MAX_BANDS];
-    float preamp_db;
-    uint8_t bypass;
-    uint8_t padding[3];
-    float delays_ms[NUM_CHANNELS];
-    float channel_gain_db[3];
-    uint8_t channel_mute[3];
-    uint8_t padding2;
-    uint8_t loudness_enabled;
-    uint8_t padding3[3];
-    float loudness_ref_spl;
-    float loudness_intensity_pct;
-    uint8_t crossfeed_enabled;
-    uint8_t crossfeed_preset;
-    uint8_t crossfeed_itd_enabled;
-    uint8_t padding4;
-    float crossfeed_custom_fc;
-    float crossfeed_custom_feed_db;
-    FlashMatrixCrosspoint matrix_crosspoints[SLOT_BASE_INPUT_CHANNELS][NUM_OUTPUT_CHANNELS];
-    FlashOutputChannel matrix_outputs[NUM_OUTPUT_CHANNELS];
-    uint8_t output_pins[NUM_PIN_OUTPUTS];
-    uint8_t pin_padding[8 - NUM_PIN_OUTPUTS];
-} LegacyFlashStorage;
+// (The pre-preset single-sector "legacy" format and its migration were removed
+//  at V21 — compatibility is intentionally broken; boot loads factory defaults
+//  when no valid V21 directory/slot is present.)
 
 // ============================================================================
 // EXTERNAL VARIABLES (defined in usb_audio.c / dsp_pipeline.c)
@@ -522,15 +481,19 @@ static float db_to_linear(float db) {
 // LOW-LEVEL FLASH HELPERS
 // ============================================================================
 
-// Erase one sector and write data into it.
+// Erase the sector(s) covering a record and write data into them.
 // `offset` is the byte offset from the start of flash (not XIP address).
-// `data` and `len` specify the payload; it is zero-padded up to page alignment.
+// `data`/`len` specify the payload; it is zero-padded up to page alignment.
+// Records up to SLOT_BYTES (a 2-sector preset slot) are supported; the erase
+// rounds up to a full sector boundary so a >4 KB slot erases both its sectors.
 static int flash_write_sector(uint32_t offset, const void *data, size_t len) {
-    // Round up to page boundary
-    size_t write_size = (len + FLASH_PAGE_SIZE - 1) & ~(FLASH_PAGE_SIZE - 1);
+    // Program size rounds to a page; erase size rounds to a sector.
+    size_t write_size = (len + FLASH_PAGE_SIZE - 1)   & ~(FLASH_PAGE_SIZE - 1);
+    size_t erase_size = (len + FLASH_SECTOR_SIZE - 1) & ~(FLASH_SECTOR_SIZE - 1);
 
-    // Use a page-aligned scratch buffer (static to avoid large stack allocs)
-    static uint8_t __attribute__((aligned(256))) write_buf[FLASH_SECTOR_SIZE];
+    // Page-aligned scratch buffer sized for the largest record (a 2-sector slot).
+    static uint8_t __attribute__((aligned(256))) write_buf[SLOT_BYTES];
+    if (len > sizeof(write_buf)) return -1;   // defensive: record too large
     memset(write_buf, 0xFF, sizeof(write_buf));
     memcpy(write_buf, data, len);
 
@@ -555,7 +518,7 @@ static int flash_write_sector(uint32_t offset, const void *data, size_t len) {
     if (do_lockout) multicore_lockout_start_blocking();
 
     uint32_t flags = save_and_disable_interrupts();
-    dspi_flash_range_erase(offset, FLASH_SECTOR_SIZE);
+    dspi_flash_range_erase(offset, erase_size);
     dspi_flash_range_program(offset, write_buf, write_size);
     restore_interrupts(flags);
 
@@ -997,26 +960,14 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->crossfeed_custom_fc = crossfeed_config.custom_fc;
     slot->crossfeed_custom_feed_db = crossfeed_config.custom_feed_db;
 
-    // Matrix mixer — inputs 0/1 inline (base), inputs 2..7 in the V20 ext tail.
-    for (int in = 0; in < NUM_INPUT_CHANNELS && in < SLOT_BASE_INPUT_CHANNELS; in++) {
+    // Matrix mixer — all inputs, direct.
+    for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             slot->matrix_crosspoints[in][out].enabled = matrix_mixer.crosspoints[in][out].enabled;
             slot->matrix_crosspoints[in][out].phase_invert = matrix_mixer.crosspoints[in][out].phase_invert;
             slot->matrix_crosspoints[in][out].gain_db = matrix_mixer.crosspoints[in][out].gain_db;
         }
     }
-#if PICO_RP2350
-    // Inputs 2..7: matrix crosspoints + preamp into the V20 ext tail.
-    for (int in = SLOT_BASE_INPUT_CHANNELS; in < NUM_INPUT_CHANNELS; in++) {
-        int e = in - SLOT_BASE_INPUT_CHANNELS;
-        for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
-            slot->matrix_crosspoints_ext[e][out].enabled = matrix_mixer.crosspoints[in][out].enabled;
-            slot->matrix_crosspoints_ext[e][out].phase_invert = matrix_mixer.crosspoints[in][out].phase_invert;
-            slot->matrix_crosspoints_ext[e][out].gain_db = matrix_mixer.crosspoints[in][out].gain_db;
-        }
-        slot->preamp_db_ext[e] = global_preamp_db[in];
-    }
-#endif
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
         slot->matrix_outputs[out].enabled = matrix_mixer.outputs[out].enabled;
         slot->matrix_outputs[out].mute = matrix_mixer.outputs[out].mute;
@@ -1060,10 +1011,8 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->leveller_max_gain_db = leveller_config.max_gain_db;
     slot->leveller_gate_threshold_db = leveller_config.gate_threshold_db;
 
-    // Per-channel preamp + Master volume (V12) — base inputs 0/1 inline;
-    // inputs 2..7 preamp goes to the V20 ext tail (filled with the matrix ext
-    // above).
-    for (int i = 0; i < NUM_INPUT_CHANNELS && i < SLOT_BASE_INPUT_CHANNELS; i++)
+    // Per-channel preamp + Master volume — all inputs, direct.
+    for (int i = 0; i < NUM_INPUT_CHANNELS; i++)
         slot->preamp_db_per_ch[i] = global_preamp_db[i];
     slot->master_volume_db = master_volume_db;
 
@@ -1186,23 +1135,12 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         }
     }
 
-    // Preamp — V12+ has per-channel values (base inputs 0/1), older versions
-    // use a single legacy field.  Inputs 2..7 come from the V20 ext tail below.
-    if (slot->version >= 12) {
-        for (int i = 0; i < NUM_INPUT_CHANNELS && i < SLOT_BASE_INPUT_CHANNELS; i++) {
-            global_preamp_db[i] = slot->preamp_db_per_ch[i];
-            float linear = db_to_linear(slot->preamp_db_per_ch[i]);
-            global_preamp_mul[i] = (int32_t)(linear * (float)(1 << 28));
-            global_preamp_linear[i] = linear;
-        }
-    } else {
-        // Legacy: apply single preamp_db to all channels (live array is [8])
-        for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
-            global_preamp_db[i] = slot->preamp_db;
-            float linear = db_to_linear(slot->preamp_db);
-            global_preamp_mul[i] = (int32_t)(linear * (float)(1 << 28));
-            global_preamp_linear[i] = linear;
-        }
+    // Per-channel preamp — all inputs, direct.
+    for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+        global_preamp_db[i] = slot->preamp_db_per_ch[i];
+        float linear = db_to_linear(slot->preamp_db_per_ch[i]);
+        global_preamp_mul[i] = (int32_t)(linear * (float)(1 << 28));
+        global_preamp_linear[i] = linear;
     }
 
     // Master volume is applied separately by callers via
@@ -1236,8 +1174,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     crossfeed_config.custom_feed_db = slot->crossfeed_custom_feed_db;
     crossfeed_update_pending = true;
 
-    // Matrix mixer — base inputs 0/1.
-    for (int in = 0; in < NUM_INPUT_CHANNELS && in < SLOT_BASE_INPUT_CHANNELS; in++) {
+    // Matrix mixer — all inputs, direct.
+    for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             matrix_mixer.crosspoints[in][out].enabled = slot->matrix_crosspoints[in][out].enabled;
             matrix_mixer.crosspoints[in][out].phase_invert = slot->matrix_crosspoints[in][out].phase_invert;
@@ -1245,36 +1183,6 @@ static void apply_slot_to_live(const PresetSlot *slot) {
             matrix_mixer.crosspoints[in][out].gain_linear = db_to_linear(slot->matrix_crosspoints[in][out].gain_db);
         }
     }
-#if PICO_RP2350
-    // Inputs 2..7: from the V20 ext tail if present, else defaulted to
-    // disabled / 0 dB so loading an older preset can't leave stale 8-channel
-    // routing behind.  matrix_crosspoints_ext / preamp_db_ext are only read
-    // when have_ext (the bytes are valid).
-    {
-        bool have_ext = (slot->version >= 20);
-        for (int in = SLOT_BASE_INPUT_CHANNELS; in < NUM_INPUT_CHANNELS; in++) {
-            int e = in - SLOT_BASE_INPUT_CHANNELS;
-            for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
-                uint8_t en = 0, pol = 0;
-                float gdb = 0.0f;
-                if (have_ext) {
-                    en  = slot->matrix_crosspoints_ext[e][out].enabled;
-                    pol = slot->matrix_crosspoints_ext[e][out].phase_invert;
-                    gdb = slot->matrix_crosspoints_ext[e][out].gain_db;
-                }
-                matrix_mixer.crosspoints[in][out].enabled = en;
-                matrix_mixer.crosspoints[in][out].phase_invert = pol;
-                matrix_mixer.crosspoints[in][out].gain_db = gdb;
-                matrix_mixer.crosspoints[in][out].gain_linear = db_to_linear(gdb);
-            }
-            float db = have_ext ? slot->preamp_db_ext[e] : 0.0f;
-            float linear = db_to_linear(db);
-            global_preamp_db[in]     = db;
-            global_preamp_mul[in]    = (int32_t)(linear * (float)(1 << 28));
-            global_preamp_linear[in] = linear;
-        }
-    }
-#endif
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
         matrix_mixer.outputs[out].enabled = slot->matrix_outputs[out].enabled;
         matrix_mixer.outputs[out].mute = slot->matrix_outputs[out].mute;
@@ -1409,49 +1317,17 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // SLOT VALIDATION
 // ============================================================================
 
-// Per-version data section lengths.  Fields are only ever appended, so each
-// older version's size is the next version's size minus its appended tail
-// (see comment on SLOT_DATA_VERSION above).
-#define SLOT_DATA_SIZE_V20 \
+// CRC byte range = the slot data section (filter_recipes .. end of struct).
+#define SLOT_DATA_SIZE_V21 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
-// V17/18/19 predate the V20 ext input section (matrix + preamp for inputs
-// 2..7).  On RP2040 SLOT_EXT_INPUT_BYTES == 0, so V20 == V17 there.
-#define SLOT_DATA_SIZE_V17  (SLOT_DATA_SIZE_V20 - SLOT_EXT_INPUT_BYTES)
-
-// V16 predates the 2 appended I2S input bytes.
-#define SLOT_DATA_SIZE_V16  (SLOT_DATA_SIZE_V17 - 2)
-
-// Pre-V16 versions additionally predate xover_recipes.
-#define SLOT_DATA_SIZE_PRE_XOVER \
-    (SLOT_DATA_SIZE_V16 - sizeof(((PresetSlot *)0)->xover_recipes))
-
-// Map a slot version code to the CRC byte range it was written with. Pre-V16
-// versions all share the same on-disk size (V13/V14/V15 each consumed
-// reserved bytes of V12 without growing the struct).  Any version outside
-// the explicit case list is invalidated — older firmware predates
-// reliable struct-length conventions, and unknown future versions are also
-// not safely interpretable.
+// V21 broke compatibility (unified channel model).  ONLY the current version is
+// accepted; any other version (older or unknown) is invalidated and the slot
+// loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case 12:
-        case 13:
-        case 14:
-        case 15:
-            return SLOT_DATA_SIZE_PRE_XOVER;
-        case 16:
-            return SLOT_DATA_SIZE_V16;
-        case 17:
-        case 18:
-        case 19:
-            // V18 renumbered filter type values; V19 added first-order shelf
-            // enum values.  On-disk layout (and CRC byte range) is identical
-            // to V17 in all three.
-            return SLOT_DATA_SIZE_V17;
-        case 20:
-            // V20 appends the ext input section (RP2350; zero-size on RP2040,
-            // so V20 == V17 there).
-            return SLOT_DATA_SIZE_V20;
+        case SLOT_DATA_VERSION:   // 21
+            return SLOT_DATA_SIZE_V21;
         default:
             return 0;
     }
@@ -1591,13 +1467,15 @@ uint8_t preset_delete(uint8_t slot) {
     // inside the flash blackout prep).
     __dmb();
 
-    // Erase the slot's flash sector (same lockout guard as flash_write_sector)
+    // Erase the slot's full flash allocation (SLOT_BYTES = all SLOT_SECTORS,
+    // 2 sectors on RP2350) so no stale data lingers in the second sector.
+    // Same lockout guard as flash_write_sector.
     bool do_lockout = multicore_lockout_victim_is_initialized(1)
                       && (__get_current_exception() == 0);
     if (do_lockout) multicore_lockout_start_blocking();
 
     uint32_t flags = save_and_disable_interrupts();
-    dspi_flash_range_erase(SLOT_SECTOR_OFFSET(slot), FLASH_SECTOR_SIZE);
+    dspi_flash_range_erase(SLOT_SECTOR_OFFSET(slot), SLOT_BYTES);
     restore_interrupts(flags);
 
     if (do_lockout) multicore_lockout_end_blocking();
@@ -1763,146 +1641,11 @@ uint8_t preset_get_active(void) {
 // BOOT / MIGRATION
 // ============================================================================
 
-// Attempt to migrate legacy single-sector data (pre-preset firmware) into
-// preset slot 0.  Called when no preset directory exists on flash.
+// Legacy single-sector migration was removed at V21 — compatibility is broken
+// intentionally.  When no valid V21 directory exists on flash, the boot path
+// falls to factory defaults rather than migrating old data.
 static bool migrate_legacy(void) {
-    const LegacyFlashStorage *legacy = LEGACY_ADDR;
-    if (legacy->magic != LEGACY_MAGIC) return false;
-
-    // Verify legacy CRC
-    const uint8_t *data_start = (const uint8_t *)&legacy->filter_recipes;
-    size_t data_len = sizeof(LegacyFlashStorage) - offsetof(LegacyFlashStorage, filter_recipes);
-    if (crc32(data_start, data_len) != legacy->crc32) return false;
-
-    // Build a PresetSlot from the legacy data.
-    // The data section layout is identical up through V6 fields (output_pins),
-    // so we can memcpy that portion.  Everything from channel_names (V8)
-    // onward is NOT in LegacyFlashStorage and must be explicitly defaulted
-    // below, because the slot is written as V16 — the apply path's
-    // `slot->version >= N` gates will read these fields rather than fall
-    // through to their default-init branches.
-    static PresetSlot slot_buf;
-    memset(&slot_buf, 0, sizeof(slot_buf));
-    slot_buf.magic = SLOT_MAGIC;
-    // CRITICAL: write a current-version slot, NOT the legacy version.  The
-    // V16+ validator looks up the data length by version via
-    // slot_data_size_for_version(); if we left version = legacy->version
-    // here, the validator would look up the pre-V16 byte range while the
-    // CRC we compute below is over the V16 range — slot would fail
-    // validation on next reboot.  Producing a clean V16 slot is also the
-    // semantic intent of migrate: project legacy data into the current
-    // format.
-    slot_buf.version = SLOT_DATA_VERSION;
-    slot_buf.slot_index = 0;
-
-    // Copy data fields (identical layout from filter_recipes onward, up
-    // through output_pins which is where LegacyFlashStorage ends).
-    memcpy(&slot_buf.filter_recipes, &legacy->filter_recipes,
-           sizeof(LegacyFlashStorage) - offsetof(LegacyFlashStorage, filter_recipes));
-
-    // ---- Post-legacy field defaults (V8 through V16) ----
-    // CRITICAL: every field added after V6 must be explicitly initialized
-    // here to the value its corresponding V<N gate in apply_slot_to_live()
-    // would have produced.  Without this, a V16-tagged slot with zero-
-    // initialized tail fields silently applies wrong values — e.g. blank
-    // channel names, MCK pin = 0, leveller defaults overridden by zeros,
-    // and worst, user_vol_index = 0 → -127 dB user volume (full mute) on
-    // boot after upgrade.  See migrate_legacy() history.
-
-    // V8: Channel names — defaults via the standard helper (output_types
-    // is all-SPDIF / NULL pointer indicates pre-I2S).
-    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
-        get_default_channel_name((uint8_t)ch, INPUT_SOURCE_USB, NULL,
-                                 slot_buf.channel_names[ch]);
-    }
-
-    // V9: I2S — all S/PDIF (output_types[] already 0 from memset).  BCK
-    // and MCK pins at their compile-time defaults, MCK off, 128× multiplier.
-    slot_buf.i2s_bck_pin       = PICO_I2S_BCK_PIN;
-    slot_buf.i2s_mck_pin       = PICO_I2S_MCK_PIN;
-    slot_buf.i2s_mck_enabled   = 0;
-    slot_buf.i2s_mck_multiplier = 0;   // V11+ encoding: 0 = 128×
-
-    // V10: Volume Leveller — module defaults.
-    slot_buf.leveller_enabled          = LEVELLER_DEFAULT_ENABLED ? 1 : 0;
-    slot_buf.leveller_speed            = LEVELLER_DEFAULT_SPEED;
-    slot_buf.leveller_lookahead        = LEVELLER_DEFAULT_LOOKAHEAD ? 1 : 0;
-    slot_buf.leveller_amount           = LEVELLER_DEFAULT_AMOUNT;
-    slot_buf.leveller_max_gain_db      = LEVELLER_DEFAULT_MAX_GAIN_DB;
-    slot_buf.leveller_gate_threshold_db = LEVELLER_DEFAULT_GATE_DB;
-
-    // V12: per-channel preamp + master volume.  Pre-V12 behavior applied
-    // slot->preamp_db (the legacy single value) to every input channel —
-    // replicate that here so V12 apply gates see consistent values.  Only the
-    // base inputs 0/1 are stored inline; the V20 ext preamp (inputs 2..7) is
-    // already 0 dB from the slot_buf memset, which is the correct default.
-    for (int i = 0; i < SLOT_BASE_INPUT_CHANNELS; i++) {
-        slot_buf.preamp_db_per_ch[i] = slot_buf.preamp_db;
-    }
-    // Master volume slot field is dormant when the directory is in
-    // MASTER_VOLUME_MODE_INDEPENDENT (the default this migration sets).
-    // Store 0 dB (unity) as a safe placeholder; a future user switch to
-    // MASTER_VOLUME_MODE_WITH_PRESET would then read this value.
-    slot_buf.master_volume_db = MASTER_VOL_MAX_DB;
-
-    // V13: Input source = USB (already 0 from memset).  spdif_rx_pin = 0
-    // is treated by apply_slot_to_live() as "invalid, leave live value
-    // alone" — leave at 0.
-
-    // V14: LG Sound Sync disabled (already 0 from memset).  Matches
-    // LG_SOUND_SYNC_DEFAULT_ENABLED == 0.
-
-    // V15: User volume — CRITICAL fix.  vol_index = 0 maps to
-    // -CENTER_VOLUME_INDEX dB (full attenuation).  Set to CENTER so the
-    // migrated device boots at 0 dB unity user volume.
-    slot_buf.user_vol_index = CENTER_VOLUME_INDEX;
-
-    // V16: Crossover bands — FLAT defaults with wire-band-index baked in.
-    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
-        for (int i = 0; i < MAX_XOVER_BANDS; i++) {
-            slot_buf.xover_recipes[ch][i].channel = (uint8_t)ch;
-            slot_buf.xover_recipes[ch][i].band    = (uint8_t)(XOVER_BAND_BASE + i);
-            slot_buf.xover_recipes[ch][i].type    = FILTER_FLAT;
-            slot_buf.xover_recipes[ch][i].bypass  = 0;
-            slot_buf.xover_recipes[ch][i].freq    = 1000.0f;
-            slot_buf.xover_recipes[ch][i].Q       = 0.707f;
-            slot_buf.xover_recipes[ch][i].gain_db = 0.0f;
-        }
-    }
-
-    // V17: I2S input.  Pin 0 = "unset, use live default" (same convention
-    // as spdif_rx_pin, already 0 from memset).  Rate must be set explicitly:
-    // the zero from memset would decode as 44.1 kHz, not the 48 kHz default.
-    slot_buf.i2s_input_rate = i2s_rate_encode(48000);
-
-    // Recompute CRC for the (now V16) slot format
-    const uint8_t *slot_data = (const uint8_t *)&slot_buf.filter_recipes;
-    slot_buf.crc32 = crc32(slot_data, slot_data_size_for_version(SLOT_DATA_VERSION));
-
-    // Write slot 0
-    if (flash_write_sector(SLOT_SECTOR_OFFSET(0), &slot_buf, sizeof(slot_buf)) != 0) {
-        return false;
-    }
-
-    // Create a fresh directory with slot 0 occupied and set as default
-    memset(&dir_cache, 0, sizeof(dir_cache));
-    dir_cache.startup_mode = PRESET_STARTUP_SPECIFIED;
-    dir_cache.default_slot = 0;
-    dir_cache.last_active_slot = 0;
-    dir_cache.output_config_mode = OUTPUT_CONFIG_MODE_WITH_PRESET;
-    dir_cache.master_volume_mode = MASTER_VOLUME_MODE_INDEPENDENT;
-    dir_cache.master_volume_db   = MASTER_VOL_DEFAULT_DB;
-    dir_cache.spdif_rx_pin = PICO_SPDIF_RX_PIN_DEFAULT;
-    dir_cache.slot_occupied = 0x0001;  // Slot 0 occupied
-    strncpy(dir_cache.slot_names[0], "Migrated", PRESET_NAME_LEN - 1);
-    io_config_defaults(&dir_cache.output_config);  // V4 device-global IO defaults
-    dir_cache_valid = true;
-
-    if (dir_flush() != 0) {
-        return false;
-    }
-
-    return true;
+    return false;
 }
 
 int preset_boot_load(void) {
