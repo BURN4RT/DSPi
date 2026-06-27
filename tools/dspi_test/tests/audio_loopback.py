@@ -22,6 +22,7 @@ restored at the end.
 from __future__ import annotations
 
 import struct
+import time
 
 from ..device import OP
 from ..framework import test, Skip
@@ -49,6 +50,11 @@ TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5
 FLAT = 0
 INPUT_USB = 0
 TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
+# Settle after an output-type switch before bit-exact measurement: the switch
+# runs complete_pipeline_reset() and the I2S clock + loopback servo re-prime, so
+# the first capture frames after the switch carry a transient.  2 s lets it fully
+# settle so I2S meets the same single-shot bit-exact standard as S/PDIF (no retry).
+TYPE_SWITCH_SETTLE_S = 2.0
 
 # Magnitude-shaping PEQ configs: (name, rbj_name, fc, Q, gain_db). Frequencies
 # straddle the RP2350 SVF/biquad boundary (Fs/7.5 ~= 6400 Hz @ 48 kHz).
@@ -92,11 +98,15 @@ def _signal_amp(gain_db):
 _RIG = None  # dict on success, or a str reason once we know it's unavailable
 
 
-def _slot_indices(slot):
-    """For S/PDIF slot `s`: (out_l, out_r) matrix/enable indices and
-    (ch_l, ch_r) EQ channel indices. Channels 0,1 are the master bus."""
+def _slot_indices(profile, slot):
+    """For output slot `s`: (out_l, out_r) matrix/enable/gain indices (0-based
+    output index) and (ch_l, ch_r) EQ channel indices.  In the unified channel
+    model the EQ channel space is inputs [0..NUM_INPUT-1] followed by outputs, so
+    output EQ channels start at NUM_INPUT_CHANNELS (2 on RP2040, 8 on RP2350) —
+    NOT a fixed +2."""
     out_l, out_r = 2 * slot, 2 * slot + 1
-    return out_l, out_r, out_l + 2, out_r + 2
+    base = profile.num_input_channels
+    return out_l, out_r, base + out_l, base + out_r
 
 
 def _baseline(dev, profile=None):
@@ -133,7 +143,7 @@ def _config_slot(dev, profile, slot, flatten_all=False, otype=TYPE_SPDIF):
     type `otype` (S/PDIF or I2S). Returns (ch_l, ch_r). With flatten_all, zero
     every band on both channels. The loopback tap is pre-encoder, so the
     captured DSP output is identical for either output type."""
-    out_l, out_r, ch_l, ch_r = _slot_indices(slot)
+    out_l, out_r, ch_l, ch_r = _slot_indices(profile, slot)
     dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(otype << 8) | slot)
     dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=out_l)
     dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=out_r)
@@ -165,7 +175,7 @@ def _autoprobe_slot(dev, profile, out_dev, in_dev, fs):
 
     best, best_lvl = None, -200.0
     for slot in range(profile.num_spdif):
-        out_l, out_r, _cl, _cr = _slot_indices(slot)
+        out_l, out_r, _cl, _cr = _slot_indices(profile, slot)
         _route_only(dev, profile, out_l, out_r)
         level, _thd, strength = audio.measure_tone(out_dev, in_dev, 0, fs, 1000.0, amp=0.3)
         if strength > CORR_MIN and level > best_lvl:
@@ -404,7 +414,7 @@ def xo_lr4_complementary_sum(dev, profile, chk):
     """
     rig = _get_rig(dev, profile)
     fc = 1000.0
-    out_l, out_r, ch_l, ch_r = _slot_indices(rig["slot"])
+    out_l, out_r, ch_l, ch_r = _slot_indices(profile, rig["slot"])
     try:
         for out in range(profile.num_output_channels):   # USB L -> both target outputs only
             _route(dev, 0, out, 0)
@@ -451,7 +461,7 @@ def _tone_level(dev, rig, freq=1000.0, amp=0.4):
 def output_gain_level(dev, profile, chk):
     """Per-output gain: measured level tracks the set dB."""
     rig = _get_rig(dev, profile)
-    out_l = _slot_indices(rig["slot"])[0]
+    out_l = _slot_indices(profile, rig["slot"])[0]
     try:
         _flatten_chain(dev, rig["ch_l"])
         dev.set_f32(OP.SET_OUTPUT_GAIN, 0.0, wvalue=out_l); dev.wait_ready()
@@ -468,7 +478,7 @@ def output_gain_level(dev, profile, chk):
 def output_mute_silences(dev, profile, chk):
     """Per-output mute drops the output to silence; unmute restores it."""
     rig = _get_rig(dev, profile)
-    out_l = _slot_indices(rig["slot"])[0]
+    out_l = _slot_indices(profile, rig["slot"])[0]
     try:
         _flatten_chain(dev, rig["ch_l"])
         base = _tone_level(dev, rig)
@@ -510,7 +520,7 @@ def level_controls(dev, profile, chk):
 def matrix_routing(dev, profile, chk):
     """Matrix crosspoint enable: a routed input reaches the output; unrouted is silent."""
     rig = _get_rig(dev, profile)
-    out_l = _slot_indices(rig["slot"])[0]
+    out_l = _slot_indices(profile, rig["slot"])[0]
     try:
         _flatten_chain(dev, rig["ch_l"])
         base = _tone_level(dev, rig)
@@ -529,7 +539,7 @@ def matrix_routing(dev, profile, chk):
 def matrix_phase_invert(dev, profile, chk):
     """Matrix phase-invert flips output polarity (the fitted path-gain sign flips)."""
     rig = _get_rig(dev, profile)
-    out_l = _slot_indices(rig["slot"])[0]
+    out_l = _slot_indices(profile, rig["slot"])[0]
     try:
         _flatten_chain(dev, rig["ch_l"])
         _route(dev, 0, out_l, 1, 0.0, 0); dev.wait_ready()
@@ -547,7 +557,7 @@ def matrix_phase_invert(dev, profile, chk):
 def output_delay(dev, profile, chk):
     """Per-output delay shifts that output by the set sample count (vs an undelayed leg)."""
     rig = _get_rig(dev, profile)
-    out_l, out_r, ch_l, ch_r = _slot_indices(rig["slot"])
+    out_l, out_r, ch_l, ch_r = _slot_indices(profile, rig["slot"])
     delay_ms = 5.0
     expect = round(delay_ms * rig["fs"] / 1000.0)   # 240 samples @ 48 kHz
     try:
@@ -673,6 +683,7 @@ def output_type_i2s_audio(dev, profile, chk):
         if not _i2s_available(dev, slot):
             raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_I2S)
+        time.sleep(TYPE_SWITCH_SETTLE_S)   # let the I2S clock + loopback servo re-prime
         amp = 0.4
         level, thd, strength = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
                                                   rig["fs"], 1000.0, amp=amp)
@@ -680,12 +691,16 @@ def output_type_i2s_audio(dev, profile, chk):
         exp_level = 20.0 * np.log10(amp / np.sqrt(2.0))
         chk.approx(level, exp_level, 1.0, f"I2S: tone level ~{exp_level:.1f} dBFS")
         chk.ok(thd < 0.1, f"I2S: THD {thd:.4f}% < 0.1%")
+        lag, _st = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
+        # Bit-exactness + unity gain of the (pre-encoder, type-agnostic) capture,
+        # single-shot to the same standard as loopback_integrity.  The 2 s settle
+        # after the type switch lets the I2S clock + loopback servo fully re-prime
+        # so the capture is clean without any retry.
         resid, scale = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
         chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
         gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
         chk.approx(gain_db, 0.0, GAIN_TOL_DB, f"I2S: path gain ~0 dB (|scale| {abs(scale):.4f})")
-        lag, _st = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
-        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
         chk.note(f"i2s_audio: level={level:.2f}dBFS thd={thd:.4f}% resid={resid:.1f}dBFS "
                  f"|scale|={abs(scale):.4f} lag={lag}")
     finally:
@@ -729,11 +744,25 @@ def output_type_switch_stress(dev, profile, chk):
 # --- Phase 4: full chain / dynamics -----------------------------------------
 
 def _flatten_master(dev, profile):
-    """Flatten the master-bus EQ (channels 0/1) so loudness/crossfeed/leveller
-    (which sit on the master bus) are measured against a flat baseline."""
+    """Flatten the stereo-bus EQ (input channels 0/1) so loudness/crossfeed/
+    leveller (which sit on the stereo input bus) are measured against a flat
+    baseline."""
     for ch in (0, 1):
         for b in range(profile.band_ceiling):
             _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
+
+
+def _require_stereo_input(dev):
+    """loudness, leveller, and crossfeed are the inherently-stereo chain; the
+    firmware bypasses them whenever more than 2 input channels are active (see
+    audio_pipeline.c `multichannel`).  Many hosts (e.g. macOS CoreAudio) open the
+    DSPi at its advertised 8-channel maximum, which holds the device in
+    multichannel mode where these effects never run — so skip, rather than fail,
+    when that is the case (the effect genuinely cannot be exercised here)."""
+    nin = dev.get_u32(OP.GET_STATUS, wvalue=23)   # live active USB input channel count
+    if nin > 2:
+        raise Skip(f"stereo-only effect not applicable: host holds {nin}-channel input "
+                   f"active (loudness/leveller/crossfeed bypassed in multichannel mode)")
 
 
 @test("audio", mutating=True)
@@ -769,6 +798,7 @@ def multiband_eq(dev, profile, chk):
 def loudness_shape(dev, profile, chk):
     """Loudness compensation at low volume boosts bass and treble vs the mid band."""
     rig = _get_rig(dev, profile)
+    _require_stereo_input(dev)
     try:
         _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
         dev.set_f32(OP.SET_USER_VOLUME, -40.0)
@@ -792,6 +822,7 @@ def loudness_shape(dev, profile, chk):
 def crossfeed_bleed(dev, profile, chk):
     """Crossfeed mixes a (filtered, attenuated) copy of one channel into the opposite."""
     rig = _get_rig(dev, profile)
+    _require_stereo_input(dev)
     try:
         _config_slot(dev, profile, rig["slot"])
         _flatten_chain(dev, rig["ch_l"]); _flatten_chain(dev, rig["ch_r"]); _flatten_master(dev, profile)
@@ -811,6 +842,7 @@ def crossfeed_bleed(dev, profile, chk):
 def leveller_boost(dev, profile, chk):
     """The leveller lifts a sustained quiet signal, bounded by the max-gain ceiling."""
     rig = _get_rig(dev, profile)
+    _require_stereo_input(dev)
     try:
         _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
         dev.set_u8(OP.SET_LEVELLER_ENABLE, 0); dev.wait_ready()
