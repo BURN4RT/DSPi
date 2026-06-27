@@ -114,9 +114,16 @@
 #define LOOPBACK_BYTES_PER_SAMPLE   3      // 24-bit
 #define LOOPBACK_BYTES_PER_FRAME    (LOOPBACK_N_CHANNELS * LOOPBACK_BYTES_PER_SAMPLE)  // 6
 // Servo never emits more than this per USB frame; sizes the iso IN EP buffer.
-// 64 frames @ 48 kHz is comfortable headroom over the ~48-50/frame nominal.
-#define LOOPBACK_MAX_FRAMES_PER_PACKET  64
-#define LOOPBACK_EP_IN_SIZE         (LOOPBACK_MAX_FRAMES_PER_PACKET * LOOPBACK_BYTES_PER_FRAME)  // 384
+// At 48 kHz the servo's hard max is floor(frac<1 + nominal 48 + SERVO_MAX_CORR 2)
+// = 50 frames; 52 leaves a 2-frame margin.  Sized at 52 (312 B) instead of 64
+// (384 B) so the host's full-speed iso reservation for input (788) + this
+// capture EP + feedback (3) = 1103 B/frame stays under the FS periodic ceiling
+// (input + the old 384 = 1175 over-subscribed and dropped output frames while
+// the capture stream was active).  Unlike the input OUT EP, this is the loopback
+// driver's own endpoint: wMaxPacketSize, usbd_edpt_iso_alloc(), and g_pkt all
+// derive from LOOPBACK_EP_IN_SIZE, so there is no maxpacket/queue mismatch.
+#define LOOPBACK_MAX_FRAMES_PER_PACKET  52
+#define LOOPBACK_EP_IN_SIZE         (LOOPBACK_MAX_FRAMES_PER_PACKET * LOOPBACK_BYTES_PER_FRAME)  // 312
 
 // Capture-function entity IDs (distinct from the playback function's 1/2/3).
 #define LOOPBACK_INPUT_TERMINAL_ID   4   // internal: output slot 0

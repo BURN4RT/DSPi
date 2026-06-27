@@ -419,7 +419,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 ---
 
 ## USB Audio Loopback Capture (DSPI_LOOPBACK)
-*Last updated: 2026-06-24*
+*Last updated: 2026-06-27 (capture EP right-sized to 312 B for the FS iso budget)*
 
 A **debug/verification-only** feature, compiled in only when the `DSPI_LOOPBACK`
 build flag is defined. It folds the standalone `~/USBrx` S/PDIF-to-USB recorder's
@@ -447,9 +447,27 @@ interface (existing interfaces 0/1/2 are unchanged):
 - Input terminal (internal, ID 4) → output terminal (USB streaming, ID 5).
 - AS alt 0 zero-bandwidth, alt 1 with one **isochronous async IN endpoint `0x81`**.
 - Format: 2-channel, 24-bit PCM, discrete rates 44.1/48 kHz (DSPi's operating
-  range), `wMaxPacketSize` = 384 B (`LOOPBACK_EP_IN_SIZE`).
+  range), `wMaxPacketSize` = 312 B (`LOOPBACK_EP_IN_SIZE`, 52 frames).
 - The MS OS 2.0 / WinUSB descriptors are untouched — their Function Subset still
   scopes WinUSB to the vendor interface (2).
+
+### Full-speed isochronous bandwidth budget
+The host reserves FS isochronous bandwidth from each endpoint's declared
+`wMaxPacketSize`. The input OUT EP declares the 8-channel max
+(`AUDIO_EP_MAX_PKT` = 788 B on RP2350) for **every** input alt, so
+`input (788) + capture-IN + feedback (3)` must stay under the ~1150 B/frame FS
+periodic ceiling. The capture EP is therefore sized at **52 frames (312 B)** —
+the servo's hard max is 50 frames/packet at 48 kHz — not 64 (384 B): at 384 the
+total was 1175 B and the host dropped output frames whenever the capture stream
+was active (periodic ~100-200 ms drop-outs); at 312 the total is 1103 B and fits
+for every input alt (stereo through 8-channel). **Do not** instead shrink the
+input OUT EP's per-alt `wMaxPacketSize` to save bandwidth: the device allocates
+and queues that endpoint at `AUDIO_EP_MAX_PKT` (`usbd_edpt_iso_alloc` /
+`usbd_edpt_xfer`), so a smaller descriptor value makes `iso_activate`'s maxpacket
+disagree with the queued length and desyncs iso reception (audible crunch). The
+capture EP is safe to shrink because it is the loopback driver's own endpoint —
+its `wMaxPacketSize`, `iso_alloc`, and `g_pkt` all derive from
+`LOOPBACK_EP_IN_SIZE`.
 
 ### Data path
 ```
