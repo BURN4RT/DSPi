@@ -46,24 +46,29 @@ def platform_packet(dev, profile, chk):
 
 @test("identity")
 def status_combined(dev, profile, chk):
-    """0x50 wValue=9 returns peaks[NUM_CHANNELS] + cpu0 + cpu1 + clip_flags."""
-    expected_len = profile.num_channels * 2 + 4
+    """0x50 wValue=9: peaks[NUM_CHANNELS] + cpu0 + cpu1 + clip_flags(u32) +
+    active_input_count. Layout is NUM_CHANNELS*2 + 7 bytes (clip widened to u32
+    and the live input count appended with the unified channel model)."""
+    expected_len = profile.num_channels * 2 + 7
     data = dev.get(OP.GET_STATUS, 64, wvalue=9)
     chk.ok(len(data) >= expected_len, f"status len {len(data)} < {expected_len}")
     if len(data) < expected_len:
         return
     import struct
     peaks = struct.unpack_from(f"<{profile.num_channels}H", data, 0)
-    cpu0 = data[profile.num_channels * 2]
-    cpu1 = data[profile.num_channels * 2 + 1]
-    clip = struct.unpack_from("<H", data, profile.num_channels * 2 + 2)[0]
+    off = profile.num_channels * 2
+    cpu0 = data[off]
+    cpu1 = data[off + 1]
+    clip = struct.unpack_from("<I", data, off + 2)[0]
+    active_in = data[off + 6]
     # Idle: peaks small (not strictly 0 — may retain residue), cpu plausible.
     for i, pk in enumerate(peaks):
         chk.in_range(pk, 0, 65535, f"peak[{i}] range")
     chk.in_range(cpu0, 0, 100, "cpu0 load")
     chk.in_range(cpu1, 0, 100, "cpu1 load")
-    chk.in_range(clip, 0, 0xFFFF, "clip_flags range")
-    chk.note(f"idle peaks max={max(peaks)} cpu0={cpu0} cpu1={cpu1} clip=0x{clip:04X}")
+    chk.member(active_in, (2, 4, 6, 8), "active input channel count")
+    chk.note(f"idle peaks max={max(peaks)} cpu0={cpu0} cpu1={cpu1} "
+             f"clip=0x{clip:08X} active_in={active_in}")
 
 
 @test("identity")
@@ -75,22 +80,24 @@ def status_subqueries(dev, profile, chk):
     chk.ok(clk > 1_000_000, f"clk_sys implausible: {clk}")
     mounted = dev.get_u32(OP.GET_STATUS, wvalue=12)
     chk.member(mounted, (0, 1), "mounted flag")
+    active_in = dev.get_u32(OP.GET_STATUS, wvalue=23)  # live active USB input channel count
+    chk.member(active_in, (2, 4, 6, 8), "active input count (sub-query 23)")
     # Unknown sub-query must return zeros, never STALL.
     unk = chk.no_stall(lambda: dev.get_u32(OP.GET_STATUS, wvalue=200), "unknown sub-query")
     chk.eq(unk, 0, "unknown sub-query returns 0")
-    chk.note(f"Fs={fs} clk_sys={clk} mounted={mounted}")
+    chk.note(f"Fs={fs} clk_sys={clk} mounted={mounted} active_in={active_in}")
 
 
 @test("identity", mutating=True)
 def clear_clips_read_then_clear(dev, profile, chk):
-    """0x83 returns prior clip flags then zeroes them; second read must be 0 (idle)."""
-    first = dev.get(OP.CLEAR_CLIPS, 2)
-    chk.eq(len(first), 2, "clear-clips length")
-    second = dev.get(OP.CLEAR_CLIPS, 2)
-    val2 = second[0] | (second[1] << 8)
+    """0x83 returns prior clip flags (u32) then zeroes them; second read must be 0 (idle)."""
+    import struct
+    first = dev.get(OP.CLEAR_CLIPS, 4)
+    chk.eq(len(first), 4, "clear-clips length")
+    second = dev.get(OP.CLEAR_CLIPS, 4)
+    val2 = struct.unpack_from("<I", second, 0)[0]
     chk.eq(val2, 0, "second clear-clips must be 0 when idle")
     # And the combined status clip field must also read 0 now.
-    import struct
-    st = dev.get(OP.GET_STATUS, profile.num_channels * 2 + 4, wvalue=9)
-    clip = struct.unpack_from("<H", st, profile.num_channels * 2 + 2)[0]
+    st = dev.get(OP.GET_STATUS, profile.num_channels * 2 + 7, wvalue=9)
+    clip = struct.unpack_from("<I", st, profile.num_channels * 2 + 2)[0]
     chk.eq(clip, 0, "status clip_flags 0 after clear")

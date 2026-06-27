@@ -373,6 +373,21 @@ matched the expectation within the listed tolerance.
 > operations preserve it. Verifying alignment *between different slots* (the firmware's
 > full guarantee) needs a multi-channel capture and is out of scope for one stereo capture.
 
+### Output types (S/PDIF and I2S)
+
+| Test | What it does | Passes when |
+|---|---|---|
+| `output_type_i2s_audio` | Sets slot 0 to **I2S** output and measures a real tone. | Tone reaches the capture at unity, THD < 0.1%, near bit-exact, L/R aligned (skips if I2S unavailable). |
+| `output_type_switch_stress` | Cycles slot 0 S/PDIF↔I2S four times, re-measuring after every switch. | Signal present, at unity level, and L/R aligned after each of the 8 switches (skips if I2S unavailable). |
+
+> The loopback tap is **pre-encoder**, so the captured samples are identical for either
+> output type; signal *presence* is therefore a liveness probe for the active output path
+> (a dead I2S consumer would stall slot 0's producer and silence the capture).
+> `output_type_switch_stress` is the hardware regression test for the shared-DMA-channel
+> teardown/re-setup path (S/PDIF and I2S TX share one DMA channel per output slot): a
+> double-claim, a stalled pipeline, or lost alignment surfaces as lost signal, a bad lag,
+> or a device reset.
+
 ### Full chain / dynamics
 
 | Test | What it does | Passes when |

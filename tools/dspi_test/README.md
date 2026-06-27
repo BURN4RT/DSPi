@@ -130,6 +130,12 @@ What it checks:
   survives pipeline-reset operations: `alignment_after_input_switch` (USB->S/PDIF->USB) and
   `alignment_after_output_type_switch` (S/PDIF->I2S->S/PDIF). Note: the capture taps one
   slot (slot 0), so this checks INTRA-slot L/R; full inter-slot alignment needs multichannel capture.
+- **output types** — `output_type_i2s_audio` measures real audio with slot 0 as **I2S**
+  (unity, low THD, near bit-exact, L/R aligned); since the tap is pre-encoder, a dead I2S
+  output path stalls the producer and the tone vanishes, so a clean tone proves the I2S
+  consumer is draining. `output_type_switch_stress` cycles slot 0 SPDIF<->I2S several times
+  and re-measures after each switch (signal present, unity level, L/R aligned), exercising the
+  shared-DMA-channel teardown/re-setup path. Both SKIP if the I2S switch is unavailable.
 - **full chain / dynamics** — `multiband_eq` (stacked PEQ bands = sum of their responses),
   `loudness_shape` (loudness boosts bass/treble at low volume), `crossfeed_bleed` (one channel
   bleeds an attenuated copy into the opposite), `leveller_boost` (a quiet signal is lifted

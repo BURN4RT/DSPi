@@ -154,16 +154,24 @@ def legacy_preamp(dev, profile, chk):
 
 @test("eq", mutating=True)
 def per_channel_preamp(dev, profile, chk):
-    """0xD0/0xD1 per-channel preamp: independent channels, NaN rejected, ch>=2 GET STALLs."""
-    dev.set_f32(OP.SET_PREAMP_CH, 3.0, wvalue=0)
-    dev.set_f32(OP.SET_PREAMP_CH, -3.0, wvalue=1)
-    chk.approx(dev.get_f32(OP.GET_PREAMP_CH, wvalue=0), 3.0, 1e-3, "ch0 independent")
-    chk.approx(dev.get_f32(OP.GET_PREAMP_CH, wvalue=1), -3.0, 1e-3, "ch1 independent")
+    """0xD0/0xD1 per-channel preamp across ALL input channels (8 on RP2350, 2 on
+    RP2040): each channel round-trips independently; NaN rejected; ch==NUM_INPUT
+    GET STALLs while a too-high SET is a silent no-op."""
+    ni = profile.num_input_channels
+    # Distinct value per input channel, then read each back independently — a
+    # cross-channel aliasing bug would show up as a mismatched read.
+    for ch in range(ni):
+        dev.set_f32(OP.SET_PREAMP_CH, float(ch) - 3.0, wvalue=ch)
+    for ch in range(ni):
+        chk.approx(dev.get_f32(OP.GET_PREAMP_CH, wvalue=ch), float(ch) - 3.0, 1e-3,
+                   f"input ch{ch} independent ({float(ch) - 3.0:+g} dB)")
     nan_rejected(dev, chk, OP.SET_PREAMP_CH, OP.GET_PREAMP_CH, wvalue=0, label="preamp ch0")
-    chk.stalls(lambda: dev.get_f32(OP.GET_PREAMP_CH, wvalue=profile.num_input_channels),
+    chk.stalls(lambda: dev.get_f32(OP.GET_PREAMP_CH, wvalue=ni),
                "GET preamp ch==NUM_INPUT STALL")
-    chk.no_stall(lambda: dev.set_f32(OP.SET_PREAMP_CH, 1.0, wvalue=profile.num_input_channels),
+    chk.no_stall(lambda: dev.set_f32(OP.SET_PREAMP_CH, 1.0, wvalue=ni),
                  "SET preamp bad ch no STALL")
+    for ch in range(ni):           # restore flat
+        dev.set_f32(OP.SET_PREAMP_CH, 0.0, wvalue=ch)
 
 
 @test("eq", mutating=True)

@@ -48,6 +48,7 @@ TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5
         "notch": 6, "allpass": 7, "allpass1": 8, "lowshelf1": 9, "highshelf1": 10}
 FLAT = 0
 INPUT_USB = 0
+TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
 
 # Magnitude-shaping PEQ configs: (name, rbj_name, fc, Q, gain_db). Frequencies
 # straddle the RP2350 SVF/biquad boundary (Fs/7.5 ~= 6400 Hz @ 48 kHz).
@@ -98,13 +99,22 @@ def _slot_indices(slot):
     return out_l, out_r, out_l + 2, out_r + 2
 
 
-def _baseline(dev):
-    """Clean, deterministic pre-conditions: USB input, unity gains."""
+def _baseline(dev, profile=None):
+    """Clean, deterministic pre-conditions: USB input, EVERY gain stage at unity.
+
+    The device master volume powers on at -20 dB (MASTER_VOL_DEFAULT_DB), and
+    user volume + user mute are independent stages; all of them must be zeroed
+    explicitly or absolute-level measurements read low. Per-input preamp is
+    zeroed across all input channels (8 on RP2350)."""
     dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_USB)
     dev.wait_ready()
-    dev.set_f32(OP.SET_MASTER_VOLUME, 0.0)
-    for ch in (0, 1):
+    dev.set_f32(OP.SET_MASTER_VOLUME, 0.0)   # power-on default is -20 dB
+    dev.set_f32(OP.SET_USER_VOLUME, 0.0)
+    dev.set_u8(OP.SET_USER_MUTE, 0)
+    n_in = profile.num_input_channels if profile is not None else 2
+    for ch in range(n_in):
         dev.set_f32(OP.SET_PREAMP_CH, 0.0, wvalue=ch)
+    dev.wait_ready()
 
 
 def _route_only(dev, profile, out_l, out_r):
@@ -118,11 +128,13 @@ def _route_only(dev, profile, out_l, out_r):
     _route(dev, 1, out_r, 1, 0.0)   # USB R -> target R
 
 
-def _config_slot(dev, profile, slot, flatten_all=False):
-    """Make `slot` the only S/PDIF output carrying USB audio (1:1, 0 dB).
-    Returns (ch_l, ch_r). With flatten_all, zero every band on both channels."""
+def _config_slot(dev, profile, slot, flatten_all=False, otype=TYPE_SPDIF):
+    """Make `slot` the only output carrying USB audio (1:1, 0 dB), as output
+    type `otype` (S/PDIF or I2S). Returns (ch_l, ch_r). With flatten_all, zero
+    every band on both channels. The loopback tap is pre-encoder, so the
+    captured DSP output is identical for either output type."""
     out_l, out_r, ch_l, ch_r = _slot_indices(slot)
-    dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(0 << 8) | slot)   # 0 = SPDIF
+    dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(otype << 8) | slot)
     dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=out_l)
     dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=out_r)
     dev.wait_ready()
@@ -179,7 +191,7 @@ def _get_rig(dev, profile):
         _RIG = f"audio loopback unavailable: {e}"
         raise Skip(_RIG)
 
-    _baseline(dev)
+    _baseline(dev, profile)
     slot = _autoprobe_slot(dev, profile, out_dev, in_dev, FS)
     ch_l, ch_r = _config_slot(dev, profile, slot, flatten_all=True)
     _RIG = {"out": out_dev, "in": in_dev, "chan": 0, "slot": slot,
@@ -571,7 +583,6 @@ def output_delay(dev, profile, chk):
 
 ALIGN_TOL_SAMPLES = 1
 INPUT_SPDIF = 1
-TYPE_SPDIF, TYPE_I2S = 0, 1
 
 
 def _lr_lag(dev, profile, rig):
@@ -626,6 +637,93 @@ def alignment_after_output_type_switch(dev, profile, chk):
         chk.note(f"after_type_switch: lag={lag} corr={strength:.2f}")
     finally:
         dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+
+
+# --- Phase 3b: per-output-type audio integrity ------------------------------
+#
+# The loopback taps slot 0's finalized DSP output BEFORE the S/PDIF or I2S
+# encoder, so the captured samples are identical for either output type. That
+# makes signal PRESENCE a real liveness probe for the active output path: if the
+# I2S consumer is not draining slot 0's producer pool, the pool backs up, the DSP
+# callback starves, and the tone vanishes from the capture. These tests measure
+# real audio with slot 0 as I2S, and stress repeated type switches (which
+# exercise the shared-DMA-channel teardown/re-setup path).
+
+
+def _i2s_available(dev, slot):
+    """True if slot can be put into I2S output mode (restores SPDIF either way)."""
+    st = dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_I2S << 8) | slot)
+    dev.wait_ready()
+    if st != 0:
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot)
+        dev.wait_ready()
+        return False
+    return True
+
+
+@test("audio", mutating=True)
+def output_type_i2s_audio(dev, profile, chk):
+    """Slot 0 as I2S output: real audio still reaches the capture at unity with
+    low THD, near bit-exact, and L/R sample-aligned. Because the tap is
+    pre-encoder, a dead I2S output path would stall the slot-0 producer and the
+    tone would disappear; a clean tone confirms the I2S consumer is draining."""
+    rig = _get_rig(dev, profile)
+    slot = rig["slot"]
+    try:
+        if not _i2s_available(dev, slot):
+            raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
+        _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_I2S)
+        amp = 0.4
+        level, thd, strength = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                                  rig["fs"], 1000.0, amp=amp)
+        chk.ok(strength > CORR_MIN, f"I2S: tone reaches capture (corr {strength:.2f})")
+        exp_level = 20.0 * np.log10(amp / np.sqrt(2.0))
+        chk.approx(level, exp_level, 1.0, f"I2S: tone level ~{exp_level:.1f} dBFS")
+        chk.ok(thd < 0.1, f"I2S: THD {thd:.4f}% < 0.1%")
+        resid, scale = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
+        chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
+        gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
+        chk.approx(gain_db, 0.0, GAIN_TOL_DB, f"I2S: path gain ~0 dB (|scale| {abs(scale):.4f})")
+        lag, _st = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
+        chk.note(f"i2s_audio: level={level:.2f}dBFS thd={thd:.4f}% resid={resid:.1f}dBFS "
+                 f"|scale|={abs(scale):.4f} lag={lag}")
+    finally:
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+        _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_SPDIF)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def output_type_switch_stress(dev, profile, chk):
+    """Repeated SPDIF<->I2S switching on slot 0 keeps the output alive, at unity,
+    and L/R sample-aligned after EVERY switch. Exercises the shared-DMA-channel
+    teardown/re-setup path (audio_spdif_teardown + full SPDIF re-setup, I2S
+    setup/teardown reclaiming the same channel); a double-claim panic, a stalled
+    pipeline, or lost inter-leg alignment would surface here as lost signal, a
+    bad lag, or a device reset (disconnect)."""
+    rig = _get_rig(dev, profile)
+    slot = rig["slot"]
+    if not _i2s_available(dev, slot):
+        raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
+    cycles = 4
+    try:
+        for i in range(cycles):
+            for otype, name in ((TYPE_SPDIF, "SPDIF"), (TYPE_I2S, "I2S")):
+                _config_slot(dev, profile, slot, otype=otype)
+                _flatten_chain(dev, rig["ch_l"])
+                _flatten_chain(dev, rig["ch_r"])
+                dev.wait_ready()
+                lag, strength = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+                level = _tone_level(dev, rig)
+                chk.ok(strength > 0.5, f"cycle {i} -> {name}: signal present (corr {strength:.2f})")
+                chk.ok(level > -20.0, f"cycle {i} -> {name}: output at level ({level:.1f} dBFS)")
+                chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"cycle {i} -> {name}: L/R aligned (lag {lag})")
+        chk.note(f"switch_stress: {cycles}x SPDIF<->I2S, signal+level+alignment intact after every switch")
+    finally:
+        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+        _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_SPDIF)
+        dev.wait_ready()
 
 
 # --- Phase 4: full chain / dynamics -----------------------------------------
