@@ -1427,15 +1427,38 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Crossover-stage availability when PDM enabled | Single-core (Core 0 only) | Single-core (Core 0 only) |
 
 ### DMA
+*Last updated: 2026-06-27 (SPDIF/I2S TX now share one DMA channel per output slot)*
 
 | Feature | RP2040 | RP2350 |
 |---------|--------|--------|
 | Priority | Global bus priority bits | Per-channel high-priority flag |
-| SPDIF TX channels | 0-1 (hardcoded) | 0-3 (hardcoded) |
-| SPDIF TX IRQ | DMA_IRQ_1 (dedicated) | DMA_IRQ_1 (dedicated) |
+| Output TX channels (SPDIF **or** I2S, per slot) | 0-1 | 0-3 |
+| SPDIF TX IRQ | DMA_IRQ_1 | DMA_IRQ_1 |
+| I2S TX IRQ | DMA_IRQ_0 | DMA_IRQ_0 |
 | SPDIF RX channels | CH4, CH5 | CH5, CH6 |
-| SPDIF RX IRQ | DMA_IRQ_0 (shared with I2S TX) | DMA_IRQ_0 (shared with I2S TX) |
-| PDM channel | Dynamic (claim) | Dynamic (claim) |
+| SPDIF RX IRQ | DMA_IRQ_1 (shared with SPDIF TX) | DMA_IRQ_1 (shared with SPDIF TX) |
+| I2S RX channels | CH4, CH5 (shared with SPDIF RX) | CH5, CH6 (shared with SPDIF RX) |
+| I2S RX IRQ | IRQ-less (chained ring) | IRQ-less (chained ring) |
+| PDM channel | Dynamic (`dma_claim_unused_channel`) | Dynamic (`dma_claim_unused_channel`) |
+
+**Per-slot DMA channel sharing (2026-06-27).** Each output slot owns exactly one
+DMA channel (channel index == slot index), used by whichever output type is
+currently active on that slot. The S/PDIF and I2S libraries each claim that
+channel on setup and release it on teardown (`audio_spdif_teardown` /
+`audio_i2s_teardown`), so an output-type switch hands the same channel from one
+library to the other; the slot's PIO SM (index == slot index, both on
+`PICO_AUDIO_SPDIF_PIO`) is handed over the same way. Previously S/PDIF TX held
+channels 0-3 permanently (claimed at boot, never released) while I2S TX used a
+disjoint, hardcoded range (8-11); the I2S range is now gone, freeing the high
+DMA channels (RP2350: 7-15 after PDM=CH4 and RX=CH5/6) for input use — notably
+multi-channel I2S input. S/PDIF TX and I2S TX deliberately sit on **different**
+DMA IRQ lines (IRQ_1 vs IRQ_0); sharing a channel is still correct because each
+library independently masks/unmasks its own `(dma_irq, channel)` enable bit and
+de-registers from its instance registry on teardown, so only the active type's
+handler ever services the channel. The brief windows where a channel is
+unclaimed during a retype cannot race a `dma_claim_unused_channel` consumer
+(PDM): retype runs synchronously on the main loop with both DMA IRQ lines
+masked, and PDM claims its channel once at init.
 
 ### Clock Configuration
 

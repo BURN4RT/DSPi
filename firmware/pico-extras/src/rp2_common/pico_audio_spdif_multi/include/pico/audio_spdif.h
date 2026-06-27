@@ -182,6 +182,18 @@ void audio_spdif_set_enabled(audio_spdif_instance_t *inst, bool enabled);
  */
 void audio_spdif_change_pin(audio_spdif_instance_t *inst, uint new_pin);
 
+/** \brief Fully tear down an S/PDIF output instance for output-type switching
+ * \ingroup audio_spdif
+ *
+ * Counterpart to audio_spdif_setup() and mirror of audio_i2s_teardown().
+ * Releases the DMA channel, PIO SM, pin, and registry slot so this slot's DMA
+ * channel can be re-claimed by its I2S instance.  The caller-owned consumer
+ * pool is detached but not freed (re-formatted on the next connect).
+ *
+ * \param inst The S/PDIF instance to tear down
+ */
+void audio_spdif_teardown(audio_spdif_instance_t *inst);
+
 /** \brief Enable multiple S/PDIF instances with synchronized PIO start
  * \ingroup audio_spdif
  *

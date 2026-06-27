@@ -425,21 +425,16 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
         if (target_types[i] == current_types[i]) continue;  // No type change
 
         if (current_types[i] == OUTPUT_TYPE_I2S) {
-            // I2S → SPDIF: teardown the I2S instance
+            // I2S → SPDIF: teardown the I2S instance (releases DMA channel i
+            // and PIO SM i; the SPDIF instance is fully re-set-up in Pass 2).
             audio_i2s_teardown(i2s_instance_ptrs[i]);
         } else {
-            // SPDIF → I2S: disable and unclaim the SPDIF SM
-            audio_spdif_instance_t *spdif_inst = spdif_instance_ptrs[i];
-            audio_spdif_set_enabled(spdif_inst, false);
-            dma_irqn_set_channel_enabled(spdif_inst->dma_irq, spdif_inst->dma_channel, false);
-            dma_channel_abort(spdif_inst->dma_channel);
-            if (spdif_inst->playing_buffer) {
-                give_audio_buffer(spdif_inst->consumer_pool, spdif_inst->playing_buffer);
-                spdif_inst->playing_buffer = NULL;
-            }
-            spdif_reset_consumer_pipeline(spdif_inst);
-            dma_irqn_acknowledge_channel(spdif_inst->dma_irq, spdif_inst->dma_channel);
-            pio_sm_unclaim(spdif_inst->pio, spdif_inst->pio_sm);
+            // SPDIF → I2S: fully tear down the SPDIF instance so it releases
+            // DMA channel i (and PIO SM i) for this slot's I2S instance to
+            // claim in Pass 2.  SPDIF and I2S now share one DMA channel per
+            // output slot (channel == slot index), freeing the high channels
+            // for input use.
+            audio_spdif_teardown(spdif_instance_ptrs[i]);
         }
     }
 
@@ -467,7 +462,10 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
                 audio_i2s_config_t i2s_cfg = {
                     .data_pin = output_pins[i],
                     .clock_pin_base = i2s_bck_pin,
-                    .dma_channel = i + 8,
+                    // Shared with this slot's S/PDIF instance: one DMA channel
+                    // per output slot (channel index == slot index).  The
+                    // outgoing S/PDIF instance released channel i in Pass 1.
+                    .dma_channel = i,
                     .pio_sm = i,
                     .pio = PICO_AUDIO_SPDIF_PIO,
                     .dma_irq = PICO_AUDIO_I2S_DMA_IRQ,
@@ -482,13 +480,23 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
                 }
             }
         } else if (had_i2s) {
-            // Setup SPDIF on slot where I2S was torn down
+            // I2S → SPDIF: the I2S teardown in Pass 1 released DMA channel i
+            // and PIO SM i.  Fully re-set-up the S/PDIF instance on the same
+            // channel/SM (mirrors boot), reclaiming the shared resources.
             audio_spdif_instance_t *spdif_inst = spdif_instance_ptrs[i];
-            pio_sm_claim(spdif_inst->pio, spdif_inst->pio_sm);
-            audio_spdif_change_pin(spdif_inst, output_pins[i]);
+            audio_spdif_config_t spdif_cfg = {
+                .pin = output_pins[i],
+                .dma_channel = i,
+                .pio_sm = i,
+                .pio = PICO_AUDIO_SPDIF_PIO,
+                .dma_irq = PICO_AUDIO_SPDIF_DMA_IRQ,
+            };
+            audio_spdif_setup(spdif_inst, &audio_format_48k, &spdif_cfg);
             // Re-formats the slot's shared static consumer pool back to S/PDIF
-            // (re-points buffers + re-fills IEC-60958 framing) and re-wires the
-            // connection — no alloc/free. The pool was last formatted for I2S.
+            // (re-points buffers + re-fills IEC-60958 framing), re-wires the
+            // connection, and re-applies the current sample-rate divider via
+            // update_pio_frequency — no alloc/free. The pool was last formatted
+            // for I2S.
             audio_spdif_connect_extra(spdif_inst, producer_pools[i], false,
                                       slot_consumer_pools[i], NULL);
             memset(i2s_instance_ptrs[i], 0, sizeof(audio_i2s_instance_t));
