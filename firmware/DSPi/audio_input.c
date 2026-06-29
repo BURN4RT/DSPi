@@ -13,8 +13,20 @@ volatile uint8_t active_input_source = INPUT_SOURCE_USB;
 // SPDIF RX GPIO pin — device-level setting (not per-preset)
 uint8_t spdif_rx_pin = PICO_SPDIF_RX_PIN_DEFAULT;
 
-// I2S RX data pin (same persistence model as spdif_rx_pin)
-uint8_t i2s_rx_pin = PICO_I2S_RX_PIN_DEFAULT;
+// I2S RX serial-data pins, one per stereo pair.  [0] is the always-present
+// stereo pair; [1..3] (RP2350) are placeholders the host assigns when enabling
+// >2-channel I2S input.  The placeholder GPIOs (16/17/18) are free of every
+// default assignment but are expected to be overridden per board, since
+// multichannel input requires explicit wiring of each ADC data line.
+uint8_t i2s_rx_pin[I2S_RX_MAX_PAIRS] = {
+    PICO_I2S_RX_PIN_DEFAULT,
+#if I2S_RX_MAX_PAIRS > 1
+    16, 17, 18,
+#endif
+};
+
+// Active I2S input channel count (2/4/6/8 on RP2350, 2 on RP2040)
+uint8_t i2s_input_channels = 2;
 
 // Selected sample rate while I2S input is active (device is the rate
 // authority in I2S input mode)

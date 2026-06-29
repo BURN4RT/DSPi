@@ -22,6 +22,7 @@
 #include "notify.h"
 
 #include <string.h>
+#include <stdio.h>   // printf() for rejected-config diagnostics
 #include <math.h>    // powf() for master volume (db_to_linear() clamps at -60 dB, insufficient)
 #include <assert.h>  // _Static_assert
 
@@ -200,8 +201,12 @@ void bulk_params_collect(WireBulkParams *out) {
     // Input source configuration (V7+; I2S fields V12+)
     out->input_config.input_source = active_input_source;
     out->input_config.spdif_rx_pin = spdif_rx_pin;
-    out->input_config.i2s_rx_pin = i2s_rx_pin;
+    out->input_config.i2s_rx_pin = i2s_rx_pin[0];
     out->input_config.i2s_input_rate = i2s_rate_encode(i2s_input_rate);
+    out->input_config.i2s_input_channels = i2s_input_channels;
+    for (int p = 0; p < 3; p++)
+        out->input_config.i2s_rx_pin_ext[p] =
+            (p + 1 < I2S_RX_MAX_PAIRS) ? i2s_rx_pin[p + 1] : 0;
 
     // LG Sound Sync (V8+).  All four fields are filled here so a single
     // GET round-trips both the user toggle and the runtime observation.
@@ -387,19 +392,51 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             }
         }
 
-        // I2S RX data pin: same hot-swap pattern.
+        // I2S RX data pins (pair 0 + multichannel extras) and channel count,
+        // validated as a SET so a pushed config can't bring two state machines
+        // up on one GPIO or on a clock pin.  0 = keep-live per field; an invalid
+        // count keeps the live count.  The proposed active set is checked against
+        // the BCK pin THIS transfer installs (in->i2s_config.bck_pin, applied
+        // unconditionally below), and applied only if acceptable — otherwise the
+        // whole I2S RX section is ignored (live config retained) and logged.  A
+        // change restarts the input so every pair re-syncs.
         {
-            uint8_t pin = in->input_config.i2s_rx_pin;
-            bool valid = (pin > 0) && (pin <= 29) && (pin != 12) &&
-                         !(pin >= 23 && pin <= 25);
-#if !PICO_RP2350
-            if (pin > 28) valid = false;
+            uint8_t proposed[I2S_RX_MAX_PAIRS];
+            proposed[0] = (in->input_config.i2s_rx_pin != 0)
+                              ? in->input_config.i2s_rx_pin : i2s_rx_pin[0];
+#if I2S_RX_MAX_PAIRS > 1
+            for (int p = 1; p < I2S_RX_MAX_PAIRS; p++) {
+                uint8_t pin = in->input_config.i2s_rx_pin_ext[p - 1];
+                proposed[p] = (pin != 0) ? pin : i2s_rx_pin[p];
+            }
 #endif
-            if (valid && pin != i2s_rx_pin) {
-                i2s_rx_pin = pin;
-                if (active_input_source == INPUT_SOURCE_I2S) {
-                    i2s_rx_pin_change_pending = true;
+            uint8_t ch = in->input_config.i2s_input_channels;
+            uint8_t count = (ch == 2 || ch == 4 || ch == 6 || ch == 8)
+                                ? ch : i2s_input_channels;
+            if (count / 2 > I2S_RX_MAX_PAIRS) count = i2s_input_channels;
+
+            // Validate the RX set against the BCK that will ACTUALLY be installed
+            // (the pushed BCK if it passes its own check below, else the kept-live
+            // pin), so a rejected/invalid BCK doesn't leave the RX validated
+            // against a value the device never adopts.  Output pins are already
+            // applied, so this matches the install-time check.
+            uint8_t eff_bck = i2s_bck_pin_acceptable(in->i2s_config.bck_pin)
+                                  ? in->i2s_config.bck_pin : i2s_bck_pin;
+            if (i2s_rx_pin_set_acceptable(proposed, count / 2, eff_bck)) {
+                bool changed = false;
+                for (int p = 0; p < I2S_RX_MAX_PAIRS; p++)
+                    if (proposed[p] != i2s_rx_pin[p]) {
+                        i2s_rx_pin[p] = proposed[p];
+                        changed = true;
+                    }
+                if (count != i2s_input_channels) {
+                    i2s_input_channels = count;
+                    changed = true;
                 }
+                if (changed && active_input_source == INPUT_SOURCE_I2S)
+                    i2s_input_restart_pending = true;
+            } else {
+                printf("Bulk apply: I2S RX pin/count config rejected (conflict); kept live\n");
             }
         }
     }
@@ -433,7 +470,18 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         extern bool    i2s_mck_enabled;
         extern uint16_t i2s_mck_multiplier;
         memcpy(output_types, in->i2s_config.output_types, NUM_SPDIF_INSTANCES);
-        i2s_bck_pin = in->i2s_config.bck_pin;
+        // Validate the pushed BCK before installing it raw: BCK/LRCLK are clock
+        // OUTPUTS, so an invalid GPIO can fault pio_gpio_init() and a collision
+        // with an output pin is driver contention.  Reject (keep the live, known-
+        // valid pin) on failure.  Output pins are already applied above, so the
+        // conflict check sees the final config; the RX set is validated against
+        // the BCK separately.
+        if (i2s_bck_pin_acceptable(in->i2s_config.bck_pin)) {
+            i2s_bck_pin = in->i2s_config.bck_pin;
+        } else {
+            printf("Bulk apply: I2S BCK pin %u rejected (invalid/conflict); kept %u\n",
+                   (unsigned)in->i2s_config.bck_pin, (unsigned)i2s_bck_pin);
+        }
 
         // MCK pin migration mirrors flash_storage.c apply_slot_to_live():
         // CLK_GPOUTn requires the pin to map to clk_gpout0..3 on this

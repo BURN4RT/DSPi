@@ -185,14 +185,28 @@ bool is_valid_gpio_pin(uint8_t pin) {
 #endif
 }
 
-bool is_pin_in_use(uint8_t pin, uint8_t exclude) {
+// Pin claimed by a "fixed" peripheral: a pin output, the I2S MCK, the SPDIF RX
+// input, or the DAC hardware-mute.  Deliberately EXCLUDES the I2S BCK/LRCLK
+// clocks and the I2S RX data pins — those have use-dependent rules the callers
+// below apply (the clocks are reserved only while running for general queries,
+// but treated as always-claimed when validating an I2S RX data pin).
+static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
     for (int i = 0; i < NUM_PIN_OUTPUTS; i++) {
-        if (i == exclude) continue;
+        if (i == exclude_output) continue;
         if (output_pins[i] == pin) return true;
     }
-    // Also check I2S BCK and LRCLK pins if any slot is I2S, or if I2S is
-    // the active input (the input SM uses the same clock pair in both its
-    // master and slave roles)
+    if (i2s_mck_enabled && pin == i2s_mck_pin) return true;   // MCK (if enabled)
+    if (pin == spdif_rx_pin) return true;                     // SPDIF RX input
+    if (dac_hw_mute_owns_pin(pin)) return true;               // DAC hardware-mute
+    return false;
+}
+
+bool is_pin_in_use(uint8_t pin, uint8_t exclude) {
+    if (pin_used_by_fixed_peripheral(pin, exclude)) return true;
+    // I2S BCK/LRCLK: reserved only while the clocks actually run (any I2S output,
+    // or I2S is the active input — both its master and slave roles drive/read the
+    // same clock pair).  A general caller (e.g. assigning a pin output) may
+    // legitimately use these GPIOs when no I2S path is live.
     bool i2s_clocks_in_use = (active_input_source == INPUT_SOURCE_I2S);
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (output_types[i] == OUTPUT_TYPE_I2S) {
@@ -201,17 +215,79 @@ bool is_pin_in_use(uint8_t pin, uint8_t exclude) {
         }
     }
     if (i2s_clocks_in_use &&
-        (pin == i2s_bck_pin || pin == (i2s_bck_pin + 1))) return true;
-    // Check MCK pin if enabled
-    if (i2s_mck_enabled && pin == i2s_mck_pin) return true;
-    // Check SPDIF RX input pin
-    if (pin == spdif_rx_pin) return true;
-    // Check I2S RX data pin
-    if (pin == i2s_rx_pin) return true;
-    // Check DAC hardware-mute pins (board-level config, may be unset
-    // — owns_pin returns false when feature is disabled).
-    if (dac_hw_mute_owns_pin(pin)) return true;
+        (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1))) return true;
+    // I2S RX data pins for every active (by count) stereo pair.
+    for (int p = 0; p < i2s_input_channels / 2 && p < I2S_RX_MAX_PAIRS; p++)
+        if (pin == i2s_rx_pin[p]) return true;
     return false;
+}
+
+// True if `pin` is the data pin of an I2S RX stereo pair other than
+// `exclude_pair`, active OR inactive.  is_pin_in_use() only reserves the
+// currently-active pairs (so the inactive placeholder pins never block other
+// functions in stereo mode); this is the complementary guard that keeps all
+// configured pair pins mutually distinct, so raising i2s_input_channels can
+// never bring two state machines up on the same GPIO.
+static bool i2s_rx_pair_pin_taken(uint8_t pin, uint8_t exclude_pair) {
+    for (int q = 0; q < I2S_RX_MAX_PAIRS; q++)
+        if (q != exclude_pair && i2s_rx_pin[q] == pin)
+            return true;
+    return false;
+}
+
+// PIN_CONFIG_* status for assigning `pin` to I2S RX stereo `pair`.  Unlike a bare
+// is_pin_in_use() check, the I2S BCK/LRCLK clocks are treated as ALWAYS claimed:
+// an I2S RX data pin coexists with the clocks whenever the input runs, so it must
+// avoid them even while I2S is currently inactive (otherwise the clash would only
+// surface on the switch INTO I2S).  Also rejects a pin already on another pair.
+static uint8_t check_i2s_rx_pin(uint8_t pin, uint8_t pair) {
+    if (!is_valid_gpio_pin(pin))                              return PIN_CONFIG_INVALID_PIN;
+    if (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1))
+                                                              return PIN_CONFIG_PIN_IN_USE;
+    if (pin_used_by_fixed_peripheral(pin, 0xFF))             return PIN_CONFIG_PIN_IN_USE;
+    if (i2s_rx_pair_pin_taken(pin, pair))                    return PIN_CONFIG_PIN_IN_USE;
+    return PIN_CONFIG_SUCCESS;
+}
+
+// Validate a proposed I2S RX data-pin SET (the first `n_pairs` entries of
+// `pins[]` are the pairs that will be active) against the given effective
+// `bck_pin`: each active pin must be a valid GPIO, not a clock pin (BCK/LRCLK),
+// not used by a fixed peripheral, and mutually distinct.  The bulk/preset
+// restore paths use this to reject an inconsistent pushed/stored I2S config as a
+// unit before it can reach i2s_input_start().  `bck_pin` is passed explicitly
+// because a restore may set BCK in the same transaction, so the live value is
+// not yet updated when this runs.
+bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs, uint8_t bck_pin) {
+    if (n_pairs > I2S_RX_MAX_PAIRS) return false;
+    for (uint8_t p = 0; p < n_pairs; p++) {
+        uint8_t pin = pins[p];
+        if (!is_valid_gpio_pin(pin)) return false;
+        if (pin == bck_pin || pin == (uint8_t)(bck_pin + 1)) return false;
+        if (pin_used_by_fixed_peripheral(pin, 0xFF)) return false;
+        for (uint8_t q = 0; q < p; q++)
+            if (pins[q] == pin) return false;   // mutual distinctness
+    }
+    return true;
+}
+
+// True if `bck_pin` is acceptable as the I2S clock base (LRCLK = bck_pin + 1):
+// both GPIOs valid, and neither collides with a fixed peripheral (a pin output,
+// MCK, SPDIF RX, or DAC mute).  BCK/LRCLK are push-pull clock OUTPUTS, so a
+// collision means two drivers contending on one pad (worse than the input-only
+// RX pins) and an invalid GPIO can fault pio_gpio_init() — the bulk/preset
+// restore paths use this to reject a pushed/stored BCK they would otherwise
+// install raw.  The BCK-vs-I2S-RX-data-pin direction is intentionally NOT
+// re-checked here: it is covered by i2s_rx_pin_set_acceptable() (the RX set is
+// validated against the installed BCK), and checking it here against the
+// not-yet-restored RX pins would spuriously reject a valid stored config.  No
+// "reject while an I2S output is active" guard (cf. REQ_SET_I2S_BCK_PIN): a
+// restore installs the output config and the clock pair together as one set.
+bool i2s_bck_pin_acceptable(uint8_t bck_pin) {
+    uint8_t lrck = (uint8_t)(bck_pin + 1);
+    if (!is_valid_gpio_pin(bck_pin) || !is_valid_gpio_pin(lrck)) return false;
+    if (pin_used_by_fixed_peripheral(bck_pin, 0xFF)) return false;
+    if (pin_used_by_fixed_peripheral(lrck, 0xFF)) return false;
+    return true;
 }
 
 // ----------------------------------------------------------------------------
@@ -1102,7 +1178,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     resp_buf[off + 3] = (uint8_t)((global_status.clip_flags >> 8) & 0xFF);
                     resp_buf[off + 4] = (uint8_t)((global_status.clip_flags >> 16) & 0xFF);
                     resp_buf[off + 5] = (uint8_t)((global_status.clip_flags >> 24) & 0xFF);
-                    resp_buf[off + 6] = usb_input_channels;   // live active input count (2/4/6/8)
+                    resp_buf[off + 6] = active_input_channel_count();   // live active input count (source-aware: USB/I2S/SPDIF)
                     vendor_send_response(resp_buf, off + 7);
                     return true;
                 }
@@ -1136,7 +1212,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     case 20: resp = audio_spdif_get_dma_starvations_instance(2); break;  // SPDIF instance 2
                     case 21: resp = audio_spdif_get_dma_starvations_instance(3); break;  // SPDIF instance 3
                     case 22: resp = usb_audio_ring_overrun_count(); break;  // USB audio ring overruns
-                    case 23: resp = usb_input_channels; break;  // live active input channel count (2/4/6/8)
+                    case 23: resp = active_input_channel_count(); break;  // live active input count (source-aware: USB/I2S/SPDIF)
                 }
                 usb_start_tiny_control_in_transfer(resp, 4);
                 return true;
@@ -1925,26 +2001,42 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 
             case REQ_SET_I2S_RX_PIN: {
                 // Mirrors REQ_SET_SPDIF_RX_PIN: RAM-only update, slot-scoped
-                // persistence via REQ_PRESET_SAVE, hot-swap deferred to the
-                // main loop when I2S input is active.
+                // persistence via REQ_PRESET_SAVE, applied to the live input
+                // when I2S is the active source.
                 //
-                // wValue = new GPIO pin number.
-                uint8_t new_pin = (uint8_t)setup->wValue;
+                // wValue = (pair << 8) | GPIO.  The high byte selects the stereo
+                // pair (0..I2S_RX_MAX_PAIRS-1); old hosts that send just the pin
+                // address pair 0 (high byte 0).
+                uint8_t new_pin = (uint8_t)(setup->wValue & 0xFF);
+                uint8_t pair    = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
-                if (!is_valid_gpio_pin(new_pin)) {
-                    status = PIN_CONFIG_INVALID_PIN;
-                } else if (new_pin == i2s_rx_pin) {
+                if (pair >= I2S_RX_MAX_PAIRS) {
+                    status = PIN_CONFIG_INVALID_OUTPUT;   // no such stereo pair
+                } else if (new_pin == i2s_rx_pin[pair]) {
                     status = PIN_CONFIG_SUCCESS;  // No-op
-                } else if (is_pin_in_use(new_pin, 0xFF)) {
-                    status = PIN_CONFIG_PIN_IN_USE;
+                } else if ((status = check_i2s_rx_pin(new_pin, pair)) != PIN_CONFIG_SUCCESS) {
+                    // check_i2s_rx_pin set status (invalid GPIO, clock pin,
+                    // peripheral clash, or another pair's pin) — reject.
                 } else {
-                    i2s_rx_pin = new_pin;
+                    i2s_rx_pin[pair] = new_pin;
                     if (active_input_source == INPUT_SOURCE_I2S) {
-                        i2s_rx_pin_change_pending = true;
+                        // Pair 0 alone (stereo) can hot-swap its data pin; any
+                        // higher pair, or a multichannel config, must restart so
+                        // every pair re-syncs (re-initing one SM in isolation
+                        // would break the inter-channel alignment guarantee).
+                        if (pair == 0 && i2s_input_channels <= 2)
+                            i2s_rx_pin_change_pending = true;
+                        else
+                            i2s_input_restart_pending = true;
                     }
                     status = PIN_CONFIG_SUCCESS;
-                    notify_param_write(offsetof(WireBulkParams, input_config.i2s_rx_pin),
-                                       1, &i2s_rx_pin);
+                    // Pair 0 maps to input_config.i2s_rx_pin; pairs 1..3 to
+                    // input_config.i2s_rx_pin_ext[pair-1].
+                    uint16_t off = (pair == 0)
+                        ? (uint16_t)offsetof(WireBulkParams, input_config.i2s_rx_pin)
+                        : (uint16_t)(offsetof(WireBulkParams, input_config.i2s_rx_pin_ext) +
+                                     (pair - 1));
+                    notify_param_write(off, 1, &i2s_rx_pin[pair]);
                 }
                 resp_buf[0] = status;
                 vendor_send_response(resp_buf, 1);
@@ -1952,7 +2044,56 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_I2S_RX_PIN: {
-                resp_buf[0] = i2s_rx_pin;
+                // wValue = pair (0..I2S_RX_MAX_PAIRS-1); old hosts send 0.
+                uint8_t pair = (uint8_t)(setup->wValue & 0xFF);
+                resp_buf[0] = (pair < I2S_RX_MAX_PAIRS) ? i2s_rx_pin[pair] : 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_I2S_INPUT_CHANNELS: {
+                // wValue = channel count (2/4/6/8).  Restarts the input when I2S
+                // is the active source so the new pair set is (de)allocated and
+                // every pair re-syncs.
+                uint8_t count = (uint8_t)(setup->wValue & 0xFF);
+                uint8_t status;
+                if (count != 2 && count != 4 && count != 6 && count != 8) {
+                    status = PIN_CONFIG_INVALID_PIN;        // not a valid count
+                } else if (count / 2 > I2S_RX_MAX_PAIRS) {
+                    status = PIN_CONFIG_INVALID_OUTPUT;     // more pairs than this part supports
+                } else {
+                    // When RAISING the count, every newly-activated pair's data
+                    // pin must pass the full I2S RX check (valid GPIO; not a
+                    // clock pin even though I2S may be inactive right now; no
+                    // peripheral or cross-pair clash).  Inactive pairs don't
+                    // reserve their pins, so a pin a pair was parked on may have
+                    // been taken since; reject rather than bring two SMs up on
+                    // one GPIO.  Lowering the count skips this (loop is empty).
+                    status = PIN_CONFIG_SUCCESS;
+                    uint8_t old_pairs = (uint8_t)(i2s_input_channels / 2);
+                    uint8_t new_pairs = (uint8_t)(count / 2);
+                    for (uint8_t p = old_pairs; p < new_pairs && status == PIN_CONFIG_SUCCESS; p++)
+                        status = check_i2s_rx_pin(i2s_rx_pin[p], p);
+                    if (status == PIN_CONFIG_SUCCESS && count != i2s_input_channels) {
+                        i2s_input_channels = count;
+                        if (active_input_source == INPUT_SOURCE_I2S) {
+                            i2s_input_restart_pending = true;
+                            // Active count changed live; push the input-format
+                            // event so the host relayouts (matches USB alts).
+                            notify_push_input_format(active_input_channel_count());
+                        }
+                        notify_param_write(
+                            offsetof(WireBulkParams, input_config.i2s_input_channels),
+                            1, &i2s_input_channels);
+                    }
+                }
+                resp_buf[0] = status;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_I2S_INPUT_CHANNELS: {
+                resp_buf[0] = i2s_input_channels;
                 vendor_send_response(resp_buf, 1);
                 return true;
             }

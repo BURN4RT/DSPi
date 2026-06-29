@@ -18,6 +18,13 @@
 // buf_l[] and buf_r[] must be filled by the caller before invoking.
 void process_input_block(uint32_t sample_count);
 
+// Number of active input channels for the current input source: the USB alt's
+// channel count, the I2S input channel count, or the stereo pair for S/PDIF;
+// clamped to NUM_INPUT_CHANNELS.  Single source of truth for the DSP pipeline's
+// input dimension AND the host-visible status (REQ_GET_STATUS), so the two can
+// never disagree about how many inputs are live.
+uint8_t active_input_channel_count(void);
+
 // Reset CPU load metering state — called on audio gap detection
 void pipeline_reset_cpu_metering(void);
 
@@ -25,11 +32,11 @@ void pipeline_reset_cpu_metering(void);
 #if PICO_RP2350
 extern float buf_l[192], buf_r[192];
 extern float buf_out[NUM_OUTPUT_CHANNELS][192];
-// Extra USB input channels 2..7 for the 8-channel USB input mode (inputs 0/1
-// remain buf_l/buf_r, shared with every other input source).  Written only by
-// the 8-channel deinterleave path; read by the matrix only when 8-channel USB
-// input is the active source, so stale contents can never leak into stereo,
-// S/PDIF, or I2S processing.
+// Extra input channels 2..7 for multichannel input modes (inputs 0/1 remain
+// buf_l/buf_r, shared with every input source).  Written by the 8-channel USB
+// deinterleave AND the multichannel I2S deinterleave; read by the matrix only
+// when n_active_inputs > 2 (active_input_channel_count()), so stale contents can
+// never leak into stereo or S/PDIF processing.
 extern float buf_in_ext[NUM_INPUT_CHANNELS - NUM_STEREO_INPUTS][192];
 #else
 extern int32_t buf_l[192], buf_r[192];

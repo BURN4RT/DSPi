@@ -113,7 +113,14 @@ static bool i2s_input_should_be_master(void) {
     return true;
 }
 
-static void perform_rate_change(uint32_t new_freq) {
+// defer_output_to_input_prefill: when true, the caller's input prefill handshake
+// (the main-loop I2S block) will drain, re-enable outputs in sync, and own the
+// DAC-mute release after this returns, so perform_rate_change() must NOT run
+// complete_pipeline_reset() (which would re-enable + release the mute early and
+// double-drain).  Set by I2S bring-up / runtime I2S rate change / source-switch
+// INTO I2S — the last of which is why this is an explicit parameter rather than
+// an active_input_source check (active is still the OLD source there).
+static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_prefill) {
     switch (new_freq) { case 44100: case 48000: case 96000: break; default: new_freq = 44100; }
 
     // Engage mute and wait for Core 1 EQ worker to drain before touching
@@ -187,7 +194,14 @@ static void perform_rate_change(uint32_t new_freq) {
     // pool — the exact underrun/pop the prefill handshake exists to prevent.
     // Let the prefill block's own enable_outputs_in_sync() restart outputs
     // when the 50 % fill threshold is reached instead.
-    if (!spdif_prefilling) {
+    //
+    // Likewise skip when the eventual input is I2S (defer_output_to_input_prefill):
+    // the main-loop I2S prefill block will drain, re-enable in sync, and own the
+    // DAC-mute release.  This is what makes the source-switch-INTO-I2S case
+    // correct (active_input_source is still the OLD source here, so
+    // complete_pipeline_reset()'s own I2S guard could not fire) and avoids a
+    // redundant drain for the runtime / bring-up I2S cases.
+    if (!spdif_prefilling && !defer_output_to_input_prefill) {
         complete_pipeline_reset();
     }
 
@@ -215,7 +229,10 @@ static void i2s_input_bringup_prefill(void) {
     bool master = i2s_input_should_be_master();
 
     if (i2s_input_rate != audio_state.freq) {
-        perform_rate_change(i2s_input_rate);
+        // Eventual input is I2S; the main-loop I2S prefill block owns the
+        // output drain/re-enable/mute-release, so defer rather than letting
+        // complete_pipeline_reset() release the mute before that drain.
+        perform_rate_change(i2s_input_rate, true);
     }
 
     extern bool i2s_mck_enabled;
@@ -900,7 +917,21 @@ static void complete_pipeline_reset(void) {
     // If release_ms > 0, dac_hw_mute_release() leaves the pin asserted
     // and returns; dac_hw_mute_tick() deasserts it later so the input
     // pipeline keeps draining while the DAC remains muted.
-    dac_hw_mute_release();
+    //
+    // EXCEPTION — I2S input with a pending prefill (preset_loading still set):
+    // the main-loop I2S prefill block (gated on preset_loading) will DRAIN and
+    // disable the outputs again after this returns, then re-enable in sync and
+    // own the release (right after its enable_outputs_in_sync()).  Releasing
+    // here would un-mute before that drain stops the clocks — and with the
+    // default release_ms == 0 the pin deasserts immediately, so the clock-stop
+    // click is fully exposed.  Defer to the prefill block in that case.  (SPDIF
+    // input is already handled by its callers skipping complete_pipeline_reset()
+    // entirely; USB has no such prefill drain, so it releases here as before.
+    // The prefill block always runs while active_input_source == I2S and
+    // preset_loading is set, so the mute is never left stuck asserted.)
+    if (!(active_input_source == INPUT_SOURCE_I2S && preset_loading)) {
+        dac_hw_mute_release();
+    }
 
     // Phase 5: re-phase a slave-role I2S input.  The synchronized start in
     // Phase 2 rewinds the I2S TX clock master to its PIO entry point, which
@@ -1113,15 +1144,24 @@ static void resume_i2s_after_flash(void) {
 //     The lock-acquisition prefill block (main loop) re-enables outputs after
 //     re-lock and owns the matching dac_hw_mute_release(); deasserting here
 //     would un-mute the DAC into pre-lock silence.
+//   - I2S input: same conclusion as SPDIF, but for a subtler reason.
+//     prepare_flash_write_operation() stops the I2S input and leaves
+//     preset_loading set, so the main-loop I2S prefill block (gated on
+//     preset_loading) DRAINS and disables the outputs AFTER this completion
+//     returns, then re-enables them in sync and owns the matching
+//     dac_hw_mute_release() (right after enable_outputs_in_sync()).  Deasserting
+//     here would un-mute BEFORE that drain stops the output clocks — exposing
+//     the exact clock-stop click the hardware mute exists to suppress.
 //
-// Completion paths that run a full pipeline reset on USB
+// So only USB releases here (its outputs genuinely stay live through the light
+// path).  Completion paths that run a full pipeline reset
 // (complete_flash_write_operation_full()) release implicitly inside
 // complete_pipeline_reset() and need not call this.  It exists for completion
 // paths that keep outputs running through the operation — today the
-// light/metadata flash path — where the release is otherwise easy to forget
-// (its omission once left the DAC silent indefinitely; see git 833a51a).
+// light/metadata flash path on USB — where the release is otherwise easy to
+// forget (its omission once left the DAC silent indefinitely; see git 833a51a).
 static inline void release_hw_mute_if_outputs_live(void) {
-    if (active_input_source != INPUT_SOURCE_SPDIF) {
+    if (active_input_source == INPUT_SOURCE_USB) {
         dac_hw_mute_release();
     }
 }
@@ -1760,7 +1800,10 @@ int main(void) {
             uint32_t r = pending_rate;
             rate_change_pending = false;
             usb_audio_drain_ring();  // Process old-rate packets before clock switch
-            perform_rate_change(r);
+            // For I2S input the main-loop prefill block owns the output restart
+            // + mute release; defer so complete_pipeline_reset() doesn't release
+            // the mute before that block's drain.  USB/SPDIF restart here.
+            perform_rate_change(r, active_input_source == INPUT_SOURCE_I2S);
         }
 
         // Handle loudness table recomputation
@@ -1955,10 +1998,14 @@ int main(void) {
                     active_input_source == INPUT_SOURCE_I2S &&
                     !input_source_change_pending) {
                     i2s_input_start(i2s_input_should_be_master());
-                    // io_config_apply() may have flagged a pin hot-swap while
-                    // applying the slot; this restart already used the new
-                    // pin, so consume the flag to avoid a redundant cycle.
+                    // io_config_apply() may have flagged a pin hot-swap
+                    // (i2s_rx_pin_change_pending) OR a full restart for a
+                    // multichannel / channel-count change (i2s_input_restart_
+                    // pending) while applying the slot; this restart already
+                    // used the new config, so consume BOTH to avoid a redundant
+                    // deferred restart (and its extra mute).
                     i2s_rx_pin_change_pending = false;
+                    i2s_input_restart_pending = false;
                     if (i2s_input_rate != audio_state.freq) {
                         pending_rate = i2s_input_rate;
                         __dmb();
@@ -2137,11 +2184,15 @@ int main(void) {
                 }
 
                 // I2S input mirror (normally skipped: factory reset forces
-                // the input source to USB).
+                // the input source to USB).  Defensive parity with the preset/
+                // bulk mirrors: if this ever runs, consume any restore-raised
+                // I2S restart flags so the deferred handler doesn't re-restart.
                 if (suspended_i2s &&
                     active_input_source == INPUT_SOURCE_I2S &&
                     !input_source_change_pending) {
                     i2s_input_start(i2s_input_should_be_master());
+                    i2s_rx_pin_change_pending = false;
+                    i2s_input_restart_pending = false;
                 }
             }
         }
@@ -2296,15 +2347,17 @@ int main(void) {
                 spdif_input_start();
             }
 
-            // I2S input mirror: restart with a freshly elected role.  The
-            // i2s_rx_pin_change_pending flag a bulk apply may have raised is
-            // consumed below by its own handler, but the restart here already
-            // picks up the new pin, so clear it to avoid a redundant cycle.
+            // I2S input mirror: restart with a freshly elected role.  A bulk
+            // apply may have raised i2s_rx_pin_change_pending (pin) or
+            // i2s_input_restart_pending (channel-count / multichannel); the
+            // restart here already picks up the new config, so clear BOTH to
+            // avoid a redundant deferred restart (and its extra mute).
             if (suspended_i2s &&
                 active_input_source == INPUT_SOURCE_I2S &&
                 !input_source_change_pending) {
                 i2s_input_start(i2s_input_should_be_master());
                 i2s_rx_pin_change_pending = false;
+                i2s_input_restart_pending = false;
                 if (i2s_input_rate != audio_state.freq) {
                     pending_rate = i2s_input_rate;
                     __dmb();
@@ -2350,7 +2403,11 @@ int main(void) {
                     uint32_t target_rate = (new_source == INPUT_SOURCE_I2S)
                                                ? i2s_input_rate
                                                : audio_state.freq;
-                    perform_rate_change(target_rate);
+                    // Switching INTO I2S: defer the output restart + mute release
+                    // to the I2S prefill block (active_input_source is still
+                    // SPDIF here, so complete_pipeline_reset()'s I2S guard can't
+                    // fire).  Switching to USB: complete_pipeline_reset() runs.
+                    perform_rate_change(target_rate, new_source == INPUT_SOURCE_I2S);
                     dsp_update_delay_samples((float)target_rate);
 
                     // Reset DSP state to prevent stale SPDIF data leaking
@@ -2371,12 +2428,14 @@ int main(void) {
                     pipeline_reset_cpu_metering();
                 }
 
-                // Regenerate input-channel default names for the new source.
-                // Custom names are preserved by string-inequality.  RAM-only;
-                // persisted on REQ_PRESET_SAVE.
+                // Regenerate input-channel default names for the new source —
+                // ALL input channels, including the multichannel extras (2..7),
+                // so 4/6/8-ch I2S and USB inputs relabel ("USB 3" -> "I2S 3"),
+                // not just the stereo pair.  Custom names are preserved by
+                // string-inequality.  RAM-only; persisted on REQ_PRESET_SAVE.
                 {
                     extern uint8_t output_types[];
-                    for (int ch = 0; ch < NUM_STEREO_INPUTS; ch++) {
+                    for (int ch = 0; ch < NUM_INPUT_CHANNELS; ch++) {
                         char old_default[PRESET_NAME_LEN];
                         char new_default[PRESET_NAME_LEN];
                         get_default_channel_name(ch, old_source, output_types, old_default);
@@ -2436,6 +2495,11 @@ int main(void) {
                 uint8_t wire_src = (uint8_t)active_input_source;
                 notify_param_write(offsetof(WireBulkParams, input_config.input_source),
                                    1, &wire_src);
+                // The active input channel count can change with the source
+                // (USB alt count / I2S count / stereo for S/PDIF).  Push the
+                // input-format event so a host driving relayout off it reacts to
+                // the switch, mirroring the USB-alt-change path.
+                notify_push_input_format(active_input_channel_count());
             }
         }
 

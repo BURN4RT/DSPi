@@ -5,18 +5,40 @@
  * the input is synchronous to the device's own clock domain, so there is
  * no servo, no rate detection and no lock handling.
  *
+ * Multichannel: the receiver fans out to up to I2S_RX_MAX_PAIRS stereo pairs
+ * (2/4/6/8 channels on RP2350; always 1 pair / 2 channels on RP2040).  Each
+ * pair is one PIO state machine + one IRQ-less DMA ring + one serial-data pin,
+ * all sharing a single BCK/LRCLK:
+ *
+ *   clock master (no output slot is I2S): pair 0's SM runs the clkmaster
+ *     program, driving BCK/LRCLK via side-set while sampling its data pin;
+ *     pairs 1.. run the wait-driven slave program against the SAME pads that
+ *     pair 0 drives.
+ *   slave (at least one output slot is I2S): every pair runs the slave
+ *     program against the BCK/LRCLK pads driven by the I2S TX clock master.
+ *
  * Hardware:
- *   - PIO: same block/SM as SPDIF RX (PICO_SPDIF_RX_PIO; SM 2 on RP2040,
- *     SM 0 on RP2350), claimed only while running
- *   - DMA: the two SPDIF RX channels in an IRQ-less infinite ring:
- *     channel A moves PIO RX FIFO words into a power-of-2-aligned ring
- *     (write-address wrap) and chains to channel B, which rewrites A's
- *     write address with the ring base and retriggers it. Zero IRQs, so
- *     capture survives IRQ-disabled windows.
+ *   - PIO: PICO_SPDIF_RX_PIO, SM I2S_RX_SM_BASE + pair (SM 2 on RP2040,
+ *     SMs 0..3 on RP2350), claimed only while running.  Free whenever SPDIF
+ *     RX is inactive (inputs are switched, never mixed).
+ *   - DMA: pair p uses channels I2S_RX_DMA_BASE + 2p (data) and +2p+1
+ *     (reload) in an IRQ-less infinite ring: the data channel moves PIO RX
+ *     FIFO words into a power-of-2-aligned ring (write-address wrap) and
+ *     chains to the reload channel, which rewrites the data channel's write
+ *     address with the ring base and retriggers it.  Zero IRQs, so capture
+ *     survives IRQ-disabled windows.  Pair 0 reuses the SPDIF RX channels;
+ *     higher pairs use channels freed by the SPDIF/I2S TX DMA-sharing work.
+ *
+ * Inter-channel alignment: all pairs are enabled on the same cycle
+ * (pio_enable_sm_mask_in_sync), so every pair latches the same first frame
+ * and the rings advance in lockstep on the one shared BCK/LRCLK.  The poll
+ * reads the same frame index from every pair, so the 2/4/6/8 channels are
+ * sample-aligned (the firmware's inviolable inter-channel alignment
+ * guarantee).  This mirrors the TX path's audio_*_enable_sync().
  *
  * L/R framing: the PIO programs guarantee the first word pushed after a
- * (re)start is a LEFT word, and the ring holds an even number of words,
- * so a word's position in the ring fixes its channel permanently. Even a
+ * (re)start is a LEFT word, and each ring holds an even number of words,
+ * so a word's position in a ring fixes its channel permanently.  Even a
  * writer-laps-reader overrun garbles audio momentarily but can never
  * swap channels.
  */
@@ -45,19 +67,27 @@
 
 #define i2s_rx_pio __CONCAT(pio, PICO_SPDIF_RX_PIO)
 
+// First state machine used.  RP2350 has a dedicated PIO block (SMs 0..3 all
+// available); RP2040 shares PIO1 where SM0 is PDM, so the input starts at SM2.
 #if PICO_RP2350
-#define I2S_RX_SM           0
+#define I2S_RX_SM_BASE      0
 #else
-#define I2S_RX_SM           2
+#define I2S_RX_SM_BASE      2
 #endif
 
-#define I2S_RX_DMA_DATA     PICO_SPDIF_RX_DMA_CH0   // PIO RXF -> ring
-#define I2S_RX_DMA_RELOAD   PICO_SPDIF_RX_DMA_CH1   // re-arms the data channel
+// DMA channels: pair p uses (base + 2p) for data and (base + 2p + 1) for
+// reload.  Pair 0 reuses the SPDIF RX channels (free whenever SPDIF input is
+// inactive); higher pairs use channels the SPDIF/I2S TX DMA-sharing work freed
+// (RP2350: 7..12 for pairs 1..3).  PICO_SPDIF_RX_DMA_CH1 == CH0 + 1 keeps
+// pair 0 == CH0/CH1.
+#define I2S_RX_DMA_BASE     PICO_SPDIF_RX_DMA_CH0
+_Static_assert(I2S_RX_DMA_BASE + 2 * I2S_RX_MAX_PAIRS <= NUM_DMA_CHANNELS,
+               "I2S RX DMA channel range exceeds the DMA channel count");
 
-// Ring sizing: must be a power of 2 (DMA address wrap) and even (L/R
-// parity). At 96 kHz stereo (192k words/s) this is ~5 ms of headroom on
-// RP2040 and ~10 ms on RP2350; main-loop stalls longer than that only
-// happen around flash operations, which suspend the input anyway.
+// Ring sizing (per pair): must be a power of 2 (DMA address wrap) and even
+// (L/R parity).  At 96 kHz stereo (192k words/s) this is ~5 ms of headroom on
+// RP2040 and ~10 ms on RP2350; main-loop stalls longer than that only happen
+// around flash operations, which suspend the input anyway.
 #if PICO_RP2350
 #define I2S_RX_RING_WORDS   2048u
 #define I2S_RX_RING_BITS    13u                     // log2(ring bytes)
@@ -71,20 +101,43 @@
 //
 // The DMA ring's write address advances per word, so the main loop (which
 // polls far faster than samples arrive) would otherwise call
-// process_input_block() with only a handful of frames each time. The CPU
+// process_input_block() with only a handful of frames each time.  The CPU
 // meter is budget-based (busy_us / (frames / Fs)), so the fixed per-block
 // cost (Core 1 EQ-worker handshake, pipeline setup) divided by a tiny frame
-// count reads as a large inflation. Batching to 48 frames matches the USB
+// count reads as a large inflation.  Batching to 48 frames matches the USB
 // packet / consumer-buffer granularity, bringing I2S CPU in line with USB.
 // At 48 kHz this adds ~1 ms of input latency; the consumer pool (50% prefill)
 // absorbs the resulting sub-buffer fill ripple.
 #define I2S_INPUT_MIN_BLOCK 48u
 
+// Per-pair ring storage.  Each row is aligned to its own byte size so the DMA
+// write-address wrap (channel_config_set_ring) stays within the pair's ring.
 static uint32_t __attribute__((aligned(I2S_RX_RING_BYTES)))
-    i2s_rx_ring[I2S_RX_RING_WORDS];
+    i2s_rx_ring[I2S_RX_MAX_PAIRS][I2S_RX_RING_WORDS];
 
-// Source word for the reload channel (holds the ring base address)
-static uintptr_t i2s_rx_ring_base_addr;
+// ============================================================================
+// PER-PAIR STATE
+// ============================================================================
+
+// One receiver stereo pair = one SM + one DMA ring + one data pin.  Every
+// lifecycle operation (start/stop/resync/poll) iterates i2s_n_pairs of these,
+// so the single-pair path is simply n_pairs == 1 with no special-casing.
+typedef struct {
+    uint8_t   sm;          // PIO state machine index
+    uint8_t   data_pin;    // this pair's serial-data GPIO (captured at start)
+    uint8_t   dma_data;    // PIO RXF -> ring
+    uint8_t   dma_reload;  // re-arms dma_data (the race-free self-retriggering ring)
+    uint32_t *ring;        // -> i2s_rx_ring[p]
+    uintptr_t ring_base;   // stable source word for the reload channel (= ring addr)
+    uint32_t  rd_word;     // software read index into this pair's ring (whole pairs)
+} I2sRxPair;
+
+static I2sRxPair i2s_pairs[I2S_RX_MAX_PAIRS];
+
+// Active pairs this session = i2s_input_channels / 2 (clamped). Captured at
+// start; stop()/poll() use it, never the live i2s_input_channels global (which
+// the host may change between start and the deferred restart).
+static uint8_t i2s_n_pairs;
 
 // ============================================================================
 // STATE
@@ -92,21 +145,21 @@ static uintptr_t i2s_rx_ring_base_addr;
 
 static volatile I2sInputState i2s_state = I2S_INPUT_INACTIVE;
 static bool i2s_role_master = false;
-static int  i2s_prog_offset = -1;
 
-// Pins captured at start time.  stop() must release what was actually
-// configured, NOT the live globals: the hot-swap handlers update
-// i2s_rx_pin / i2s_bck_pin before the deferred stop runs, so releasing
-// the globals would strand the old pins on the input PIO function.
-static uint8_t i2s_active_rx_pin;
+// Loaded PIO program offsets (-1 = not loaded).  The clkmaster program is
+// loaded only in the master role (pair 0); the slave program is shared by all
+// slave-role SMs (master role pairs 1.., or every pair in the slave role).
+static int i2s_clkmaster_offset = -1;
+static int i2s_slave_offset = -1;
+
+// BCK pin captured at start.  stop() must release what was actually
+// configured, NOT the live global: the hot-swap handlers update i2s_bck_pin
+// before the deferred stop runs, so releasing the global would strand the old
+// clock pins on the input PIO function.  (Data pins are captured per pair.)
 static uint8_t i2s_active_bck_pin;
 
-// Software read index into the ring, in words (0 .. I2S_RX_RING_WORDS-1).
-// Always advanced in whole stereo pairs so its parity is preserved.
-static uint32_t i2s_rd_word;
-
-// RAM copy of the slave program with the BCK/LRCLK GPIO numbers patched
-// into the wait instructions (i2s_bck_pin is runtime-configurable).
+// RAM copy of the slave program with the BCK/LRCLK GPIO numbers patched into
+// the wait instructions (i2s_bck_pin is runtime-configurable).
 static uint16_t i2s_slave_prog_ram[7];
 static struct pio_program i2s_slave_prog = {
     .instructions = i2s_slave_prog_ram,
@@ -125,85 +178,111 @@ static uint32_t rx_master_divider_24_8(uint32_t sample_freq) {
     return (uint32_t)((num + sample_freq - 1) / sample_freq);
 }
 
-// Patch the 5-bit GPIO index field of a `wait gpio` instruction
+// Patch the 5-bit GPIO index field of a `wait gpio` instruction.
 static inline uint16_t patch_wait_gpio(uint16_t instr, uint8_t pin) {
     return (uint16_t)((instr & ~0x1Fu) | (pin & 0x1Fu));
 }
 
-static inline uint32_t ring_write_word(void) {
-    return (uint32_t)((dma_hw->ch[I2S_RX_DMA_DATA].write_addr -
-                       (uint32_t)i2s_rx_ring_base_addr) / 4u) %
+// Current DMA write position (in words) within a pair's ring.
+static inline uint32_t pair_write_word(const I2sRxPair *pr) {
+    return (uint32_t)((dma_hw->ch[pr->dma_data].write_addr - (uint32_t)pr->ring_base) / 4u) %
            I2S_RX_RING_WORDS;
 }
 
-// Wait (bounded) for DMA to drain the PIO RX FIFO. Used before re-anchoring
-// the read pointer so no in-flight words land after the anchor; avoids
-// clearing the FIFO while the DMA holds unserviced DREQ credits.
-static void drain_rx_fifo(void) {
+// Wait (bounded) for DMA to drain one SM's PIO RX FIFO.  Used before
+// re-anchoring a read pointer so no in-flight words land after the anchor.
+static void drain_rx_fifo(uint8_t sm) {
     for (uint32_t spin = 0; spin < 10000; spin++) {
-        if (pio_sm_get_rx_fifo_level(i2s_rx_pio, I2S_RX_SM) == 0) break;
+        if (pio_sm_get_rx_fifo_level(i2s_rx_pio, sm) == 0) break;
         tight_loop_contents();
     }
 }
 
-static void start_dma_ring(void) {
-    // Reload channel: one word, no increments, no chain (chain-to-self).
-    // Each completion of the data channel chains here; this writes the
-    // ring base into the data channel's write address trigger alias,
-    // which also reloads its transfer count. Runs forever, zero IRQs.
-    dma_channel_config cb = dma_channel_get_default_config(I2S_RX_DMA_RELOAD);
+// Patch and load the shared slave program (BCK/LRCLK pins are runtime config).
+// Patch map per i2s_input.pio: instr 0,1 = LRCLK; 2..5 = BCK.
+static void load_slave_program(void) {
+    memcpy(i2s_slave_prog_ram, audio_i2s_rx_slave_program_instructions,
+           sizeof(i2s_slave_prog_ram));
+    i2s_slave_prog_ram[0] = patch_wait_gpio(i2s_slave_prog_ram[0], i2s_active_bck_pin + 1);
+    i2s_slave_prog_ram[1] = patch_wait_gpio(i2s_slave_prog_ram[1], i2s_active_bck_pin + 1);
+    for (int i = 2; i <= 5; i++) {
+        i2s_slave_prog_ram[i] = patch_wait_gpio(i2s_slave_prog_ram[i], i2s_active_bck_pin);
+    }
+    i2s_slave_offset = pio_add_program(i2s_rx_pio, &i2s_slave_prog);
+}
+
+// Set up one pair's IRQ-less ring (data channel + self-retriggering reload).
+static void start_pair_dma_ring(const I2sRxPair *pr) {
+    // Reload channel: one word, no increments, chain-to-self.  Each completion
+    // of the data channel chains here; this writes the ring base into the data
+    // channel's write-address trigger alias, which also reloads its transfer
+    // count.  Runs forever, zero IRQs.
+    dma_channel_config cb = dma_channel_get_default_config(pr->dma_reload);
     channel_config_set_transfer_data_size(&cb, DMA_SIZE_32);
     channel_config_set_read_increment(&cb, false);
     channel_config_set_write_increment(&cb, false);
-    channel_config_set_chain_to(&cb, I2S_RX_DMA_RELOAD);
-    dma_channel_configure(I2S_RX_DMA_RELOAD, &cb,
-                          &dma_hw->ch[I2S_RX_DMA_DATA].al2_write_addr_trig,
-                          &i2s_rx_ring_base_addr, 1, false);
+    channel_config_set_chain_to(&cb, pr->dma_reload);
+    dma_channel_configure(pr->dma_reload, &cb,
+                          &dma_hw->ch[pr->dma_data].al2_write_addr_trig,
+                          &pr->ring_base, 1, false);
 
-    // Data channel: PIO RX FIFO -> ring with write-address wrap
-    dma_channel_config ca = dma_channel_get_default_config(I2S_RX_DMA_DATA);
+    // Data channel: PIO RX FIFO -> ring with write-address wrap.
+    dma_channel_config ca = dma_channel_get_default_config(pr->dma_data);
     channel_config_set_transfer_data_size(&ca, DMA_SIZE_32);
     channel_config_set_read_increment(&ca, false);
     channel_config_set_write_increment(&ca, true);
     channel_config_set_ring(&ca, true, I2S_RX_RING_BITS);
-    channel_config_set_dreq(&ca, pio_get_dreq(i2s_rx_pio, I2S_RX_SM, false));
-    channel_config_set_chain_to(&ca, I2S_RX_DMA_RELOAD);
-    dma_channel_configure(I2S_RX_DMA_DATA, &ca,
-                          i2s_rx_ring, &i2s_rx_pio->rxf[I2S_RX_SM],
+    channel_config_set_dreq(&ca, pio_get_dreq(i2s_rx_pio, pr->sm, false));
+    channel_config_set_chain_to(&ca, pr->dma_reload);
+    dma_channel_configure(pr->dma_data, &ca,
+                          pr->ring, &i2s_rx_pio->rxf[pr->sm],
                           I2S_RX_RING_WORDS, true);
 }
 
-// Race-free teardown of the self-retriggering ring.
+// Race-free teardown of every pair's self-retriggering ring.
 //
-// The data channel chains to the reload channel, and the reload channel
-// re-triggers the data channel by writing its al2_write_addr_trig. Aborting
-// the two naively (two sequential dma_channel_abort calls) lets one channel
-// re-arm the other in the gap between the aborts, or lets aborting the data
-// channel trigger its chain target. Either way a channel can be left BUSY,
-// so dma_channel_abort's `while (BUSY)` spin never returns (watchdog reset)
-// or a channel is left live after unclaim (corrupted on the next start).
+// Each data channel chains to its reload channel, and the reload channel
+// re-triggers the data channel by writing its al2_write_addr_trig.  Aborting
+// these naively (sequential dma_channel_abort calls) lets one channel re-arm
+// the other in the gap, so dma_channel_abort's `while (BUSY)` spin never
+// returns (watchdog reset) or a channel is left live after unclaim.
 //
-// Break the loop deterministically: first disarm the data channel's chain
-// (the reload channel only ever runs because the data channel chains to it,
-// so once disarmed it cannot fire again), then abort BOTH channels in a
-// single write so neither can re-arm the other. The bounded guard ensures a
-// hardware quirk degrades to a clean stop rather than an unbounded spin.
-static void stop_dma_ring(void) {
-    // Disarm data -> reload chaining via the non-triggering CTRL alias
-    // (al1_ctrl); point the data channel's chain_to at itself.
-    hw_write_masked(&dma_hw->ch[I2S_RX_DMA_DATA].al1_ctrl,
-                    (uint32_t)I2S_RX_DMA_DATA << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB,
-                    DMA_CH0_CTRL_TRIG_CHAIN_TO_BITS);
+// Break the loops deterministically: first disarm every data channel's chain
+// via the non-triggering CTRL alias (point chain_to at itself), then abort all
+// channels in a single dma_hw->abort write so none can re-arm another.  The
+// bounded guard degrades a hardware quirk to a clean stop rather than a hang.
+static void stop_all_dma_rings(void) {
+    uint32_t abort_mask = 0;
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        const I2sRxPair *pr = &i2s_pairs[p];
+        hw_write_masked(&dma_hw->ch[pr->dma_data].al1_ctrl,
+                        (uint32_t)pr->dma_data << DMA_CH0_CTRL_TRIG_CHAIN_TO_LSB,
+                        DMA_CH0_CTRL_TRIG_CHAIN_TO_BITS);
+        abort_mask |= (1u << pr->dma_data) | (1u << pr->dma_reload);
+    }
 
-    // Abort both channels atomically (one register write, both bits set).
-    dma_hw->abort = (1u << I2S_RX_DMA_DATA) | (1u << I2S_RX_DMA_RELOAD);
+    dma_hw->abort = abort_mask;
 
     uint32_t guard = 1000000u;
-    while (((dma_hw->ch[I2S_RX_DMA_DATA].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS) ||
-            (dma_hw->ch[I2S_RX_DMA_RELOAD].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS)) &&
-           --guard) {
+    while (guard--) {
+        bool any_busy = false;
+        for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+            if ((dma_hw->ch[i2s_pairs[p].dma_data].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS) ||
+                (dma_hw->ch[i2s_pairs[p].dma_reload].ctrl_trig & DMA_CH0_CTRL_TRIG_BUSY_BITS)) {
+                any_busy = true;
+                break;
+            }
+        }
+        if (!any_busy) break;
         tight_loop_contents();
     }
+}
+
+// Build the SM enable bitmask for the active pairs.
+static inline uint32_t i2s_sm_mask(void) {
+    uint32_t mask = 0;
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) mask |= (1u << i2s_pairs[p].sm);
+    return mask;
 }
 
 // ============================================================================
@@ -212,149 +291,213 @@ static void stop_dma_ring(void) {
 
 void i2s_input_init(void) {
     i2s_state = I2S_INPUT_INACTIVE;
-    i2s_rx_ring_base_addr = (uintptr_t)i2s_rx_ring;
+    // Ring addresses are fixed for the life of the program; the per-pair
+    // ring_base is the stable source the reload DMA channel reads.
+    for (uint8_t p = 0; p < I2S_RX_MAX_PAIRS; p++) {
+        i2s_pairs[p].ring = i2s_rx_ring[p];
+        i2s_pairs[p].ring_base = (uintptr_t)i2s_rx_ring[p];
+    }
 }
 
 void i2s_input_start(bool clock_master) {
-    // Guard against double-start (would panic on resource re-claim)
+    // Guard against double-start (would panic on resource re-claim).
     if (i2s_state != I2S_INPUT_INACTIVE) return;
 
-    pio_sm_claim(i2s_rx_pio, I2S_RX_SM);
-    dma_channel_claim(I2S_RX_DMA_DATA);
-    dma_channel_claim(I2S_RX_DMA_RELOAD);
-
-    // Defensive: SPDIF RX shares these channels on DMA_IRQ_1; make sure no
-    // stale per-channel IRQ enables survive from a previous SPDIF session,
-    // since this ring runs without any IRQs.
-    dma_irqn_set_channel_enabled(PICO_SPDIF_RX_DMA_IRQ, I2S_RX_DMA_DATA, false);
-    dma_irqn_set_channel_enabled(PICO_SPDIF_RX_DMA_IRQ, I2S_RX_DMA_RELOAD, false);
-    dma_irqn_acknowledge_channel(PICO_SPDIF_RX_DMA_IRQ, I2S_RX_DMA_DATA);
-    dma_irqn_acknowledge_channel(PICO_SPDIF_RX_DMA_IRQ, I2S_RX_DMA_RELOAD);
-
+    // Number of stereo pairs = active channels / 2, clamped to the platform
+    // maximum.  Each pair claims one SM, two DMA channels and one data pin.
+    uint8_t pairs = (uint8_t)(i2s_input_channels / 2u);
+    if (pairs < 1) pairs = 1;
+    if (pairs > I2S_RX_MAX_PAIRS) pairs = I2S_RX_MAX_PAIRS;
+    i2s_n_pairs = pairs;
     i2s_role_master = clock_master;
-    i2s_active_rx_pin = i2s_rx_pin;
     i2s_active_bck_pin = i2s_bck_pin;
 
-    // Data pin: input path only. pio_gpio_init sets pad IE and clears the
-    // RP2350 pad isolation latch; the SM never drives it (pindir input).
-    pio_gpio_init(i2s_rx_pio, i2s_rx_pin);
+    // Assign and claim per-pair resources.
+    for (uint8_t p = 0; p < pairs; p++) {
+        I2sRxPair *pr = &i2s_pairs[p];
+        pr->sm         = (uint8_t)(I2S_RX_SM_BASE + p);
+        pr->data_pin   = i2s_rx_pin[p];
+        pr->dma_data   = (uint8_t)(I2S_RX_DMA_BASE + 2u * p);
+        pr->dma_reload = (uint8_t)(I2S_RX_DMA_BASE + 2u * p + 1u);
+        pr->rd_word    = 0;
 
-    if (clock_master) {
-        // We own BCK/LRCLK: route them to this PIO block
-        pio_gpio_init(i2s_rx_pio, i2s_bck_pin);
-        pio_gpio_init(i2s_rx_pio, i2s_bck_pin + 1);
+        pio_sm_claim(i2s_rx_pio, pr->sm);
+        dma_channel_claim(pr->dma_data);
+        dma_channel_claim(pr->dma_reload);
 
-        i2s_prog_offset = pio_add_program(i2s_rx_pio,
-                                          &audio_i2s_rx_clkmaster_program);
-        audio_i2s_rx_clkmaster_program_init(i2s_rx_pio, I2S_RX_SM,
-                                            (uint)i2s_prog_offset,
-                                            i2s_rx_pin, i2s_bck_pin);
+        // Defensive: SPDIF RX shares the low channels on DMA_IRQ_1; clear any
+        // stale per-channel IRQ enables since these rings run IRQ-less.
+        dma_irqn_set_channel_enabled(PICO_SPDIF_RX_DMA_IRQ, pr->dma_data, false);
+        dma_irqn_set_channel_enabled(PICO_SPDIF_RX_DMA_IRQ, pr->dma_reload, false);
+        dma_irqn_acknowledge_channel(PICO_SPDIF_RX_DMA_IRQ, pr->dma_data);
+        dma_irqn_acknowledge_channel(PICO_SPDIF_RX_DMA_IRQ, pr->dma_reload);
 
-        uint32_t div = rx_master_divider_24_8(audio_state.freq);
-        pio_sm_set_clkdiv_int_frac(i2s_rx_pio, I2S_RX_SM,
-                                   (uint16_t)(div >> 8u), (uint8_t)(div & 0xFFu));
-    } else {
-        // Clocks come from the I2S TX master (another PIO block). Do NOT
-        // touch their function; just make sure the input buffers are on
-        // (gpio_set_function set IE already, this is belt and braces).
-        gpio_set_input_enabled(i2s_bck_pin, true);
-        gpio_set_input_enabled(i2s_bck_pin + 1, true);
-
-        // Patch the BCK/LRCLK wait instructions with the runtime pins.
-        // Patch map per i2s_input.pio: 0,1 = LRCLK; 2..5 = BCK.
-        memcpy(i2s_slave_prog_ram, audio_i2s_rx_slave_program_instructions,
-               sizeof(i2s_slave_prog_ram));
-        i2s_slave_prog_ram[0] = patch_wait_gpio(i2s_slave_prog_ram[0], i2s_bck_pin + 1);
-        i2s_slave_prog_ram[1] = patch_wait_gpio(i2s_slave_prog_ram[1], i2s_bck_pin + 1);
-        for (int i = 2; i <= 5; i++) {
-            i2s_slave_prog_ram[i] = patch_wait_gpio(i2s_slave_prog_ram[i], i2s_bck_pin);
-        }
-
-        i2s_prog_offset = pio_add_program(i2s_rx_pio, &i2s_slave_prog);
-        audio_i2s_rx_slave_program_init(i2s_rx_pio, I2S_RX_SM,
-                                        (uint)i2s_prog_offset, i2s_rx_pin);
-        pio_sm_set_clkdiv_int_frac(i2s_rx_pio, I2S_RX_SM, 1, 0);
+        // Data pin: input path only.  pio_gpio_init sets pad IE and clears the
+        // RP2350 pad isolation latch; the SM never drives it (pindir input).
+        pio_gpio_init(i2s_rx_pio, pr->data_pin);
     }
 
-    // DMA first (SM is disabled with clean FIFOs after pio_sm_init), then
-    // the SM, so the first pushed word lands at the ring base = LEFT word.
-    i2s_rd_word = 0;
-    start_dma_ring();
-
     if (clock_master) {
-        // Preload the bit counter and enter at the start of a left frame
-        pio_sm_exec(i2s_rx_pio, I2S_RX_SM, pio_encode_set(pio_x, 29));
-        pio_sm_exec(i2s_rx_pio, I2S_RX_SM,
-                    pio_encode_jmp((uint)i2s_prog_offset +
+        // We own BCK/LRCLK: route them to this PIO block and enable their input
+        // buffers so pairs 1.. (slave program) can read the pads pair 0 drives.
+        pio_gpio_init(i2s_rx_pio, i2s_active_bck_pin);
+        pio_gpio_init(i2s_rx_pio, i2s_active_bck_pin + 1);
+        gpio_set_input_enabled(i2s_active_bck_pin, true);
+        gpio_set_input_enabled(i2s_active_bck_pin + 1, true);
+
+        // Pair 0: clock-generating program + matched 24.8 divider.
+        i2s_clkmaster_offset = pio_add_program(i2s_rx_pio, &audio_i2s_rx_clkmaster_program);
+        audio_i2s_rx_clkmaster_program_init(i2s_rx_pio, i2s_pairs[0].sm,
+                                            (uint)i2s_clkmaster_offset,
+                                            i2s_pairs[0].data_pin, i2s_active_bck_pin);
+        uint32_t div = rx_master_divider_24_8(audio_state.freq);
+        pio_sm_set_clkdiv_int_frac(i2s_rx_pio, i2s_pairs[0].sm,
+                                   (uint16_t)(div >> 8u), (uint8_t)(div & 0xFFu));
+
+        // Pairs 1..: wait-driven slave program against the driven BCK/LRCLK pads.
+        if (pairs > 1) {
+            load_slave_program();
+            for (uint8_t p = 1; p < pairs; p++) {
+                audio_i2s_rx_slave_program_init(i2s_rx_pio, i2s_pairs[p].sm,
+                                                (uint)i2s_slave_offset,
+                                                i2s_pairs[p].data_pin);
+                pio_sm_set_clkdiv_int_frac(i2s_rx_pio, i2s_pairs[p].sm, 1, 0);
+            }
+        }
+    } else {
+        // Clocks come from the I2S TX master (another PIO block).  Make sure
+        // the BCK/LRCLK input buffers are on (gpio_set_function set IE already;
+        // this is belt and braces), then run the slave program on every pair.
+        gpio_set_input_enabled(i2s_active_bck_pin, true);
+        gpio_set_input_enabled(i2s_active_bck_pin + 1, true);
+
+        load_slave_program();
+        for (uint8_t p = 0; p < pairs; p++) {
+            audio_i2s_rx_slave_program_init(i2s_rx_pio, i2s_pairs[p].sm,
+                                            (uint)i2s_slave_offset,
+                                            i2s_pairs[p].data_pin);
+            pio_sm_set_clkdiv_int_frac(i2s_rx_pio, i2s_pairs[p].sm, 1, 0);
+        }
+    }
+
+    // DMA rings before enabling the SMs (the SMs are disabled with clean FIFOs
+    // after pio_sm_init), so the first pushed word lands at each ring base =
+    // LEFT word.
+    for (uint8_t p = 0; p < pairs; p++) {
+        i2s_pairs[p].rd_word = 0;
+        start_pair_dma_ring(&i2s_pairs[p]);
+    }
+
+    // Master pair 0 start procedure: preload the bit counter and enter at the
+    // start of a left frame.  Done while disabled; the sync-enable below does
+    // not touch the PC or registers, so this survives.
+    if (clock_master) {
+        pio_sm_exec(i2s_rx_pio, i2s_pairs[0].sm, pio_encode_set(pio_x, 29));
+        pio_sm_exec(i2s_rx_pio, i2s_pairs[0].sm,
+                    pio_encode_jmp((uint)i2s_clkmaster_offset +
                                    audio_i2s_rx_clkmaster_wrap_target));
     }
-    // Slave role: pio_sm_init left the PC at the program entry point
+    // Slave SMs: pio_sm_init left the PC at the program entry point.
 
-    pio_sm_set_enabled(i2s_rx_pio, I2S_RX_SM, true);
+    // Enable every pair on the SAME cycle so the rings advance in lockstep on
+    // the one shared BCK/LRCLK.  (Mirrors audio_*_enable_sync() on the TX path.)
+    pio_enable_sm_mask_in_sync(i2s_rx_pio, i2s_sm_mask());
+
+    // Master-role multichannel frame-skew correction.
+    //
+    // Pair 0 runs the clkmaster program: it generates BCK/LRCLK and begins
+    // sampling immediately, so its ring index 0 is the FIRST frame it drives
+    // ("frame 0").  The other pairs run the wait-driven slave program; because
+    // LRCLK is already low at enable, their preamble cannot detect the start of
+    // frame 0 and instead locks on the next LRCLK fall, making their first
+    // sample frame 1 (ring index 0 = "frame 1").  At equal ring indices the
+    // slaves therefore lead pair 0 by exactly one frame.  Advancing pair 0's
+    // read pointer by one stereo frame (2 words) lands every pair's read
+    // pointer on the same physical frame; from there all rings advance in
+    // lockstep, so the 2/4/6/8 channels stay sample-aligned (the inviolable
+    // inter-channel guarantee).  The offset is cycle-exact per the clkmaster vs
+    // slave PIO start timing and is independent of ADC settling latency (a
+    // garbage frame 0 is simply discarded by the skip).  Single-pair master
+    // has no peer to align with, and the slave role is already symmetric (every
+    // pair, including pair 0, runs the same preamble), so neither needs it.
+    if (clock_master && pairs > 1)
+        i2s_pairs[0].rd_word = 2;
 
     i2s_state = I2S_INPUT_RUNNING;
-    printf("I2S RX: started on GPIO %u (%s)\n", i2s_rx_pin,
-           clock_master ? "clock master" : "slave");
+    printf("I2S RX: started %u channel(s) on GPIO", (unsigned)(pairs * 2u));
+    for (uint8_t p = 0; p < pairs; p++) printf(" %u", i2s_pairs[p].data_pin);
+    printf(" (%s)\n", clock_master ? "clock master" : "slave");
 }
 
 void i2s_input_stop(void) {
     if (i2s_state == I2S_INPUT_INACTIVE) return;
 
-    pio_sm_set_enabled(i2s_rx_pio, I2S_RX_SM, false);
+    // Disable all SMs, then tear down every ring race-free (see
+    // stop_all_dma_rings) before unclaiming anything.
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        pio_sm_set_enabled(i2s_rx_pio, i2s_pairs[p].sm, false);
+    }
+    stop_all_dma_rings();
 
-    // Tear down the chained DMA ring race-free (see stop_dma_ring). A naive
-    // pair of dma_channel_abort() calls here intermittently hung (watchdog
-    // reset) because the two channels re-trigger each other.
-    stop_dma_ring();
+    // Remove the loaded program(s).
+    if (i2s_clkmaster_offset >= 0) {
+        pio_remove_program(i2s_rx_pio, &audio_i2s_rx_clkmaster_program,
+                           (uint)i2s_clkmaster_offset);
+        i2s_clkmaster_offset = -1;
+    }
+    if (i2s_slave_offset >= 0) {
+        pio_remove_program(i2s_rx_pio, &i2s_slave_prog, (uint)i2s_slave_offset);
+        i2s_slave_offset = -1;
+    }
 
+    // Release BCK/LRCLK to high-Z (master role only).  If an output master is
+    // taking over it re-initializes them on its own PIO block immediately after.
     if (i2s_role_master) {
-        if (i2s_prog_offset >= 0) {
-            pio_remove_program(i2s_rx_pio, &audio_i2s_rx_clkmaster_program,
-                               (uint)i2s_prog_offset);
-        }
-        // Release BCK/LRCLK to high-Z; if an output master is taking over
-        // it re-initializes them on its own PIO block immediately after.
         gpio_set_function(i2s_active_bck_pin, GPIO_FUNC_NULL);
         gpio_set_dir(i2s_active_bck_pin, GPIO_IN);
         gpio_set_function(i2s_active_bck_pin + 1, GPIO_FUNC_NULL);
         gpio_set_dir(i2s_active_bck_pin + 1, GPIO_IN);
-    } else if (i2s_prog_offset >= 0) {
-        pio_remove_program(i2s_rx_pio, &i2s_slave_prog, (uint)i2s_prog_offset);
     }
-    i2s_prog_offset = -1;
 
-    // Release the data pin to high-Z
-    gpio_set_function(i2s_active_rx_pin, GPIO_FUNC_NULL);
-    gpio_set_dir(i2s_active_rx_pin, GPIO_IN);
-
-    pio_sm_unclaim(i2s_rx_pio, I2S_RX_SM);
-    dma_channel_unclaim(I2S_RX_DMA_DATA);
-    dma_channel_unclaim(I2S_RX_DMA_RELOAD);
+    // Release each pair's data pin and free its SM + DMA channels.
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        I2sRxPair *pr = &i2s_pairs[p];
+        gpio_set_function(pr->data_pin, GPIO_FUNC_NULL);
+        gpio_set_dir(pr->data_pin, GPIO_IN);
+        pio_sm_unclaim(i2s_rx_pio, pr->sm);
+        dma_channel_unclaim(pr->dma_data);
+        dma_channel_unclaim(pr->dma_reload);
+    }
 
     i2s_state = I2S_INPUT_INACTIVE;
     printf("I2S RX: stopped\n");
 }
 
 void i2s_input_resync(void) {
-    // Only a running SLAVE needs re-phasing: the TX clock master restarts
-    // from its PIO entry point during synchronized output starts, which
-    // resets LRCLK phase under our bit counter. The master role generates
-    // its own clocks and is unaffected.
+    // Only running SLAVES need re-phasing: the TX clock master restarts from
+    // its PIO entry point during synchronized output starts, which resets
+    // LRCLK phase under our bit counters.  The master role generates its own
+    // clocks and is unaffected.
     if (i2s_state != I2S_INPUT_RUNNING || i2s_role_master) return;
 
-    pio_sm_set_enabled(i2s_rx_pio, I2S_RX_SM, false);
-
-    // Let DMA finish moving whatever the SM already pushed, then anchor
-    // the read pointer at the current write position: the next word the
+    // Disable every pair, let DMA drain what each SM already pushed, then
+    // anchor each read pointer at its current write position: the next word the
     // re-entered program pushes is a LEFT word.
-    drain_rx_fifo();
-    pio_sm_restart(i2s_rx_pio, I2S_RX_SM);   // clears ISR shift counter
-    i2s_rd_word = ring_write_word();
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        pio_sm_set_enabled(i2s_rx_pio, i2s_pairs[p].sm, false);
+    }
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        I2sRxPair *pr = &i2s_pairs[p];
+        drain_rx_fifo(pr->sm);
+        pio_sm_restart(i2s_rx_pio, pr->sm);   // clears ISR shift counter
+        pr->rd_word = pair_write_word(pr);
+        pio_sm_exec(i2s_rx_pio, pr->sm,
+                    pio_encode_jmp((uint)i2s_slave_offset +
+                                   audio_i2s_rx_slave_offset_entry_point));
+    }
 
-    pio_sm_exec(i2s_rx_pio, I2S_RX_SM,
-                pio_encode_jmp((uint)i2s_prog_offset +
-                               audio_i2s_rx_slave_offset_entry_point));
-    pio_sm_set_enabled(i2s_rx_pio, I2S_RX_SM, true);
+    // Re-enable all pairs on the same cycle so they re-acquire the same frame.
+    pio_enable_sm_mask_in_sync(i2s_rx_pio, i2s_sm_mask());
 }
 
 // ============================================================================
@@ -365,43 +508,78 @@ DSP_TIME_CRITICAL
 uint32_t i2s_input_poll(void) {
     if (i2s_state != I2S_INPUT_RUNNING) return 0;
 
-    uint32_t wr = ring_write_word();
-    uint32_t avail = (wr - i2s_rd_word) % I2S_RX_RING_WORDS;
-    uint32_t frames = avail / 2u;
-    // Batch: wait for a pipeline-sized block so the fixed per-block cost is
-    // amortized like the USB path (see I2S_INPUT_MIN_BLOCK). The input is
-    // continuous, so avail always climbs to the threshold; this never starves.
-    if (frames < I2S_INPUT_MIN_BLOCK) return 0;
-    if (frames > 192u) frames = 192u;   // buf_l/buf_r capacity
-
-#if PICO_RP2350
-    float preamp_l = global_preamp_linear[0];
-    float preamp_r = global_preamp_linear[1];
-    const float inv_2147483648 = 1.0f / 2147483648.0f;
-#else
-    int32_t preamp_l = global_preamp_mul[0];
-    int32_t preamp_r = global_preamp_mul[1];
-#endif
-
-    uint32_t idx = i2s_rd_word;
-    for (uint32_t i = 0; i < frames; i++) {
-        // 24-bit audio in bits [31:8]; mask the don't-care low byte
-        int32_t raw_l = (int32_t)(i2s_rx_ring[idx] & 0xFFFFFF00u);
-        idx = (idx + 1u) % I2S_RX_RING_WORDS;
-        int32_t raw_r = (int32_t)(i2s_rx_ring[idx] & 0xFFFFFF00u);
-        idx = (idx + 1u) % I2S_RX_RING_WORDS;
-
-#if PICO_RP2350
-        buf_l[i] = (float)raw_l * inv_2147483648 * preamp_l;
-        buf_r[i] = (float)raw_r * inv_2147483648 * preamp_r;
-#else
-        // Q28: int32 full-scale >> 2 -> Q28, then preamp; matches the
-        // SPDIF RX and USB 24-bit paths so output unity gain holds
-        buf_l[i] = fast_mul_q28(raw_l >> 2, preamp_l);
-        buf_r[i] = fast_mul_q28(raw_r >> 2, preamp_r);
-#endif
+    // Frames to consume this poll = the minimum available across all pairs.
+    // The pairs fill in lockstep on the shared clock, so this is the common
+    // frame count; taking the minimum keeps every channel on the same frame
+    // index even under a word of DMA timing jitter between rings.
+    uint32_t frames = 192u;   // buf capacity cap
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        uint32_t avail = (pair_write_word(&i2s_pairs[p]) - i2s_pairs[p].rd_word) %
+                         I2S_RX_RING_WORDS;
+        uint32_t f = avail / 2u;
+        if (f < frames) frames = f;
     }
-    i2s_rd_word = idx;
+    // Batch: wait for a pipeline-sized block (see I2S_INPUT_MIN_BLOCK).  The
+    // input is continuous, so the minimum always climbs to the threshold.
+    if (frames < I2S_INPUT_MIN_BLOCK) return 0;
+
+    // Deinterleave each pair into its two pipeline input channels (2p, 2p+1).
+    // Inputs 0/1 are the shared stereo bus (buf_l/buf_r); 2.. are buf_in_ext.
+    for (uint8_t p = 0; p < i2s_n_pairs; p++) {
+        I2sRxPair *pr = &i2s_pairs[p];
+        int ch_l = 2 * p, ch_r = 2 * p + 1;
+
+#if PICO_RP2350
+        float *out_l = (ch_l == 0) ? buf_l : buf_in_ext[ch_l - NUM_STEREO_INPUTS];
+        float *out_r = (ch_r == 1) ? buf_r : buf_in_ext[ch_r - NUM_STEREO_INPUTS];
+        float preamp_l = global_preamp_linear[ch_l];
+        float preamp_r = global_preamp_linear[ch_r];
+        const float inv_2147483648 = 1.0f / 2147483648.0f;
+#else
+        // RP2040 is single-pair (channels 0/1 only); Q28 path.
+        int32_t *out_l = buf_l;
+        int32_t *out_r = buf_r;
+        int32_t preamp_l = global_preamp_mul[ch_l];
+        int32_t preamp_r = global_preamp_mul[ch_r];
+#endif
+
+        uint32_t idx = pr->rd_word;
+        for (uint32_t i = 0; i < frames; i++) {
+            // 24-bit audio in bits [31:8]; mask the don't-care low byte.
+            int32_t raw_l = (int32_t)(pr->ring[idx] & 0xFFFFFF00u);
+            idx = (idx + 1u) % I2S_RX_RING_WORDS;
+            int32_t raw_r = (int32_t)(pr->ring[idx] & 0xFFFFFF00u);
+            idx = (idx + 1u) % I2S_RX_RING_WORDS;
+
+#if PICO_RP2350
+            out_l[i] = (float)raw_l * inv_2147483648 * preamp_l;
+            out_r[i] = (float)raw_r * inv_2147483648 * preamp_r;
+#else
+            // Q28: int32 full-scale >> 2 -> Q28, then preamp; matches the
+            // SPDIF RX and USB 24-bit paths so output unity gain holds.
+            out_l[i] = fast_mul_q28(raw_l >> 2, preamp_l);
+            out_r[i] = fast_mul_q28(raw_r >> 2, preamp_r);
+#endif
+        }
+        pr->rd_word = idx;
+    }
+
+#if PICO_RP2350
+    // Live channel-count RAISE guard.  When the host raises i2s_input_channels
+    // while I2S is the running source, the pipeline immediately sees the larger
+    // active count, but the extra pairs are not allocated/filled until the
+    // deferred restart (main loop) fires.  This poll has filled only the
+    // currently-running pairs (i2s_n_pairs), so zero the extra input rows the
+    // matrix will read (it iterates active_input_channel_count()) — it then sees
+    // silence, never stale buf_in_ext content, until the restart fills them.
+    // (A count DROP needs nothing: the matrix simply stops reading the surplus
+    // rows.)  RP2040 is single-pair, so this never triggers; it is RP2350-only
+    // because buf_in_ext exists only there.
+    uint32_t active = active_input_channel_count();
+    for (uint32_t ch = 2u * (uint32_t)i2s_n_pairs; ch < active; ch++)
+        memset(buf_in_ext[ch - NUM_STEREO_INPUTS], 0,
+               frames * sizeof(buf_in_ext[0][0]));
+#endif
 
     process_input_block(frames);
     return frames;
@@ -410,19 +588,32 @@ uint32_t i2s_input_poll(void) {
 // Push one silent block through the DSP pipeline to prefill the output consumer
 // pools when the input cannot supply samples itself.
 //
-// This is only used during a SLAVE-role prefill. In slave mode the input is
+// This is only used during a SLAVE-role prefill.  In slave mode the input is
 // clocked by the I2S output clock master, so draining the outputs to prefill
 // (the SPDIF-style handshake) also stops the input's BCK/LRCLK and no input
 // samples arrive; the pools could never reach the 50% target and outputs would
-// never re-enable. Synthesizing silence fills the pools deterministically;
+// never re-enable.  Synthesizing silence fills the pools deterministically;
 // real audio resumes after enable_outputs_in_sync() restarts the clock master
-// and re-phases the input ring. Master-role prefill uses real input audio via
+// and re-phases the input rings.  Master-role prefill uses real input audio via
 // i2s_input_poll() and never calls this.
 void i2s_input_prefill_silence(uint32_t frames) {
     if (frames == 0) return;
-    if (frames > 192u) frames = 192u;   // buf_l/buf_r capacity
+    if (frames > 192u) frames = 192u;   // buf capacity
+
+    // Zero every active input channel so the matrix sees silence on all of
+    // them (stale buf_in_ext content must not leak through in multichannel).
+    uint8_t pairs = (uint8_t)(i2s_input_channels / 2u);
+    if (pairs < 1) pairs = 1;
+    if (pairs > I2S_RX_MAX_PAIRS) pairs = I2S_RX_MAX_PAIRS;
     memset(buf_l, 0, frames * sizeof(buf_l[0]));
     memset(buf_r, 0, frames * sizeof(buf_r[0]));
+#if PICO_RP2350
+    for (uint8_t p = 1; p < pairs; p++) {
+        memset(buf_in_ext[2 * p - NUM_STEREO_INPUTS], 0, frames * sizeof(buf_in_ext[0][0]));
+        memset(buf_in_ext[2 * p + 1 - NUM_STEREO_INPUTS], 0, frames * sizeof(buf_in_ext[0][0]));
+    }
+#endif
+
     process_input_block(frames);
 }
 

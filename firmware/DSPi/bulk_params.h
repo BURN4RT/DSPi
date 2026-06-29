@@ -192,9 +192,14 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  input_source;           // InputSource enum (0=USB, 1=SPDIF, 2=I2S)
     uint8_t  spdif_rx_pin;          // SPDIF RX GPIO pin (applied on SET when apply_pins=true)
-    uint8_t  i2s_rx_pin;             // I2S RX data GPIO pin (V12+, same gate as spdif_rx_pin)
+    uint8_t  i2s_rx_pin;             // I2S RX data GPIO, stereo pair 0 (V12+)
     uint8_t  i2s_input_rate;         // I2S input rate enum: 0=44100, 1=48000, 2=96000 (V12+)
-    uint8_t  reserved[12];           // Future expansion (pad to 16 bytes)
+    // I2S multichannel input (RP2350).  Claimed from the reserved bytes with a
+    // 0 = "absent, keep live value" convention (matching i2s_rx_pin), so the
+    // wire layout/size is unchanged and the format version need not bump.
+    uint8_t  i2s_input_channels;     // Active I2S input channels: 2/4/6/8 (0 = absent)
+    uint8_t  i2s_rx_pin_ext[3];      // I2S RX data GPIOs for stereo pairs 1..3 (0 = unset)
+    uint8_t  reserved[8];            // Future expansion (pad to 16 bytes)
 } WireInputConfig;                   // 16 bytes
 
 // ============================================================================

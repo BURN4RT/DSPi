@@ -113,7 +113,11 @@
 //        intentionally: ONLY V21 slots are accepted; pre-V21 slots fail
 //        validation and load factory defaults (no migration).  The slot now
 //        spans 2 flash sectors (SLOT_BYTES).
-#define SLOT_DATA_VERSION       21
+//   V22: I2S multichannel input appended (i2s_input_channels + i2s_rx_pin_ext[3];
+//        struct grows by 4 bytes).  Backward-compatible tail-append: V21 slots
+//        still load (the new fields default to unset) via the per-version CRC
+//        range mechanism (slot_data_size_for_version).
+#define SLOT_DATA_VERSION       22
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -149,16 +153,36 @@ typedef struct __attribute__((packed)) {
     uint8_t i2s_mck_enabled;         // MCK on/off (0 or 1)
     uint8_t i2s_mck_multiplier;      // 0 = 128x, 1 = 256x
     uint8_t spdif_rx_pin;            // SPDIF RX GPIO (device-level)
-    uint8_t i2s_rx_pin;              // I2S RX data GPIO (0 = unset → default);
-                                     // claimed from reserved[0], old directories
-                                     // have it zeroed so CRC stays valid
+    uint8_t i2s_rx_pin;              // I2S RX data GPIO, stereo pair 0 (0 = unset → default)
     uint8_t i2s_input_rate_p1;       // I2S input rate, wire encoding PLUS ONE
                                      // (0 = unset → 48 kHz; 1=44100, 2=48000,
                                      // 3=96000).  +1 sentinel because old
                                      // directories carry zeros here and plain
                                      // encoding 0 would mean 44.1 kHz
+    uint8_t i2s_input_channels;      // Active I2S input channels: 2/4/6/8.  Claimed from
+                                     // the former reserved[0]; 0 in pre-V5 directories =
+                                     // unset → 2 on apply
+    uint8_t i2s_rx_pin_ext[3];       // I2S RX data GPIOs for stereo pairs 1..3 (DIR V5+;
+                                     // 0 = unset).  Grows the struct by 3 bytes, so the
+                                     // V4→V5 directory migration reads old configs via
+                                     // FlashOutputConfig_v4
+} FlashOutputConfig;                 // 23 bytes
+
+// Historical 20-byte device-global IO config (directory V4), before the I2S
+// multichannel input fields were appended.  Read only by the V4→V5 directory
+// migration in load_directory().
+typedef struct __attribute__((packed)) {
+    uint8_t output_pins[8];
+    uint8_t output_types[4];
+    uint8_t i2s_bck_pin;
+    uint8_t i2s_mck_pin;
+    uint8_t i2s_mck_enabled;
+    uint8_t i2s_mck_multiplier;
+    uint8_t spdif_rx_pin;
+    uint8_t i2s_rx_pin;
+    uint8_t i2s_input_rate_p1;
     uint8_t reserved[1];
-} FlashOutputConfig;                 // 20 bytes
+} FlashOutputConfig_v4;              // 20 bytes
 
 // --- Preset Directory v1 (legacy — kept only for upgrade migration) ---
 typedef struct __attribute__((packed)) {
@@ -249,10 +273,32 @@ typedef struct __attribute__((packed)) {
     DacHwMuteConfig dac_hw_mute;             // 16 bytes; enabled=0 by default
 
     // V4 addition: device-global physical IO config (INDEPENDENT mode store).
-    FlashOutputConfig output_config;         // 20 bytes
+    // V5 grows it by 3 bytes (I2S multichannel input: i2s_rx_pin_ext[3]).
+    FlashOutputConfig output_config;         // 23 bytes
 } PresetDirectory;
 
-#define DIR_VERSION_CURRENT  4
+// Historical directory layout at V4, where output_config was the 20-byte
+// FlashOutputConfig_v4.  Read only by the V4→V5 migration in load_directory();
+// identical to PresetDirectory except the output_config type.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig_v4 output_config;      // 20 bytes
+} PresetDirectory_v4;
+
+#define DIR_VERSION_CURRENT  5
 
 // --- Preset Slot (sectors 1-10) ---
 typedef struct __attribute__((packed)) {
@@ -362,6 +408,12 @@ typedef struct __attribute__((packed)) {
     // missing-field case never decodes a bogus 44.1 kHz from a zero byte.
     uint8_t i2s_rx_pin;
     uint8_t i2s_input_rate;
+
+    // I2S multichannel input (V22+, struct grows by 4 bytes).  Same 0 = unset
+    // semantics as i2s_rx_pin; gated on version >= 22 in io_config_from_slot()
+    // so pre-V22 slots never decode these as configured.
+    uint8_t i2s_input_channels;      // 2/4/6/8 (0 = unset → device/live default)
+    uint8_t i2s_rx_pin_ext[3];       // I2S RX data GPIOs, stereo pairs 1..3 (0 = unset)
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -573,6 +625,37 @@ static bool dir_load_cache(void) {
         return true;
     }
 
+    if (flash_dir->version == 4) {
+        // V4 → V5 migration.  V5 grows the device-global output_config by 3
+        // bytes (I2S multichannel input: i2s_rx_pin_ext[3]).  Validate the v4
+        // CRC, copy every field forward, and copy the 20-byte v4 output_config
+        // into the 23-byte field — the new i2s_rx_pin_ext bytes stay zero
+        // (= unset) from the memset, and i2s_input_channels inherits the old
+        // reserved byte (0 = unset → 2 on apply).
+        const PresetDirectory_v4 *v4 = (const PresetDirectory_v4 *)flash_dir;
+        const uint8_t *v4_data_start = (const uint8_t *)&v4->startup_mode;
+        size_t v4_data_len = sizeof(PresetDirectory_v4) - offsetof(PresetDirectory_v4, startup_mode);
+        if (crc32(v4_data_start, v4_data_len) != v4->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v4->startup_mode;
+        dir_cache.default_slot       = v4->default_slot;
+        dir_cache.last_active_slot   = v4->last_active_slot;
+        dir_cache.output_config_mode = v4->output_config_mode;
+        dir_cache.slot_occupied      = v4->slot_occupied;
+        dir_cache.master_volume_mode = v4->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v4->spdif_rx_pin;
+        dir_cache.master_volume_db   = v4->master_volume_db;
+        memcpy(dir_cache.slot_names, v4->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v4->dac_hw_mute;
+        memcpy(&dir_cache.output_config, &v4->output_config, sizeof(v4->output_config));
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist as V5
+        return true;
+    }
+
     if (flash_dir->version == 3) {
         // V3 → V4 migration.  Validate the v3 CRC, copy fields forward, and
         // seed the new device-global output_config from firmware IO defaults.
@@ -781,6 +864,7 @@ static void io_config_defaults(FlashOutputConfig *cfg) {
     cfg->spdif_rx_pin       = PICO_SPDIF_RX_PIN_DEFAULT;
     cfg->i2s_rx_pin         = PICO_I2S_RX_PIN_DEFAULT;
     cfg->i2s_input_rate_p1  = (uint8_t)(i2s_rate_encode(48000) + 1);
+    cfg->i2s_input_channels = 2;   // stereo; i2s_rx_pin_ext[] left 0 (unset) by the memset
 }
 
 // Snapshot the live IO globals into cfg (for REQ_SAVE_OUTPUT_CONFIG).
@@ -793,8 +877,11 @@ static void io_config_from_live(FlashOutputConfig *cfg) {
     cfg->i2s_mck_enabled    = i2s_mck_enabled ? 1 : 0;
     cfg->i2s_mck_multiplier = (i2s_mck_multiplier == 256) ? 1 : 0;  // 0=128x, 1=256x
     cfg->spdif_rx_pin       = spdif_rx_pin;
-    cfg->i2s_rx_pin         = i2s_rx_pin;
+    cfg->i2s_rx_pin         = i2s_rx_pin[0];
     cfg->i2s_input_rate_p1  = (uint8_t)(i2s_rate_encode(i2s_input_rate) + 1);
+    cfg->i2s_input_channels = i2s_input_channels;
+    for (int p = 0; p < 3; p++)
+        cfg->i2s_rx_pin_ext[p] = (p + 1 < I2S_RX_MAX_PAIRS) ? i2s_rx_pin[p + 1] : 0;
 }
 
 // Extract a slot's IO config into cfg, honoring the slot's data version
@@ -830,6 +917,19 @@ static void io_config_from_slot(const PresetSlot *slot, FlashOutputConfig *cfg) 
             cfg->i2s_rx_pin = slot->i2s_rx_pin;
         cfg->i2s_input_rate_p1 = (uint8_t)(slot->i2s_input_rate + 1);
     }
+
+    // I2S multichannel input (V22+): device-level baseline, slot overrides.
+    // 0 = unset (keep the baseline), matching the per-pin convention above.
+    cfg->i2s_input_channels = dir_cache.output_config.i2s_input_channels;
+    memcpy(cfg->i2s_rx_pin_ext, dir_cache.output_config.i2s_rx_pin_ext,
+           sizeof(cfg->i2s_rx_pin_ext));
+    if (slot->version >= 22) {
+        if (slot->i2s_input_channels != 0)
+            cfg->i2s_input_channels = slot->i2s_input_channels;
+        for (int p = 0; p < 3; p++)
+            if (slot->i2s_rx_pin_ext[p] != 0)
+                cfg->i2s_rx_pin_ext[p] = slot->i2s_rx_pin_ext[p];
+    }
 }
 
 // Apply a FlashOutputConfig to the live IO globals.  Validates pins (invalid →
@@ -853,7 +953,18 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
     }
 
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) output_types[i] = cfg->output_types[i];
-    i2s_bck_pin = cfg->i2s_bck_pin;
+    // Validate the stored/restored BCK before installing it raw (see
+    // i2s_bck_pin_acceptable): BCK/LRCLK are clock OUTPUTS, so an invalid GPIO
+    // can fault pio_gpio_init() and a collision with an output pin is driver
+    // contention.  Output pins are applied above, so the conflict check sees the
+    // final config; keep the live (known-valid) pin on failure.  The RX set
+    // below is validated against whatever BCK ends up installed.
+    if (i2s_bck_pin_acceptable(cfg->i2s_bck_pin)) {
+        i2s_bck_pin = cfg->i2s_bck_pin;
+    } else {
+        printf("io_config: I2S BCK pin %u rejected (invalid/conflict); kept %u\n",
+               (unsigned)cfg->i2s_bck_pin, (unsigned)i2s_bck_pin);
+    }
 
     // MCK pin must map to clk_gpoutN on this platform (see the V9 apply note);
     // otherwise reset to default and force MCK off so the change is visible.
@@ -877,12 +988,43 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
             spdif_rx_pin_change_pending = true;
     }
 
-    // I2S RX data pin (same unset/hot-swap semantics as spdif_rx_pin).
-    if (cfg->i2s_rx_pin != 0 && io_pin_valid(cfg->i2s_rx_pin) &&
-        cfg->i2s_rx_pin != i2s_rx_pin) {
-        i2s_rx_pin = cfg->i2s_rx_pin;
-        if (active_input_source == INPUT_SOURCE_I2S)
-            i2s_rx_pin_change_pending = true;
+    // I2S RX data pins (pair 0 + multichannel extras) and channel count, applied
+    // as a validated SET (i2s_rx_pin_set_acceptable) so a stored config can't
+    // bring two state machines up on one GPIO or on a clock pin.  0 = keep-live
+    // per field; an invalid count keeps the live count.  BCK is applied above,
+    // so the live i2s_bck_pin is the value the proposed pins must avoid.
+    // Rejected as a unit (live retained) if inconsistent; a change restarts the
+    // input so every pair re-syncs.
+    {
+        uint8_t proposed[I2S_RX_MAX_PAIRS];
+        proposed[0] = (cfg->i2s_rx_pin != 0) ? cfg->i2s_rx_pin : i2s_rx_pin[0];
+#if I2S_RX_MAX_PAIRS > 1
+        for (int p = 1; p < I2S_RX_MAX_PAIRS; p++) {
+            uint8_t pin = cfg->i2s_rx_pin_ext[p - 1];
+            proposed[p] = (pin != 0) ? pin : i2s_rx_pin[p];
+        }
+#endif
+        uint8_t ch = cfg->i2s_input_channels;
+        uint8_t count = (ch == 2 || ch == 4 || ch == 6 || ch == 8)
+                            ? ch : i2s_input_channels;
+        if (count / 2 > I2S_RX_MAX_PAIRS) count = i2s_input_channels;
+
+        if (i2s_rx_pin_set_acceptable(proposed, count / 2, i2s_bck_pin)) {
+            bool changed = false;
+            for (int p = 0; p < I2S_RX_MAX_PAIRS; p++)
+                if (proposed[p] != i2s_rx_pin[p]) {
+                    i2s_rx_pin[p] = proposed[p];
+                    changed = true;
+                }
+            if (count != i2s_input_channels) {
+                i2s_input_channels = count;
+                changed = true;
+            }
+            if (changed && active_input_source == INPUT_SOURCE_I2S)
+                i2s_input_restart_pending = true;
+        } else {
+            printf("io_config: I2S RX pin/count config rejected (conflict); kept live\n");
+        }
     }
 
     // I2S input rate (+1 sentinel: 0 = unset, leave live value alone).
@@ -983,8 +1125,13 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->spdif_rx_pin = spdif_rx_pin;
 
     // I2S input pin + rate (V17): same storage/apply model as spdif_rx_pin.
-    slot->i2s_rx_pin = i2s_rx_pin;
+    slot->i2s_rx_pin = i2s_rx_pin[0];
     slot->i2s_input_rate = i2s_rate_encode(i2s_input_rate);
+
+    // I2S multichannel input (V22): channel count + extra data pins.
+    slot->i2s_input_channels = i2s_input_channels;
+    for (int p = 0; p < 3; p++)
+        slot->i2s_rx_pin_ext[p] = (p + 1 < I2S_RX_MAX_PAIRS) ? i2s_rx_pin[p + 1] : 0;
 
     // Channel names
     memcpy(slot->channel_names, channel_names, sizeof(slot->channel_names));
@@ -1317,16 +1464,24 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // SLOT VALIDATION
 // ============================================================================
 
-// CRC byte range = the slot data section (filter_recipes .. end of struct).
+// CRC byte range = the slot data section (filter_recipes .. end of the version's
+// fields).  V21 ended at i2s_input_rate; V22 appended the I2S multichannel
+// fields, so V21's range stops where those begin (a stored V21 slot's CRC was
+// computed without them).
 #define SLOT_DATA_SIZE_V21 \
+    (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V22 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
-// V21 broke compatibility (unified channel model).  ONLY the current version is
-// accepted; any other version (older or unknown) is invalidated and the slot
-// loads factory defaults.
+// V21 broke compatibility (unified channel model); V22 is a backward-compatible
+// tail-append (I2S multichannel input).  V22 and V21 slots are both accepted —
+// a V21 slot loads with the multichannel fields defaulted (unset) — while
+// older/unknown versions are invalidated and the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 21
+        case SLOT_DATA_VERSION:   // 22
+            return SLOT_DATA_SIZE_V22;
+        case 21:
             return SLOT_DATA_SIZE_V21;
         default:
             return 0;

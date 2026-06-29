@@ -28,6 +28,8 @@ int16_t read_temperature_cdeg(void);
 // Pin validation helpers
 bool is_valid_gpio_pin(uint8_t pin);
 bool is_pin_in_use(uint8_t pin, uint8_t exclude);
+// i2s_rx_pin_set_acceptable() is declared in audio_input.h (lightweight, so the
+// restore paths can call it without pulling TinyUSB in) and defined here.
 
 // MCK encode/decode for wire and flash persistence
 uint8_t  mck_encode(uint16_t val);

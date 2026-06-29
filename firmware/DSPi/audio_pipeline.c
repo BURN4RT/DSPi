@@ -183,6 +183,21 @@ void pipeline_reset_cpu_metering(void) {
 // mixer, per-output EQ/gain/delay, output encoding, buffer return, CPU
 // metering.  Reads from file-scope buf_l[]/buf_r[] (filled by caller).
 // ----------------------------------------------------------------------------
+
+// Single source of truth for the active input channel count (see header).
+// RAM-resident so process_input_block() can call it without an XIP stall.
+uint8_t __not_in_flash_func(active_input_channel_count)(void) {
+    int n;
+    if (active_input_source == INPUT_SOURCE_USB)
+        n = usb_input_channels;
+    else if (active_input_source == INPUT_SOURCE_I2S)
+        n = i2s_input_channels;
+    else
+        n = NUM_STEREO_INPUTS;            // S/PDIF (and any future stereo source)
+    if (n > NUM_INPUT_CHANNELS) n = NUM_INPUT_CHANNELS;
+    return (uint8_t)n;
+}
+
 void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     uint32_t packet_start = time_us_32();
 
@@ -267,16 +282,14 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
     bool is_bypassed = bypass_master_eq;
 
-    // Active input count for this packet: the USB alt's channel count (2/4/6/8)
-    // when USB is the source, else the stereo pair (S/PDIF / I2S).  In
-    // multichannel mode (>2 inputs) the inherently-stereo chain — loudness,
-    // leveller, crossfeed — is bypassed; each input gets only its own PEQ, then
-    // the matrix.  The matrix iterates n_active_inputs, so buf_in_ext (inputs
-    // 2..7) is read ONLY when those inputs are actually active; stale samples
-    // can never leak into stereo / S/PDIF / I2S output.
-    int n_active_inputs = (active_input_source == INPUT_SOURCE_USB)
-                              ? usb_input_channels : NUM_STEREO_INPUTS;
-    if (n_active_inputs > NUM_INPUT_CHANNELS) n_active_inputs = NUM_INPUT_CHANNELS;
+    // Active input count for this packet (see active_input_channel_count()):
+    // the USB alt's channel count, the I2S input channel count, or the stereo
+    // pair for S/PDIF.  In multichannel mode (>2 inputs) the inherently-stereo
+    // chain — loudness, leveller, crossfeed — is bypassed; each input gets only
+    // its own PEQ, then the matrix.  The matrix iterates n_active_inputs, so
+    // buf_in_ext (inputs 2..7) is read ONLY when those inputs are actually
+    // active; stale samples can never leak into stereo / S/PDIF output.
+    int n_active_inputs = active_input_channel_count();
     bool multichannel = (n_active_inputs > NUM_STEREO_INPUTS);
 
     // Snapshot loudness state for this packet

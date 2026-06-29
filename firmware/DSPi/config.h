@@ -324,8 +324,13 @@ extern volatile uint32_t nominal_feedback_10_14;
 // is selected by command instead of detected.
 #define REQ_SET_INPUT_RATE          0xED  // payload = uint32_t Hz (44100/48000/96000)
 #define REQ_GET_INPUT_RATE          0xEE  // returns 2x uint32_t {current Hz, selected I2S Hz}
-#define REQ_SET_I2S_RX_PIN          0xF1  // wValue = GPIO pin, returns status byte
-#define REQ_GET_I2S_RX_PIN          0xF2  // returns uint8_t
+#define REQ_SET_I2S_RX_PIN          0xF1  // wValue = (pair<<8)|GPIO; pair 0..3 selects the
+                                          // stereo pair (old hosts send wValue=pin => pair 0).
+                                          // Returns status byte.
+#define REQ_GET_I2S_RX_PIN          0xF2  // wValue = pair (0..3); returns that pair's GPIO
+// I2S input channel count (RP2350 multichannel input: 2/4/6/8 -> 1..4 stereo pairs).
+#define REQ_SET_I2S_INPUT_CHANNELS  0xF3  // wValue = channel count (2/4/6/8); returns status byte
+#define REQ_GET_I2S_INPUT_CHANNELS  0xF4  // returns uint8_t (active count)
 
 // LG Sound Sync (optical) Commands.  Per-preset feature: gate is stored in
 // PresetSlot, vendor SET only updates live state — flash persistence happens
