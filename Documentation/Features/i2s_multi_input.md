@@ -170,16 +170,18 @@ maximum from the device rather than hard-coding 8 (see "Capability detection").
 | Item | Default GPIO |
 |---|---|
 | BCK (`i2s_bck_pin`) | 14 (LRCLK = 15) |
-| Pair 0 data (`i2s_rx_pin[0]`) | 4 |
-| Pair 1 data (`i2s_rx_pin[1]`) | 16 |
-| Pair 2 data (`i2s_rx_pin[2]`) | 17 |
-| Pair 3 data (`i2s_rx_pin[3]`) | 18 |
+| Pair 0 data (`i2s_rx_pin[0]`) | 1 |
+| Pair 1 data (`i2s_rx_pin[1]`) | 2 |
+| Pair 2 data (`i2s_rx_pin[2]`) | 3 |
+| Pair 3 data (`i2s_rx_pin[3]`) | 4 |
 | Channel count | 2 |
 | Rate | 48000 |
 
-The pair 1..3 defaults (16/17/18) are placeholders. Multichannel input requires
-wiring one ADC data line per pair, so always let the user assign the extra data
-pins to match their board, then save a preset.
+The four data-pin defaults (GPIO 1/2/3/4) are a contiguous block chosen to be
+free of every default peripheral assignment, so enabling 4/6/8-channel input out
+of the box does not self-collide. They are still placeholders: multichannel input
+requires wiring one ADC data line per pair, so always let the user assign the
+data pins to match their board, then save a preset.
 
 ---
 
@@ -561,8 +563,9 @@ clash is rejected (fix the pins first); a *lower* always succeeds.
 ## 12. Gotchas and edge cases
 
 - **RP2040 is stereo-only.** Cap your UI; `4/6/8` and pairs `1..3` are rejected.
-- **Extra data pins need real wiring.** The 16/17/18 defaults are placeholders;
-  assign them to your board before enabling 4/6/8, then save a preset.
+- **Extra data pins need real wiring.** The GPIO 1/2/3/4 defaults are
+  placeholders (a collision-free block, but almost never where your ADC is
+  wired); assign them to your board before enabling 4/6/8, then save a preset.
 - **Order tip.** Set the count first, then the pins. The defaults are distinct
   and free, so a raise never trips on a stale pin; if you set pins first while
   the count is still 2, the extra pairs are inactive and not yet validated

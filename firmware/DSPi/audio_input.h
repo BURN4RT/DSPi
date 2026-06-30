@@ -28,10 +28,12 @@ typedef enum {
 // default (see DAC_HW_MUTE_DEFAULT_PIN in dac_hw_mute.h).
 #define PICO_SPDIF_RX_PIN_DEFAULT  5
 
-// Default I2S RX data GPIO (stereo pair 0). GPIO 4 is unused by any default
+// Default I2S RX data GPIO (stereo pair 0).  The four data-pin defaults are the
+// contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all unused by any default
 // assignment (SPDIF RX 5, outputs 6-9, PDM 10, DAC mute 11, UART TX 12, BCK 14,
-// LRCLK 15, MCK 21 on RP2040 / 13 on RP2350).
-#define PICO_I2S_RX_PIN_DEFAULT    4
+// LRCLK 15, MCK 21 on RP2040 / 13 on RP2350), so enabling 4/6/8-channel input
+// out of the box never self-collides.  Real boards override these per wiring.
+#define PICO_I2S_RX_PIN_DEFAULT    1
 
 // Maximum I2S RX stereo pairs.  Each pair is one PIO state machine + one DMA
 // ring + one serial-data pin, sharing the single BCK/LRCLK.  RP2350 fans out to
