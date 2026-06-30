@@ -373,8 +373,11 @@ slots (L,R interleaved), `8` is PDM (RP2350).
 | `REQ_SET_CHANNEL_NAME` | `0x9B` | channel index | 1..32 byte UTF-8 name |
 | `REQ_GET_CHANNEL_NAME` | `0x9C` | channel index | returns 32 bytes |
 
-Default input names are source-aware: with I2S active the inputs default to
-`"I2S L"`, `"I2S R"`, `"I2S 3"` ... `"I2S 8"`. They switch automatically when the
+Default input names are source-aware. I2S input uses numbered stereo pairs in the
+same `<prefix> <pair> <L/R>` form as the outputs: `"I2S 1 L"`, `"I2S 1 R"`,
+`"I2S 2 L"`, `"I2S 2 R"` ... `"I2S 4 R"`. (For reference, USB input uses discrete
+per-channel numbers `"USB 1"`..`"USB 8"`, and S/PDIF uses `"SPDIF L"`/`"SPDIF R"`.)
+They switch automatically when the
 source changes (only names you have not customized). Custom names persist with
 the preset.
 

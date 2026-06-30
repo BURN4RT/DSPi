@@ -1250,7 +1250,12 @@ The main loop handler for each operation follows the pattern:
 
 Default channel names are derived from current device state, not hard-coded:
 
-- **Input channels (0..7):** all labelled by `active_input_source` — `"USB"`, `"SPDIF"`, or `"I2S"` prefix. The stereo pair is `"<src> L"/"<src> R"`; the multichannel extras (2..7, present for USB 8-ch alts and I2S 4/6/8-ch input) are `"<src> N"` (e.g. `"I2S 3"`), NOT a hard-coded `"USB N"` — `get_default_channel_name()` (`usb_audio.c`) applies the source prefix to every input channel. On an input-source switch the default-name regeneration in `main.c` covers all `NUM_INPUT_CHANNELS` (not just the stereo pair), so multichannel inputs relabel; custom names are preserved by string-inequality. Future enums (ADAT) extend the same switch.
+- **Input channels (0..7):** named by `active_input_source` (`get_default_channel_name()`, `usb_audio.c`), each source in its natural model:
+  - **USB** - discrete channels `"USB 1"` .. `"USB 8"` (a USB stream's channels are independent, not stereo pairs, so per-channel numbers, no L/R).
+  - **I2S** - stereo pairs `"I2S 1 L"`, `"I2S 1 R"`, `"I2S 2 L"`, ... (pair = `ch/2 + 1`; matches the output naming style; I2S input is 1..4 pairs).
+  - **S/PDIF** - a single stereo pair `"SPDIF L"` / `"SPDIF R"`.
+
+  On an input-source switch the default-name regeneration in `main.c` covers all `NUM_INPUT_CHANNELS`, so multichannel inputs relabel; custom names are preserved by string-inequality. Future per-channel sources fall through to the USB-style branch.
 - **Output slot channels:** labelled by `output_types[slot]` — `"SPDIF N L/R"` for `OUTPUT_TYPE_SPDIF`, `"I2S N L/R"` for `OUTPUT_TYPE_I2S`, where N is 1-based slot index.
 - **PDM (last channel):** always `"PDM"`.
 

@@ -251,21 +251,21 @@ void get_default_channel_name(int ch, uint8_t input_source,
     if (ch < 0 || ch >= NUM_CHANNELS) return;
 
     if (ch < NUM_INPUT_CHANNELS) {
-        // Input channels, all named after the active source.  The multichannel
-        // extras (ch >= NUM_STEREO_INPUTS) exist for USB 8-ch alts AND I2S
-        // 4/6/8-ch input, so they must carry the source prefix too — not a
-        // hard-coded "USB", which would mislabel multichannel I2S.
-        const char *prefix;
-        switch (input_source) {
-            case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
-            case INPUT_SOURCE_I2S:   prefix = "I2S";   break;
-            case INPUT_SOURCE_USB:   /* fallthrough */
-            default:                 prefix = "USB";   break;
+        // Input channel names follow each source's natural model:
+        //   USB   - discrete channels: "USB 1" .. "USB 8".  A USB stream's
+        //           channels are independent, not stereo pairs, so they are
+        //           numbered per channel with no L/R.
+        //   I2S   - stereo pairs: "I2S 1 L", "I2S 1 R", "I2S 2 L", ... (matches
+        //           the output naming style; I2S input can be 1..4 pairs).
+        //   SPDIF - a single stereo pair: "SPDIF L" / "SPDIF R".
+        if (input_source == INPUT_SOURCE_I2S) {
+            snprintf(buf, PRESET_NAME_LEN, "I2S %d %c",
+                     ch / 2 + 1, (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source == INPUT_SOURCE_SPDIF) {
+            snprintf(buf, PRESET_NAME_LEN, "SPDIF %c", (ch % 2 == 0) ? 'L' : 'R');
+        } else {  // USB (and any future per-channel source)
+            snprintf(buf, PRESET_NAME_LEN, "USB %d", ch + 1);
         }
-        if (ch < NUM_STEREO_INPUTS)
-            snprintf(buf, PRESET_NAME_LEN, "%s %c", prefix, (ch == 0) ? 'L' : 'R');
-        else
-            snprintf(buf, PRESET_NAME_LEN, "%s %d", prefix, ch + 1);
         return;
     }
 
