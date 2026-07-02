@@ -1,0 +1,8 @@
+# Use the DSPi-specific PipeWire ALSA card profile.
+
+SUBSYSTEM!="sound", GOTO="dspi_pipewire_end"
+ACTION!="change", GOTO="dspi_pipewire_end"
+KERNEL!="card*", GOTO="dspi_pipewire_end"
+SUBSYSTEMS=="usb", ATTRS{idVendor}=="2e8b", ATTRS{idProduct}=="feaa", ENV{ACP_PROFILE_SET}="dspi-iec958.conf"
+
+LABEL="dspi_pipewire_end"
