@@ -366,7 +366,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 #endif
         for (int i = 0; i < NUM_PIN_OUTPUTS; i++) {
             uint8_t pin = in->pins.pins[i];
-            bool valid = (pin <= 29) && (pin != 12) && !(pin >= 23 && pin <= 25);
+            bool valid = (pin <= 29) && (pin != 16) && (pin != 17) && !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
             if (pin > 28) valid = false;
 #endif
@@ -378,7 +378,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         // new GPIO without a vendor-command round trip.
         {
             uint8_t pin = in->input_config.spdif_rx_pin;
-            bool valid = (pin > 0) && (pin <= 29) && (pin != 12) &&
+            bool valid = (pin > 0) && (pin <= 29) && (pin != 16) && (pin != 17) &&
                          !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
             if (pin > 28) valid = false;

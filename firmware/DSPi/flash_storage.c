@@ -836,7 +836,7 @@ static void dir_ensure(void) {
 // True if `pin` is a usable output/RX GPIO on this platform.  (0 is allowed for
 // output pins; the SPDIF RX path additionally rejects 0 as "absent".)
 static bool io_pin_valid(uint8_t pin) {
-    bool valid = (pin <= 29) && (pin != 12) && !(pin >= 23 && pin <= 25);
+    bool valid = (pin <= 29) && (pin != 16) && (pin != 17) && !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
     if (pin > 28) valid = false;
 #endif

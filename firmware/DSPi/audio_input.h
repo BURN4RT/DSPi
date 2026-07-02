@@ -30,8 +30,8 @@ typedef enum {
 
 // Default I2S RX data GPIO (stereo pair 0).  The four data-pin defaults are the
 // contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all unused by any default
-// assignment (SPDIF RX 5, outputs 6-9, PDM 10, DAC mute 11, UART TX 12, BCK 14,
-// LRCLK 15, MCK 21 on RP2040 / 13 on RP2350), so enabling 4/6/8-channel input
+// assignment (SPDIF RX 5, outputs 6-9, PDM 10, DAC mute 11, BCK 14, LRCLK 15,
+// MCK 21 on RP2040 / 13 on RP2350, UART0 16/17), so enabling 4/6/8-channel input
 // out of the box never self-collides.  Real boards override these per wiring.
 #define PICO_I2S_RX_PIN_DEFAULT    1
 

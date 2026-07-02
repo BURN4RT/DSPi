@@ -176,7 +176,7 @@ uint16_t mck_decode(uint8_t raw)  { return (raw == 1) ? 256 : 128; }
 // ----------------------------------------------------------------------------
 
 bool is_valid_gpio_pin(uint8_t pin) {
-    if (pin == 12) return false;                // UART TX
+    if (pin == 16 || pin == 17) return false;   // UART0 TX/RX (debug)
     if (pin >= 23 && pin <= 25) return false;   // Power/LED
 #if PICO_RP2350
     return pin <= 29;

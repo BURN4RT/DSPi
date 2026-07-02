@@ -1285,7 +1285,8 @@ Default channel names are derived from current device state, not hard-coded:
 | 8 | S/PDIF 3 | Outputs 5-6 |
 | 9 | S/PDIF 4 | Outputs 7-8 |
 | 10 | PDM Sub | Output 9 |
-| 12 | UART TX | Debug |
+| 16 | UART0 TX | Debug |
+| 17 | UART0 RX | Debug |
 | 25 | LED | Heartbeat |
 
 **RP2040:**
@@ -1295,7 +1296,8 @@ Default channel names are derived from current device state, not hard-coded:
 | 6 | S/PDIF 1 | Outputs 1-2 |
 | 7 | S/PDIF 2 | Outputs 3-4 |
 | 10 | PDM Sub | Output 5 |
-| 12 | UART TX | Debug |
+| 16 | UART0 TX | Debug |
+| 17 | UART0 RX | Debug |
 | 25 | LED | Heartbeat |
 
 ### Runtime Reconfiguration
@@ -1303,7 +1305,7 @@ Default channel names are derived from current device state, not hard-coded:
 
 Vendor commands `REQ_SET_OUTPUT_PIN` (0x7C) / `REQ_GET_OUTPUT_PIN` (0x7D).
 
-**Constraints:** Valid GPIO range, not reserved (12, 23-25), and not in use by another output, the I2S BCK/LRCLK or MCK pin, the SPDIF RX pin, or the DAC hardware-mute pin (`is_pin_in_use`).
+**Constraints:** Valid GPIO range, not reserved (16-17 UART0, 23-25 power/LED), and not in use by another output, the I2S BCK/LRCLK or MCK pin, the SPDIF RX pin, or the DAC hardware-mute pin (`is_pin_in_use`).
 
 **S/PDIF and I2S slots:** Deferred to the main loop, not applied in the USB ISR. `REQ_SET_OUTPUT_PIN` writes the target into `output_pins[out_idx]` (RAM-only, like `spdif_rx_pin`) and sets a bit in `output_pin_change_mask`; the main-loop gate (shared `pipeline_reset_ready()` hold) then runs `process_pin_changes(mask)`. That helper mirrors `process_type_switches`: `prepare_pipeline_reset()` (soft mute + Core 1 fence + DAC hardware-mute assert) → suspend SPDIF RX if running → `drain_and_disable_outputs()` → `audio_spdif_change_pin()` / `audio_i2s_change_data_pin()` on each flagged slot while disabled → `complete_pipeline_reset()` for the **synchronized** restart of all slots → restart RX. The synchronized restart is the point: a moved slot re-enters in phase with the others, preserving the inviolable inter-slot sample alignment. (The prior implementation restarted only the changed slot live in the ISR, which clicked and left that slot phase-misaligned until the next full reset.) `change_pin` masks the channel's DMA IRQ before aborting the DMA so the handler can't start a conflicting transfer during PIO SM reinit, and clears any stale completion flag before unmasking. Back-to-back requests accumulate in the mask and apply in one batch. Persistence follows `output_config_mode`: in with-preset mode the pin travels with the preset (`REQ_PRESET_SAVE` captures it, applied on load); in independent mode it is device-global (`REQ_SAVE_OUTPUT_CONFIG` persists it, applied at boot).
 

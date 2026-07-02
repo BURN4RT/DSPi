@@ -107,7 +107,12 @@ target_compile_definitions(DSPi PRIVATE
     # interrupt-safe _spdif_rx_common_end.
     PICO_SPDIF_RX_DMA_IRQ=1
 
-    PICO_DEFAULT_UART_TX_PIN=12
+    # Debug UART0 parked at the numeric top of the exposed GPIOs (16/17), clear
+    # of every default audio pin (I2S-in 1-4, SPDIF-in 5, outputs 6-10, mute 11,
+    # clocks 13-15) and of the ADC pins (26-28).  Both TX and RX are overridden
+    # so the SDK default (RX on GPIO 1) can't steal the I2S-RX pair-0 data line.
+    PICO_DEFAULT_UART_TX_PIN=16
+    PICO_DEFAULT_UART_RX_PIN=17
 )
 
 target_link_libraries(DSPi
