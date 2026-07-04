@@ -1759,6 +1759,19 @@ refused with `CTRL_DISPATCH_BUSY` (wire `CTRL_STATUS_BUSY`) while a USB control
 SET is mid-transfer, so the two paths never race the same state. The client
 retries the whole request.
 
+**Chunked USB bulk access (0xA2/0xA3, added 2026-07-04).** Windows/WinUSB caps
+control-transfer data stages at 4 KB, so the 5864-byte V16 `WireBulkParams`
+cannot cross a single `0xA0`/`0xA1` transfer on any Windows host (GitHub
+issue #62). `REQ_GET_ALL_PARAMS_CHUNK` (0xA2) and `REQ_SET_ALL_PARAMS_CHUNK`
+(0xA3) move the same payload in `wValue`-offset chunks riding the bulk owner
+lock as a multi-transfer session: GET offset 0 snapshots the struct under the
+lock (all chunks read one coherent image, released at the final chunk's ACK);
+SET chunks land sequentially in `bulk_param_buf` and the final byte hands the
+buffer to the normal `bulk_params_pending` apply. Sessions survive chunk
+SETUPs but are torn down by any other vendor request or the 3 s stale reap;
+both commands are USB-only (refused on UART/I2C, which have no size cap).
+Host migration guide: `Documentation/Features/bulk_params_chunking.md`.
+
 **bulk_param_buf owner lock.** The single shared bulk buffer is serialized across
 USB/UART/I2C via `vendor_bulk_try_acquire` / `vendor_bulk_release` /
 `vendor_bulk_touch` (IRQ-safe). External owners go stale after 500 ms unless they
@@ -1893,6 +1906,8 @@ format version is unchanged by this feature.
 | REQ_GET_CHANNEL_NAME | 0x9C | IN | Get channel name (wValue=channel, returns 32 bytes) |
 | REQ_GET_ALL_PARAMS | 0xA0 | IN | Get complete DSP state (3664 bytes at V11, multi-packet control transfer) |
 | REQ_SET_ALL_PARAMS | 0xA1 | OUT | Set complete DSP state (3664 bytes at V11, multi-packet control transfer) |
+| REQ_GET_ALL_PARAMS_CHUNK | 0xA2 | IN | Read WireBulkParams in <= 4 KB chunks (wValue = offset); USB-only, WinUSB 4 KB cap workaround |
+| REQ_SET_ALL_PARAMS_CHUNK | 0xA3 | OUT | Write WireBulkParams in sequential chunks (wValue = offset); apply fires on the final byte; USB-only |
 | REQ_GET_BUFFER_STATS | 0xB0 | IN | Get 44-byte buffer fill level statistics packet |
 | REQ_RESET_BUFFER_STATS | 0xB1 | IN | Reset watermarks (wValue bit 0), returns 1-byte ack |
 | REQ_SET_LEVELLER_ENABLE | 0xB4 | OUT | Enable/disable volume leveller |

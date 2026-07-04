@@ -213,6 +213,17 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_ALL_PARAMS          0xA0
 #define REQ_SET_ALL_PARAMS          0xA1
 
+// Chunked bulk-params access (USB-only).  Works around the Windows/WinUSB
+// 4 KB control-transfer cap that the full WireBulkParams (5864 B at V16)
+// cannot cross (GitHub issue #62).  wValue = byte offset, wLength = chunk
+// size.  GET: offset 0 snapshots the struct under the bulk lock, later
+// offsets read the snapshot out; the lock frees after the final chunk.
+// SET: chunks must be sequential from offset 0; the normal deferred apply
+// fires when the last byte lands.  UART and I2C have no size cap and use
+// plain 0xA0/0xA1; these two commands are refused on those transports.
+#define REQ_GET_ALL_PARAMS_CHUNK    0xA2
+#define REQ_SET_ALL_PARAMS_CHUNK    0xA3
+
 // I2S Output Configuration Commands
 #define REQ_SET_OUTPUT_TYPE         0xC0
 #define REQ_GET_OUTPUT_TYPE         0xC1

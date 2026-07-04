@@ -152,6 +152,30 @@ bool vendor_is_bulk_set(uint8_t bRequest, uint16_t wLength) {
            wLength <= sizeof(WireBulkParams);
 }
 
+// --- Chunked bulk-params sessions (USB only; see 0xA2/0xA3 in config.h) ---
+// A session spans multiple EP0 control transfers, so the bulk lock must
+// survive intervening chunk SETUPs; the SETUP-stage USB-owner cleanup
+// exempts chunk requests while a session is open.  Abandoned sessions are
+// torn down by the first non-chunk vendor request or the 3 s stale reap.
+static bool     usb_chunk_get_open = false;   // snapshot parked in bulk_param_buf
+static bool     usb_chunk_get_done = false;   // final chunk queued; release at ACK
+static bool     usb_chunk_set_open = false;
+static uint16_t usb_chunk_set_received = 0;   // next expected byte offset
+
+static void usb_chunk_sessions_close(void) {
+    usb_chunk_get_open = false;
+    usb_chunk_get_done = false;
+    usb_chunk_set_open = false;
+    usb_chunk_set_received = 0;
+}
+
+// True while `req` continues an open chunk session (so the SETUP cleanup
+// must not drop the USB-held bulk lock underneath it).
+static bool usb_chunk_session_continues(uint8_t bRequest) {
+    return (bRequest == REQ_GET_ALL_PARAMS_CHUNK && usb_chunk_get_open) ||
+           (bRequest == REQ_SET_ALL_PARAMS_CHUNK && usb_chunk_set_open);
+}
+
 // Shared CtrlDispatchResult to CTRL_STATUS_* wire mapping for the external
 // transports (one definition so UART and I2C can never disagree).
 uint8_t ctrl_status_from_dispatch(CtrlDispatchResult r) {
@@ -1857,6 +1881,41 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 return true;
             }
 
+            case REQ_GET_ALL_PARAMS_CHUNK: {
+                // USB-only workaround for the WinUSB 4 KB control cap:
+                // wValue = byte offset, wLength = chunk size.  Offset 0
+                // acquires the bulk lock and snapshots the full struct so
+                // every chunk reads one coherent image; the lock releases
+                // at the ACK of the final chunk (or via cleanup/reap if
+                // the host abandons the session).
+                uint32_t off = setup->wValue;
+                uint32_t n   = setup->wLength;
+                if (_active_source != CTRL_SOURCE_USB) return false;
+                if (n == 0 || off >= sizeof(WireBulkParams)) return false;
+
+                if (off == 0) {
+                    if (bulk_buf_owner != BULK_OWNER_USB &&
+                        !vendor_bulk_try_acquire(CTRL_SOURCE_USB)) {
+                        return false;   // another transport owns the buffer
+                    }
+                    usb_chunk_set_open = false;   // GET supersedes a stale SET
+                    usb_chunk_set_received = 0;
+                    bulk_params_collect((WireBulkParams *)bulk_param_buf);
+                    usb_chunk_get_open = true;
+                    usb_chunk_get_done = false;
+                } else if (!usb_chunk_get_open ||
+                           bulk_buf_owner != BULK_OWNER_USB) {
+                    return false;   // no snapshot (session lost); restart at 0
+                }
+
+                if (off + n > sizeof(WireBulkParams))
+                    n = sizeof(WireBulkParams) - off;
+                usb_chunk_get_done = (off + n >= sizeof(WireBulkParams));
+                vendor_bulk_touch(CTRL_SOURCE_USB);
+                return tud_control_xfer(_vendor_rhport, _vendor_current_req,
+                                        bulk_param_buf + off, (uint16_t)n);
+            }
+
             case REQ_GET_ALL_PARAMS: {
                 // Caller (USB SETUP path or vendor_dispatch_get) must hold
                 // the bulk lock before this runs; see the entry points.
@@ -2416,8 +2475,14 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
     if (stage == CONTROL_STAGE_SETUP) {
         // EP0 transfers are strictly serialized: a new SETUP means any prior
         // USB control transfer is over, so drop a USB-held bulk lock (covers
-        // host-aborted 0xA0/0xA1 transfers whose ACK never fired).
-        if (bulk_buf_owner == BULK_OWNER_USB) bulk_buf_owner = BULK_OWNER_NONE;
+        // host-aborted 0xA0/0xA1 transfers whose ACK never fired).  Chunked
+        // sessions (0xA2/0xA3) intentionally span SETUPs and keep the lock;
+        // any other vendor request tears an open session down.
+        if (bulk_buf_owner == BULK_OWNER_USB &&
+            !usb_chunk_session_continues(req->bRequest)) {
+            bulk_buf_owner = BULK_OWNER_NONE;
+            usb_chunk_sessions_close();
+        }
         usb_set_in_flight = false;
 
         // ---- Microsoft OS 2.0 platform-capability vendor requests ----
@@ -2461,6 +2526,12 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             if (!ok && req->bRequest == REQ_GET_ALL_PARAMS) {
                 vendor_bulk_release(CTRL_SOURCE_USB);
             }
+            if (!ok && req->bRequest == REQ_GET_ALL_PARAMS_CHUNK) {
+                // Failed or invalid chunk: drop the session so the host's
+                // restart from offset 0 takes a fresh snapshot.
+                vendor_bulk_release(CTRL_SOURCE_USB);
+                usb_chunk_sessions_close();
+            }
             // Clear any source tag that the GET dispatcher set for embedded
             // SETs — bleeding HOST_SET would misattribute unrelated writes
             // that happen outside a dispatch bracket (e.g. timer callbacks).
@@ -2482,6 +2553,36 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             usb_set_in_flight  = true;
             usb_set_setup_time = time_us_32();
             return tud_control_xfer(rhport, req, bulk_param_buf, req->wLength);
+        }
+
+        if (req->bRequest == REQ_SET_ALL_PARAMS_CHUNK) {
+            // Chunked bulk SET (USB-only WinUSB workaround): wValue = byte
+            // offset, payload lands directly at bulk_param_buf + offset.
+            // Chunks must arrive sequentially from offset 0; completion is
+            // detected at the ACK stage, which hands the buffer to the
+            // main-loop apply exactly like a single-shot 0xA1.
+            uint32_t off = req->wValue;
+            uint32_t n   = req->wLength;
+            if (n == 0 || off + n > sizeof(WireBulkParams)) return false;
+            if (off == 0) {
+                if (bulk_buf_owner != BULK_OWNER_USB &&
+                    !vendor_bulk_try_acquire(CTRL_SOURCE_USB)) {
+                    return false;
+                }
+                usb_chunk_get_open = false;   // SET supersedes a stale GET
+                usb_chunk_get_done = false;
+                usb_chunk_set_open = true;
+                usb_chunk_set_received = 0;
+            } else if (!usb_chunk_set_open ||
+                       bulk_buf_owner != BULK_OWNER_USB ||
+                       off != usb_chunk_set_received) {
+                return false;   // out of order or session lost; restart at 0
+            }
+            vendor_bulk_touch(CTRL_SOURCE_USB);
+            usb_set_in_flight  = true;
+            usb_set_setup_time = time_us_32();
+            return tud_control_xfer(rhport, req, bulk_param_buf + off,
+                                    (uint16_t)n);
         }
 
         if (req->wLength == 0) {
@@ -2522,6 +2623,22 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             req->bRequest == REQ_GET_ALL_PARAMS) {
             vendor_bulk_release(CTRL_SOURCE_USB);   // bulk GET fully streamed
         }
+        if (req->bmRequestType_bit.direction == TUSB_DIR_OUT &&
+            req->bRequest == REQ_SET_ALL_PARAMS_CHUNK && usb_chunk_set_open) {
+            // Chunk landed in bulk_param_buf; on the final one, hand the
+            // buffer to the main-loop apply exactly like single-shot 0xA1.
+            usb_chunk_set_received = (uint16_t)(req->wValue + req->wLength);
+            if (usb_chunk_set_received >= sizeof(WireBulkParams)) {
+                usb_chunk_sessions_close();
+                bulk_params_pending = true;
+                vendor_bulk_release(CTRL_SOURCE_USB);
+            }
+        }
+        if (req->bmRequestType_bit.direction == TUSB_DIR_IN &&
+            req->bRequest == REQ_GET_ALL_PARAMS_CHUNK && usb_chunk_get_done) {
+            usb_chunk_sessions_close();             // final chunk fully streamed
+            vendor_bulk_release(CTRL_SOURCE_USB);
+        }
         if (req->bmRequestType_bit.direction == TUSB_DIR_OUT) {
             usb_set_in_flight = false;
         }
@@ -2537,10 +2654,16 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
 // TinyUSB machinery is involved for external transports.
 // ----------------------------------------------------------------------------
 
-// Interface self-configuration is USB-only: an external controller must
-// never be able to reconfigure (and lock itself out of) its own transport.
+// Commands refused on the external transports.  Interface self-configuration
+// is USB-only so an external controller can never reconfigure (and lock
+// itself out of) its own transport; the chunked bulk commands exist solely
+// for the Windows/WinUSB 4 KB control cap, and UART/I2C (which have no size
+// cap) must use plain 0xA0/0xA1 instead of holding chunk sessions open.
 static bool ctrl_cmd_usb_only(uint8_t bRequest) {
-    return bRequest == REQ_SET_UART_CONFIG || bRequest == REQ_SET_I2C_CONFIG;
+    return bRequest == REQ_SET_UART_CONFIG ||
+           bRequest == REQ_SET_I2C_CONFIG ||
+           bRequest == REQ_GET_ALL_PARAMS_CHUNK ||
+           bRequest == REQ_SET_ALL_PARAMS_CHUNK;
 }
 
 CtrlDispatchResult vendor_dispatch_get(CtrlSource src, uint8_t bRequest,

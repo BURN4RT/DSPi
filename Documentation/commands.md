@@ -995,6 +995,8 @@ with no OUT data, issued as an IN transfer (returns a status/echo byte).
 | 0x9C | GET_CHANNEL_NAME | R | returns `channel_names[ch]` (32 bytes) |
 | 0xA0 | GET_ALL_PARAMS | R | `bulk_params_collect()` -> chunked `WireBulkParams` |
 | 0xA1 | SET_ALL_PARAMS | W | payload -> `bulk_param_buf` (chunked); `bulk_params_pending` -> `bulk_params_apply()` + `dsp_recalculate_all_filters()` + reset (gated) |
+| 0xA2 | GET_ALL_PARAMS_CHUNK | R | wValue = byte offset; offset 0 snapshots under the bulk lock; USB-only (WinUSB 4 KB cap; see `Features/bulk_params_chunking.md`) |
+| 0xA3 | SET_ALL_PARAMS_CHUNK | W | wValue = byte offset, sequential from 0 into `bulk_param_buf`; final byte sets `bulk_params_pending`; USB-only |
 | 0xB0 | GET_BUFFER_STATS | R | `BufferStatsPacket` from consumer stats / watermarks / PDM fill |
 | 0xB1 | RESET_BUFFER_STATS | W-as-R | `reset_buffer_watermarks()` if wValue&1 |
 | 0xB2 | GET_USB_ERROR_STATS | R | returns zeroed `UsbErrorStatsPacket` (TinyUSB exposes no counters) |
