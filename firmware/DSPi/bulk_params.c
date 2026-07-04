@@ -20,6 +20,8 @@
 #include "lg_sound_sync.h"
 #include "dac_hw_mute.h"
 #include "notify.h"
+#include "uart_control.h"
+#include "i2c_control.h"
 
 #include <string.h>
 #include <stdio.h>   // printf() for rejected-config diagnostics
@@ -370,6 +372,10 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 #if !PICO_RP2350
             if (pin > 28) valid = false;
 #endif
+            // Never let a pushed config steal a live control interface's
+            // GPIOs: over UART/I2C that would sever the link doing the push
+            // (the self-lockout the USB-only config rule exists to prevent).
+            if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) valid = false;
             output_pins[i] = valid ? pin : default_pins[i];
         }
 
@@ -383,6 +389,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 #if !PICO_RP2350
             if (pin > 28) valid = false;
 #endif
+            if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) valid = false;
             if (valid && pin != spdif_rx_pin) {
                 spdif_rx_pin = pin;
                 if (active_input_source == INPUT_SOURCE_SPDIF) {

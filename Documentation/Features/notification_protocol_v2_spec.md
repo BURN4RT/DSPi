@@ -131,10 +131,14 @@ typedef enum : uint8_t {
     PARAM_SRC_GPIO       = 5,  // Hardware control (knobs, encoders, pads)
     PARAM_SRC_INTERNAL   = 6,  // Firmware-initiated (clamp, auto-recalc)
     PARAM_SRC_UAC1       = 7,  // UAC1 Feature Unit SET_CUR (OS volume slider, mute key)
+    PARAM_SRC_UART       = 8,  // External UART control interface (added 2026-07-04)
+    PARAM_SRC_I2C        = 9,  // External I2C target control interface (added 2026-07-04)
 } ParamSource;
 ```
 
 The source is set by a scoped bracket in the caller (analogous to today's `notify_master_vol_host_initiated`). See §4.4.
+
+Hosts must treat unknown source values as "changed by someone else" rather than erroring: the range grows when new control transports are added (values 8 and 9 arrived with the UART/I2C control interfaces; see `control_interfaces_spec.md`). Do not index a fixed-size array by this byte without a bounds check.
 
 ## 4. Firmware Architecture
 

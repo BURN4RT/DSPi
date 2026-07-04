@@ -66,10 +66,18 @@ CtrlDispatchResult vendor_dispatch_set(CtrlSource src, uint8_t bRequest,
 
 // bulk_param_buf ownership.  Serializes USB / UART / I2C use of the single
 // shared bulk buffer.  External owners go stale after 500 ms unless they
-// refresh with vendor_bulk_touch() while actively streaming.  IRQ-safe.
+// refresh with vendor_bulk_touch() while actively streaming; a dead USB
+// owner (cable pull mid-EP0) is reaped after 3 s.  IRQ-safe.
 bool vendor_bulk_try_acquire(CtrlSource src);
 void vendor_bulk_release(CtrlSource src);
 void vendor_bulk_touch(CtrlSource src);
+
+// True if (bRequest, wLength) is a bulk SET whose payload belongs in
+// bulk_param_buf.  Single definition shared by USB and both transports.
+bool vendor_is_bulk_set(uint8_t bRequest, uint16_t wLength);
+
+// Map a dispatch result to the CTRL_STATUS_* wire code (shared by UART/I2C).
+uint8_t ctrl_status_from_dispatch(CtrlDispatchResult r);
 
 // Wire-level status codes shared by the external transports (byte 0 of every
 // UART/I2C response frame).
@@ -89,6 +97,9 @@ int16_t read_temperature_cdeg(void);
 // Pin validation helpers
 bool is_valid_gpio_pin(uint8_t pin);
 bool is_pin_in_use(uint8_t pin, uint8_t exclude);
+// Full acceptability check for a UART/I2C control-interface GPIO (validity,
+// I2S clock pair always claimed, live peripherals).  Returns PIN_CONFIG_*.
+uint8_t ctrl_iface_check_pin(uint8_t pin);
 // i2s_rx_pin_set_acceptable() is declared in audio_input.h (lightweight, so the
 // restore paths can call it without pulling TinyUSB in) and defined here.
 

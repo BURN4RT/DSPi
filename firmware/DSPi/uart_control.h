@@ -36,8 +36,9 @@
 #include <stdbool.h>
 
 // Boot-time bring-up from the persisted config.  Same as uart_ctrl_apply but
-// without rollback; call once before the main loop starts.
-void uart_ctrl_init(const UartCtrlConfig *cfg);
+// without rollback; call once before the main loop starts.  Returns the
+// PIN_CONFIG_* validation status (recorded for REQ_GET_CTRL_IFACE_STATUS).
+uint8_t uart_ctrl_init(const UartCtrlConfig *cfg);
 
 // Reconfigure at runtime (main-loop context only).  Tears the current
 // interface down first so a pin-in-use check does not see our own pins, then
@@ -58,8 +59,5 @@ bool uart_ctrl_owns_pin(uint8_t pin);
 
 // True iff the peripheral is up and listening.
 bool uart_ctrl_is_live(void);
-
-// Copy the live (currently applied) config into *out.
-void uart_ctrl_get_live_config(UartCtrlConfig *out);
 
 #endif // UART_CONTROL_H

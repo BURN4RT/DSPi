@@ -103,7 +103,7 @@ float preset_get_saved_master_volume(void);
 void preset_set_dac_hw_mute(const DacHwMuteConfig *cfg);
 void preset_get_dac_hw_mute(DacHwMuteConfig *out);
 
-// External control-interface config (UART/I2C, board-level, directory-stored —
+// External control-interface config (UART/I2C, board-level, directory-stored,
 // V6+).  Setter is synchronous and main-loop only; a NULL pointer leaves that
 // interface's stored config unchanged.  Getter copies out; either may be NULL.
 void preset_set_ctrl_iface(const UartCtrlConfig *uart, const I2cCtrlConfig *i2c);

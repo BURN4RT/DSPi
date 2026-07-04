@@ -41,6 +41,8 @@
 #include "leveller.h"
 #include "lg_sound_sync.h"
 #include "notify.h"
+#include "uart_control.h"    // uart_ctrl_owns_pin (io_pin_valid guard)
+#include "i2c_control.h"     // i2c_ctrl_owns_pin (io_pin_valid guard)
 #include "bulk_params.h"     // WireBulkParams offsets for user_mute notify
 
 #include "hardware/flash.h"
@@ -942,8 +944,12 @@ static void dir_ensure(void) {
 // True if `pin` is a usable output/RX GPIO on this platform.  (0 is allowed for
 // output pins; the SPDIF RX path additionally rejects 0 as "absent".)
 static bool io_pin_valid(uint8_t pin) {
-    // GPIO 16/17 are assignable again (debug UART removed); live collisions
-    // with the UART/I2C control interfaces are caught by is_pin_in_use().
+    // GPIO 16/17 are assignable again (debug UART removed).  Live UART/I2C
+    // control pins are rejected here so a stored or pushed IO config can
+    // never steal the control link applying it (self-lockout guard); at
+    // boot the interfaces are not yet up, so stored audio pins win and a
+    // colliding control config stays down (visible via 0xF9).
+    if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) return false;
     bool valid = (pin <= 29) && !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
     if (pin > 28) valid = false;

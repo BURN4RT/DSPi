@@ -1299,12 +1299,10 @@ void core0_init() {
         UartCtrlConfig ucfg;
         I2cCtrlConfig  icfg;
         preset_get_ctrl_iface(&ucfg, &icfg);
-        // Record boot validation results so REQ_GET_CTRL_IFACE_STATUS is
+        // Record the boot validation results so REQ_GET_CTRL_IFACE_STATUS is
         // truthful when a stored config's pins now collide (live stays 0).
-        ctrl_uart_last_status = uart_ctrl_validate(&ucfg);
-        ctrl_i2c_last_status  = i2c_ctrl_validate(&icfg);
-        uart_ctrl_init(&ucfg);
-        i2c_ctrl_init(&icfg);
+        ctrl_uart_last_status = uart_ctrl_init(&ucfg);
+        ctrl_i2c_last_status  = i2c_ctrl_init(&icfg);
     }
 
     // Sync MCK library state with the just-loaded globals.  usb_sound_card_init()

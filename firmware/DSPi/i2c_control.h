@@ -45,7 +45,8 @@
 #define I2C_CTRL_RESP_HDR_LEN 3
 
 // Boot-time bring-up from the persisted directory config.  Main loop only.
-void i2c_ctrl_init(const I2cCtrlConfig *cfg);
+// Returns the PIN_CONFIG_* validation status.
+uint8_t i2c_ctrl_init(const I2cCtrlConfig *cfg);
 
 // Tear down, validate, reconfigure.  Returns PIN_CONFIG_* status; on
 // validation failure the previous config is restored best-effort.
@@ -65,8 +66,5 @@ bool i2c_ctrl_owns_pin(uint8_t pin);
 
 // True when the peripheral is up and listening at the configured address.
 bool i2c_ctrl_is_live(void);
-
-// Snapshot of the live configuration.
-void i2c_ctrl_get_live_config(I2cCtrlConfig *out);
 
 #endif // I2C_CONTROL_H

@@ -50,6 +50,8 @@
 #include "flash_storage.h"     /* dir_cache, flash_storage_mark_directory_dirty */
 #include "notify.h"            /* notify_param_write */
 #include "bulk_params.h"       /* WireBulkParams offsets */
+#include "uart_control.h"      /* uart_ctrl_owns_pin */
+#include "i2c_control.h"       /* i2c_ctrl_owns_pin */
 
 #include "hardware/gpio.h"
 #include "pico/time.h"         /* time_us_64 */
@@ -165,6 +167,8 @@ static bool collides_with_other_subsystem(uint8_t pin) {
     if (i2s_mck_enabled && pin == i2s_mck_pin) return true;
     /* SPDIF RX */
     if (pin == spdif_rx_pin) return true;
+    /* Live UART / I2C control interface pins */
+    if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) return true;
     return false;
 }
 
