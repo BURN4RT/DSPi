@@ -218,13 +218,16 @@ static void release_claimed_pin(void) {
 
 /* Claim the configured pin: gpio_init + set output value + set_dir(OUT).
  * Pre-setting the value before enabling output direction means the pin
- * transitions directly from input to output at the correct (un-muted)
- * level — never momentarily floats during the dir change, which
- * matters in cold-boot scenarios where the DAC may have power before
- * the RP2 finishes init.  Records the claim for later release. */
-static void claim_pin(uint8_t pin) {
+ * transitions directly from input to output at the correct level — never
+ * momentarily floats during the dir change, which matters in cold-boot
+ * scenarios where the DAC may have power before the RP2 finishes init.
+ * `assert_muted` selects that pre-set level: false brings the pin up at
+ * the idle (un-muted) level, as at boot; true brings it up MUTED so a
+ * pin reassigned during an in-flight pipeline/flash mute never exposes an
+ * un-muted window.  Records the claim for later release. */
+static void claim_pin(uint8_t pin, bool assert_muted) {
     gpio_init(pin);
-    gpio_put(pin, unmuted_level());
+    gpio_put(pin, assert_muted ? muted_level() : unmuted_level());
     gpio_set_dir(pin, GPIO_OUT);
     s_pin_claimed = true;
 }
@@ -234,10 +237,31 @@ static void claim_pin(uint8_t pin) {
 /* ----------------------------------------------------------------- */
 
 void dac_hw_mute_init(const DacHwMuteConfig *cfg) {
-    /* Release any previously-claimed pin first so this function is
-     * idempotent — set_config() calls back into us after a runtime
-     * config change with potentially a different pin. */
-    release_claimed_pin();
+    /* Carry an in-flight pipeline/flash mute across a live config re-apply.
+     * set_config() is invoked from inside the flash-write brackets:
+     * prepare_flash_write_operation() (via prepare_pipeline_reset ->
+     * dac_hw_mute_assert) has ALREADY driven the pin muted and waited out
+     * the hold, and dir_flush() runs a ~45 ms IRQ-off flash blackout a few
+     * lines later.  A fresh boot init drops the pin to its un-muted level;
+     * doing that here would un-mute the DAC for that blackout, exposing the
+     * output-pool underrun as full-volume noise — the exact event this
+     * feature exists to hide, and the reported bug.  So when a lifecycle
+     * mute is currently held, preserve it: bring the (possibly new) pin up
+     * MUTED and keep s_lifecycle_asserted set, leaving the release to the
+     * completion path (complete_pipeline_reset / complete_flash_write_
+     * operation_*).  Same-source re-apply funnels through here for both the
+     * REQ_SET_DAC_HW_MUTE_CONFIG handler and the bulk REQ_SET_ALL_PARAMS
+     * apply, so both are covered. */
+    bool carry_assert = s_lifecycle_asserted && s_pin_claimed;
+
+    /* Tear the old pin down to high-Z only when the pin number actually
+     * changes (or the feature is being disabled / has no pin).  A same-pin
+     * re-apply — the common hold/release-timer edit — leaves the GPIO
+     * driven throughout, so a carried mute never blips to high-Z in the
+     * gap between release and re-claim. */
+    bool pin_changes = !cfg || cfg->enabled == 0 || !s_pin_claimed ||
+                       cfg->pin != s_cfg.pin;
+    if (pin_changes) release_claimed_pin();
 
     /* Copy the new config into our live mirror.  If cfg is NULL or
      * the feature is off, leave s_cfg zeroed (BSS-zero state) so
@@ -253,18 +277,26 @@ void dac_hw_mute_init(const DacHwMuteConfig *cfg) {
     }
     memcpy(&s_cfg, cfg, sizeof(s_cfg));
 
-    /* Claim the pin if one is configured.  Validation is the caller's
-     * responsibility (set_config() does it before calling us; the boot
-     * path trusts whatever was persisted because it was validated when
-     * it was written). */
-    if (s_cfg.pin != DAC_HW_MUTE_PIN_NONE) {
-        claim_pin(s_cfg.pin);
+    /* Claim the pin only on a fresh/changed assignment (a same-pin re-apply
+     * keeps the existing claim).  Bring it up MUTED when carrying a mute so
+     * a changed pin never exposes an un-muted window; idle level otherwise,
+     * matching boot.  Validation is the caller's responsibility (set_config()
+     * does it before calling us; the boot path trusts persisted values). */
+    if (s_cfg.pin != DAC_HW_MUTE_PIN_NONE && pin_changes) {
+        claim_pin(s_cfg.pin, carry_assert);
     }
+
+    /* Adopt the carried lifecycle assertion under the new config.  The hold
+     * was already satisfied before this re-apply, so no deadline is re-armed;
+     * refresh_pin_assertion() drives the pin to the muted or idle level for
+     * the (possibly changed) polarity.  When not carrying a mute this is the
+     * original behavior: everything zeroed and the pin left un-muted. */
     s_asserted = false;
-    s_lifecycle_asserted = false;
+    s_lifecycle_asserted = carry_assert;
     s_lifecycle_hold_us = 0;
     s_lifecycle_release_us = 0;
     s_test_release_us = 0;
+    refresh_pin_assertion();
 }
 
 uint8_t dac_hw_mute_set_config(const DacHwMuteConfig *cfg) {
