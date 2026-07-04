@@ -1107,14 +1107,25 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
 // ----------------------------------------------------------------------------
 
 // Send a control IN response from the current vendor GET handler.  For USB
-// this completes the EP0 transfer; for an external transport dispatch it
-// captures the (static-storage) pointer for the transport to stream.  Case
-// bodies stay unchanged either way.
+// this completes the EP0 transfer.  For an external transport the bytes are
+// consumed by the caller only AFTER the handler returns, so stack-local
+// response buffers would be dangling by then; non-bulk responses are
+// therefore copied into a static sink here, while the handler frame is
+// still alive.  Only bulk_param_buf (serialized by the bulk owner lock)
+// stays zero-copy.  USB tolerates stack buffers up to 64 bytes because
+// tud_control_xfer copies one EP0 transaction's worth synchronously;
+// anything larger must be static (today only the bulk buffer is).
+static uint8_t _ext_resp_copy[64];
 static void vendor_send_response(const void *data, uint16_t len) {
     if (_active_source == CTRL_SOURCE_USB) {
         tud_control_xfer(_vendor_rhport, _vendor_current_req, (void *)data, len);
+    } else if (data == bulk_param_buf) {
+        _ext_resp_data = bulk_param_buf;
+        _ext_resp_len  = len;
     } else {
-        _ext_resp_data = (const uint8_t *)data;
+        if (len > sizeof(_ext_resp_copy)) len = sizeof(_ext_resp_copy);
+        memcpy(_ext_resp_copy, data, len);
+        _ext_resp_data = _ext_resp_copy;
         _ext_resp_len  = len;
     }
 }

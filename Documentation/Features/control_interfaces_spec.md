@@ -440,6 +440,18 @@ The `status` byte in every UART and I2C response uses the same set:
 | `0x06` | `CTRL_STATUS_OVERSIZE` |
 | `0x07` | `CTRL_STATUS_FRAME_ERROR` |
 
+**What `OK` means on a SET.** `CTRL_STATUS_OK` confirms the frame was valid
+and the command was dispatched; it does not certify the parameter was
+applied. A recognized command whose payload fails the handler's own
+validation (too short, value out of range, invalid channel index) is
+silently ignored, exactly as it is over USB, and still answers `OK`.
+`CTRL_STATUS_ERROR` is returned only for commands the dispatcher itself
+rejects (unknown `bRequest`, or a wValue-only SET sent as a SET-type frame
+instead of a GET-type frame). A client that needs positive confirmation
+should follow the SET with the matching GET and compare; this readback
+contract is the same one USB hosts use (see the write-to-readback map in
+`Documentation/commands.md`).
+
 ### 5.2 Flash-blackout caveat
 
 Any command that writes flash (preset save/load/delete, device-global saves,
