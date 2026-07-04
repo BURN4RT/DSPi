@@ -852,11 +852,11 @@ static inline void dir_apply_dac_hw_mute_defaults(void) {
 // fresh-flash, V5→V6 migration, and sanitize-on-load paths.
 static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i) {
     if (u) {
-        u->enabled  = 0;
-        u->tx_pin   = UART_CTRL_DEFAULT_TX_PIN;
-        u->rx_pin   = UART_CTRL_DEFAULT_RX_PIN;
-        u->reserved = 0;
-        u->baud     = UART_CTRL_DEFAULT_BAUD;
+        u->enabled       = 0;
+        u->tx_pin        = UART_CTRL_DEFAULT_TX_PIN;
+        u->rx_pin        = UART_CTRL_DEFAULT_RX_PIN;
+        u->notify_enable = 0;
+        u->baud          = UART_CTRL_DEFAULT_BAUD;
     }
     if (i) {
         i->enabled = 0;
@@ -876,6 +876,10 @@ static void dir_sanitize_ctrl_iface(void) {
         u->baud < UART_CTRL_BAUD_MIN || u->baud > UART_CTRL_BAUD_MAX) {
         ctrl_iface_defaults(u, NULL);
     }
+    // notify_enable claims the formerly-reserved byte, which old firmware
+    // never validated; clamp a stray value instead of wiping the user's
+    // whole stored config over a byte that used to be meaningless.
+    if (u->notify_enable > 1) u->notify_enable = 0;
     I2cCtrlConfig *i = &dir_cache.i2c_ctrl;
     if (i->enabled > 1 || i->sda_pin > 29 || i->scl_pin > 29 ||
         i->address < I2C_CTRL_ADDRESS_MIN || i->address > I2C_CTRL_ADDRESS_MAX) {

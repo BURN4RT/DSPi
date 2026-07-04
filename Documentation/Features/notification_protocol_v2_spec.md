@@ -1,7 +1,7 @@
 # Notification Protocol v2 Specification
 
-*Status: draft — pending review*
-*Last updated: 2026-04-19*
+*Status: implemented*
+*Last updated: 2026-07-04*
 
 ## 1. Motivation
 
@@ -188,7 +188,9 @@ A single file-scope `WireBulkParams param_shadow` kept in sync with live state. 
 
 ### 4.3 Notification Ring
 
-Replace the single-slot `notify_master_vol_pending` with a fixed-size ring:
+Replace the single-slot `notify_master_vol_pending` with a fixed-size ring. The
+ring has **one producer and multiple independent consumers** (§4.7); each entry
+stores its sequence number, stamped at **push** time:
 
 ```c
 #define NOTIFY_RING_SIZE  32    // power of two
@@ -196,28 +198,30 @@ Replace the single-slot `notify_master_vol_pending` with a fixed-size ring:
 typedef struct {
     uint8_t  event_id;
     uint8_t  source;
+    uint8_t  seq;         // stamped at push (§4.7); v1 entries carry none
     uint16_t wire_offset;
     uint16_t wire_size;
     uint8_t  value[52];   // max PARAM_CHANGED payload
 } NotifyRingEntry;
 
 static NotifyRingEntry notify_ring[NOTIFY_RING_SIZE];
-static volatile uint8_t notify_head, notify_tail;
+static volatile uint8_t notify_head;
+static volatile uint8_t notify_tails[NOTIFY_CONSUMER_COUNT];  // one tail per consumer
 static volatile uint32_t notify_overflow_count;
 ```
 
 **Push rule (called from `param_write` and other emit sites):**
 1. Disable interrupts (short critical section, single-producer assumption is safer if core 1 can also emit).
-2. For coalesceable events (PARAM_CHANGED): scan unsent entries in the ring for a match on `(event_id, wire_offset, wire_size)`. If found, overwrite `value` in place and return.
-3. Otherwise, append at `head`. If the ring is full, increment `notify_overflow_count` and drop the event. Exception: `BULK_INVALIDATED` displaces the oldest unsent entry when the ring is full (it is always deliverable).
+2. For coalesceable events (PARAM_CHANGED): scan the **fully-unsent window** (§4.7) for a match on `(event_id, wire_offset, wire_size)`. If found, overwrite `value` in place and return (its push-time seq stands, since only one packet ever goes out for it).
+3. Otherwise, append at `head`. The push **never fails**: if advancing `head` would collide with an active consumer's tail, that consumer's oldest entry is force-dropped first (its tail is force-advanced, counted in `notify_consumer_drops[c]`) and the push proceeds. Each pushed v2 entry is stamped `seq = ++notify_seq` here; the v1 legacy master-volume entry carries no seq and does not consume one (§4.7). The old "ring full -> drop, except BULK_INVALIDATED displaces the oldest" path is gone; force-advance guarantees delivery for every event type.
 
-**Drain rule (called from `usb_notify_tick` and `xfer_cb`):**
-1. If no entry is pending, arm with the 1-byte `NOTIFY_EVT_IDLE` packet (preserves the always-armed invariant — §3.1).
-2. Otherwise, claim EP via `usbd_edpt_claim`.
-3. Pop entry from `tail`, format into `notify_buf`, stamp `seq = ++notify_seq`, fire `usbd_edpt_xfer`.
-4. On `xfer_cb`, immediately re-arm (idle or next entry).
+**Drain rule (per consumer; USB runs from `usb_notify_tick` / `xfer_cb`, UART from `uart_ctrl_poll`):**
+1. If the consumer has no entry pending, arm with the 1-byte `NOTIFY_EVT_IDLE` packet (USB, to preserve the always-armed invariant, §3.1) or send nothing (UART).
+2. `notify_peek_next_for(consumer, ...)` formats the consumer's next entry into a buffer using the entry's stored `seq`; it does **not** allocate a seq and does **not** advance the tail. It skips entries not meant for this consumer (the v1 master-volume entry is USB-only).
+3. Hand the packet to the transport (USB: claim EP then `usbd_edpt_xfer`; UART: frame it as a `0x40` frame). On successful hand-off, `notify_commit_pop_for(consumer)` advances that consumer's tail.
+4. USB re-arms on `xfer_cb` (idle or next entry).
 
-**Claim failure / xfer rejection** re-inserts the entry at `tail` (push-front) so ordering is preserved.
+Because seq is stamped once at push and stored in the entry, a re-peek or an xfer retry **reuses the same seq** rather than burning a new one; per-consumer gap detection identifies the event, not the transmission attempt. A **claim failure / xfer rejection** simply leaves the entry queued (the commit did not run), so ordering and seq are preserved.
 
 ### 4.4 Source Tag Propagation
 
@@ -253,7 +257,71 @@ Implementation: a `notify_suppress_count` that emit paths check. `preset_apply`,
 
 ### 4.6 Flash Blackout
 
-Unchanged. The ring absorbs events pushed during the blackout; the main loop drains them after. `notify_overflow_count` may tick up if a preset-load + reset sequence lands entirely inside the blackout; `BULK_INVALIDATED`'s displacement rule guarantees at least one is delivered.
+Unchanged. The ring absorbs events pushed during the blackout; the main loop drains them after. `notify_overflow_count` may tick up if a preset-load + reset sequence lands entirely inside the blackout; the producer's force-advance (§4.7) guarantees `BULK_INVALIDATED` is still delivered.
+
+### 4.7 Multi-consumer ring
+
+The single ring feeds more than one transport. As of the UART control interface's
+notification support, the ring has one producer and **multiple independent
+consumers**, each with its own tail into the shared `notify_ring[]`:
+
+| Consumer | Enum | Active when |
+|----------|------|-------------|
+| USB | `NOTIFY_CONSUMER_USB` (0) | Always (the EP 0x83 drain always runs) |
+| UART | `NOTIFY_CONSUMER_UART` (1) | The UART control transport is live **and** `UartCtrlConfig.notify_enable == 1` |
+
+`notify_consumer_set_active(c, active)` toggles a consumer. Activation **snaps
+that consumer's tail to the current head**, so a newly activated consumer sees
+events from that moment on, never a stale backlog. Inactive consumers are
+ignored by the producer's room-making logic. `notify.h` exposes the drain API in
+per-consumer form: `notify_peek_next_for`, `notify_commit_pop_for`,
+`notify_has_pending_for`.
+
+**Per-consumer tails and drop counters.** `notify_head` is the single next-free
+slot; `notify_tails[c]` is consumer `c`'s next-to-send. `head == tails[c]` means
+the ring is empty **for c**. Each consumer drains at its own pace.
+`notify_consumer_drops[c]` counts entries force-dropped from consumer `c`'s view
+(the legacy aggregates `notify_overflow_count` / `notify_drops_count` are kept for
+existing tooling).
+
+**Force-drop policy: a laggard never stalls anyone.** The producer never blocks
+and never fails a push. If appending would make `head` collide with an active
+consumer's tail, that consumer's oldest entry is dropped (its tail is
+force-advanced, `notify_consumer_drops[c]++`) and the push proceeds. A slow or
+starved consumer therefore loses its oldest events but never delays the producer
+or any other consumer. The dropped consumer detects the loss as a **seq gap** and
+recovers with a full `REQ_GET_ALL_PARAMS` (§3.2, §5). This replaces the old
+displace-oldest-on-full path that existed only for `BULK_INVALIDATED`; force-
+advance guarantees delivery for every event type without it.
+
+**Push-time sequence stamping.** `seq` is assigned once, at **push** time, and
+stored in the ring entry (previously it was allocated at drain/transmission time).
+Two consequences:
+- A re-peek or an xfer retry no longer burns a sequence number. Under the old
+  drain-time scheme, a claim failure or rejected transfer could allocate a seq
+  and then not deliver it, which read as a **phantom gap** to USB hosts. Storing
+  the seq in the entry removes that artifact; a gap now means a real drop.
+- The **v1 legacy master-volume entry carries no seq and does not consume one.**
+  Every v1 event has a v2 `PARAM_CHANGED` twin. The v1 entry is delivered to the
+  USB consumer only; other consumers skip it, and because it holds no seq, that
+  skip never reads as a drop. (Were v1 to consume a seq value, the UART consumer
+  would see a one-count gap on every master-volume change.)
+
+**Coalesce window restricted to fully-unsent entries.** Coalescing (PARAM_CHANGED
+on `(offset, size)`, and the single pending `BULK_INVALIDATED` / v1 master-volume)
+may mutate an entry only if **no active consumer has consumed it yet**. The window
+starts at the **fastest** consumer's tail (the one with the fewest pending
+entries). Touching an entry that a faster consumer already sent would make that
+consumer miss the update, so those entries are off-limits; a fresh entry is pushed
+instead.
+
+**USB-reset semantics.** `notify_reset_queue()` (called on USB bus reset) resets
+**only the USB consumer's view**: it snaps `notify_tails[USB]` to `head` (dropping
+the USB backlog, since the host re-syncs with a full read on reconnect) and clears
+the source/bulk brackets. It deliberately leaves the global `notify_seq` counter
+and every other consumer's backlog **intact**; resetting seq would fake a
+wrap-around gap for a mid-stream UART consumer, and clearing another consumer's
+tail would drop events it has not yet drained.
 
 ## 5. Host Migration
 

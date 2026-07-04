@@ -16,9 +16,15 @@
  *                  (no payload; wLen caps the response size, 0 = full)
  *   Response SET : A5 81 status lenL lenH crcL crcH                 (len always 0)
  *   Response GET : A5 82 status lenL lenH payload[len] crcL crcH    (payload only when status==OK)
+ *   Notification : A5 40 00 lenL lenH packet[len] crcL crcH         (device-initiated)
  *
- * Type 0x40 is reserved for future device-initiated notification frames; it is
- * not implemented here (any unknown type byte is treated as noise and dropped).
+ * Notification frames carry the same v2 notify packet the USB interrupt
+ * endpoint (EP 0x83) delivers, verbatim (see notify.h and the notification
+ * protocol spec).  They are pushed only when UartCtrlConfig.notify_enable is
+ * set and only at frame boundaries while the link is otherwise idle, so a
+ * response is never split by one; clients must accept a 0x40 frame at any
+ * point between frames.  A gap in the packets' sequence bytes means events
+ * were dropped for this consumer; recover with a full REQ_GET_ALL_PARAMS.
  *
  * CRC is CRC16-CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflection, no final
  * XOR) computed over every byte after the sync byte (the type byte through the

@@ -114,25 +114,53 @@ void notify_push_bulk_invalidated(ParamSource src);
 // Active USB input channel count changed (2/4/6/8) — host switched the alt.
 void notify_push_input_format(uint8_t channels);
 
-// Drain interface used by usb_audio.c.
+// ---------------------------------------------------------------------------
+// Consumers
 //
-// peek: format the next pending packet into out_buf (max max_len bytes).
-//       Returns the packet length (always > 0 if pending, 0 if ring empty).
-//       Does NOT advance the tail — call notify_commit_pop() on successful
-//       xfer submission.
-uint16_t notify_peek_next(uint8_t *out_buf, uint16_t max_len);
+// The ring supports multiple independent consumers, each with its own tail:
+// USB (EP 0x83 drain in usb_audio.c) and the UART control transport's
+// notification frames.  One producer path feeds all of them.  A lagging
+// consumer never delays the producer or the other consumers: when the
+// producer catches a consumer's tail, that consumer's oldest entry is
+// force-dropped (counted in notify_consumer_drops) and the push proceeds.
+// Consumers detect their drops from the packet sequence-number gap and
+// recover with a full REQ_GET_ALL_PARAMS read.
+// ---------------------------------------------------------------------------
 
-// Commit the last peek — advances the ring tail.  Must be called iff the
-// packet returned by peek was successfully submitted to the USB stack.
-void notify_commit_pop(void);
+typedef enum {
+    NOTIFY_CONSUMER_USB  = 0,   // always active
+    NOTIFY_CONSUMER_UART = 1,   // active while the UART transport is live
+                                // with notifications enabled
+    NOTIFY_CONSUMER_COUNT
+} NotifyConsumer;
 
-// True when at least one entry is pending delivery.  Lock-free fast path.
-bool notify_has_pending(void);
+// Activate / deactivate a consumer.  Activation snaps the consumer's tail
+// to the current head (it sees events from now on, never a stale backlog).
+// Inactive consumers are ignored by the producer's room-making logic.
+void notify_consumer_set_active(NotifyConsumer c, bool active);
 
-// Clear all pending state.  Called on USB reset.
+// peek: format consumer `c`'s next pending packet into out_buf (max max_len
+// bytes).  Returns the packet length, or 0 when nothing is pending.  Skips
+// entries not meant for this consumer (the v1 legacy master-volume packet
+// is USB-only; every v1 event has a v2 twin).  Does NOT advance the tail;
+// call notify_commit_pop_for() once the packet is safely handed off.
+uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_len);
+
+// Commit the last peek for consumer `c`, advancing its tail.  A no-op if
+// the producer force-dropped past the peeked entry in the meantime.
+void notify_commit_pop_for(NotifyConsumer c);
+
+// True when consumer `c` is active and has at least one entry pending.
+bool notify_has_pending_for(NotifyConsumer c);
+
+// Reset the USB consumer's view (drop its pending backlog) and the global
+// source/bulk brackets.  Called on USB bus reset.  Other consumers'
+// backlogs and the global sequence counter are deliberately untouched.
 void notify_reset_queue(void);
 
-// Debug / diagnostics.
+// Debug / diagnostics.  notify_consumer_drops counts force-dropped entries
+// per consumer; the two legacy aggregates are kept for existing tooling.
+extern volatile uint32_t notify_consumer_drops[NOTIFY_CONSUMER_COUNT];
 extern volatile uint32_t notify_overflow_count;
 extern volatile uint32_t notify_drops_count;
 

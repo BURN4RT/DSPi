@@ -1290,21 +1290,6 @@ void core0_init() {
         dac_hw_mute_init(&hw);
     }
 
-    // External control interfaces (UART / I2C target).  Must come after
-    // preset_boot_load() so the persisted directory config is available and
-    // after the output/DAC-mute pin claims above so a stored config whose
-    // pins now collide is quietly kept down (live=false; the host sees it
-    // via REQ_GET_CTRL_IFACE_STATUS).  Both interfaces ship disabled.
-    {
-        UartCtrlConfig ucfg;
-        I2cCtrlConfig  icfg;
-        preset_get_ctrl_iface(&ucfg, &icfg);
-        // Record the boot validation results so REQ_GET_CTRL_IFACE_STATUS is
-        // truthful when a stored config's pins now collide (live stays 0).
-        ctrl_uart_last_status = uart_ctrl_init(&ucfg);
-        ctrl_i2c_last_status  = i2c_ctrl_init(&icfg);
-    }
-
     // Sync MCK library state with the just-loaded globals.  usb_sound_card_init()
     // (above) called audio_i2s_mck_setup() with the boot-default pin; if the
     // preset specifies a different mck_pin or wants mck_enabled=true, the
@@ -1455,6 +1440,23 @@ void core0_init() {
     // subsequent param_write call sees a truthful baseline and only emits
     // notifications on real changes.
     notify_init();
+
+    // External control interfaces (UART / I2C target).  Deliberately last:
+    // after preset_boot_load() (persisted config available), after every
+    // audio pin claim above (a stored control config whose pins now collide
+    // is quietly kept down, visible via REQ_GET_CTRL_IFACE_STATUS), and
+    // after notify_init() so the UART bring-up's notify-consumer activation
+    // is not wiped by the consumer-table reset.  Both interfaces ship
+    // disabled.
+    {
+        UartCtrlConfig ucfg;
+        I2cCtrlConfig  icfg;
+        preset_get_ctrl_iface(&ucfg, &icfg);
+        // Record the boot validation results so REQ_GET_CTRL_IFACE_STATUS is
+        // truthful when a stored config's pins now collide (live stays 0).
+        ctrl_uart_last_status = uart_ctrl_init(&ucfg);
+        ctrl_i2c_last_status  = i2c_ctrl_init(&icfg);
+    }
 }
 
 int main(void) {

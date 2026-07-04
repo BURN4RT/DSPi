@@ -242,7 +242,7 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 **Persistence (compat-breaking).** Wire `WIRE_FORMAT_VERSION=16` (direct 8-input matrix/preamp + 17-channel EQ; no tail-append/version gates; 5864 B). Flash `SLOT_DATA_VERSION=21` (direct layout; the slot spans **2 flash sectors** on RP2350; 1 on RP2040). No migration — pre-version data loads factory defaults.
 
 ### Notification Endpoint (device→host push)
-*Last updated: 2026-05-17 (added PARAM_SRC_UAC1 = 7 for UAC1 Feature Unit writes)*
+*Last updated: 2026-07-04 (multi-consumer ring: UART transport added as a second consumer; push-time seq)*
 
 The vendor interface carries one **bulk IN** endpoint (EP 0x83, wMaxPacketSize = 64) for out-of-band device→host notifications. The transport runs two protocol versions in parallel: v1 (8-byte `MASTER_VOLUME` packets, kept for existing host apps) and v2 (generic `PARAM_CHANGED` + discrete events, the primary protocol going forward). `USB_BCD_DEVICE = 0x0201` so Windows re-reads descriptors after the 8→64 byte EP bump.
 
@@ -254,7 +254,7 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 
 **Subsystem state:**
 - `param_shadow`: mirror of `WireBulkParams` (3664 B BSS at V11). `notify_param_write` compares writes against it; notifications only fire on real byte-level changes.
-- `notify_ring[32]`: SPSC ring of pending events (1920 B BSS). Coalesces PARAM_CHANGED entries on `(event_id, offset, size)` — a swept knob generates one queued entry, not hundreds.
+- `notify_ring[32]`: single-producer, **multi-consumer** ring of pending events (1920 B BSS). Coalesces PARAM_CHANGED entries on `(event_id, offset, size)`; a swept knob generates one queued entry, not hundreds. Coalescing only mutates entries no active consumer has consumed yet (window starts at the fastest consumer's tail). See "Multi-consumer ring" below.
 - `notify_bulk_depth`: nesting counter. While `> 0`, per-field `param_write` calls are suppressed (shadow still updates) and the outermost `notify_end_bulk()` emits a single `BULK_INVALIDATED` event.
 - `notify_current_source`: global source tag set by scoped brackets (see below).
 
@@ -275,9 +275,11 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 
 **Bulk operations** (preset load, factory reset, bulk SET): wrapped in `notify_begin_bulk(source)` / `notify_end_bulk()`. Per-field writes don't flood the ring; the host sees one `BULK_INVALIDATED` and reads `REQ_GET_ALL_PARAMS` for the full state. Preset load also emits `NOTIFY_EVT_PRESET_LOADED(slot)` before the bulk opens.
 
-**Drain:** `usb_notify_drain` (usb_audio.c) claims EP 0x83 via `usbd_edpt_claim`, calls `notify_peek_next` to format the next packet into the stable TX buffer, and submits via `usbd_edpt_xfer`. On success, `notify_commit_pop` advances the ring tail. On xfer rejection, the entry stays queued; the next tick retries.
+**Drain:** each consumer drains its own tail via `notify_peek_next_for(consumer, ...)` / `notify_commit_pop_for(consumer)`. The USB consumer (`usb_notify_drain` in usb_audio.c) claims EP 0x83 via `usbd_edpt_claim`, formats the next packet into the stable TX buffer, and submits via `usbd_edpt_xfer`; on success `notify_commit_pop_for(USB)` advances the USB tail, and on xfer rejection the entry stays queued for the next tick. The UART consumer drains from `uart_ctrl_poll` (see "Multi-consumer ring").
 
-**Initialisation:** `notify_init()` is called from `core0_init()` after `preset_boot_load()` so `bulk_params_collect(&param_shadow)` sees a fully-populated live state. The USB reset path (`uac1_driver_reset`) calls `notify_reset_queue()` to drop stale events.
+**Multi-consumer ring:** the ring supports independent consumers, each with its own tail: `NOTIFY_CONSUMER_USB` (always active) and `NOTIFY_CONSUMER_UART` (active while the UART transport is live with `notify_enable` set). `notify_consumer_set_active(c, active)` snaps a newly activated consumer's tail to `head` so it sees no stale backlog. A lagging consumer never stalls the producer or another consumer: if a push would collide with a consumer's tail, that consumer's oldest entry is force-dropped (counted in `notify_consumer_drops[c]`) and the push proceeds; the consumer detects the loss as a seq gap and re-reads `REQ_GET_ALL_PARAMS`. Sequence numbers are stamped at **push** time and stored in the ring entry (not allocated at drain time), so a re-peek or xfer retry does not burn a number; this removed a historical phantom-gap artifact for USB hosts where a rejected transfer had allocated but not delivered a seq. The v1 legacy master-volume entry carries no seq, consumes none, and is delivered to the USB consumer only (every v1 event has a v2 twin, which the UART consumer receives instead). The old displace-oldest-on-full path for `BULK_INVALIDATED` is gone; force-advance guarantees delivery for every event type.
+
+**Initialisation:** `notify_init()` is called from `core0_init()` after `preset_boot_load()` so `bulk_params_collect(&param_shadow)` sees a fully-populated live state. The control-interface init block (UART / I2C) is now **deliberately placed after** `notify_init()` in `core0_init()`, so the UART bring-up's notify-consumer activation is not wiped by the consumer-table reset inside `notify_init()`. The USB reset path (`uac1_driver_reset`) calls `notify_reset_queue()`, which resets **only** the USB consumer's view (drops its backlog) and the source/bulk brackets; the global seq counter and other consumers' backlogs are left intact (resetting seq would fake a wrap-around gap for a mid-stream UART consumer).
 
 **v1 back-compat:** `update_master_volume` still pushes an 8-byte `MASTER_VOLUME` (0x01) event into the ring. Existing v1 host apps that only recognise byte 0 = 0x01 continue to work; v2 hosts receive the parallel PARAM_CHANGED event and dispatch by offset.
 
@@ -1789,8 +1791,19 @@ transport.
 
 - `uart_control.c` / `.h`: sync-byte + CRC16-CCITT-FALSE framing (poly `0x1021`,
   init `0xFFFF`), fixed 8N1, configurable baud 9600..1000000. Types `0x01`/`0x02`
-  requests, `0x81`/`0x82` responses; `0x40` reserved for future device-initiated
-  notifications (not implemented; v1 is request/response only).
+  requests, `0x81`/`0x82` responses, and `0x40` **device-initiated notification**
+  frames (`A5 40 00 lenL lenH packet crc16`). The notification `packet` is the
+  verbatim v2 notify packet the USB EP 0x83 delivers; the UART transport is a
+  second consumer of the notification ring (`NOTIFY_CONSUMER_UART`). Frames are
+  opt-in via `UartCtrlConfig.notify_enable` (formerly a reserved byte; 0/1,
+  default 0; validated in `uart_ctrl_validate`, sanitized in `flash_storage.c`;
+  no directory version bump or wire change since all prior configs carry 0
+  there). They are pushed only when the link is otherwise idle so a response is
+  never split; a saturating requester can starve them, and the seq-gap contract
+  (client re-reads `REQ_GET_ALL_PARAMS`) covers recovery. The v1 legacy
+  master-volume packet is never sent over UART. Enabling/disabling tracks the
+  live interface: `up()` activates the UART consumer when `notify_enable` is set,
+  `down()` deactivates it.
 - `i2c_control.c` / `.h`: target-only, 8-byte header write frames,
   `[status,lenL,lenH,payload]` read frames with `0xFF` padding, a `[0x01,0,0]`
   BUSY frame before the main loop dispatches, and resumable chunked reads. Up to
@@ -1808,10 +1821,13 @@ USB IRQs).
 
 ### Boot and main-loop wiring
 
-- **Boot** (`main.c`): after `preset_boot_load()` and after the output / DAC-mute
-  pin claims, `preset_get_ctrl_iface()` supplies the persisted configs to
-  `uart_ctrl_init()` / `i2c_ctrl_init()`. A stored config whose pins now collide
-  is quietly kept down (live=false), visible via `REQ_GET_CTRL_IFACE_STATUS`.
+- **Boot** (`main.c`): the control-interface init block is deliberately last in
+  `core0_init()`: after `preset_boot_load()`, after the output / DAC-mute pin
+  claims, and after `notify_init()` (so the UART bring-up's notify-consumer
+  activation is not wiped by the consumer-table reset inside `notify_init()`).
+  `preset_get_ctrl_iface()` supplies the persisted configs to `uart_ctrl_init()`
+  / `i2c_ctrl_init()`. A stored config whose pins now collide is quietly kept
+  down (live=false), visible via `REQ_GET_CTRL_IFACE_STATUS`.
 - **Main loop:** `uart_ctrl_poll()` and `i2c_ctrl_poll()` run every iteration.
 - **Deferred config SET:** a USB `0xF5`/`0xF7` sets `ctrl_set_uart_pending` /
   `ctrl_set_i2c_pending`; the main loop does the live apply first (GPIO/IRQ work,

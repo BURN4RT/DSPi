@@ -11,6 +11,7 @@
 #include "vendor_commands.h"
 #include "usb_audio.h"
 #include "bulk_params.h"
+#include "notify.h"
 #include "config.h"
 
 #include "pico/stdlib.h"
@@ -26,7 +27,7 @@
 #define UART_SYNC            0xA5u
 #define UART_TYPE_SET        0x01u
 #define UART_TYPE_GET        0x02u
-#define UART_TYPE_NOTIFY     0x40u  // reserved (device->host); not implemented
+#define UART_TYPE_NOTIFY     0x40u  // device->host async notification frame
 #define UART_RESP_SET        0x81u
 #define UART_RESP_GET        0x82u
 
@@ -89,6 +90,10 @@ static bool     parser_holds_bulk = false;  // parser owns the bulk lock
 
 static uint8_t  payload_buf[PAYLOAD_MAX];
 static uint8_t  tx_copy[TX_COPY_MAX];
+// Notification packet staging: decoupled from tx_copy so response and
+// notification lifetimes can never entangle.  Sized for the largest v2
+// notify packet (12 + 52).
+static uint8_t  notify_pkt[64];
 static uint32_t last_byte_time = 0;
 
 // ---------------------------------------------------------------------------
@@ -498,9 +503,12 @@ static void up(void) {
     uart_set_irq_enables(g_uart, true, false);  // RX + RX-timeout, no TX IRQ
 
     g_is_live = true;
+    notify_consumer_set_active(NOTIFY_CONSUMER_UART,
+                               g_live.notify_enable != 0);
 }
 
 static void down(void) {
+    notify_consumer_set_active(NOTIFY_CONSUMER_UART, false);
     if (g_irq_installed) {
         uart_set_irq_enables(g_uart, false, false);
         irq_set_enabled(g_irq, false);
@@ -525,6 +533,7 @@ static void down(void) {
 uint8_t uart_ctrl_validate(const UartCtrlConfig *cfg) {
     if (!cfg) return PIN_CONFIG_INVALID_PARAM;
     if (cfg->enabled > 1) return PIN_CONFIG_INVALID_PARAM;
+    if (cfg->notify_enable > 1) return PIN_CONFIG_INVALID_PARAM;
     if (cfg->baud < UART_CTRL_BAUD_MIN || cfg->baud > UART_CTRL_BAUD_MAX)
         return PIN_CONFIG_INVALID_PARAM;
     if (!is_valid_gpio_pin(cfg->tx_pin) || !is_valid_gpio_pin(cfg->rx_pin))
@@ -601,6 +610,23 @@ void uart_ctrl_poll(void) {
 
     // Parse new bytes only when the transport is otherwise idle.
     if (!tx.active && !pending.active) parse_ring();
+
+    // Notification frames go out only when the transport is STILL idle
+    // after parsing, so request/response traffic always takes precedence
+    // (a saturating requester can starve notifications; the ring's
+    // force-drop plus the packet seq gap covers that, and the client
+    // re-reads full state).  The packet is copied into notify_pkt by the
+    // peek, so the ring entry is committed immediately; the TX pump then
+    // streams the frame at FIFO pace with no blocking.
+    if (g_live.notify_enable && !tx.active && !pending.active) {
+        uint16_t n = notify_peek_next_for(NOTIFY_CONSUMER_UART,
+                                          notify_pkt, sizeof(notify_pkt));
+        if (n) {
+            notify_commit_pop_for(NOTIFY_CONSUMER_UART);
+            start_tx(UART_TYPE_NOTIFY, CTRL_STATUS_OK, notify_pkt, n, false);
+            pump_tx();   // start pushing bytes this same poll
+        }
+    }
 }
 
 bool uart_ctrl_owns_pin(uint8_t pin) {

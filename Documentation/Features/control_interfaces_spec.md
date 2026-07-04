@@ -86,14 +86,17 @@ All fields little-endian, packed, no padding.
 
 ```c
 // UART control interface configuration (8 bytes).  Framing is fixed 8N1
-// (the wire CRC16 covers integrity, so parity adds nothing); only the baud
-// rate is configurable.
+// (the wire CRC16 covers integrity, so parity adds nothing); the baud rate
+// and the notify_enable flag are configurable.  notify_enable claims the
+// byte that was formerly reserved; every stored or wired config predating it
+// carries 0 there, so notifications default off with no directory version
+// bump and no change to the 8-byte wire layout.
 typedef struct __attribute__((packed)) {
-    uint8_t  enabled;   // 0 = off, 1 = on
-    uint8_t  tx_pin;    // GPIO carrying a UARTx TX mux; pin % 4 == 0
-    uint8_t  rx_pin;    // GPIO carrying a UARTx RX mux; pin % 4 == 1, same instance
-    uint8_t  reserved;  // 0
-    uint32_t baud;      // 9600 .. 1000000
+    uint8_t  enabled;       // 0 = off, 1 = on
+    uint8_t  tx_pin;        // GPIO carrying a UARTx TX mux; pin % 4 == 0
+    uint8_t  rx_pin;        // GPIO carrying a UARTx RX mux; pin % 4 == 1, same instance
+    uint8_t  notify_enable; // 0 = off (default), 1 = push type-0x40 notification frames (see 3.6)
+    uint32_t baud;          // 9600 .. 1000000
 } UartCtrlConfig;
 
 // I2C target control interface configuration (8 bytes).  Bus speed and
@@ -208,9 +211,10 @@ comparing the config's `enabled` against the live flag from `0xF9`.
 - **Framing:** fixed **8N1** (8 data bits, no parity, 1 stop bit). Parity is
   intentionally not offered; the wire CRC16 provides integrity end to end.
 - **Baud:** configurable 9600 .. 1000000; default 115200.
-- **Direction:** full duplex, but the protocol is strictly request/response;
-  the device only transmits in reply to a request (see 3.6 for the reserved
-  notification channel).
+- **Direction:** full duplex. The protocol is request/response, with one
+  optional exception: when notifications are enabled the device may also send
+  unsolicited notification frames at frame boundaries while the link is idle
+  (see 3.6).
 
 ### 3.2 Frame formats
 
@@ -233,6 +237,11 @@ Response SET  (device -> host):
 Response GET  (device -> host):
   A5 82 status lenL lenH payload[len]                             crcL crcH
       (payload present only when status == OK)
+
+Notification (device -> host):
+  A5 40 00 lenL lenH packet[len]                                  crcL crcH
+      (device-initiated; byte 2 is a fixed 0x00 status placeholder;
+       `packet` is a verbatim v2 notify packet; see 3.6)
 ```
 
 Type byte summary:
@@ -241,7 +250,7 @@ Type byte summary:
 |------|---------|
 | `0x01` | SET request |
 | `0x02` | GET request |
-| `0x40` | Reserved for future device-initiated notifications (not implemented) |
+| `0x40` | Device-initiated notification (opt-in; see 3.6) |
 | `0x81` | SET response |
 | `0x82` | GET response |
 
@@ -299,14 +308,47 @@ shared `CTRL_STATUS_*` codes:
   hundred milliseconds and retries on timeout or on `BUSY` / `BULK_LOCKED` / a
   CRC error.
 
-### 3.6 Future notifications
+### 3.6 Asynchronous notifications
 
-Frame type `0x40` is reserved for device-initiated asynchronous notification
-frames (for example, to push a parameter change or a preset-load event to the
-UART controller without polling). Version 1 is **request/response only**; the
-device never sends unsolicited frames today. A forward-compatible client should
-already treat a leading `0xA5 0x40 ...` frame as "ignore for now" rather than a
-protocol error. Until then, poll the relevant GET commands for state.
+The device can push change/event notifications to the UART controller without
+polling, using frame type `0x40`. This mirrors the USB interrupt/notification
+endpoint (EP 0x83): a UART client can track parameter changes, preset loads, and
+input-format changes live instead of re-reading GET commands on a timer.
+
+**Enabling.** Notifications are opt-in via the `notify_enable` byte of
+`UartCtrlConfig` (0 = off, the default; 1 = on). Like all interface
+configuration, `notify_enable` is set over USB only (`REQ_SET_UART_CONFIG`,
+`0xF5`); it cannot be changed over the UART link itself. See 2.1.
+
+**Frame.** A notification frame is `A5 40 00 lenL lenH packet[len] crcL crcH`.
+Byte 2 is a fixed `0x00` placeholder in the status slot (there is no status on a
+device-initiated frame). `packet` is the **verbatim v2 notify packet**, byte for
+byte the same payload the USB notification endpoint delivers; parse it exactly as
+described in `Documentation/Features/notification_protocol_v2_spec.md`. The v1
+legacy master-volume packet is **never** sent over UART; every v1 event has a v2
+twin, so a UART client sees the v2 `PARAM_CHANGED` for master volume instead.
+
+**Idle-priority rule.** A notification frame is emitted only at a frame boundary
+while the link is otherwise idle (no response is being sent and no request is
+being parsed or dispatched), so a notification **never splits or delays a
+response**; request/response traffic always takes precedence. A notification may
+therefore appear at any point between frames. A client that streams requests
+back to back can starve notifications indefinitely; that is intentional and the
+seq-gap recovery contract below covers it.
+
+**Recovery contract.** Every v2 packet carries an 8-bit `seq` byte that
+increments per notification for this consumer. A **gap** in `seq` (a jump larger
+than 1, accounting for the wrap at 256) means one or more events were dropped for
+this consumer; recover by issuing a full `REQ_GET_ALL_PARAMS` (`0xA0`) to re-sync
+state. Drops happen when the device produces events faster than a starved or slow
+UART consumer drains them; the ring force-drops the consumer's oldest entry to
+keep the producer and other consumers moving, and the seq gap is how the client
+detects it.
+
+A client that does not enable notifications simply never sees a `0x40` frame and
+polls the relevant GET commands for state, exactly as before. A
+forward-compatible client that leaves notifications off should still treat a
+stray `0xA5 0x40 ...` frame as "ignore" rather than a protocol error.
 
 ### 3.7 Bulk transfer notes (0xA0 / 0xA1)
 
@@ -335,7 +377,11 @@ short.
 ### 4.1 Electrical and bus parameters
 
 - **Role:** target (slave) only. The DSPi never initiates bus traffic; an
-  external controller is always the master.
+  external controller is always the master. There is consequently **no
+  asynchronous notification channel on I2C** (that requires the target to
+  initiate a transfer, which it cannot): an I2C controller stays **poll-only**
+  and re-reads the relevant GET commands for state. The `0x40` notification
+  frame (3.6) is UART-only.
 - **Addressing:** 7-bit. Configurable address 0x08 .. 0x77; default 0x42.
 - **Speed:** up to **400 kHz** (Fast-mode). The device does not restrict the SCL
   rate itself; keep the master at or below 400 kHz.

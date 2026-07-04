@@ -1043,10 +1043,11 @@ static void __not_in_flash_func(usb_notify_drain)(uint8_t rhport) {
     uint16_t len;
     bool consumed_ring_entry = false;
 
-    if (notify_has_pending()) {
+    if (notify_has_pending_for(NOTIFY_CONSUMER_USB)) {
         // Format the next queued event.  peek does NOT advance the tail;
         // we commit only after the xfer is accepted by DCD.
-        len = notify_peek_next(notify_buf, NOTIFY_EP_MAX_PKT);
+        len = notify_peek_next_for(NOTIFY_CONSUMER_USB, notify_buf,
+                                   NOTIFY_EP_MAX_PKT);
         consumed_ring_entry = (len > 0);
     } else {
         len = 0;
@@ -1070,7 +1071,7 @@ static void __not_in_flash_func(usb_notify_drain)(uint8_t rhport) {
     // Xfer accepted.  Advance the ring tail only if this packet represented
     // a real event; idle keep-alives don't consume ring entries.
     if (consumed_ring_entry) {
-        notify_commit_pop();
+        notify_commit_pop_for(NOTIFY_CONSUMER_USB);
     }
 }
 

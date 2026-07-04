@@ -800,8 +800,14 @@ transport wire protocol is in `Documentation/Features/control_interfaces_spec.md
 | 0xF8 | `GET_I2C_CONFIG` | R | 0 | resp 8 bytes | Live `I2cCtrlConfig` |
 | 0xF9 | `GET_CTRL_IFACE_STATUS` | R | 0 | resp 8 bytes | `CtrlIfaceStatus`: `[uart_last_status, uart_live, i2c_last_status, i2c_live, proto_version(=1), 0,0,0]` |
 
-`UartCtrlConfig` (8 bytes, LE): `[enabled(0/1), tx_pin, rx_pin, reserved, baud(u32)]`.
-Defaults: disabled, TX GPIO 16, RX GPIO 17, baud 115200 (range 9600..1000000).
+`UartCtrlConfig` (8 bytes, LE): `[enabled(0/1), tx_pin, rx_pin, notify_enable(0/1), baud(u32)]`.
+Defaults: disabled, TX GPIO 16, RX GPIO 17, notifications off, baud 115200 (range 9600..1000000).
+`notify_enable` claims the byte that was formerly reserved: set it to 1 to have the
+device push device-initiated notification frames (type `0x40`, carrying the verbatim
+v2 notify packet) over the UART link; 0 (the default) leaves the link poll-only. All
+prior stored/wired configs carry 0 there, so the default is off with no wire or
+directory-version change. Like all interface config it is USB-only to set. See
+section 18 and `Documentation/Features/control_interfaces_spec.md` (3.6).
 
 `I2cCtrlConfig` (8 bytes, LE): `[enabled(0/1), sda_pin, scl_pin, address, reserved[4]]`.
 Defaults: disabled, SDA GPIO 18, SCL GPIO 19, address 0x42 (range 0x08..0x77).
@@ -834,6 +840,13 @@ changed field and `size` is its length; `value` is the new little-endian bytes.
 This lets a host dispatch on offset rather than a per-command switch. `src` is the
 origin (1=host SET, 2=bulk SET, 3=preset, 4=factory, 5=GPIO, 6=internal, 7=UAC1).
 On `BULK_INVALIDATED` or `PRESET_LOADED`, re-read `REQ_GET_ALL_PARAMS`.
+
+The same v2 packets can also be delivered over the **UART control transport** as
+type-`0x40` frames when `UartCtrlConfig.notify_enable` is set (see section 17 and
+`control_interfaces_spec.md` 3.6); the v1 legacy master-volume packet is USB-only.
+A gap in the packet `seq` byte means events were dropped for that consumer; recover
+with `REQ_GET_ALL_PARAMS`. The I2C target is poll-only (it cannot initiate a
+transfer, so it has no notification channel).
 
 ---
 

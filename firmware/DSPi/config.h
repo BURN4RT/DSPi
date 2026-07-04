@@ -367,12 +367,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 // UART control interface configuration.  Fixed 8N1 framing (the wire CRC16
 // covers integrity, so parity adds nothing); only the baud rate is
 // configurable.  Persisted device-level in the preset directory (V6+).
+// notify_enable claims the former reserved byte: every stored/wired config
+// predating it carries 0 there, so notifications default off with no
+// directory version bump or wire change.
 typedef struct __attribute__((packed)) {
-    uint8_t  enabled;      // 0/1
-    uint8_t  tx_pin;       // GPIO with UARTx TX mux (pin%4 == 0)
-    uint8_t  rx_pin;       // GPIO with UARTx RX mux (pin%4 == 1), same instance
-    uint8_t  reserved;
-    uint32_t baud;         // UART_CTRL_BAUD_MIN..MAX
+    uint8_t  enabled;       // 0/1
+    uint8_t  tx_pin;        // GPIO with UARTx TX mux (pin%4 == 0)
+    uint8_t  rx_pin;        // GPIO with UARTx RX mux (pin%4 == 1), same instance
+    uint8_t  notify_enable; // 0/1: push async notification frames (type 0x40)
+    uint32_t baud;          // UART_CTRL_BAUD_MIN..MAX
 } UartCtrlConfig;
 
 // I2C target (slave) control interface configuration.  Bus speed and clock
