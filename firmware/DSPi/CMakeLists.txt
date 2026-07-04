@@ -30,6 +30,8 @@ add_executable(DSPi
     flash_clkdiv.h
     flash_storage.c
     flash_storage.h
+    i2c_control.c
+    i2c_control.h
     i2s_input.c
     i2s_input.h
     leveller.c
@@ -45,6 +47,8 @@ add_executable(DSPi
     pdm_generator.h
     spdif_input.c
     spdif_input.h
+    uart_control.c
+    uart_control.h
     usb_audio.c
     usb_audio.h
     vendor_commands.c
@@ -85,6 +89,13 @@ endif()
 
 pico_set_binary_type(DSPi copy_to_ram)
 
+if (PICO_PLATFORM STREQUAL "rp2040")
+    # Custom copy-to-RAM script: keeps the vendor-command dispatcher and the
+    # UART/I2C control transports executing from flash (XIP) to fit the
+    # 264 KB RAM budget.  RP2350 has headroom and uses the SDK script.
+    pico_set_linker_script(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/memmap_dspi_rp2040_copy_to_ram.ld)
+endif()
+
 pico_generate_pio_header(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/i2s_input.pio)
 
 target_include_directories(DSPi PRIVATE
@@ -106,13 +117,6 @@ target_compile_definitions(DSPi PRIVATE
     # irq_has_shared_handler), removed irq_set_enabled in teardown,
     # interrupt-safe _spdif_rx_common_end.
     PICO_SPDIF_RX_DMA_IRQ=1
-
-    # Debug UART0 parked at the numeric top of the exposed GPIOs (16/17), clear
-    # of every default audio pin (I2S-in 1-4, SPDIF-in 5, outputs 6-10, mute 11,
-    # clocks 13-15) and of the ADC pins (26-28).  Both TX and RX are overridden
-    # so the SDK default (RX on GPIO 1) can't steal the I2S-RX pair-0 data line.
-    PICO_DEFAULT_UART_TX_PIN=16
-    PICO_DEFAULT_UART_RX_PIN=17
 )
 
 target_link_libraries(DSPi
@@ -122,10 +126,15 @@ target_link_libraries(DSPi
     hardware_pwm
     hardware_flash
     hardware_adc
+    hardware_i2c
+    pico_i2c_slave
     pico_audio_spdif_multi
     pico_audio_i2s_multi
     pico_spdif_rx
     tinyusb_device
 )
+
+# Debug UART removed; GPIO 16/17 are freed for the UART control interface.
+pico_enable_stdio_uart(DSPi 0)
 
 pico_add_extra_outputs(DSPi)

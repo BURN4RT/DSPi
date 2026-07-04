@@ -615,7 +615,7 @@ The band index is implicit in array position (row = channel, column = band).
 
 These are the commands a remote UI polls for live metering. All are reads.
 
-### 14.1 `REQ_GET_STATUS` (0x50, read) — `wValue` selects the sub-query
+### 14.1 `REQ_GET_STATUS` (0x50, read): `wValue` selects the sub-query
 
 Most sub-queries return **4 bytes** (a `u32`/packed value). `wValue=9` is special
 and returns a combined packet.
@@ -783,6 +783,35 @@ After the 1-byte ACK the firmware waits ~100 ms and resets into the UF2
 bootloader. The bridge will lose the device until new firmware is flashed and it
 re-enumerates as the DSPi again. Gate this behind explicit user confirmation.
 
+### 17.1 External control interfaces (UART / I2C target)
+
+The firmware can also be driven over an external UART or I2C target interface at
+full parity with USB. These five commands configure and inspect those transports.
+The two SET commands (`0xF5`, `0xF7`) are **USB only**: when issued over the UART
+or I2C transport itself they are refused with a `BLOCKED` status, so an external
+controller can never reconfigure or lock itself out of its own link. The full
+transport wire protocol is in `Documentation/Features/control_interfaces_spec.md`.
+
+| ID | Name | Dir | wValue | Payload / Response | Notes |
+|----|------|-----|--------|--------------------|-------|
+| 0xF5 | `SET_UART_CONFIG` | W (0x41) | 0 | payload 8-byte `UartCtrlConfig` | **USB only.** Validates + applies deferred; persists on success; returns `PIN_CONFIG_*` (0=ok, 1=bad pin, 2=pin in use, 5=bad baud) |
+| 0xF6 | `GET_UART_CONFIG` | R | 0 | resp 8 bytes | Live `UartCtrlConfig` |
+| 0xF7 | `SET_I2C_CONFIG` | W (0x41) | 0 | payload 8-byte `I2cCtrlConfig` | **USB only.** As 0xF5; status 5 = bad I2C address (valid 0x08..0x77) |
+| 0xF8 | `GET_I2C_CONFIG` | R | 0 | resp 8 bytes | Live `I2cCtrlConfig` |
+| 0xF9 | `GET_CTRL_IFACE_STATUS` | R | 0 | resp 8 bytes | `CtrlIfaceStatus`: `[uart_last_status, uart_live, i2c_last_status, i2c_live, proto_version(=1), 0,0,0]` |
+
+`UartCtrlConfig` (8 bytes, LE): `[enabled(0/1), tx_pin, rx_pin, reserved, baud(u32)]`.
+Defaults: disabled, TX GPIO 16, RX GPIO 17, baud 115200 (range 9600..1000000).
+
+`I2cCtrlConfig` (8 bytes, LE): `[enabled(0/1), sda_pin, scl_pin, address, reserved[4]]`.
+Defaults: disabled, SDA GPIO 18, SCL GPIO 19, address 0x42 (range 0x08..0x77).
+
+Both interfaces ship disabled; configuration is device-level, persists across
+reboots, and survives a factory reset. `uart_live` / `i2c_live` in the status
+readback reflect whether the interface actually came up: a stored config whose
+pins collide with the current output wiring at boot stays down even though its
+`enabled` byte is 1.
+
 ---
 
 ## 18. Asynchronous notifications (optional)
@@ -838,6 +867,8 @@ Every settable parameter has a matching read. Use this to verify a write landed
 | 0xED SET_INPUT_RATE | 0xEE GET_INPUT_RATE |
 | 0xE6 SET_LG_SOUND_SYNC_ENABLE | 0xE7 GET_LG_SOUND_SYNC_ENABLE |
 | 0xEA SET_DAC_HW_MUTE_CONFIG | 0xEB GET_DAC_HW_MUTE_CONFIG |
+| 0xF5 SET_UART_CONFIG (USB only) | 0xF6 GET_UART_CONFIG |
+| 0xF7 SET_I2C_CONFIG (USB only) | 0xF8 GET_I2C_CONFIG |
 | 0x9B SET_CHANNEL_NAME | 0x9C GET_CHANNEL_NAME |
 | 0x94 PRESET_SET_NAME | 0x93 PRESET_GET_NAME |
 | 0x96 PRESET_SET_STARTUP | 0x97 PRESET_GET_STARTUP |
@@ -878,6 +909,11 @@ rejection or trigger a busy window / re-enumeration.
 > changes through a synchronized, muted pipeline reset. A bridge must not attempt
 > to "optimize" by issuing partial or out-of-band reconfiguration; always use these
 > opcodes as defined.
+
+**Section 22 walks through the exact end-to-end workings of the most consequential
+of these operations** (bulk apply, the device-global saves, preset writes, pin
+writes, output-bus reconfiguration, factory reset, the persistence model, and the
+bootloader jump). Read it before implementing any of them in a bridge.
 
 ---
 
@@ -1016,6 +1052,11 @@ with no OUT data, issued as an IN transfer (returns a status/echo byte).
 | 0xF0 | ENTER_BOOTLOADER | W-as-R | returns 1, then `reset_usb_boot(0,0)` (never returns) |
 | 0xF1 | SET_I2S_RX_PIN | W-as-R | writes `i2s_rx_pin`; if I2S active `i2s_rx_pin_change_pending` -> I2S stop/start on new pin (gated) |
 | 0xF2 | GET_I2S_RX_PIN | R | returns `i2s_rx_pin` |
+| 0xF5 | SET_UART_CONFIG | W | **USB only** (BLOCKED over UART/I2C); `ctrl_set_uart_pending` -> main loop `uart_ctrl_apply()`, persist directory on success; returns `PIN_CONFIG_*` |
+| 0xF6 | GET_UART_CONFIG | R | returns persisted 8-byte `UartCtrlConfig` |
+| 0xF7 | SET_I2C_CONFIG | W | **USB only** (BLOCKED over UART/I2C); `ctrl_set_i2c_pending` -> main loop `i2c_ctrl_apply()`, persist directory on success; returns `PIN_CONFIG_*` |
+| 0xF8 | GET_I2C_CONFIG | R | returns persisted 8-byte `I2cCtrlConfig` |
+| 0xF9 | GET_CTRL_IFACE_STATUS | R | returns 8-byte `CtrlIfaceStatus` (uart/i2c last_status + live flags, proto_version=1) |
 
 > The Microsoft OS 2.0 vendor code (`0x01`) is intercepted earlier in
 > `tud_vendor_control_xfer_cb` for descriptor delivery and is not an application opcode.
@@ -1055,3 +1096,238 @@ hardware-mute settle hold has elapsed); "not gated" runs as soon as the loop rea
 | `i2s_rx_pin_change_pending` / `i2s_input_restart_pending` | if I2S active: prepare reset, `i2s_input_stop()` + `i2s_input_start()` | yes |
 
 "W-as-R" = write/action dispatched on the IN (read, `0xC1`) path; see Section 1.1.
+
+---
+
+## 22. Detailed workings: stateful, flash, and reconfiguration operations
+
+The commands below either **write flash**, **rewrite a large amount of live
+state**, **reconfigure physical I/O**, or **leave the application entirely**.
+They are the ones a bridge is most likely to get wrong. Everything you need to
+drive them correctly is collected here in one place. Read Section 22.1 first: the
+three shared mechanisms it describes underlie every operation that follows.
+
+### 22.1 The three shared mechanisms
+
+**(a) The deferred pending-flag pattern.** Most of these handlers do almost
+nothing at request time: they validate the shape of the request, set a `volatile`
+`*_pending` flag (or a change bitmask), and return an "accepted" status
+immediately. The real work runs later in `main.c`'s main loop. Consequences:
+
+* The status byte you get back means "**request queued and shaped correctly**", not
+  "applied". Later validation can still reject the value silently (DAC mute pin
+  conflicts, GPIO already in use, bad output slot). Always follow a write that
+  matters with its readback (Section 19) and compare.
+* Between "accepted" and "applied" there is a **busy window**. If the deferred work
+  writes flash or resets the pipeline it briefly disables the USB control IRQ, so a
+  control transfer issued during that window can time out or STALL. Back off ~150 ms
+  and retry, and poll `GET_PLATFORM` (0x7F) to confirm the device is responsive
+  again (Section 1.3).
+* Flags marked **"gated"** additionally wait for `pipeline_reset_ready()`: if a DAC
+  hardware-mute settle hold is armed, the operation does not begin until that
+  non-blocking hold has elapsed. "Not gated" flags run as soon as the loop reaches
+  them.
+
+**(b) The flash write bracket and blackout.** A flash write erases and programs one
+**4 KB sector** at a time. Each sector write halts Core 1
+(`multicore_lockout_start_blocking`) and masks all interrupts
+(`save_and_disable_interrupts`) for the erase plus program, so the USB control
+endpoint is dead for the duration. Budget **up to ~45 ms of blackout per sector**.
+Commands that touch two sectors (a preset slot plus the directory) cost roughly
+double. The persistent region is 12 sectors (48 KB) at the top of flash:
+
+| Sector | Contents |
+|--------|----------|
+| 0 | **Directory** (`DSP2`): 10-bit slot-occupancy bitmask, 10 x 32-byte slot names, startup mode/slot, last-active slot, and the **device-global** fields (independent master volume, independent IO config, DAC hardware-mute config, mode flags) |
+| 1 .. 10 | **Preset slots 0 .. 9** (`DSP3`): one full DSP-state body per slot |
+| 11 | **Legacy** (`DSP1`): original single-sector format, auto-migrated to slot 0 on first boot |
+
+So slot **names, startup policy, occupancy, and every device-global setting live in
+sector 0**; only the per-slot DSP bodies live in sectors 1..10. A rename or a
+startup change is a light one-sector (directory) write; a preset save is a
+two-sector write (slot body plus directory update).
+
+**(c) The muted, synchronized pipeline reset (the slot-alignment guarantee).**
+Any operation that could disturb output timing is bracketed by
+`prepare_pipeline_reset(PRESET_MUTE_SAMPLES)` (soft-mute the output and fence Core 1;
+`PRESET_MUTE_SAMPLES` = 256, about 5 ms at 48 kHz) and, at the end,
+`complete_pipeline_reset()` (or `process_type_switches()` / `process_pin_changes()`),
+which restarts **every** output slot in lockstep. This is how the firmware keeps all
+four S/PDIF instances, the I2S slots, and PDM sample-aligned across the change. Inter-
+slot phase alignment is an inviolable product invariant; a bridge must never try to
+reconfigure a subset of slots out of band to avoid the mute.
+
+### 22.2 `0xA1` SET_ALL_PARAMS (bulk apply of all live state)
+
+* **Transport.** OUT write (`0x41`), `wValue=0`. Payload is a `WireBulkParams`
+  packet (or a valid shorter prefix). The firmware accepts `wLength` in
+  `[WIRE_BULK_PARAMS_MIN_SIZE, sizeof(WireBulkParams)]` (the V2 size up to the current
+  3664-byte V14) and receives it into `bulk_param_buf` via EP0 64-byte chunking. It is
+  **version tolerant**: it honors only the sections present per `header.format_version`
+  and `header.payload_length`, so an older host's shorter packet still applies cleanly.
+* **Handler (immediate).** The full transfer lands in `bulk_param_buf`; on the control
+  **status (ACK) stage** the handler sets `bulk_params_pending = true`. No state changes
+  in IRQ context.
+* **Deferred work (gated).** In the main loop: snapshot current `output_types`; drain the
+  USB ring; `prepare_pipeline_reset()` (mute + Core 1 fence); suspend S/PDIF and I2S RX
+  if active; `bulk_params_apply()` (pin/IO config is applied **only** in with-preset
+  output-config mode, so a bulk push does not stomp device-global wiring in independent
+  mode); `dsp_recalculate_all_filters()` + delays; re-sync MCK; re-derive Core 1 mode;
+  then either `process_type_switches()` for any slot whose output type changed, or
+  `complete_pipeline_reset()` to re-align all slots; finally restart RX.
+* **Flash footprint.** **None.** `SET_ALL_PARAMS` rewrites **live RAM state only**; it does
+  **not** persist anything. To make a bulk-applied state survive a power cycle you must
+  separately save it (a preset save, or the device-global saves in 22.3). This is the most
+  common misconception about this command.
+* **Slot alignment.** Preserved via the muted synchronized reset (22.1c).
+* **Confirm.** Re-read with `GET_ALL_PARAMS` (`0xA0`) after the busy window; compare
+  `header.payload_length` and the fields you set.
+* **Cautions.** Largest single write in the protocol; always brackets a mute of at least
+  ~5 ms; can flip the physical output bus (S/PDIF <-> I2S) if the payload changes output
+  types.
+
+### 22.3 Device-global saves: `0xD6` SAVE_MASTER_VOLUME (and siblings)
+
+These persist a **device-global** value into the **directory sector** (sector 0). Device-
+global settings do **not** travel with presets; they are read at boot and on factory
+reset and are untouched by preset load.
+
+| ID | Command | Persists | Deferred flag | Gated |
+|----|---------|----------|---------------|-------|
+| 0xD6 | `SAVE_MASTER_VOLUME` | live master volume -> directory device-global field | `flash_save_master_volume_pending` | no |
+| 0x52 | `SAVE_OUTPUT_CONFIG` | live physical IO config -> directory device-global block | `flash_save_output_config_pending` | no |
+| 0x51 | `SAVE_PARAMS` (legacy) | legacy "save current state" | `save_params_pending` | no |
+
+* **Transport.** All three are **write-as-read** (issue as `0xC1`, `wValue=0`); each returns a
+  1-byte status (`PRESET_OK` / `FLASH_OK`) meaning "accepted".
+* **Handler / deferred.** The handler only sets the pending flag; the main loop performs the
+  directory-sector write (one sector, so one ~45 ms blackout; **not** gated, so it runs as
+  soon as the loop reaches it).
+* **Confirm.** For `0xD6`, read back `GET_SAVED_MASTER_VOLUME` (`0xD7`), which returns the
+  **stored** device-global value (distinct from `GET_MASTER_VOLUME` `0xD3`, which returns the
+  **live** ceiling set by `0xD2`).
+* **Note on modes.** Whether a preset load overwrites the live master volume / IO config is
+  governed by `master_volume_mode` (`0xD4/0xD5`) and `output_config_mode` (`0x98/0x99`). In
+  independent mode (0) the device-global copy saved here is authoritative; in per-preset mode
+  (1) the value travels inside each preset instead.
+
+### 22.4 Preset save / load / delete / rename / startup writes
+
+All slot bodies live in sectors 1..10; occupancy, names, startup policy, and last-active
+live in the directory (sector 0). Every one of these is a flash write.
+
+* **`0x90` PRESET_SAVE** (write-as-read, `wValue`=slot). Deferred (`preset_save_pending`,
+  **not** gated). `preset_save()` collects live DSP state, engages the audio mute, writes the
+  **slot sector**, then updates the **directory** (sets the occupied bit and last-active).
+  That is a **two-sector write**; budget ~2x the single-sector blackout. Returns `PRESET_*`.
+* **`0x91` PRESET_LOAD** (write-as-read, `wValue`=slot). Deferred (`preset_load_pending`,
+  **gated**). This is a **read plus a full muted pipeline reset**, not a slot-body write: it
+  drains, mutes, suspends RX, reads the slot (or applies factory defaults if the slot is
+  unconfigured), applies to live state, recalculates filters/delays, **zeroes all delay lines**
+  (so stale audio from the previous preset cannot bleed through), re-derives Core 1 mode,
+  performs any needed output-type switches or a `complete_pipeline_reset()`, restarts RX, and
+  finally does one **light directory write** to record last-active. It pushes a `PRESET_LOADED`
+  then a `BULK_INVALIDATED` notification (0x83). **Confirm with `PRESET_GET_ACTIVE` (`0x9A`)**,
+  and re-read `GET_ALL_PARAMS` on `BULK_INVALIDATED`.
+* **`0x92` PRESET_DELETE** (write-as-read, `wValue`=slot; the loop consumes a `preset_delete_mask`
+  bit, **not** gated). Erases the **slot sector** and updates the **directory** (clears the
+  occupied bit and the name). Two-sector cost. The active slot **stays selected** even if you
+  delete it; it simply becomes unconfigured and will load factory defaults on the next load.
+* **`0x94` PRESET_SET_NAME** (OUT write, `wValue`=slot, 1..32-byte payload). Deferred
+  (`flash_set_name_pending`, **not** gated). Names live **in the directory**, so this is a light
+  **one-sector (directory) write**. Read back with `PRESET_GET_NAME` (`0x93`).
+* **`0x96` PRESET_SET_STARTUP** (OUT write, 2-byte payload `mode`,`slot`; mode 0=specified,
+  1=last-active). Deferred (`flash_set_startup_pending`, **not** gated). Light **directory**
+  write. Read back with `PRESET_GET_STARTUP` (`0x97`).
+
+Related light directory writes handled the same way: `0x98` SET_OUTPUT_CONFIG_MODE and
+`0xD4` SET_MASTER_VOLUME_MODE (each flips a mode flag stored in the directory).
+
+### 22.5 Hardware pin writes
+
+Move a GPIO to a new physical pin. All are **write-as-read** (`0xC1`), take the new GPIO in
+`wValue`, and return a 1-byte `PIN_CONFIG_*` status. **None of them write flash**: a moved pin
+persists only when you subsequently save it (a preset save in with-preset mode, or
+`SAVE_OUTPUT_CONFIG` in independent mode). GPIO validity and in-use rules are in Section 2.6;
+a rejected pin returns `INVALID_PIN`/`PIN_IN_USE`/`OUTPUT_ACTIVE` and changes nothing.
+
+| ID | Command | Deferred work | Gated | Notes |
+|----|---------|---------------|-------|-------|
+| 0x7C | `SET_OUTPUT_PIN` | S/PDIF or I2S slot: `output_pin_change_mask` -> `process_pin_changes()` (mute, repin, restart **all** slots in sync). PDM: **immediate** `pdm_change_pin()` | yes (S/PDIF/I2S path) | PDM pin move requires that output be **disabled first** (else `OUTPUT_ACTIVE`) |
+| 0xE4 | `SET_SPDIF_RX_PIN` | if S/PDIF is the active input: `spdif_rx_pin_change_pending` -> `spdif_input_stop()`/`start()` on the new pin | no | brief input silence during the hot-swap |
+| 0xF1 | `SET_I2S_RX_PIN` | if I2S is the active input: `i2s_rx_pin_change_pending` -> I2S stop/start | yes | mirrors 0xE4 |
+| 0xC2 | `SET_I2S_BCK_PIN` | moves the BCK/LRCLK pair (LRCLK = BCK+1); if I2S input active, `i2s_input_restart_pending` -> restart | (input restart) | **rejected while any output slot is I2S**; BCK/LRCLK are shared by all I2S slots |
+
+Because the S/PDIF/I2S output-pin path routes through `process_pin_changes()`, all output slots
+are muted and restarted together: **slot alignment is preserved**. Read back the matching GET
+(0x7D / 0xE5 / 0xF2 / 0xC3) to confirm.
+
+### 22.6 I2S / S/PDIF / DAC output configuration writes
+
+These reconfigure the physical output bus or the board-level DAC mute.
+
+* **`0xC0` SET_OUTPUT_TYPE** (write-as-read, `wValue = (new_type << 8) | slot`; type 0=S/PDIF,
+  1=I2S). Deferred (`output_type_change_mask` + `pending_output_types[]`, **gated**).
+  `process_type_switches()` tears down and re-sets the S/PDIF or I2S library for the slot
+  (heap alloc/free) and runs its **own synchronized pipeline reset**, so all slots stay
+  aligned. Expect a busy window. Read back with `GET_OUTPUT_TYPE` (`0xC1`). Not persisted until
+  saved (22.5 note).
+* **`0xC4/0xC6/0xC8` MCK enable / pin / multiplier** (write-as-read). Mostly **immediate**
+  library calls (`audio_i2s_mck_*`); no pipeline reset. The MCK pin must be a CLK_GPOUTn-capable
+  GPIO (GPIO 21 on RP2040; 13/15/21 on RP2350) or the write returns `INVALID_PIN`. Read back
+  0xC5 / 0xC7 / 0xC9.
+* **`0xEA` SET_DAC_HW_MUTE_CONFIG** (OUT write, 16-byte `DacHwMuteConfig`). Deferred
+  (`flash_set_dac_hw_mute_pending`, **not** gated). The main loop validates the config, claims
+  the mute GPIO, and **persists it to the directory sector** (it writes the in-RAM `dir_cache`
+  and marks the directory dirty for a deferred flush). **Validation happens in the deferred
+  handler and a bad config is silently dropped**, so you must **always read back with `0xEB`**
+  and compare. This is the one output-config write that does persist to flash on its own.
+* **`0xEC` TEST_DAC_HW_MUTE** (write-as-read). Fires a ~1-second async mute pulse on the
+  configured pin so an installer can confirm it by ear; no flash, no lasting state change.
+
+### 22.7 `0x53` FACTORY_RESET
+
+* **Transport.** Write-as-read (`0xC1`, `wValue=0`); returns `FLASH_OK` (accepted).
+* **Deferred work (gated).** `factory_reset_pending` -> drain, `prepare_pipeline_reset()`,
+  suspend RX, `flash_factory_reset()`, `dsp_recalculate_all_filters()`, zero the delay lines,
+  re-derive Core 1 mode, perform any output-type switches (if the live config had I2S outputs),
+  restart RX.
+* **Flash footprint.** **None.** Despite the name, `flash_factory_reset()` only resets **live
+  DSP state** to firmware defaults (via `apply_factory_defaults()`) and re-applies the
+  device-global IO config; it does **not** erase any stored preset slot or the directory. So a
+  factory reset does **not** wipe your saved presets, names, startup policy, or device-global
+  settings; it resets the currently-running state and **keeps the active slot selected**. Use
+  `PRESET_DELETE` (22.4) to actually remove stored slot data.
+* **Slot alignment.** Preserved via the muted synchronized reset (22.1c).
+
+### 22.8 The persistence model (bulk / live vs. flash)
+
+Because so many commands return "accepted" without touching flash, it is worth stating plainly
+what does and does not survive a power cycle:
+
+* **Live-only (lost on reboot unless separately saved):** every `SET_*` scalar
+  (EQ, delays, gains, loudness, crossfeed, leveller), all pin/output-type/MCK writes, and
+  crucially **`SET_ALL_PARAMS` (`0xA1`)**. These change RAM only.
+* **Writes flash directly:** `PRESET_SAVE` (`0x90`), `PRESET_DELETE` (`0x92`),
+  `PRESET_SET_NAME` (`0x94`), `PRESET_SET_STARTUP` (`0x96`), the mode flags
+  (`0x98`/`0xD4`), the device-global saves `SAVE_PARAMS`/`SAVE_OUTPUT_CONFIG`/`SAVE_MASTER_VOLUME`
+  (`0x51`/`0x52`/`0xD6`), and `SET_DAC_HW_MUTE_CONFIG` (`0xEA`).
+* **Neither (state/action only):** `FACTORY_RESET` (`0x53`, resets live state, no flash write),
+  `PRESET_LOAD` (`0x91`, reads a slot plus a light directory last-active write), and
+  `TEST_DAC_HW_MUTE` (`0xEC`).
+
+A typical "commit the current tuning" flow is therefore: push live changes (individual `SET_*`
+or one `SET_ALL_PARAMS`), confirm via readback, **then** `PRESET_SAVE` to a slot to persist.
+
+### 22.9 `0xF0` ENTER_BOOTLOADER (firmware update)
+
+* **Transport.** Write-as-read (`0xC1`, `wValue=0`). Returns a 1-byte `1` (ACK), then after
+  ~100 ms the firmware calls `reset_usb_boot(0,0)` and never returns.
+* **Effect.** The device drops off USB and re-enumerates as the RP2 **UF2 mass-storage
+  bootloader** (`RPI-RP2`). It is no longer the DSPi and answers no vendor commands until a UF2
+  is flashed and it reboots back into the application. This command does not itself write flash;
+  it jumps to the ROM bootloader.
+* **Bridge handling.** Gate strictly behind explicit user confirmation; there is no undo from the
+  host side. Expect the device handle to disappear immediately after the ACK; the host must
+  release it and wait for the mass-storage device (to drive the update) and, later, for the DSPi
+  to re-enumerate. Do not issue any further vendor command after the ACK.

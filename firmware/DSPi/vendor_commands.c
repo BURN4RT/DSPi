@@ -27,6 +27,8 @@
 #include "leveller.h"
 #include "bulk_params.h"
 #include "notify.h"
+#include "uart_control.h"
+#include "i2c_control.h"
 #include "pdm_generator.h"
 #include "usb_descriptors.h"
 #include "tusb.h"
@@ -35,6 +37,7 @@
 #include "hardware/adc.h"
 #include "hardware/vreg.h"
 #include "hardware/clocks.h"
+#include "hardware/sync.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -56,6 +59,82 @@ static uint16_t vendor_last_wLength = 0;
 // without every GET case having to plumb rhport + request through.
 static uint8_t _vendor_rhport;
 static tusb_control_request_t const *_vendor_current_req;
+
+// ----------------------------------------------------------------------------
+// ORCHESTRATOR STATE (transport-neutral dispatch)
+// ----------------------------------------------------------------------------
+
+// Which transport the current dispatch runs for.  USB responses go straight
+// to tud_control_xfer(); external ones are captured for the transport to
+// stream at its own pace.  Only ever changed from main-loop context.
+static CtrlSource _active_source = CTRL_SOURCE_USB;
+static const uint8_t *_ext_resp_data;
+static uint16_t _ext_resp_len;
+
+// notify source tag for the running dispatch; entry points set it before
+// invoking the SET/GET handlers (HOST_SET for USB, UART/I2C for external).
+static ParamSource _dispatch_src = PARAM_SRC_HOST_SET;
+
+// A USB control SET is between SETUP and DATA/ACK: the USB ISR may still be
+// writing vendor_rx_buf / bulk_param_buf, and vendor_last_* is live.
+// External dispatch must wait it out (BUSY).  Stale after 100 ms in case the
+// host aborts the transfer mid-flight.
+static volatile bool usb_set_in_flight = false;
+static uint32_t usb_set_setup_time;
+
+static bool usb_set_busy(void) {
+    if (!usb_set_in_flight) return false;
+    if ((uint32_t)(time_us_32() - usb_set_setup_time) > 100000u) {
+        usb_set_in_flight = false;   // aborted transfer; reclaim
+        return false;
+    }
+    return true;
+}
+
+// bulk_param_buf ownership.  The buffer is shared by all transports for both
+// 0xA0 collect-and-stream and 0xA1 receive-then-apply; exactly one owner at
+// a time.  bulk_params_pending additionally guards the main-loop apply
+// window after a SET is handed over.
+typedef enum { BULK_OWNER_NONE = 0, BULK_OWNER_USB, BULK_OWNER_UART, BULK_OWNER_I2C } BulkOwner;
+static volatile BulkOwner bulk_buf_owner = BULK_OWNER_NONE;
+static uint32_t bulk_owner_since;
+
+static BulkOwner bulk_owner_for(CtrlSource src) {
+    return (src == CTRL_SOURCE_UART) ? BULK_OWNER_UART :
+           (src == CTRL_SOURCE_I2C)  ? BULK_OWNER_I2C  : BULK_OWNER_USB;
+}
+
+// IRQ-safe: the I2C target ISR acquires the lock when a bulk SET header
+// arrives mid-transaction, racing the main loop's USB/UART acquires.
+bool vendor_bulk_try_acquire(CtrlSource src) {
+    uint32_t save = save_and_disable_interrupts();
+    // External owners release deterministically from their poll loops; the
+    // stale window only matters if a transport dies mid-stream.  Streaming
+    // owners refresh via vendor_bulk_touch().
+    if (bulk_buf_owner != BULK_OWNER_NONE && bulk_buf_owner != BULK_OWNER_USB &&
+        (uint32_t)(time_us_32() - bulk_owner_since) > 500000u) {
+        bulk_buf_owner = BULK_OWNER_NONE;
+    }
+    bool ok = (bulk_buf_owner == BULK_OWNER_NONE && !bulk_params_pending);
+    if (ok) {
+        bulk_buf_owner = bulk_owner_for(src);
+        bulk_owner_since = time_us_32();
+    }
+    restore_interrupts(save);
+    return ok;
+}
+
+void vendor_bulk_release(CtrlSource src) {
+    uint32_t save = save_and_disable_interrupts();
+    if (bulk_buf_owner == bulk_owner_for(src)) bulk_buf_owner = BULK_OWNER_NONE;
+    restore_interrupts(save);
+}
+
+// Refresh the stale timer while a slow transport actively streams a bulk
+// payload (a full bulk GET takes ~0.5 s at 115200 baud).
+void vendor_bulk_touch(CtrlSource src) {
+    if (bulk_buf_owner == bulk_owner_for(src)) bulk_owner_since = time_us_32();
+}
 
 // Internal helpers exported via vendor_send_response() replacement.
 static void vendor_send_response(const void *data, uint16_t len);
@@ -176,7 +255,8 @@ uint16_t mck_decode(uint8_t raw)  { return (raw == 1) ? 256 : 128; }
 // ----------------------------------------------------------------------------
 
 bool is_valid_gpio_pin(uint8_t pin) {
-    if (pin == 16 || pin == 17) return false;   // UART0 TX/RX (debug)
+    // GPIO 16/17 are general-purpose again since the debug UART was removed;
+    // when the UART control interface claims them, is_pin_in_use() covers it.
     if (pin >= 23 && pin <= 25) return false;   // Power/LED
 #if PICO_RP2350
     return pin <= 29;
@@ -198,6 +278,8 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
     if (i2s_mck_enabled && pin == i2s_mck_pin) return true;   // MCK (if enabled)
     if (pin == spdif_rx_pin) return true;                     // SPDIF RX input
     if (dac_hw_mute_owns_pin(pin)) return true;               // DAC hardware-mute
+    if (uart_ctrl_owns_pin(pin)) return true;                 // UART control (if live)
+    if (i2c_ctrl_owns_pin(pin)) return true;                  // I2C control (if live)
     return false;
 }
 
@@ -304,10 +386,10 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
     vendor_buffer_t *buffer = &_buf;
     (void)buffer;
 
-    // Tag every setter call that runs inside this dispatch as HOST_SET so
-    // the v2 notification subsystem can attribute its origin.  Cleared at
-    // the single exit point below.
-    notify_set_source(PARAM_SRC_HOST_SET);
+    // Tag every setter call that runs inside this dispatch with the origin
+    // the entry point selected (HOST_SET for USB, UART/I2C for external
+    // transports).  Cleared at the single exit point below.
+    notify_set_source(_dispatch_src);
 
     // Process command based on saved request info
     switch (vendor_last_request) {
@@ -860,6 +942,31 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
             break;
         }
 
+        case REQ_SET_UART_CONFIG: {
+            // USB-only (vendor_dispatch_set refuses it on UART/I2C).
+            // Deferred to main loop: apply does GPIO/IRQ work and the
+            // persist is a ~45 ms flash write.  Result lands in
+            // ctrl_uart_last_status, readable via REQ_GET_CTRL_IFACE_STATUS.
+            if (buffer->data_len >= sizeof(UartCtrlConfig)) {
+                memcpy((void *)&ctrl_set_uart_val, vendor_rx_buf,
+                       sizeof(UartCtrlConfig));
+                __dmb();
+                ctrl_set_uart_pending = true;
+            }
+            break;
+        }
+
+        case REQ_SET_I2C_CONFIG: {
+            // USB-only; same deferred apply+persist shape as UART above.
+            if (buffer->data_len >= sizeof(I2cCtrlConfig)) {
+                memcpy((void *)&ctrl_set_i2c_val, vendor_rx_buf,
+                       sizeof(I2cCtrlConfig));
+                __dmb();
+                ctrl_set_i2c_pending = true;
+            }
+            break;
+        }
+
         case REQ_SET_CHANNEL_NAME: {
             // wValue = channel index, payload = 1-32 bytes of name
             uint8_t ch = vendor_last_wValue & 0xFF;
@@ -946,10 +1053,17 @@ static void vendor_handle_set_data(tusb_control_request_t const *req) {
 // VENDOR RESPONSE HELPER
 // ----------------------------------------------------------------------------
 
-// Send a control IN response from the current vendor GET handler.
-// Stashes the request + rhport at SETUP so case bodies can stay unchanged.
+// Send a control IN response from the current vendor GET handler.  For USB
+// this completes the EP0 transfer; for an external transport dispatch it
+// captures the (static-storage) pointer for the transport to stream.  Case
+// bodies stay unchanged either way.
 static void vendor_send_response(const void *data, uint16_t len) {
-    tud_control_xfer(_vendor_rhport, _vendor_current_req, (void *)data, len);
+    if (_active_source == CTRL_SOURCE_USB) {
+        tud_control_xfer(_vendor_rhport, _vendor_current_req, (void *)data, len);
+    } else {
+        _ext_resp_data = (const uint8_t *)data;
+        _ext_resp_len  = len;
+    }
 }
 
 // Legacy compatibility shim for the pico-extras helper that sent a small
@@ -974,9 +1088,9 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 
     // Some "SET" commands are dispatched through vendor_handle_get because
     // they carry all parameters in wValue and have no DATA stage (e.g.
-    // REQ_SET_OUTPUT_TYPE, REQ_SET_MCK_*).  Tag them as HOST_SET so their
-    // param_write calls get the correct source.
-    notify_set_source(PARAM_SRC_HOST_SET);
+    // REQ_SET_OUTPUT_TYPE, REQ_SET_MCK_*).  Tag them with the entry point's
+    // origin so their param_write calls get the correct source.
+    notify_set_source(_dispatch_src);
 
     {
         // Device -> Host (GET requests)
@@ -1647,14 +1761,48 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 return false;
             }
 
+            case REQ_GET_UART_CONFIG: {
+                // Returns the persisted directory config (source of truth);
+                // live state and last apply status come from 0xF9.
+                UartCtrlConfig cfg;
+                preset_get_ctrl_iface(&cfg, NULL);
+                memcpy(resp_buf, &cfg, sizeof(cfg));
+                vendor_send_response(resp_buf, sizeof(cfg));
+                return true;
+            }
+
+            case REQ_GET_I2C_CONFIG: {
+                I2cCtrlConfig cfg;
+                preset_get_ctrl_iface(NULL, &cfg);
+                memcpy(resp_buf, &cfg, sizeof(cfg));
+                vendor_send_response(resp_buf, sizeof(cfg));
+                return true;
+            }
+
+            case REQ_GET_CTRL_IFACE_STATUS: {
+                CtrlIfaceStatus st = {
+                    .uart_last_status = ctrl_uart_last_status,
+                    .uart_live        = uart_ctrl_is_live() ? 1 : 0,
+                    .i2c_last_status  = ctrl_i2c_last_status,
+                    .i2c_live         = i2c_ctrl_is_live() ? 1 : 0,
+                    .proto_version    = CTRL_IFACE_PROTO_VERSION,
+                    .reserved         = {0},
+                };
+                memcpy(resp_buf, &st, sizeof(st));
+                vendor_send_response(resp_buf, sizeof(st));
+                return true;
+            }
+
             case REQ_GET_ALL_PARAMS: {
+                // Caller (USB SETUP path or vendor_dispatch_get) must hold
+                // the bulk lock before this runs; see the entry points.
                 bulk_params_collect((WireBulkParams *)bulk_param_buf);
                 uint16_t len = sizeof(WireBulkParams);
                 if (setup->wLength < len) len = setup->wLength;
-                // tud_control_xfer handles EP0 chunking (including trailing ZLP
-                // on exact-multiple-of-64 transfers) internally.
-                return tud_control_xfer(_vendor_rhport, _vendor_current_req,
-                                         bulk_param_buf, len);
+                // For USB, tud_control_xfer handles EP0 chunking (including
+                // trailing ZLP on exact-multiple-of-64 transfers) internally.
+                vendor_send_response(bulk_param_buf, len);
+                return true;
             }
 
             case REQ_GET_BUFFER_STATS: {
@@ -2192,8 +2340,15 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
     // without every case body having to plumb them through.
     _vendor_rhport       = rhport;
     _vendor_current_req  = req;
+    _dispatch_src        = PARAM_SRC_HOST_SET;
 
     if (stage == CONTROL_STAGE_SETUP) {
+        // EP0 transfers are strictly serialized: a new SETUP means any prior
+        // USB control transfer is over, so drop a USB-held bulk lock (covers
+        // host-aborted 0xA0/0xA1 transfers whose ACK never fired).
+        if (bulk_buf_owner == BULK_OWNER_USB) bulk_buf_owner = BULK_OWNER_NONE;
+        usb_set_in_flight = false;
+
         // ---- Microsoft OS 2.0 platform-capability vendor requests ----
         // Windows 8.1+ sends these after reading our BOS descriptor:
         //   bmRequestType=0xC0, bRequest=MS_VENDOR_CODE, wIndex=7  → return
@@ -2223,8 +2378,18 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
         }
 
         if (req->bmRequestType_bit.direction == TUSB_DIR_IN) {
+            // Bulk GET streams from bulk_param_buf across many EP0 packets
+            // after the handler returns; hold the lock until ACK so an
+            // external transport can't re-collect into it mid-stream.
+            if (req->bRequest == REQ_GET_ALL_PARAMS &&
+                !vendor_bulk_try_acquire(CTRL_SOURCE_USB)) {
+                return false;
+            }
             // GET path — dispatches into the legacy switch.
             bool ok = vendor_handle_get(req);
+            if (!ok && req->bRequest == REQ_GET_ALL_PARAMS) {
+                vendor_bulk_release(CTRL_SOURCE_USB);
+            }
             // Clear any source tag that the GET dispatcher set for embedded
             // SETs — bleeding HOST_SET would misattribute unrelated writes
             // that happen outside a dispatch bracket (e.g. timer callbacks).
@@ -2245,6 +2410,9 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
             // sizeof(WireBulkParams) and this gate is effectively strict
             // equality: only a full current-version payload is accepted here.
             // bulk_params_apply() re-checks format_version + payload_length.
+            if (!vendor_bulk_try_acquire(CTRL_SOURCE_USB)) return false;
+            usb_set_in_flight  = true;
+            usb_set_setup_time = time_us_32();
             return tud_control_xfer(rhport, req, bulk_param_buf, req->wLength);
         }
 
@@ -2254,6 +2422,10 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
         }
 
         if (req->wLength <= sizeof(vendor_rx_buf)) {
+            // The USB ISR fills vendor_rx_buf between now and the DATA
+            // callback; external dispatch is held off until then.
+            usb_set_in_flight  = true;
+            usb_set_setup_time = time_us_32();
             return tud_control_xfer(rhport, req, vendor_rx_buf, req->wLength);
         }
 
@@ -2265,16 +2437,117 @@ bool tud_vendor_control_xfer_cb(uint8_t rhport, uint8_t stage,
         // SET data received — run the legacy command dispatcher.
         if (req->bmRequestType_bit.direction == TUSB_DIR_OUT) {
             vendor_handle_set_data(req);
+            usb_set_in_flight = false;
         }
         return true;
     }
 
     if (stage == CONTROL_STAGE_ACK) {
-        // Status-stage completed.  Signal the main loop to apply bulk SET.
+        // Status-stage completed.  Signal the main loop to apply bulk SET;
+        // the pending flag takes over guarding bulk_param_buf from the lock.
         if (req->bmRequestType_bit.direction == TUSB_DIR_OUT &&
             req->bRequest == REQ_SET_ALL_PARAMS) {
             bulk_params_pending = true;
+            vendor_bulk_release(CTRL_SOURCE_USB);
+        }
+        if (req->bmRequestType_bit.direction == TUSB_DIR_IN &&
+            req->bRequest == REQ_GET_ALL_PARAMS) {
+            vendor_bulk_release(CTRL_SOURCE_USB);   // bulk GET fully streamed
+        }
+        if (req->bmRequestType_bit.direction == TUSB_DIR_OUT) {
+            usb_set_in_flight = false;
         }
     }
     return true;
+}
+
+// ----------------------------------------------------------------------------
+// EXTERNAL TRANSPORT ENTRY POINTS (UART / I2C target)
+//
+// Main-loop context only.  These wrap the same SET/GET switches the USB path
+// uses; the synthesized tusb_control_request_t is a plain struct here, no
+// TinyUSB machinery is involved for external transports.
+// ----------------------------------------------------------------------------
+
+// Interface self-configuration is USB-only: an external controller must
+// never be able to reconfigure (and lock itself out of) its own transport.
+static bool ctrl_cmd_usb_only(uint8_t bRequest) {
+    return bRequest == REQ_SET_UART_CONFIG || bRequest == REQ_SET_I2C_CONFIG;
+}
+
+CtrlDispatchResult vendor_dispatch_get(CtrlSource src, uint8_t bRequest,
+                                       uint16_t wValue, uint16_t wIndex, uint16_t wLength,
+                                       const uint8_t **resp_data, uint16_t *resp_len) {
+    if (src == CTRL_SOURCE_USB) return CTRL_DISPATCH_ERROR;  // USB uses the TinyUSB path
+    if (usb_set_busy())         return CTRL_DISPATCH_BUSY;
+    if (ctrl_cmd_usb_only(bRequest)) return CTRL_DISPATCH_BLOCKED;
+
+    bool bulk = (bRequest == REQ_GET_ALL_PARAMS);
+    if (bulk && !vendor_bulk_try_acquire(src)) return CTRL_DISPATCH_BULK_LOCKED;
+
+    tusb_control_request_t req = {
+        .bmRequestType = 0xC0,   // vendor | device-to-host (informational only)
+        .bRequest = bRequest,
+        .wValue   = wValue,
+        .wIndex   = wIndex,
+        .wLength  = wLength ? wLength : 0xFFFF,
+    };
+    _active_source = src;
+    _ext_resp_data = NULL;
+    _ext_resp_len  = 0;
+    _dispatch_src  = (src == CTRL_SOURCE_UART) ? PARAM_SRC_UART : PARAM_SRC_I2C;
+    bool ok = vendor_handle_get(&req);
+    notify_set_source(PARAM_SRC_UNKNOWN);
+    _active_source = CTRL_SOURCE_USB;
+    _dispatch_src  = PARAM_SRC_HOST_SET;
+
+    if (!ok || _ext_resp_data == NULL) {
+        if (bulk) vendor_bulk_release(src);
+        return CTRL_DISPATCH_ERROR;
+    }
+    *resp_data = _ext_resp_data;
+    *resp_len  = _ext_resp_len;
+    return CTRL_DISPATCH_OK;
+}
+
+CtrlDispatchResult vendor_dispatch_set(CtrlSource src, uint8_t bRequest,
+                                       uint16_t wValue, uint16_t wIndex,
+                                       const uint8_t *payload, uint16_t wLength) {
+    (void)wIndex;   // SET handlers carry sub-params in wValue only (matches USB)
+    if (src == CTRL_SOURCE_USB) return CTRL_DISPATCH_ERROR;
+    if (usb_set_busy())         return CTRL_DISPATCH_BUSY;
+    if (ctrl_cmd_usb_only(bRequest)) return CTRL_DISPATCH_BLOCKED;
+
+    if (bRequest == REQ_SET_ALL_PARAMS) {
+        // Caller streamed the payload into bulk_param_buf under its own lock.
+        if (bulk_buf_owner != bulk_owner_for(src)) return CTRL_DISPATCH_ERROR;
+        if (wLength < WIRE_BULK_PARAMS_MIN_SIZE ||
+            wLength > sizeof(WireBulkParams)) {
+            return CTRL_DISPATCH_ERROR;
+        }
+        // Hand the buffer to the main-loop apply; pending flag guards it now.
+        bulk_params_pending = true;
+        vendor_bulk_release(src);
+        return CTRL_DISPATCH_OK;
+    }
+
+    if (wLength > sizeof(vendor_rx_buf)) return CTRL_DISPATCH_ERROR;
+    vendor_last_request = bRequest;
+    vendor_last_wValue  = wValue;
+    vendor_last_wLength = wLength;
+    if (wLength) memcpy(vendor_rx_buf, payload, wLength);
+
+    tusb_control_request_t req = {
+        .bmRequestType = 0x40,   // vendor | host-to-device (informational only)
+        .bRequest = bRequest,
+        .wValue   = wValue,
+        .wIndex   = wIndex,
+        .wLength  = wLength,
+    };
+    _active_source = src;
+    _dispatch_src  = (src == CTRL_SOURCE_UART) ? PARAM_SRC_UART : PARAM_SRC_I2C;
+    vendor_handle_set_data(&req);
+    _active_source = CTRL_SOURCE_USB;
+    _dispatch_src  = PARAM_SRC_HOST_SET;
+    return CTRL_DISPATCH_OK;
 }

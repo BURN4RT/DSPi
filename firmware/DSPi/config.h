@@ -343,6 +343,64 @@ extern volatile uint32_t nominal_feedback_10_14;
 // System
 #define REQ_ENTER_BOOTLOADER        0xF0
 
+// External control interfaces (UART / I2C target).  SETs are USB-only:
+// the dispatcher rejects them when they arrive over UART or I2C so an
+// external controller can never reconfigure (and lock itself out of) its
+// own transport.  See Documentation/Features/control_interfaces_spec.md.
+#define REQ_SET_UART_CONFIG         0xF5  // payload = UartCtrlConfig (8 bytes); USB-only
+#define REQ_GET_UART_CONFIG         0xF6  // returns UartCtrlConfig (live)
+#define REQ_SET_I2C_CONFIG          0xF7  // payload = I2cCtrlConfig (8 bytes); USB-only
+#define REQ_GET_I2C_CONFIG          0xF8  // returns I2cCtrlConfig (live)
+#define REQ_GET_CTRL_IFACE_STATUS   0xF9  // returns CtrlIfaceStatus (8 bytes)
+
+// UART control interface configuration.  Fixed 8N1 framing (the wire CRC16
+// covers integrity, so parity adds nothing); only the baud rate is
+// configurable.  Persisted device-level in the preset directory (V6+).
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;      // 0/1
+    uint8_t  tx_pin;       // GPIO with UARTx TX mux (pin%4 == 0)
+    uint8_t  rx_pin;       // GPIO with UARTx RX mux (pin%4 == 1), same instance
+    uint8_t  reserved;
+    uint32_t baud;         // UART_CTRL_BAUD_MIN..MAX
+} UartCtrlConfig;
+
+// I2C target (slave) control interface configuration.  Bus speed and clock
+// stretching are controller-side properties for a target and are not stored.
+typedef struct __attribute__((packed)) {
+    uint8_t enabled;       // 0/1
+    uint8_t sda_pin;       // GPIO with I2Cx SDA mux (pin%2 == 0)
+    uint8_t scl_pin;       // GPIO with I2Cx SCL mux (pin%2 == 1), same instance
+    uint8_t address;       // 7-bit target address, 0x08..0x77
+    uint8_t reserved[4];
+} I2cCtrlConfig;
+
+// REQ_GET_CTRL_IFACE_STATUS response.  last_status is the result of the most
+// recent REQ_SET_*_CONFIG (PIN_CONFIG_* code); live reflects whether the
+// interface is actually up (differs from config.enabled after a boot-time
+// pin collision kept it down).
+typedef struct __attribute__((packed)) {
+    uint8_t uart_last_status;
+    uint8_t uart_live;
+    uint8_t i2c_last_status;
+    uint8_t i2c_live;
+    uint8_t proto_version;   // external wire protocol version (1)
+    uint8_t reserved[3];
+} CtrlIfaceStatus;
+
+#define CTRL_IFACE_PROTO_VERSION    1
+
+// Defaults (both interfaces ship disabled; one-time USB setup enables them)
+#define UART_CTRL_DEFAULT_TX_PIN    16
+#define UART_CTRL_DEFAULT_RX_PIN    17
+#define UART_CTRL_DEFAULT_BAUD      115200u
+#define UART_CTRL_BAUD_MIN          9600u
+#define UART_CTRL_BAUD_MAX          1000000u
+#define I2C_CTRL_DEFAULT_SDA_PIN    18
+#define I2C_CTRL_DEFAULT_SCL_PIN    19
+#define I2C_CTRL_DEFAULT_ADDRESS    0x42
+#define I2C_CTRL_ADDRESS_MIN        0x08
+#define I2C_CTRL_ADDRESS_MAX        0x77
+
 // Preset configuration
 #define PRESET_SLOTS                10
 #define PRESET_NAME_LEN             32
@@ -374,6 +432,7 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define PIN_CONFIG_PIN_IN_USE       0x02
 #define PIN_CONFIG_INVALID_OUTPUT   0x03
 #define PIN_CONFIG_OUTPUT_ACTIVE    0x04
+#define PIN_CONFIG_INVALID_PARAM    0x05  // non-pin field out of range (baud, I2C address)
 
 // Output type identifiers
 #define OUTPUT_TYPE_SPDIF           0

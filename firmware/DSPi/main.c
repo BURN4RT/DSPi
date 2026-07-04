@@ -32,6 +32,8 @@
 #include "pdm_generator.h"
 #include "usb_audio.h"
 #include "notify.h"
+#include "uart_control.h"
+#include "i2c_control.h"
 #include "loudness.h"
 #include "crossfeed.h"
 #include "leveller.h"
@@ -1288,6 +1290,23 @@ void core0_init() {
         dac_hw_mute_init(&hw);
     }
 
+    // External control interfaces (UART / I2C target).  Must come after
+    // preset_boot_load() so the persisted directory config is available and
+    // after the output/DAC-mute pin claims above so a stored config whose
+    // pins now collide is quietly kept down (live=false; the host sees it
+    // via REQ_GET_CTRL_IFACE_STATUS).  Both interfaces ship disabled.
+    {
+        UartCtrlConfig ucfg;
+        I2cCtrlConfig  icfg;
+        preset_get_ctrl_iface(&ucfg, &icfg);
+        // Record boot validation results so REQ_GET_CTRL_IFACE_STATUS is
+        // truthful when a stored config's pins now collide (live stays 0).
+        ctrl_uart_last_status = uart_ctrl_validate(&ucfg);
+        ctrl_i2c_last_status  = i2c_ctrl_validate(&icfg);
+        uart_ctrl_init(&ucfg);
+        i2c_ctrl_init(&icfg);
+    }
+
     // Sync MCK library state with the just-loaded globals.  usb_sound_card_init()
     // (above) called audio_i2s_mck_setup() with the boot-default pin; if the
     // preset specifies a different mck_pin or wants mck_enabled=true, the
@@ -1469,6 +1488,13 @@ int main(void) {
         // deferred from update_master_volume() to here so we never call
         // usbd_edpt_xfer from within a control-transfer DATA stage.
         usb_notify_tick();
+
+        // External control transports: parse any complete UART/I2C frames
+        // and dispatch them through the shared vendor-command surface.
+        // Both are cheap no-ops while disabled and never block; heavy work
+        // (bulk apply, flash) stays on the existing deferred paths below.
+        uart_ctrl_poll();
+        i2c_ctrl_poll();
 
         // LG Sound Sync detection tick — internally throttled and
         // gated on (feature enabled && SPDIF input && SPDIF locked).
@@ -1676,6 +1702,40 @@ int main(void) {
                 prepare_flash_write_operation();
                 preset_save_master_volume();
                 complete_flash_write_operation_light();
+            }
+
+            // UART / I2C control-interface config (USB-only SETs, deferred).
+            // Live apply first (GPIO/IRQ work, no flash); persist to the
+            // directory only when the new config validated, so a bad SET
+            // can never clobber a good stored config.
+            if (ctrl_set_uart_pending) {
+                UartCtrlConfig cfg;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&cfg, (const void *)&ctrl_set_uart_val, sizeof(cfg));
+                ctrl_set_uart_pending = false;
+                restore_interrupts(f);
+                uint8_t status = uart_ctrl_apply(&cfg);
+                ctrl_uart_last_status = status;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    prepare_flash_write_operation();
+                    preset_set_ctrl_iface(&cfg, NULL);
+                    complete_flash_write_operation_light();
+                }
+            }
+
+            if (ctrl_set_i2c_pending) {
+                I2cCtrlConfig cfg;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&cfg, (const void *)&ctrl_set_i2c_val, sizeof(cfg));
+                ctrl_set_i2c_pending = false;
+                restore_interrupts(f);
+                uint8_t status = i2c_ctrl_apply(&cfg);
+                ctrl_i2c_last_status = status;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    prepare_flash_write_operation();
+                    preset_set_ctrl_iface(NULL, &cfg);
+                    complete_flash_write_operation_light();
+                }
             }
 
             // DAC hardware mute config update (deferred from USB ISR).

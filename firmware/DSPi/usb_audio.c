@@ -145,6 +145,16 @@ volatile bool dac_hw_mute_test_pending = false;
 // into the directory's independent field.  Value is read at dispatch time.
 volatile bool flash_save_master_volume_pending = false;
 
+// Deferred UART / I2C control-interface config (USB-only commands).  Main
+// loop validates, applies live (GPIO/IRQ work), and persists to the
+// directory; the status bytes back REQ_GET_CTRL_IFACE_STATUS.
+volatile bool ctrl_set_uart_pending = false;
+UartCtrlConfig ctrl_set_uart_val;
+volatile uint8_t ctrl_uart_last_status = PIN_CONFIG_SUCCESS;
+volatile bool ctrl_set_i2c_pending = false;
+I2cCtrlConfig ctrl_set_i2c_val;
+volatile uint8_t ctrl_i2c_last_status = PIN_CONFIG_SUCCESS;
+
 // Deferred SPDIF RX hot-swap. Set when the spdif_rx_pin live global is
 // updated (by vendor command, bulk params apply, or preset load) while
 // INPUT_SOURCE_SPDIF is active — main loop bridges the stop/start

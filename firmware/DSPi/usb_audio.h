@@ -172,6 +172,15 @@ extern volatile bool dac_hw_mute_test_pending;
 
 extern volatile bool flash_set_spdif_rx_pin_pending;
 
+// External control interface (UART / I2C) config apply+persist, deferred to
+// the main loop.  Last-status bytes feed REQ_GET_CTRL_IFACE_STATUS.
+extern volatile bool ctrl_set_uart_pending;
+extern UartCtrlConfig ctrl_set_uart_val;
+extern volatile uint8_t ctrl_uart_last_status;
+extern volatile bool ctrl_set_i2c_pending;
+extern I2cCtrlConfig ctrl_set_i2c_val;
+extern volatile uint8_t ctrl_i2c_last_status;
+
 extern volatile bool save_params_pending;
 extern volatile bool preset_save_pending;
 extern volatile bool preset_load_pending;

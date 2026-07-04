@@ -250,6 +250,11 @@ typedef struct __attribute__((packed)) {
 // physical IO config either travel with presets (WITH_PRESET, default) or be
 // stored once here and applied at boot (INDEPENDENT) — mirroring the
 // master-volume independent/with-preset mechanism.
+//
+// V6 appends the device-level external control-interface config (UART and I2C
+// control ports).  Like the DAC hardware-mute block these are board-level
+// attributes (which pins/baud/address the control link uses), not a listening
+// profile, so they live device-global in the directory rather than per-preset.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -275,6 +280,10 @@ typedef struct __attribute__((packed)) {
     // V4 addition: device-global physical IO config (INDEPENDENT mode store).
     // V5 grows it by 3 bytes (I2S multichannel input: i2s_rx_pin_ext[3]).
     FlashOutputConfig output_config;         // 23 bytes
+
+    // V6 addition: device-level external control-interface config (board-level).
+    UartCtrlConfig uart_ctrl;                // 8 bytes; enabled=0 by default
+    I2cCtrlConfig  i2c_ctrl;                 // 8 bytes; enabled=0 by default
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -298,7 +307,28 @@ typedef struct __attribute__((packed)) {
     FlashOutputConfig_v4 output_config;      // 20 bytes
 } PresetDirectory_v4;
 
-#define DIR_VERSION_CURRENT  5
+// Historical directory layout at V5, before the V6 control-interface fields.
+// Read only by the V5→V6 migration in load_directory(); identical to
+// PresetDirectory except it lacks the trailing uart_ctrl / i2c_ctrl blocks.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 23 bytes
+} PresetDirectory_v5;
+
+#define DIR_VERSION_CURRENT  6
 
 // --- Preset Slot (sectors 1-10) ---
 typedef struct __attribute__((packed)) {
@@ -476,6 +506,8 @@ volatile uint32_t preset_mute_counter = 0;
 static void apply_factory_defaults(void);
 static inline void dir_apply_dac_hw_mute_defaults(void);  // defined below
 static void io_config_defaults(FlashOutputConfig *cfg);    // defined below (IO config section)
+static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i);  // defined below
+static void dir_sanitize_ctrl_iface(void);                            // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
 // VALIDATION section.  collect_live_state() and migrate_legacy() use it
 // to compute the CRC byte range that matches whatever version they're
@@ -621,7 +653,39 @@ static bool dir_load_cache(void) {
             return false;
         }
         memcpy(&dir_cache, flash_dir, sizeof(dir_cache));
+        // Defense against corrupt/hand-edited flash: bound-check the control
+        // interface structs, resetting any implausible one to defaults.
+        dir_sanitize_ctrl_iface();
         dir_cache_valid = true;
+        return true;
+    }
+
+    if (flash_dir->version == 5) {
+        // V5 → V6 migration.  V6 appends the device-level control-interface
+        // config (uart_ctrl / i2c_ctrl).  Validate the v5 CRC, copy every field
+        // forward, and seed the new blocks with defaults (disabled).
+        const PresetDirectory_v5 *v5 = (const PresetDirectory_v5 *)flash_dir;
+        const uint8_t *v5_data_start = (const uint8_t *)&v5->startup_mode;
+        size_t v5_data_len = sizeof(PresetDirectory_v5) - offsetof(PresetDirectory_v5, startup_mode);
+        if (crc32(v5_data_start, v5_data_len) != v5->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v5->startup_mode;
+        dir_cache.default_slot       = v5->default_slot;
+        dir_cache.last_active_slot   = v5->last_active_slot;
+        dir_cache.output_config_mode = v5->output_config_mode;
+        dir_cache.slot_occupied      = v5->slot_occupied;
+        dir_cache.master_volume_mode = v5->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v5->spdif_rx_pin;
+        dir_cache.master_volume_db   = v5->master_volume_db;
+        memcpy(dir_cache.slot_names, v5->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v5->dac_hw_mute;
+        dir_cache.output_config      = v5->output_config;
+        ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist as V6
         return true;
     }
 
@@ -651,6 +715,7 @@ static bool dir_load_cache(void) {
         memcpy(dir_cache.slot_names, v4->slot_names, sizeof(dir_cache.slot_names));
         dir_cache.dac_hw_mute        = v4->dac_hw_mute;
         memcpy(&dir_cache.output_config, &v4->output_config, sizeof(v4->output_config));
+        ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);  // V6 blocks
         dir_cache_valid = true;
         (void)dir_flush();   // persist as V5
         return true;
@@ -686,6 +751,7 @@ static bool dir_load_cache(void) {
         dir_cache.dac_hw_mute        = v3->dac_hw_mute;    // carry forward as-is
         io_config_defaults(&dir_cache.output_config);
         dir_cache.output_config.spdif_rx_pin = v3->spdif_rx_pin;  // keep device RX pin
+        ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);  // V6 blocks
         dir_cache_valid = true;
         (void)dir_flush();
         return true;
@@ -719,6 +785,7 @@ static bool dir_load_cache(void) {
         dir_apply_dac_hw_mute_defaults();
         io_config_defaults(&dir_cache.output_config);      // V4 device-global IO
         dir_cache.output_config.spdif_rx_pin = v2->spdif_rx_pin;  // keep device RX pin
+        ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);  // V6 blocks
         dir_cache_valid = true;
         (void)dir_flush();
         return true;
@@ -750,6 +817,7 @@ static bool dir_load_cache(void) {
         // to PCM5102A-friendly defaults — see v2→v3 path above.
         dir_apply_dac_hw_mute_defaults();
         io_config_defaults(&dir_cache.output_config);      // V4 device-global IO (v1 has no RX pin)
+        ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);  // V6 blocks
         dir_cache_valid = true;
         (void)dir_flush();  // persist as V4; if the flush fails, cache stays valid in RAM
         return true;
@@ -774,6 +842,43 @@ static inline void dir_apply_dac_hw_mute_defaults(void) {
     dir_cache.dac_hw_mute.hold_ms    = DAC_HW_MUTE_DEFAULT_HOLD_MS;
     dir_cache.dac_hw_mute.release_ms = DAC_HW_MUTE_DEFAULT_RELEASE_MS;
     memset(dir_cache.dac_hw_mute.reserved, 0, sizeof(dir_cache.dac_hw_mute.reserved));
+}
+
+// Populate the control-interface configs with factory defaults (config.h pins /
+// baud / address).  enabled = 0 so both stay off until the user turns them on.
+// Either pointer may be NULL to leave that interface untouched.  Used by the
+// fresh-flash, V5→V6 migration, and sanitize-on-load paths.
+static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i) {
+    if (u) {
+        u->enabled  = 0;
+        u->tx_pin   = UART_CTRL_DEFAULT_TX_PIN;
+        u->rx_pin   = UART_CTRL_DEFAULT_RX_PIN;
+        u->reserved = 0;
+        u->baud     = UART_CTRL_DEFAULT_BAUD;
+    }
+    if (i) {
+        i->enabled = 0;
+        i->sda_pin = I2C_CTRL_DEFAULT_SDA_PIN;
+        i->scl_pin = I2C_CTRL_DEFAULT_SCL_PIN;
+        i->address = I2C_CTRL_DEFAULT_ADDRESS;
+        memset(i->reserved, 0, sizeof(i->reserved));
+    }
+}
+
+// Bound-check the directory's control-interface structs; any implausible field
+// resets that interface to defaults (disabled).  Deeper checks (pin mux,
+// collisions) run elsewhere at apply time.
+static void dir_sanitize_ctrl_iface(void) {
+    UartCtrlConfig *u = &dir_cache.uart_ctrl;
+    if (u->enabled > 1 || u->tx_pin > 29 || u->rx_pin > 29 ||
+        u->baud < UART_CTRL_BAUD_MIN || u->baud > UART_CTRL_BAUD_MAX) {
+        ctrl_iface_defaults(u, NULL);
+    }
+    I2cCtrlConfig *i = &dir_cache.i2c_ctrl;
+    if (i->enabled > 1 || i->sda_pin > 29 || i->scl_pin > 29 ||
+        i->address < I2C_CTRL_ADDRESS_MIN || i->address > I2C_CTRL_ADDRESS_MAX) {
+        ctrl_iface_defaults(NULL, i);
+    }
 }
 
 // Write the RAM-cached directory back to flash.
@@ -816,6 +921,7 @@ static void dir_ensure(void) {
     // have to flip enabled=1.
     dir_apply_dac_hw_mute_defaults();
     io_config_defaults(&dir_cache.output_config);  // V4 device-global IO defaults
+    ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);  // V6 control interfaces
     dir_cache_valid = true;
     // Don't flush yet — will be flushed on first preset save
 }
@@ -836,7 +942,9 @@ static void dir_ensure(void) {
 // True if `pin` is a usable output/RX GPIO on this platform.  (0 is allowed for
 // output pins; the SPDIF RX path additionally rejects 0 as "absent".)
 static bool io_pin_valid(uint8_t pin) {
-    bool valid = (pin <= 29) && (pin != 16) && (pin != 17) && !(pin >= 23 && pin <= 25);
+    // GPIO 16/17 are assignable again (debug UART removed); live collisions
+    // with the UART/I2C control interfaces are caught by is_pin_in_use().
+    bool valid = (pin <= 29) && !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
     if (pin > 28) valid = false;
 #endif
@@ -1753,6 +1861,24 @@ void preset_get_dac_hw_mute(DacHwMuteConfig *out) {
     if (!out) return;
     dir_ensure();
     memcpy(out, &dir_cache.dac_hw_mute, sizeof(*out));
+}
+
+// Control-interface (UART/I2C) persistence.  Mirrors preset_set_dac_hw_mute:
+// synchronous, main-loop only, writes the directory sector once.  A NULL
+// pointer leaves that interface's stored config unchanged.  Callers must have
+// already validated the configs; sanitize-on-load is only a corruption guard.
+void preset_set_ctrl_iface(const UartCtrlConfig *uart, const I2cCtrlConfig *i2c) {
+    if (!uart && !i2c) return;
+    dir_ensure();
+    if (uart) memcpy(&dir_cache.uart_ctrl, uart, sizeof(dir_cache.uart_ctrl));
+    if (i2c)  memcpy(&dir_cache.i2c_ctrl,  i2c,  sizeof(dir_cache.i2c_ctrl));
+    dir_flush();
+}
+
+void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out) {
+    dir_ensure();
+    if (uart_out) memcpy(uart_out, &dir_cache.uart_ctrl, sizeof(*uart_out));
+    if (i2c_out)  memcpy(i2c_out,  &dir_cache.i2c_ctrl,  sizeof(*i2c_out));
 }
 
 // Copy the live master volume into the directory's independent field and

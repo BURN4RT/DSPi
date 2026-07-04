@@ -25,6 +25,7 @@
 19. [LG Sound Sync](#lg-sound-sync)
 20. [Memory Layout](#memory-layout)
 21. [Performance Characteristics](#performance-characteristics)
+22. [External Control Interfaces (UART / I2C Target)](#external-control-interfaces-uart--i2c-target)
 
 ---
 
@@ -1155,14 +1156,24 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 4)
-*Last updated: 2026-06-01*
+### Preset Directory Fields (Version 6)
+*Last updated: 2026-07-04*
 
-`DIR_VERSION_CURRENT` = 4. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 6. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
-device-global `FlashOutputConfig` block; `dir_load_cache()` migrates V1/V2/V3
-forward (seeding `output_config` from firmware IO defaults, carrying the device
-SPDIF RX pin into the block). See `Documentation/Features/output_config_independent_load.md`.
+device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
+I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
+external control-interface config: an 8-byte `UartCtrlConfig` and an 8-byte
+`I2cCtrlConfig`. `dir_load_cache()` migrates V1..V5 forward: the V5-to-V6 step
+validates the V5 CRC, copies every field, then seeds the two new blocks with
+`ctrl_iface_defaults()` (both disabled, default pins/baud/address) and reflushes
+as V6. On every load, `dir_sanitize_ctrl_iface()` bounds-checks the two structs
+(enabled 0/1, pins <= 29, baud in range, I2C address 0x08..0x77) and resets any
+implausible one to defaults; deeper mux/collision checks run at apply time. Both
+blocks are device-level (a listening profile, not per-preset) and **survive a
+factory reset**, exactly like `dac_hw_mute`. See
+`Documentation/Features/output_config_independent_load.md` and
+`Documentation/Features/control_interfaces_spec.md`.
 
 | Field | Description |
 |-------|-------------|
@@ -1176,7 +1187,9 @@ SPDIF RX pin into the block). See `Documentation/Features/output_config_independ
 | master_volume_db | Independent master volume (mode 0 source); float, default -20 dB |
 | slot_names[10][32] | 32-byte NUL-terminated names per slot |
 | dac_hw_mute | DAC hardware-mute config (V3+, board-level) |
-| output_config | Device-global `FlashOutputConfig` (V4+): output pins/types, I2S BCK/MCK pin/enable/multiplier, SPDIF RX pin — the source of truth in independent mode |
+| output_config | Device-global `FlashOutputConfig` (V4+, +3 bytes at V5): output pins/types, I2S BCK/MCK pin/enable/multiplier, SPDIF RX pin, I2S RX multichannel pins; the source of truth in independent mode |
+| uart_ctrl | UART control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
+| i2c_ctrl | I2C target control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-04-09*
@@ -1272,7 +1285,14 @@ Default channel names are derived from current device state, not hard-coded:
 ---
 
 ## Pin Configuration
-*Last updated: 2026-02-15*
+*Last updated: 2026-07-04*
+
+The debug UART was removed entirely (stdio_uart off), freeing GPIO 16/17; they
+are no longer reserved and are now the default pins for the UART control
+interface. GPIO 18/19 are the default I2C control-interface pins. Live
+control-interface pins are reserved against all other pin-assignment commands
+(they participate in `is_pin_in_use`); see the External Control Interfaces
+section.
 
 ### Default Assignments
 
@@ -1285,8 +1305,10 @@ Default channel names are derived from current device state, not hard-coded:
 | 8 | S/PDIF 3 | Outputs 5-6 |
 | 9 | S/PDIF 4 | Outputs 7-8 |
 | 10 | PDM Sub | Output 9 |
-| 16 | UART0 TX | Debug |
-| 17 | UART0 RX | Debug |
+| 16 | UART control TX (default; disabled until enabled over USB) | Control |
+| 17 | UART control RX (default) | Control |
+| 18 | I2C control SDA (default; disabled until enabled over USB) | Control |
+| 19 | I2C control SCL (default) | Control |
 | 25 | LED | Heartbeat |
 
 **RP2040:**
@@ -1296,16 +1318,18 @@ Default channel names are derived from current device state, not hard-coded:
 | 6 | S/PDIF 1 | Outputs 1-2 |
 | 7 | S/PDIF 2 | Outputs 3-4 |
 | 10 | PDM Sub | Output 5 |
-| 16 | UART0 TX | Debug |
-| 17 | UART0 RX | Debug |
+| 16 | UART control TX (default; disabled until enabled over USB) | Control |
+| 17 | UART control RX (default) | Control |
+| 18 | I2C control SDA (default; disabled until enabled over USB) | Control |
+| 19 | I2C control SCL (default) | Control |
 | 25 | LED | Heartbeat |
 
 ### Runtime Reconfiguration
-*Last updated: 2026-05-30*
+*Last updated: 2026-07-04*
 
 Vendor commands `REQ_SET_OUTPUT_PIN` (0x7C) / `REQ_GET_OUTPUT_PIN` (0x7D).
 
-**Constraints:** Valid GPIO range, not reserved (16-17 UART0, 23-25 power/LED), and not in use by another output, the I2S BCK/LRCLK or MCK pin, the SPDIF RX pin, or the DAC hardware-mute pin (`is_pin_in_use`).
+**Constraints:** Valid GPIO range, not reserved (23-25 power/LED; GPIO 16/17 are no longer reserved now that the debug UART is gone), and not in use by another output, the I2S BCK/LRCLK or MCK pin, the SPDIF RX pin, the DAC hardware-mute pin, or a live UART/I2C control-interface pin (`is_pin_in_use`).
 
 **S/PDIF and I2S slots:** Deferred to the main loop, not applied in the USB ISR. `REQ_SET_OUTPUT_PIN` writes the target into `output_pins[out_idx]` (RAM-only, like `spdif_rx_pin`) and sets a bit in `output_pin_change_mask`; the main-loop gate (shared `pipeline_reset_ready()` hold) then runs `process_pin_changes(mask)`. That helper mirrors `process_type_switches`: `prepare_pipeline_reset()` (soft mute + Core 1 fence + DAC hardware-mute assert) → suspend SPDIF RX if running → `drain_and_disable_outputs()` → `audio_spdif_change_pin()` / `audio_i2s_change_data_pin()` on each flagged slot while disabled → `complete_pipeline_reset()` for the **synchronized** restart of all slots → restart RX. The synchronized restart is the point: a moved slot re-enters in phase with the others, preserving the inviolable inter-slot sample alignment. (The prior implementation restarted only the changed slot live in the ISR, which clicked and left that slot phase-misaligned until the next full reset.) `change_pin` masks the channel's DMA IRQ before aborting the DMA so the handler can't start a conflicting transfer during PIO SM reinit, and clears any stale completion flag before unmasking. Back-to-back requests accumulate in the mask and apply in one batch. Persistence follows `output_config_mode`: in with-preset mode the pin travels with the preset (`REQ_PRESET_SAVE` captures it, applied on load); in independent mode it is device-global (`REQ_SAVE_OUTPUT_CONFIG` persists it, applied at boot).
 
@@ -1389,7 +1413,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-05-19*
+*Last updated: 2026-07-04*
 
 ### Hardware
 
@@ -1400,6 +1424,8 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | FPU | None (software float) | Single-precision VFP |
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
+| UART + I2C external control | Yes (identical) | Yes (identical) |
+| Control-path code location | Flash XIP (custom copy-to-RAM script) | RAM (stock copy-to-RAM script) |
 
 ### DSP Processing
 
@@ -1497,7 +1523,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-06-24 (noted DSPI_LOOPBACK debug-build BSS delta)*
+*Last updated: 2026-07-04 (RP2040 control-path objects kept in flash XIP)*
 
 > **DSPI_LOOPBACK debug build (2026-06-24).** The numbers below describe the
 > normal (release) build. The optional `DSPI_LOOPBACK` build adds ~8.7 KB BSS on
@@ -1520,6 +1546,22 @@ masked, and PDM claims its channel once at init.
 > `audio_consumer_pool_reformat()` (pico_audio); `*_connect_extra()` now take the pool
 > as a parameter. Producer pools remain heap (allocated once at boot, never churn).
 > Per-instance silence buffers are likewise static (embedded in the instance struct).
+
+> **RP2040 control-path code in flash XIP (2026-07-04).** The RP2040 uses a
+> custom copy-to-RAM linker script
+> (`memmap_dspi_rp2040_copy_to_ram.ld`, selected only for `rp2040`) that keeps
+> six objects executing from flash (XIP) instead of being copied to RAM:
+> `vendor_commands.c.o`, `uart_control.c.o`, `i2c_control.c.o`,
+> `bulk_params.c.o`, `lg_sound_sync.c.o`, and `usb_descriptors.c.o` (their
+> `.text` and `.rodata`, a `.xip_ctrl_text` output section). Together they are
+> roughly 26 KB of code+rodata, keeping the copy-to-RAM image under the 264 KB
+> budget after the external-control feature with ~13 KB of headroom (~4.6 KB
+> in the loopback debug build). This is safe because none of it is audio-path
+> code, none of it contains `DSP_TIME_CRITICAL` sections, and none of it runs
+> inside the IRQs-off flash-write window; the XIP cache keeps the hot paths
+> near RAM speed. RP2350 has RAM headroom and uses the SDK's stock copy-to-RAM
+> script (all six objects run from RAM there); its layout is unchanged by this
+> feature.
 
 ### RP2040 (264 KB SRAM)
 
@@ -1686,8 +1728,92 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 
 ---
 
+## External Control Interfaces (UART / I2C Target)
+*Last updated: 2026-07-04*
+
+An external microcontroller can drive the entire vendor-command surface over a
+UART or the I2C target (slave) interface, at parity with USB. Full integrator
+detail lives in `Documentation/Features/control_interfaces_spec.md`; this section
+covers the firmware-side structure.
+
+### Orchestrator refactor
+
+The vendor command surface was made transport-neutral. USB (EP0), UART, and I2C
+each parse their own wire framing into the same `bRequest` / `wValue` / `wIndex` /
+`wLength` shape and call a shared dispatcher in `vendor_commands.c`:
+
+- `vendor_dispatch_get(CtrlSource, bRequest, wValue, wIndex, wLength, &resp_data, &resp_len)`
+- `vendor_dispatch_set(CtrlSource, bRequest, wValue, wIndex, payload, wLength)`
+
+`CtrlSource` is `USB` (0) / `UART` (1) / `I2C` (2). New commands added to the
+SET/GET switches are automatically reachable from every transport with nothing
+per-transport to implement.
+
+**Response sink.** A GET dispatch returns a pointer/length into static storage
+that stays valid until the next dispatch from any transport, so a transport poll
+consumes or copies it before returning. `REQ_GET_ALL_PARAMS` points into
+`bulk_param_buf` and holds the bulk lock until the caller releases it.
+
+**USB SET-in-flight guard.** External dispatch runs from the main loop and is
+refused with `CTRL_DISPATCH_BUSY` (wire `CTRL_STATUS_BUSY`) while a USB control
+SET is mid-transfer, so the two paths never race the same state. The client
+retries the whole request.
+
+**bulk_param_buf owner lock.** The single shared bulk buffer is serialized across
+USB/UART/I2C via `vendor_bulk_try_acquire` / `vendor_bulk_release` /
+`vendor_bulk_touch` (IRQ-safe). External owners go stale after 500 ms unless they
+refresh while actively streaming. A contended request returns
+`CTRL_DISPATCH_BULK_LOCKED` (wire `CTRL_STATUS_BULK_LOCKED`).
+
+**USB-only self-config.** `REQ_SET_UART_CONFIG` (`0xF5`) and `REQ_SET_I2C_CONFIG`
+(`0xF7`) are refused on the external transports (`CTRL_DISPATCH_BLOCKED` / wire
+`CTRL_STATUS_BLOCKED`) so an external controller can never reconfigure or lock
+itself out of its own transport. All other commands, including the config GETs,
+the status readback, presets, bulk, and bootloader entry, work on every
+transport.
+
+### Transport modules
+
+- `uart_control.c` / `.h`: sync-byte + CRC16-CCITT-FALSE framing (poly `0x1021`,
+  init `0xFFFF`), fixed 8N1, configurable baud 9600..1000000. Types `0x01`/`0x02`
+  requests, `0x81`/`0x82` responses; `0x40` reserved for future device-initiated
+  notifications (not implemented; v1 is request/response only).
+- `i2c_control.c` / `.h`: target-only, 8-byte header write frames,
+  `[status,lenL,lenH,payload]` read frames with `0xFF` padding, a `[0x01,0,0]`
+  BUSY frame before the main loop dispatches, and resumable chunked reads. Up to
+  400 kHz; weak internal pull-ups enabled but external pull-ups recommended.
+
+### Non-blocking design and IRQ priorities
+
+Both transports are strictly non-blocking. Their ISRs only shuttle bytes between
+the peripheral FIFOs and module ring/buffers; all frame parsing, dispatch, and TX
+happen in `uart_ctrl_poll()` / `i2c_ctrl_poll()` from the main loop, so the audio
+pipeline is never touched. The I2C target stretches the clock only to ISR latency
+at FIFO boundaries, never while waiting on application state (that is what the
+BUSY frame is for). Both control IRQs run at priority `0xC0` (below the audio and
+USB IRQs).
+
+### Boot and main-loop wiring
+
+- **Boot** (`main.c`): after `preset_boot_load()` and after the output / DAC-mute
+  pin claims, `preset_get_ctrl_iface()` supplies the persisted configs to
+  `uart_ctrl_init()` / `i2c_ctrl_init()`. A stored config whose pins now collide
+  is quietly kept down (live=false), visible via `REQ_GET_CTRL_IFACE_STATUS`.
+- **Main loop:** `uart_ctrl_poll()` and `i2c_ctrl_poll()` run every iteration.
+- **Deferred config SET:** a USB `0xF5`/`0xF7` sets `ctrl_set_uart_pending` /
+  `ctrl_set_i2c_pending`; the main loop does the live apply first (GPIO/IRQ work,
+  tearing the interface down before validating so its own pins are not seen as
+  in-use), then persists to the directory **only on** `PIN_CONFIG_SUCCESS`, so a
+  bad SET never clobbers a good stored config. Changes arriving over UART/I2C emit
+  USB-host notifications tagged `PARAM_SRC_UART` (8) / `PARAM_SRC_I2C` (9).
+
+Interface config is device-level, not part of `WireBulkParams`; the bulk wire
+format version is unchanged by this feature.
+
+---
+
 ## Vendor Command Reference
-*Last updated: 2026-06-11*
+*Last updated: 2026-07-04*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -1816,6 +1942,11 @@ Atomic read-then-clear: returns the current `clip_flags` value (2 bytes, little-
 | REQ_GET_INPUT_RATE | 0xEE | IN | Returns 8 bytes: 2x uint32_t {current pipeline Hz, selected I2S input Hz} |
 | REQ_SET_I2S_RX_PIN | 0xF1 | IN* | Set I2S RX data GPIO pin (wValue=pin, returns status) |
 | REQ_GET_I2S_RX_PIN | 0xF2 | IN | Get I2S RX data GPIO pin |
+| REQ_SET_UART_CONFIG | 0xF5 | OUT | Configure UART control interface (8-byte `UartCtrlConfig`; **USB only**, refused with BLOCKED over UART/I2C; deferred apply, persist on success; returns `PIN_CONFIG_*`) |
+| REQ_GET_UART_CONFIG | 0xF6 | IN | Get persisted `UartCtrlConfig` (8 bytes) |
+| REQ_SET_I2C_CONFIG | 0xF7 | OUT | Configure I2C target control interface (8-byte `I2cCtrlConfig`; **USB only**, refused with BLOCKED over UART/I2C; deferred apply, persist on success; returns `PIN_CONFIG_*`) |
+| REQ_GET_I2C_CONFIG | 0xF8 | IN | Get persisted `I2cCtrlConfig` (8 bytes) |
+| REQ_GET_CTRL_IFACE_STATUS | 0xF9 | IN | Get `CtrlIfaceStatus` (8 bytes: uart/i2c last_status + live flags, proto_version=1) |
 
 ### Bulk Parameter Transfer
 *Last updated: 2026-06-11*
