@@ -633,8 +633,10 @@ static int flash_write_sector(uint32_t offset, const void *data, size_t len) {
     // Guarded: (a) victim_is_initialized handles first-boot (Core 1 not
     // launched yet) and launch-to-init race; (b) __get_current_exception
     // skips lockout in IRQ context (USB vendor handler) where SDK lock
-    // internals are unsafe — IRQ callers rely on copy_to_ram build for
-    // XIP safety (see CMakeLists.txt:38).
+    // internals are unsafe. IRQ-context saves are safe because Core 1's
+    // entire execution set is RAM-resident (enforced by
+    // scripts/check_ram_placement.py); core-1 lockout is still used when
+    // not in IRQ context.
     bool do_lockout = multicore_lockout_victim_is_initialized(1)
                       && (__get_current_exception() == 0);
     if (do_lockout) multicore_lockout_start_blocking();

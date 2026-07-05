@@ -215,7 +215,7 @@ static inline uint32_t* _to_buff_ptr(uint32_t ptr)
 
 // default spdif_rx block callback function (you may override at external)
 __attribute__((weak))
-void spdif_rx_callback_func(uint32_t* buff, uint32_t sub_frame_count, uint8_t c_bits[SPDIF_BLOCK_SIZE / 16], bool parity_err)
+void __time_critical_func(spdif_rx_callback_func)(uint32_t* buff, uint32_t sub_frame_count, uint8_t c_bits[SPDIF_BLOCK_SIZE / 16], bool parity_err)
 {
     (void) buff;
     (void) sub_frame_count;
@@ -224,7 +224,7 @@ void spdif_rx_callback_func(uint32_t* buff, uint32_t sub_frame_count, uint8_t c_
     return;
 }
 
-static int _check_block(uint32_t buff[SPDIF_BLOCK_SIZE])
+static int __time_critical_func(_check_block)(uint32_t buff[SPDIF_BLOCK_SIZE])
 {
     uint pos_syncB = 0;
     uint32_t block_parity_err_count = 0;
@@ -300,7 +300,7 @@ static int _check_block(uint32_t buff[SPDIF_BLOCK_SIZE])
     return block_aligned;
 }
 
-static uint32_t _dma_done_and_restart(uint8_t dma_channel, dma_channel_config* dma_config)
+static uint32_t __time_critical_func(_dma_done_and_restart)(uint8_t dma_channel, dma_channel_config* dma_config)
 {
     uint32_t done_ptr = buff_wr_done_ptr;
     if (spdif_rx_get_state() == SPDIF_RX_STATE_STABLE) {

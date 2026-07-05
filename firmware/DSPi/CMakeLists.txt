@@ -81,6 +81,10 @@ if (PICO_PLATFORM STREQUAL "rp2040")
     # RP2040: SPDIF RX on PIO1 SM2 (SM0=PDM; SM1 free since MCK moved to
     # CLK_GPOUT). I2S RX reuses the same SM when SPDIF RX is inactive.
     target_compile_definitions(DSPi PRIVATE PICO_SPDIF_RX_PIO=1)
+    # Hardware divider aeabi shims used by the fixed-point audio path; RP2350 uses native SDIV/UDIV.
+    target_compile_definitions(DSPi PRIVATE PICO_DIVIDER_IN_RAM=1)
+    # 64-bit mul and clz shims (feedback math, float internals); native on RP2350.
+    target_compile_definitions(DSPi PRIVATE PICO_INT64_OPS_IN_RAM=1 PICO_BITS_IN_RAM=1)
 else()
     # RP2350: SPDIF RX on PIO2 (dedicated block, proven working).
     # I2S RX reuses the same SM when SPDIF RX is inactive.
@@ -89,13 +93,16 @@ endif()
 # PICO_FLASH_SPI_CLKDIV=6 is set at the top-level CMakeLists so it reaches
 # the boot2 build (target-level defines don't propagate to it).
 
-pico_set_binary_type(DSPi copy_to_ram)
+# XIP execution: cold code runs from flash through the XIP cache; hot
+# audio/USB code stays in RAM via .time_critical / __not_in_flash_func
+# attributes and the RAM code pull list in the custom scripts below.
+# scripts/check_ram_placement.py enforces the hot-symbol placement.
+pico_set_binary_type(DSPi default)
 
 if (PICO_PLATFORM STREQUAL "rp2040")
-    # Custom copy-to-RAM script: keeps the vendor-command dispatcher and the
-    # UART/I2C control transports executing from flash (XIP) to fit the
-    # 264 KB RAM budget.  RP2350 has headroom and uses the SDK script.
-    pico_set_linker_script(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/memmap_dspi_rp2040_copy_to_ram.ld)
+    pico_set_linker_script(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/memmap_dspi_rp2040_xip.ld)
+else()
+    pico_set_linker_script(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/memmap_dspi_rp2350_xip.ld)
 endif()
 
 pico_generate_pio_header(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/i2s_input.pio)
@@ -119,6 +126,16 @@ target_compile_definitions(DSPi PRIVATE
     # irq_has_shared_handler), removed irq_set_enabled in teardown,
     # interrupt-safe _spdif_rx_common_end.
     PICO_SPDIF_RX_DMA_IRQ=1
+
+    # RAM-places the TinyUSB rp2040-port IRQ path; both platforms use this USB port.
+    PICO_RP2040_USB_FAST_IRQ=1
+    # SDK float shims go to .time_critical; used per block by the feedback servo and leveller.
+    PICO_FLOAT_IN_RAM=1
+    # Double shims too: the leveller's powf reaches double helpers per block.
+    PICO_DOUBLE_IN_RAM=1
+    # RP2040 mem_ops ROM shims (memset/memcpy wraps) go to RAM; called from core 1
+    # and per-block paths. No effect on RP2350 (compiler mem ops; see linker script).
+    PICO_MEM_IN_RAM=1
 )
 
 target_link_libraries(DSPi

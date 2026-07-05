@@ -182,7 +182,7 @@ void pdm_change_pin(uint8_t new_pin) {
     pdm_current_pin = new_pin;
 }
 
-void pdm_push_sample(int32_t sample, bool reset) {
+void __not_in_flash_func(pdm_push_sample)(int32_t sample, bool reset) {
     uint8_t next_head = pdm_head + 1;
     if (next_head != pdm_tail) {
         pdm_msg_t msg;
@@ -200,7 +200,7 @@ void pdm_push_sample(int32_t sample, bool reset) {
 // PDM PROCESSING LOOP (extracted from former pdm_core1_entry)
 // Runs sigma-delta modulation when core1_mode == CORE1_MODE_PDM
 // ----------------------------------------------------------------------------
-static void pdm_processing_loop() {
+static void __not_in_flash_func(pdm_processing_loop)() {
     int32_t local_pdm_err = 0;
     int32_t local_pdm_err2 = 0;
     uint32_t active_us_accumulator = 0;
@@ -693,7 +693,7 @@ static void __not_in_flash_func(eq_worker_loop)() {
 // BUFFER FILL LEVEL ACCESSORS (called from Core 0)
 // ----------------------------------------------------------------------------
 
-uint8_t pdm_get_dma_fill_pct(void) {
+uint8_t __not_in_flash_func(pdm_get_dma_fill_pct)(void) {
     if (!pdm_enabled || pdm_dma_chan < 0) return 0;
     uint32_t write_idx = pdm_stats_write_idx;
     uint32_t read_addr = dma_hw->ch[pdm_dma_chan].read_addr;
@@ -702,7 +702,7 @@ uint8_t pdm_get_dma_fill_pct(void) {
     return (uint8_t)(delta * 100 / PDM_DMA_BUFFER_SIZE);
 }
 
-uint8_t pdm_get_ring_fill_pct(void) {
+uint8_t __not_in_flash_func(pdm_get_ring_fill_pct)(void) {
     uint8_t count = (uint8_t)(pdm_head - pdm_tail);
     return (uint8_t)(count * 100 / RING_SIZE);
 }
@@ -710,7 +710,7 @@ uint8_t pdm_get_ring_fill_pct(void) {
 // ----------------------------------------------------------------------------
 // CORE 1 ENTRY — mode dispatcher
 // ----------------------------------------------------------------------------
-void pdm_core1_entry() {
+void __not_in_flash_func(pdm_core1_entry)() {
 #if PICO_RP2350
     // Enable flush-to-zero and default-NaN on Core 1 (each core has its own FPSCR).
     // Prevents denormal performance penalty in SVF/biquad state decay.

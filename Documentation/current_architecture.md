@@ -31,7 +31,7 @@
 ---
 
 ## System Overview
-*Last updated: 2026-02-15*
+*Last updated: 2026-07-05*
 
 DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspberry Pi Pico (RP2040) and Pico 2 (RP2350). It receives stereo PCM audio over USB and routes it through a configurable DSP pipeline to multiple output channels via PIO-based S/PDIF and PDM.
 
@@ -50,12 +50,12 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 - Full parameter persistence to flash
 - Vendor control interface (WinUSB/WCID) for real-time parameter control
 
-**Firmware binary:** `copy_to_ram` — entire firmware executes from SRAM for deterministic latency.
+**Firmware binary:** `default` (XIP) on both platforms; cold code executes from flash through the XIP cache while the hot audio/USB set is RAM-resident (see "Memory Layout").
 
 ---
 
 ## Source File Map
-*Last updated: 2026-06-11*
+*Last updated: 2026-07-05*
 
 ### Core Firmware (`firmware/DSPi/`)
 
@@ -93,6 +93,15 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 | `usb_descriptors.c` | Hand-rolled UAC1 configuration descriptor as a packed byte array + TinyUSB `tud_descriptor_*_cb()` callbacks |
 | `usb_descriptors.h` | Descriptor declarations, UAC1 request opcodes, per-alt EP descriptor pointer externs |
 | `dcp_inline.h` | RP2350 DCP (Double Coprocessor) inline assembly wrappers |
+| `memmap_dspi_rp2040_xip.ld` | RP2040 XIP linker script (SDK `memmap_default.ld` + hot-object excludes and RAM pull list) |
+| `memmap_dspi_rp2350_xip.ld` | RP2350 XIP linker script (same derivation as the RP2040 variant) |
+
+### Build / verification scripts (repo `scripts/`)
+
+| File | Purpose |
+|------|---------|
+| `scripts/check_ram_placement.py` | Verifies the XIP build: hot symbols resolve to RAM (A), no hot-function branch reaches flash (B), no Core-1 flash literal-pool pointers (B2), sizes vs baseline + `.data` budgets (C). Accepts release and loopback ELFs. |
+| `scripts/ram_baseline.json` | Recorded copy_to_ram baseline sizes used by `check_ram_placement.py` Check C. |
 
 ### LUFA Compatibility (`firmware/DSPi/lufa/`)
 
@@ -105,13 +114,13 @@ Multi-instance S/PDIF output library (PIO-based, converted from pico-extras sing
 ---
 
 ## Build System
-*Last updated: 2026-04-18*
+*Last updated: 2026-07-05*
 
 ### CMake Configuration
 
 **Build file:** `firmware/DSPi/CMakeLists.txt`
 
-**Binary type:** `copy_to_ram` (entire firmware in SRAM)
+**Binary type:** `default` (XIP) on both platforms via `pico_set_binary_type(DSPi default)`. Cold code runs from flash through the XIP cache; only the hot audio/USB set is RAM-resident, driven by source attributes (`.time_critical`, `__not_in_flash_func`) plus two custom linker scripts `memmap_dspi_rp2040_xip.ld` / `memmap_dspi_rp2350_xip.ld`. See "Memory Layout" for the residency model, the RAM pull list, and the `scripts/check_ram_placement.py` verifier.
 
 **Optimization levels:**
 - General code: `-O2`
@@ -128,6 +137,14 @@ Multi-instance S/PDIF output library (PIO-based, converted from pico-extras sing
 - `PICO_AUDIO_SPDIF_PIO=0`
 - `PICO_AUDIO_SPDIF_DMA_IRQ=1`
 - `PICO_AUDIO_I2S_DMA_IRQ=0`
+
+**XIP residency compile definitions (both platforms unless noted):**
+- `PICO_RP2040_USB_FAST_IRQ=1`; routes the TinyUSB rp2040-port USB ISR path to RAM (both platforms use this port)
+- `PICO_FLOAT_IN_RAM=1`; float shims in RAM
+- `PICO_DOUBLE_IN_RAM=1`; double shims in RAM (the leveller's powf reaches double helpers per block)
+- `PICO_MEM_IN_RAM=1`; mem* shims in RAM
+- `PICO_DIVIDER_IN_RAM=1`; RP2040 only, divider shims in RAM
+- `PICO_INT64_OPS_IN_RAM=1` and `PICO_BITS_IN_RAM=1`; RP2040 only, 64-bit mul and clz shims in RAM
 
 **Vendor commands** were temporarily excluded in Phase 1 and re-added in Phase 2; `vendor_commands.c` / `vendor_commands.h` are now back in `add_executable()`.
 
@@ -423,7 +440,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 ---
 
 ## USB Audio Loopback Capture (DSPI_LOOPBACK)
-*Last updated: 2026-06-27 (capture EP right-sized to 312 B for the FS iso budget)*
+*Last updated: 2026-07-05 (XIP: RP2040 no longer RAM-tight; loopback ELFs are accepted by check_ram_placement.py)*
 
 A **debug/verification-only** feature, compiled in only when the `DSPI_LOOPBACK`
 build flag is defined. It folds the standalone `~/USBrx` S/PDIF-to-USB recorder's
@@ -517,9 +534,11 @@ registration + interface guard), `audio_pipeline.c` (slot-0 tap), `CMakeLists.tx
 
 ### Memory / platform note
 The capture ring + buffers add **~8.7 KB BSS** on both platforms (measured: RP2040
-BSS 129436 → 138120; RP2350 237404 → 246092). RP2040 is RAM-tight in this build
-(~6 KB headroom under `copy_to_ram`); RP2350 has ample margin. Behavior is
-identical on both platforms.
+BSS 129436 → 138120; RP2350 237404 → 246092). Under the XIP build both platforms
+have ample RAM headroom for this BSS (RP2040 free RAM ~91 KB, RP2350 ~192 KB before
+the loopback additions), so the RP2040 RAM-tightness noted under the old
+`copy_to_ram` image no longer applies. Behavior is identical on both platforms. The
+loopback ELFs are also accepted by `scripts/check_ram_placement.py`.
 
 ---
 
@@ -1134,13 +1153,13 @@ The wire format and persisted preset data are unchanged (only `intensity_pct` an
 ---
 
 ## Flash Storage
-*Last updated: 2026-04-09*
+*Last updated: 2026-07-05*
 
 ### Flash Operation Safety
 
-Flash erase/program requires quiescing XIP (execute-in-place). `flash_write_sector()` and `preset_delete()` use a guarded `multicore_lockout` to safely park Core 1 in RAM during the operation:
+Flash erase/program requires quiescing XIP (execute-in-place): only the erase/program windows forbid flash fetches; ordinary XIP execution is legal even with IRQs disabled. `flash_write_sector()` and `preset_delete()` run with IRQs disabled and park Core 1 via a guarded `multicore_lockout` when Core 1 is a registered victim:
 
-- **Guard condition:** `multicore_lockout_victim_is_initialized(1) && (__get_current_exception() == 0)`. The SDK function handles first-boot (Core 1 not launched) and launch-to-init race windows. The exception check skips lockout from IRQ context (USB vendor handler), where SDK lock internals are unsafe. IRQ callers rely on the `copy_to_ram` build for XIP safety.
+- **Guard condition:** `multicore_lockout_victim_is_initialized(1) && (__get_current_exception() == 0)`. The SDK function handles first-boot (Core 1 not launched) and launch-to-init race windows. The exception check skips lockout from IRQ context (USB vendor handler), where SDK lock internals are unsafe. IRQ-context saves that skip the lockout are safe because everything Core 1 can execute is RAM-resident (enforced by `scripts/check_ram_placement.py` Check B / B2), so a parked-or-not Core 1 never fetches from flash during the erase/program window. The audio consequence of a flash write is unchanged (muted window, feedback re-seed).
 - **Core 1 victim init:** `multicore_lockout_victim_init()` called at the start of `pdm_core1_entry()`.
 - **Interrupt blackout:** ~45ms for sector erase + program. All interrupts disabled on Core 0 during this window. The existing mute strategy (`preset_loading` + `preset_mute_counter`) and feedback reseed cover the audio gap.
 
@@ -1424,7 +1443,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-05*
 
 ### Hardware
 
@@ -1436,7 +1455,11 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
 | UART + I2C external control | Yes (identical) | Yes (identical) |
-| Control-path code location | Flash XIP (custom copy-to-RAM script) | RAM (stock copy-to-RAM script) |
+| Binary type | `default` (XIP) | `default` (XIP) |
+| Cold code location (control paths, storage, coeff design, init) | Flash XIP | Flash XIP |
+| RAM code+rodata+data (.data) | 44,376 B (was 108,692 under copy_to_ram) | 48,688 B (was 147,332 under copy_to_ram) |
+| Free RAM | ~80,596 B (was ~10,476) | ~182,228 B (was ~75,540) |
+| Custom XIP linker script | `memmap_dspi_rp2040_xip.ld` (+divider/int64/bit-ops IN_RAM defines) | `memmap_dspi_rp2350_xip.ld` |
 
 ### DSP Processing
 
@@ -1534,14 +1557,15 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-05 (Control Surfaces: control_surfaces.c.o added to RP2040 XIP list; ~400 B engine BSS; directory +132 B within its sector)*
+*Last updated: 2026-07-05 (XIP migration: binary type `default` on both platforms; only the hot audio/USB set is RAM-resident; RAM .data drops to 44,376 B RP2040 / 48,688 B RP2350; free RAM rises to ~80,596 / ~182,228 B)*
 
-> **DSPI_LOOPBACK debug build (2026-06-24).** The numbers below describe the
-> normal (release) build. The optional `DSPI_LOOPBACK` build adds ~8.7 KB BSS on
-> both platforms (a 1024-frame capture ring + a 384 B packet buffer + small
-> state). On RP2040 this leaves the `copy_to_ram` image with only ~6 KB of RAM
-> headroom — acceptable for a debug build but not for release. See
-> "USB Audio Loopback Capture (DSPI_LOOPBACK)".
+> **DSPI_LOOPBACK debug build (2026-06-24, updated 2026-07-05).** The numbers below
+> describe the normal (release) build. The optional `DSPI_LOOPBACK` build adds
+> ~8.7 KB BSS on both platforms (a 1024-frame capture ring + a 384 B packet buffer
+> + small state). Under the XIP build both platforms have ample RAM headroom for
+> this (RP2040 free RAM ~91 KB, RP2350 ~192 KB before the loopback BSS); the
+> RP2040 RAM-tightness noted under the old `copy_to_ram` image no longer applies.
+> See "USB Audio Loopback Capture (DSPI_LOOPBACK)".
 
 > **Static consumer pools (2026-05-31).** The per-output-slot consumer buffer pool
 > is now a single statically-allocated (BSS) pool per slot, **shared by the slot's
@@ -1558,25 +1582,77 @@ masked, and PDM claims its channel once at init.
 > as a parameter. Producer pools remain heap (allocated once at boot, never churn).
 > Per-instance silence buffers are likewise static (embedded in the instance struct).
 
-> **RP2040 control-path code in flash XIP (2026-07-05).** The RP2040 uses a
-> custom copy-to-RAM linker script
-> (`memmap_dspi_rp2040_copy_to_ram.ld`, selected only for `rp2040`) that keeps
-> seven objects executing from flash (XIP) instead of being copied to RAM:
-> `vendor_commands.c.o`, `uart_control.c.o`, `i2c_control.c.o`,
-> `control_surfaces.c.o`, `bulk_params.c.o`, `lg_sound_sync.c.o`, and
-> `usb_descriptors.c.o` (their `.text` and `.rodata`, a `.xip_ctrl_text` output
-> section). Together they keep the copy-to-RAM image under the 264 KB budget
-> after the control-path features. This is safe because none of it is audio-path
-> code, none of it contains `DSP_TIME_CRITICAL` sections, and none of it runs
-> inside the IRQs-off flash-write window; the XIP cache keeps the hot paths
-> near RAM speed. RP2350 has RAM headroom and uses the SDK's stock copy-to-RAM
-> script (all seven objects run from RAM there); its layout is unchanged by this
-> feature.
+> **XIP execution model (2026-07-05).** Both platforms build binary type
+> `default` (XIP): cold code executes from flash through the XIP cache and only
+> the hot audio/USB set is copied to RAM. This replaces the previous
+> `copy_to_ram` image (and its RP2040-only custom copy-to-RAM script with the
+> `.xip_ctrl_text` section, both now deleted). The seven control-path objects the
+> old script kept in flash (`vendor_commands`, `uart_control`, `i2c_control`,
+> `control_surfaces`, `bulk_params`, `lg_sound_sync`, `usb_descriptors`) now
+> simply run from flash like all other cold code, on both platforms.
+>
+> **What lands in RAM.** Residency is driven by source attributes: functions
+> marked `.time_critical` (`DSP_TIME_CRITICAL` / `__time_critical_func`) and
+> `__not_in_flash_func` land in RAM `.data` under the SDK default script rules.
+> The hot set is the DSP pipeline, the USB ISR path (`PICO_RP2040_USB_FAST_IRQ=1`
+> routes the TinyUSB rp2040-port ISR to RAM; both platforms use this port), the
+> TinyUSB event queue (`tu_fifo`) and endpoint claim helpers (`tusb.c`), the DMA
+> IRQ handlers, the feedback servo, the alarm pool + hardware timer + clocks
+> (cancelled/re-armed per block by the SPDIF RX ISR; `clock_get_hz` and the MCK
+> divider sit on the clock-servo path), the notify ring (drained from the USB
+> ISR while parameters change), the float/double/mem shims (`PICO_FLOAT_IN_RAM`,
+> `PICO_DOUBLE_IN_RAM`, `PICO_MEM_IN_RAM` both platforms; `PICO_DIVIDER_IN_RAM`,
+> `PICO_INT64_OPS_IN_RAM`, `PICO_BITS_IN_RAM` RP2040 only), and the entire
+> Core-1 execution set.
+> Newly attribute-marked hot functions include `fb_ctrl_sof_update` /
+> `fb_ctrl_get_10_14` (per-SOF ISR), `spdif_input_update_clock_servo` and the
+> SPDIF RX stable/lost callbacks, the full PDM Core-1 set (`pdm_core1_entry`,
+> `pdm_processing_loop`, `pdm_push_sample`, `pdm_get_dma_fill_pct`,
+> `pdm_get_ring_fill_pct`), `usb_audio_drain_ring` / `usb_audio_flush_ring`,
+> `update_buffer_watermarks` / `get_slot_consumer_fill`, and the pico-extras
+> spdif_rx DMA-ISR callees (`_check_block`, `_dma_done_and_restart`,
+> `spdif_rx_callback_func`). The pico-extras `pico_audio` `AUDIO_TIME_CRITICAL`,
+> `pico_audio_spdif_multi` `SPDIF_TIME_CRITICAL`, and `pico_audio_i2s_multi`
+> `I2S_TIME_CRITICAL` attributes now apply on both platforms (all were
+> RP2350-only, leaving the per-block producer/consumer and sample-encode
+> functions in flash on RP2040); `audio_i2s_mck_set_divider` (clock-servo path)
+> is also `I2S_TIME_CRITICAL`. The RP2040
+> `dspi_flash_range_erase` / `dspi_flash_range_program` wrappers in
+> `flash_clkdiv.c` are now `__no_inline_not_in_flash_func`, matching RP2350.
+> `main.c` (including the main-loop glue) stays in flash deliberately: every
+> block-rate entry point it calls is RAM-marked, and the USB ring plus consumer
+> pools absorb microsecond-scale XIP misses.
+>
+> **Linker scripts.** `firmware/DSPi/memmap_dspi_rp2040_xip.ld` and
+> `memmap_dspi_rp2350_xip.ld` each derive from the SDK 2.2.0 `memmap_default.ld`
+> with three local edits: (a) the flash `.text` `EXCLUDE_FILE` list is extended
+> with path-anchored hot objects (TinyUSB `usbd.c.o`, `usbd_control.c.o`,
+> `dcd_rp2040.c.o`, `rp2040_usb.c.o`, `tusb_fifo.c.o`, `tusb.c.o`; SDK
+> `float_math.c.o`, `pico_time/time.c.o`, `pheap.c.o`, `hardware_timer/timer.c.o`,
+> `hardware_clocks/clocks.c.o`; project `notify.c.o`; fork `spdif_rx.c.o`) plus
+> newlib `mem*` patterns covering the Arm GNU naming (`*libg.a:*libc_a-mem*.o`
+> and friends; the stock SDK pattern misses them, so `memset`/`memmove` would
+> silently land in flash); (b) the same exclusions on flash `.rodata`; (c) a RAM
+> code pull list in `.data`, bracketed by `__ram_code_pull_start__` /
+> `__ram_code_pull_end__` with an `ASSERT(> 3K)` rename tripwire that fails the
+> link if the pull list stops resolving.
+>
+> **Verification.** `scripts/check_ram_placement.py` runs against the built ELFs
+> (`python3 scripts/check_ram_placement.py build-rp2040/DSPi/DSPi.elf
+> build-rp2350/DSPi/DSPi.elf`; the loopback ELFs are also accepted). Check A
+> asserts a curated hot-symbol list resolves to RAM; Check B walks the transitive
+> branch closure of the hot RAM functions, fails on any direct call into flash,
+and warns on flash reached through linker long-call veneers (cold paths); Check
+> B2 scans Core-1 function bodies for flash-range literal-pool pointers
+> (whitelisting two provably init-time-only references); Check C compares sizes
+> against `scripts/ram_baseline.json` (the recorded copy_to_ram baseline) and
+> enforces the `.data` budgets (60 KB RP2040, 64 KB RP2350). All four build
+> variants currently pass with 0 FAIL.
 
 > **Control Surfaces footprint (2026-07-05).** The engine adds ~400 bytes of
 > BSS on both platforms (`s_cfg` 132 B live config, `s_rt[8]` runtime state,
-> `s_slot_status[8]`, and small cursors); its code+rodata rides the RP2040 XIP
-> list (above) so it does not consume the copy-to-RAM budget. In flash, the
+> `s_slot_status[8]`, and small cursors); its code+rodata is cold and runs from
+> flash XIP (above) so it does not consume RAM `.data`. In flash, the
 > preset directory grows by the 132-byte `CsFlashConfig` (V7) but stays well
 > within its existing 4 KB sector, so the flash layout is unchanged.
 
@@ -1599,10 +1675,12 @@ masked, and PDM claims its channel once at init.
 | Consumer pools + silence (static, 2 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~27 KB |
 | I2S RX DMA ring (1024 × 4, 4 KB aligned) | 4 KB |
 | Other BSS | ~20 KB |
-| **Total BSS** | **~126 KB** (measured 2026-06-11: 129432 B) |
-| Code in RAM (.text copy_to_ram) | ~114 KB |
+| **Total BSS** | **~132 KB** (measured: 134,932 B; unchanged by the XIP migration) |
+| RAM code+rodata+data (.data section, hot set only) | 44,376 B (was 108,692 under copy_to_ram) |
+| Flash-resident code (.text + .rodata + boot2, XIP) | ~98 KB |
+| Free RAM | ~80,596 B (was ~10,476 under copy_to_ram) |
 | SPDIF producer pools (heap, 2 × 8 × 192 × 8) | ~24 KB |
-| Stack + remaining heap | ~6 KB |
+| Stack + remaining heap | drawn from the free-RAM pool above |
 
 ### RP2350 (520 KB SRAM)
 
@@ -1624,16 +1702,18 @@ masked, and PDM claims its channel once at init.
 | Consumer pools + silence (static, 4 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~55 KB |
 | I2S RX DMA ring (2048 × 4, 8 KB aligned) | 8 KB |
 | Other BSS | ~24 KB |
-| **Total BSS** | **~243 KB** (measured 2026-06-24: 248620 B; +~10 KB for 8-channel USB input + V15 bulk buffer) |
-| Code in RAM (.time_critical + copy_to_ram) | ~109 KB |
+| **Total BSS** | **~284 KB** (measured: 291,052 B; unchanged by the XIP migration) |
+| RAM code+rodata+data (.data section, hot set only) | 48,688 B (was 147,332 under copy_to_ram) |
+| Flash-resident code (.text + .rodata + boot2, XIP) | ~98 KB |
+| Free RAM | ~182,228 B (was ~75,540 under copy_to_ram) |
 | SPDIF producer pools (heap, 4 × 8 × 192 × 8) | ~48 KB |
-| Stack + remaining heap | ~150 KB |
+| Stack + remaining heap | drawn from the free-RAM pool above |
 
 ### Flash Layout
 
 | Region | RP2040 (2 MB) | RP2350 (4 MB) |
 |--------|---------------|---------------|
-| Firmware code | ~68 KB | ~66 KB |
+| Firmware code (.text + .rodata + boot2; flash-resident under XIP) | ~98 KB | ~98 KB |
 | Preset storage (12 sectors) | 48 KB | 48 KB |
 | Free flash | ~1.9 MB | ~3.9 MB |
 

@@ -58,15 +58,15 @@
 /* Both run in core-0 thread context (not IRQ), so there is no true preemption;*/
 /* free-running volatile head/tail indices are sufficient.                     */
 /* -------------------------------------------------------------------------- */
-/* 1024 frames = ~21 ms @ 48 kHz (8 KB).  Kept modest because DSPi is built
- * copy_to_ram, so this BSS competes with the program image in RP2040's 264 KB. */
+/* 1024 frames = ~21 ms @ 48 kHz (8 KB).  Kept modest because this BSS competes
+ * with the RAM-resident hot text under the XIP build in RP2040's 264 KB. */
 #define RING_FRAMES   1024u                 /* power of two */
 #define RING_MASK     (RING_FRAMES - 1u)
 
-// Plain .bss (zeroed at startup, RAM-resident under copy_to_ram) — keeping an
-// 8 KB zero buffer out of a __not_in_flash loaded section avoids bloating the
-// image.  The accessor functions are __not_in_flash_func, so they stay valid
-// during flash erase/program even though this build runs entirely from RAM.
+// Plain .bss (zeroed at startup); keeping an 8 KB zero buffer out of a
+// __not_in_flash loaded section avoids bloating the image.  Under the XIP build
+// the hot loopback functions carry __not_in_flash_func, so they stay valid
+// during flash erase/program.
 static int32_t loopback_ring[RING_FRAMES * 2];
 static volatile uint32_t ring_head;          /* next frame to write (producer) */
 static volatile uint32_t ring_tail;          /* next frame to read  (consumer) */

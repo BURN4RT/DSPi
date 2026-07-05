@@ -94,11 +94,13 @@ void __no_inline_not_in_flash_func(dspi_flash_range_program)(uint32_t flash_offs
 
 void dspi_flash_apply_clkdiv(void) {}
 
-void dspi_flash_range_erase(uint32_t flash_offs, size_t count) {
+// RAM-resident like the SDK implementations they wrap, so the flash-op entry
+// points are uniformly XIP-safe on both platforms.
+void __no_inline_not_in_flash_func(dspi_flash_range_erase)(uint32_t flash_offs, size_t count) {
     flash_range_erase(flash_offs, count);
 }
 
-void dspi_flash_range_program(uint32_t flash_offs, const uint8_t *data, size_t count) {
+void __no_inline_not_in_flash_func(dspi_flash_range_program)(uint32_t flash_offs, const uint8_t *data, size_t count) {
     flash_range_program(flash_offs, data, count);
 }
 

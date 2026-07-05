@@ -19,12 +19,9 @@
  *   - Includes MCK generator on a separate PIO SM
  */
 
-// RP2350: Force time-critical functions into RAM to avoid XIP cache misses
-#if PICO_RP2350
+// Per-block producer/consumer path; must stay in RAM under XIP builds
+// on both platforms (reached via connection function pointers).
 #define I2S_TIME_CRITICAL __attribute__((noinline, section(".time_critical")))
-#else
-#define I2S_TIME_CRITICAL
-#endif
 
 #include <stdio.h>
 #include <string.h>
@@ -1023,6 +1020,7 @@ bool audio_i2s_mck_is_enabled(void) {
     return mck_running;
 }
 
+I2S_TIME_CRITICAL
 void audio_i2s_mck_set_divider(uint32_t div_24_8) {
     // Servo path — bypasses the Fs × multiplier math.  Same hot-reload
     // mechanics as update_frequency(): if running, write the new divider

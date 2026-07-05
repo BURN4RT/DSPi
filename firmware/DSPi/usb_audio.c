@@ -698,6 +698,7 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
 // Drain all pending packets from the ring, running the DSP pipeline for
 // each.  Called as the first operation in the main loop and before any
 // disruptive deferred operation (rate change, output type switch, etc.).
+DSP_TIME_CRITICAL
 void usb_audio_drain_ring(void) {
     usb_audio_slot_t *slot;
     while ((slot = usb_audio_ring_peek(&audio_ring)) != NULL) {
@@ -709,6 +710,7 @@ void usb_audio_drain_ring(void) {
 // Discard all pending ring data and reset gap-detection timestamp.
 // Used on stream stop/start transitions to flush stale packets from a
 // previous stream.
+DSP_TIME_CRITICAL
 void usb_audio_flush_ring(void) {
     usb_audio_ring_flush(&audio_ring);
     audio_ring_last_push_us = 0;

@@ -1064,6 +1064,7 @@ void get_slot_consumer_stats(uint slot, uint *cons_free, uint *cons_prepared, ui
     }
 }
 
+DSP_TIME_CRITICAL
 uint get_slot_consumer_fill(uint slot) {
     // See get_slot_consumer_stats(): never touch per-slot pools while a type
     // switch is mutating ownership/state.
@@ -1105,6 +1106,7 @@ void reset_buffer_watermarks(void) {
     pdm_ring_max_fill_pct = 0;
 }
 
+DSP_TIME_CRITICAL
 static void update_buffer_watermarks(void) {
     uint consumer_capacity = SPDIF_CONSUMER_BUFFER_COUNT;
 

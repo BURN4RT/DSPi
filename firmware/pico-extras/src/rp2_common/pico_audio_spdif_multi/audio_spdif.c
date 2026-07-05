@@ -4,12 +4,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-// RP2350: Force time-critical functions into RAM to avoid XIP cache misses
-#if PICO_RP2350
+// Per-block producer/consumer path; must stay in RAM under XIP builds
+// on both platforms (reached via connection function pointers).
 #define SPDIF_TIME_CRITICAL __attribute__((noinline, section(".time_critical")))
-#else
-#define SPDIF_TIME_CRITICAL
-#endif
 
 #include <stdio.h>
 #include <stddef.h>

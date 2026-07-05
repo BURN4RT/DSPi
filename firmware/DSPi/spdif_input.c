@@ -95,7 +95,7 @@ static volatile uint32_t dbg_stable_count = 0;
 static volatile uint32_t dbg_lost_count = 0;
 static volatile spdif_rx_samp_freq_t dbg_last_freq = SAMP_FREQ_NONE;
 
-static void on_stable_callback(spdif_rx_samp_freq_t freq) {
+static void __not_in_flash_func(on_stable_callback)(spdif_rx_samp_freq_t freq) {
     dbg_stable_count++;
     dbg_last_freq = freq;
     spdif_rx_detected_rate = spdif_freq_to_hz(freq);
@@ -103,7 +103,7 @@ static void on_stable_callback(spdif_rx_samp_freq_t freq) {
     spdif_rx_stable_flag = true;
 }
 
-static void on_lost_stable_callback(void) {
+static void __not_in_flash_func(on_lost_stable_callback)(void) {
     dbg_lost_count++;
     spdif_rx_lost_flag = true;
 }
@@ -349,6 +349,7 @@ uint32_t spdif_input_poll(void) {
 // CLOCK SERVO
 // ============================================================================
 
+DSP_TIME_CRITICAL
 void spdif_input_update_clock_servo(void) {
     if (spdif_state != SPDIF_INPUT_LOCKED || spdif_tx_base_divider == 0)
         return;

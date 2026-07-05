@@ -80,10 +80,10 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define AUDIO_BUFFER_SAMPLES  192
 
 // DELAY CONFIGURATION
-// Per-platform maximum delay line length.  RP2040 has 264 KB SRAM total and
-// runs copy_to_ram, so the delay arrays (NUM_DELAY_CHANNELS × MAX_DELAY_SAMPLES
-// × 4 bytes) compete directly with text/heap.  Keep RP2040 at 21 ms; RP2350
-// has ample SRAM for the longer window.
+// Per-platform maximum delay line length.  RP2040 has 264 KB SRAM total; under
+// the XIP-with-hot-RAM layout the delay arrays (NUM_DELAY_CHANNELS ×
+// MAX_DELAY_SAMPLES × 4 bytes) still compete with the RAM-resident hot text and
+// heap.  Keep RP2040 at 21 ms; RP2350 has ample SRAM for the longer window.
 #if PICO_RP2350
 #define MAX_DELAY_SAMPLES 2048   // 42 ms at 48 kHz
 #else
@@ -847,8 +847,9 @@ extern uint8_t channel_band_counts[NUM_CHANNELS];
 extern volatile SystemStatusPacket global_status;
 
 // ----------------------------------------------------------------------------
-// RP2350-SPECIFIC: Force time-critical functions into RAM
-// RP2350 has different XIP cache behavior that causes audio underruns
+// Force time-critical functions into RAM. Under the XIP build, .time_critical
+// placement is the load-bearing RAM-residency mechanism on both platforms;
+// without it these functions would run from flash and stall the audio path.
 // ----------------------------------------------------------------------------
 #define DSP_TIME_CRITICAL __attribute__((section(".time_critical")))
 
