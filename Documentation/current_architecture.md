@@ -27,6 +27,7 @@
 21. [Performance Characteristics](#performance-characteristics)
 22. [External Control Interfaces (UART / I2C Target)](#external-control-interfaces-uart--i2c-target)
 23. [Control Surfaces (User-Wired Physical Controls)](#control-surfaces-user-wired-physical-controls)
+24. [Test Signal Generator](#test-signal-generator)
 
 ---
 
@@ -292,6 +293,8 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 **Emit hookpoints:** `update_master_volume` emits both v1 (`notify_push_master_volume_v1`) and v2 (`notify_param_write`). `update_preamp` emits v2. Direct-write setters in `vendor_commands.c` (delays, gain/mute, loudness, crossfeed, leveller, matrix, pins, I2S, MCK, SPDIF RX pin, channel names) each call `notify_param_write` after the live-state write. Deferred setters (EQ band, input source) emit at apply time in `main.c`. **UAC1 Feature Unit VOLUME SET_CUR** (`usb_audio.c` data-stage handler) also emits a PARAM_CHANGED on `user_volume.user_volume_db` with source `PARAM_SRC_UAC1`, so v2 hosts see OS volume slider movements on the same field they already listen to for `REQ_SET_USER_VOLUME` (tagged `PARAM_SRC_HOST_SET`) and LG Sound Sync writes — `audio_state.volume` is shared across all three controllers and the notify field mirrors it source-agnostically, while the distinct source byte lets hosts attribute the change to the right controller. UAC1 Feature Unit MUTE has no notify (no parallel WireBulkParams field — `user_volume.user_mute` represents the *vendor* mute with different gating semantics, not `audio_state.mute`).
 
 **Bulk operations** (preset load, factory reset, bulk SET): wrapped in `notify_begin_bulk(source)` / `notify_end_bulk()`. Per-field writes don't flood the ring; the host sees one `BULK_INVALIDATED` and reads `REQ_GET_ALL_PARAMS` for the full state. Preset load also emits `NOTIFY_EVT_PRESET_LOADED(slot)` before the bulk opens.
+
+**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), and `NOTIFY_EVT_SIGGEN_STATE` (0x07). The last announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator").
 
 **Drain:** each consumer drains its own tail via `notify_peek_next_for(consumer, ...)` / `notify_commit_pop_for(consumer)`. The USB consumer (`usb_notify_drain` in usb_audio.c) claims EP 0x83 via `usbd_edpt_claim`, formats the next packet into the stable TX buffer, and submits via `usbd_edpt_xfer`; on success `notify_commit_pop_for(USB)` advances the USB tail, and on xfer rejection the entry stays queued for the next tick. The UART consumer drains from `uart_ctrl_poll` (see "Multi-consumer ring").
 
@@ -1557,7 +1560,14 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-05 (XIP migration: binary type `default` on both platforms; only the hot audio/USB set is RAM-resident; RAM .data drops to 44,376 B RP2040 / 48,688 B RP2350; free RAM rises to ~80,596 / ~182,228 B)*
+*Last updated: 2026-07-05 (XIP migration: binary type `default` on both platforms; only the hot audio/USB set is RAM-resident; RAM .data drops to 44,376 B RP2040 / 48,688 B RP2350; free RAM rises to ~80,596 / ~182,228 B; siggen BSS note added)*
+
+> **Test signal generator (2026-07-05).** The siggen subsystem adds a small amount
+> of BSS (well under 1 KB: applied + staged `SiggenConfig`, three 44.1/48/96 kHz
+> derived-parameter rows, per-channel RNG/pink state, and multitone/channel-ID
+> increment tables) plus its RAM-resident render kernels (the synth kernels,
+> planner, and `siggen_render` are `DSP_TIME_CRITICAL`). Control/config code stays
+> cold in flash. See "Test Signal Generator".
 
 > **DSPI_LOOPBACK debug build (2026-06-24, updated 2026-07-05).** The numbers below
 > describe the normal (release) build. The optional `DSPI_LOOPBACK` build adds
@@ -2091,6 +2101,11 @@ Behavior is identical on both platforms (same 8 bindings, same ADC pins 26-28).
 | REQ_SET_ALL_PARAMS | 0xA1 | OUT | Set complete DSP state (3664 bytes at V11, multi-packet control transfer) |
 | REQ_GET_ALL_PARAMS_CHUNK | 0xA2 | IN | Read WireBulkParams in <= 4 KB chunks (wValue = offset); USB-only, WinUSB 4 KB cap workaround |
 | REQ_SET_ALL_PARAMS_CHUNK | 0xA3 | OUT | Write WireBulkParams in sequential chunks (wValue = offset); apply fires on the final byte; USB-only |
+| REQ_SIGGEN_SET_CONFIG | 0xA4 | OUT | Stage a test-signal `SiggenConfig` (36 B); validates + stages, restarts if running, never auto-starts (see Test Signal Generator) |
+| REQ_SIGGEN_GET_CONFIG | 0xA5 | IN | Get the applied `SiggenConfig` (36 B) |
+| REQ_SIGGEN_CONTROL | 0xA6 | IN* | Test-signal action in wValue (`SIGGEN_CTL_*`: 0 stop, 1 start, 2 stop-now); returns 1-byte ack |
+| REQ_SIGGEN_GET_STATUS | 0xA7 | IN | Get `SiggenStatus` (16 B: state, signal_type, walk channel, elapsed, cycles, stop reason, sweep freq) |
+| REQ_SIGGEN_GET_CAPS | 0xA8 | IN | wValue=0xFFFF -> `SiggenCapsHeader` (8 B); wValue=type index -> `SiggenTypeDesc` (62 B) |
 | REQ_GET_BUFFER_STATS | 0xB0 | IN | Get 44-byte buffer fill level statistics packet |
 | REQ_RESET_BUFFER_STATS | 0xB1 | IN | Reset watermarks (wValue bit 0), returns 1-byte ack |
 | REQ_SET_LEVELLER_ENABLE | 0xB4 | OUT | Enable/disable volume leveller |
@@ -2787,3 +2802,75 @@ Deferred to Phase 2b:
 | RP2040 | n/a | 84,844 | 95,612 | 90,704 |
 
 Phase 1 removed the vendor surface entirely (~9 KB saved). Phase 2 re-added it (~10.5 KB), and also added the IAD (+8 bytes) and the vendor interface descriptor (+9 bytes). Net vs. pre-migration on RP2350: +1.5 KB text.
+
+---
+
+## Test Signal Generator
+*Last updated: 2026-07-05*
+
+The **test signal generator** ("siggen", `siggen.c` / `siggen.h`) synthesizes
+measurement and diagnostic signals directly into the output pipeline, without a
+host audio stream. It is used for room-correction sweeps, polarity and
+channel-identification checks, THD/IMD and inter-sample-peak tests, and bring-up
+diagnostics, driven from DSPi Console or any control bridge (USB / UART / I2C).
+Full protocol: `Documentation/Features/test_signals_spec.md`.
+
+**Injection point.** `siggen_render()` writes the generated signal into the
+per-output mix buffers (`buf_out[]`) inside `process_input_block()`, **between the
+matrix-mix pass and the per-output processing pass**. Masked output channels have
+their routed audio replaced; unmasked channels keep playing program audio. Every
+output slot still advances by the same `sample_count`, so **inter-slot alignment is
+preserved by construction** (this is a hard project invariant). Downstream stages
+(crossover, PEQ, output trim, master volume, mute, delay, encode) run unchanged.
+
+**Signal catalogue.** Fifteen `SiggenType` values: sine, square (polyBLEP), white
+and pink noise, log/linear/stepped sweeps, impulse, alternating clicks, polarity
+pulse, tone burst, tone pair (SMPTE/CCIF IMD), multitone (Schroeder-phased,
+sum-normalized; max 16 tones RP2350 / 8 RP2040), ISP inter-sample-peak patterns
+(+3.01 / +1.25 dBTP), and channel-ID (per-channel pentatonic blip melody, always
+walks). `level_db` is a peak level in dBFS (-120..0).
+
+**Architecture.** A per-block segment planner (state machine: fade-in, run, gap,
+fade-out, and cycle/repeat/walk sequencing) advances all timing once per block and
+emits `[offset, length, gain-ramp, active-mask]` segments; per-type synth kernels
+then fill each segment. Sequencing is platform-independent; only the sample kernels
+fork between the RP2350 float path and the RP2040 Q28 fixed-point path. The sine
+kernel is a 7th-order polynomial (THD approx -139 dB). Rate-dependent constants are
+precomputed at apply time for 44.1/48/96 kHz, so the render path makes no `libm`
+calls (and no float math on RP2040); any other pipeline rate falls back to the
+48 kHz row.
+
+**Flags.** `SIGGEN_FLAG_RAW` bypasses only crossover + PEQ on generator channels
+(trim, master volume, mute, delay still apply) via `siggen_raw_mask`, which is read
+once per block by the per-output EQ gating on both cores (`audio_pipeline.c`,
+`pdm_generator.c`); the bypassed filter states freeze while RAW is active.
+`SIGGEN_FLAG_DECORR` gives noise types an independent generator per channel.
+`SIGGEN_FLAG_WALK` plays masked channels one per cycle. A channel emits only if it
+is both in `channel_mask` and enabled in the matrix mixer (enabled-intersection
+rule); `invert_mask` flips polarity per channel for cancellation tests.
+
+**Fades.** Start/stop/config-swap use a 5 ms linear overlay fade
+(`SIGGEN_FADE_MS`) that covers the first/last cycle rather than delaying it, so
+sweep timing is exact. Sweeps and walked continuous signals additionally get
+per-cycle attack/release windows, and per-cycle synth state resets so repeated
+sweeps are bit-identical (needed for coherent averaging in room correction).
+
+**Pump.** When the generator is running and no source is streaming, the main loop
+calls `siggen_pump()` (`audio_pipeline.c`), feeding zero-input blocks through the
+full pipeline paced by the slot-0 consumer fill level (top-up to half full). It
+stands down while a source streams, an input-source change or output-type switch is
+pending, or the producer pool is unallocated, so a real stream seamlessly takes
+over pacing.
+
+**Lifecycle.** Transient only: off at boot, never persisted; `siggen_stop_immediate
+(SIGGEN_STOP_PRESET)` hard-stops it on preset load and factory reset. `main.c`
+calls `siggen_service()` + `siggen_pump()` each main-loop iteration;
+`siggen_service()` applies staged configs after a fade-out (SET/START while
+running restarts) and pushes the deferred `NOTIFY_EVT_SIGGEN_STATE` (0x07)
+start/stop/completion notification. Vendor commands `0xA4..0xA8` cover
+SET/GET config, CONTROL (start/stop/stop-now), GET status, and self-describing GET
+caps; `0xA9..0xAF` are reserved.
+
+**Memory / CPU.** Small BSS (under 1 KB) plus RAM-resident render kernels
+(`DSP_TIME_CRITICAL`); control/config code stays cold in flash. The only cross-core
+datum is `siggen_raw_mask`, written by Core 0 between blocks.

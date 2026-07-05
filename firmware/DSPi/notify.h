@@ -48,6 +48,11 @@
 // Reserved for future use.
 // 0x06 — batched PARAM_CHANGED (see spec §10.5)
 
+// v2 test-signal-generator state event (start, stop, completion).
+// Packet: [ver=2, evt=0x07, flags=0, seq, state, reason, signal_type, channel]
+// state = SiggenState, reason = SIGGEN_STOP_*, channel = walk channel or 0xFF.
+#define NOTIFY_EVT_SIGGEN_STATE      0x07
+
 // v2 protocol version byte (first byte of every v2 packet)
 #define NOTIFY_V2_VERSION            0x02
 
@@ -113,6 +118,9 @@ void notify_push_preset_loaded(uint8_t slot);
 void notify_push_bulk_invalidated(ParamSource src);
 // Active USB input channel count changed (2/4/6/8) — host switched the alt.
 void notify_push_input_format(uint8_t channels);
+// Test-signal generator started/stopped/completed (see siggen.h).
+void notify_push_siggen_state(uint8_t state, uint8_t reason,
+                              uint8_t signal_type, uint8_t channel);
 
 // ---------------------------------------------------------------------------
 // Consumers

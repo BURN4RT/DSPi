@@ -12,6 +12,8 @@
 #include "audio_pipeline.h"
 #include "usb_audio.h"
 #include "audio_input.h"
+#include "spdif_input.h"
+#include "i2s_input.h"
 #include "config.h"
 #include "dsp_pipeline.h"
 #include "crossover.h"
@@ -20,6 +22,7 @@
 #include "leveller.h"
 #include "flash_storage.h"
 #include "pdm_generator.h"
+#include "siggen.h"
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
@@ -414,6 +417,12 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     }
 
+    // Test-signal injection: replaces the matrix mix on generator channels
+    // before per-output processing and the Core 1 dispatch, so every output
+    // slot still advances by the same sample_count (alignment preserved).
+    if (siggen_running)
+        siggen_render(buf_out, sample_count, sample_rate_hz);
+
     // ========== PASS 5-7: Per-Output EQ + Gain + Delay + Output ==========
     if (core1_mode == CORE1_MODE_EQ_WORKER) {
         // --- Dual-core path: Core 1 handles EQ+delay+SPDIF for outputs 2-7 ---
@@ -435,7 +444,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // Core 0: EQ + gain for outputs 0-1
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) continue;
-            if (!matrix_mixer.outputs[out].mute) {
+            if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
@@ -532,7 +541,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // rationale; steady-state step==0 falls back to constant-gain path).
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             if (!matrix_mixer.outputs[out].enabled) continue;
-            if (!matrix_mixer.outputs[out].mute) {
+            if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
@@ -757,6 +766,12 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     }
 
+    // Test-signal injection: replaces the matrix mix on generator channels
+    // before per-output processing and the Core 1 dispatch, so every output
+    // slot still advances by the same sample_count (alignment preserved).
+    if (siggen_running)
+        siggen_render(buf_out, sample_count, sample_rate_hz);
+
     // ========== PASS 5-7: Per-Output EQ + Gain + Delay + Output ==========
     // PDM output index
     int pdm_out = NUM_OUTPUT_CHANNELS - 1;
@@ -779,7 +794,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // Core 0: EQ + gain for outputs 0-1 (SPDIF pair 1)
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) continue;
-            if (!matrix_mixer.outputs[out].mute) {
+            if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
@@ -870,7 +885,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // → constant-gain path with no extra per-sample work).
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             if (!matrix_mixer.outputs[out].enabled) continue;
-            if (!matrix_mixer.outputs[out].mute) {
+            if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
                     xover_process_channel_block(xover_filters[eq_ch], buf_out[out], sample_count);
@@ -1126,5 +1141,46 @@ static void update_buffer_watermarks(void) {
         uint8_t ring_pct = pdm_get_ring_fill_pct();
         if (ring_pct < pdm_ring_min_fill_pct) pdm_ring_min_fill_pct = ring_pct;
         if (ring_pct > pdm_ring_max_fill_pct) pdm_ring_max_fill_pct = ring_pct;
+    }
+}
+
+// ----------------------------------------------------------------------------
+// TEST-SIGNAL PUMP
+// ----------------------------------------------------------------------------
+//
+// process_input_block() is normally driven by whichever input source delivers
+// samples.  When the generator is running and no source is streaming, nothing
+// would call it and the outputs would drain to silence, so the main loop
+// calls this pump instead.  It feeds zero-input blocks, paced by the slot-0
+// consumer fill level (the same signal the USB feedback servo and the SPDIF
+// prefill logic use), topping up to half-full.  Every block goes through the
+// full pipeline, so inter-slot alignment and the delay-line write index
+// advance exactly as they do for a real input source.
+void siggen_pump(void) {
+    if (!siggen_running) return;
+
+    // Never pump while the pipeline is owned by someone else: an input
+    // source actively delivering blocks, a pending source change, an output
+    // type switch mutating the pools, or a flash operation (preset mute).
+    if (preset_loading || input_source_change_pending ||
+        output_type_switch_in_progress || producer_pool_1 == NULL)
+        return;
+    bool streaming =
+        (active_input_source == INPUT_SOURCE_USB && usb_audio_stream_active()) ||
+        (active_input_source == INPUT_SOURCE_SPDIF &&
+         spdif_input_get_state() == SPDIF_INPUT_LOCKED) ||
+        (active_input_source == INPUT_SOURCE_I2S &&
+         i2s_input_get_state() == I2S_INPUT_RUNNING);
+    if (streaming) return;
+
+    // Bounded top-up per call to keep the main loop responsive; the loop
+    // spins fast enough to sustain any supported rate.
+    for (int b = 0; b < 2; b++) {
+        if (get_slot_consumer_fill(0) >= SPDIF_CONSUMER_BUFFER_COUNT / 2)
+            break;
+        int n_in = active_input_channel_count();
+        for (int k = 0; k < n_in; k++)
+            memset(input_bufs[k], 0, AUDIO_BUFFER_SAMPLES * sizeof(input_bufs[0][0]));
+        process_input_block(AUDIO_BUFFER_SAMPLES);
     }
 }

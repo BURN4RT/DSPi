@@ -414,6 +414,16 @@ static volatile uint8_t usb_input_bit_depth = 16;
 volatile uint8_t usb_input_channels = 2;
 #define AUDIO_GAP_THRESHOLD_US 50000  // 50ms - reset sync if packets stop this long
 
+// True while USB audio packets are actively arriving.  The in-band gap check
+// in process_audio_packet only fires on the NEXT packet, so a host that stops
+// streaming leaves sync_started latched; the test-signal pump needs a live
+// view to know when to take over pacing.
+bool usb_audio_stream_active(void) {
+    if (!sync_started) return false;
+    uint64_t last = last_packet_time_us;
+    return last > 0 && (time_us_64() - last) <= AUDIO_GAP_THRESHOLD_US;
+}
+
 // Consumer fill for instance 0 — used by watermark monitoring only
 // (no longer part of the active feedback path).
 volatile uint8_t spdif0_consumer_fill = 0;

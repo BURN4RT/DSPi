@@ -231,6 +231,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_ALL_PARAMS_CHUNK    0xA2
 #define REQ_SET_ALL_PARAMS_CHUNK    0xA3
 
+// Test signal generator (see siggen.h and
+// Documentation/Features/test_signals_spec.md).  0xA9-0xAF reserved for
+// future generator extensions.
+#define REQ_SIGGEN_SET_CONFIG       0xA4  // payload = SiggenConfig (36 B)
+#define REQ_SIGGEN_GET_CONFIG       0xA5  // returns SiggenConfig
+#define REQ_SIGGEN_CONTROL          0xA6  // wValue = SIGGEN_CTL_*; returns status byte
+#define REQ_SIGGEN_GET_STATUS       0xA7  // returns SiggenStatus (16 B)
+#define REQ_SIGGEN_GET_CAPS         0xA8  // wValue = type index / 0xFFFF = header
+
 // I2S Output Configuration Commands
 #define REQ_SET_OUTPUT_TYPE         0xC0
 #define REQ_GET_OUTPUT_TYPE         0xC1

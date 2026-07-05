@@ -30,6 +30,7 @@
 #include "flash_storage.h"
 #include "pico/audio_i2s_multi.h"
 #include "pdm_generator.h"
+#include "siggen.h"
 #include "usb_audio.h"
 #include "notify.h"
 #include "uart_control.h"
@@ -1519,6 +1520,13 @@ int main(void) {
         // no-op while no binding is active.
         control_surfaces_tick();
 
+        // Test-signal generator: apply staged configs and emit deferred
+        // notifications, then drive the pipeline with generator blocks when
+        // no input source is streaming.  Both are immediate no-ops while the
+        // generator is idle.
+        siggen_service();
+        siggen_pump();
+
         // Drain USB audio ring — highest priority (only when USB is active input).
         // USB ISR pushes raw packets into the ring; we run the full DSP
         // pipeline here in main-loop context instead of USB IRQ context.
@@ -1979,6 +1987,10 @@ int main(void) {
                 preset_load_pending = false;
                 __dmb();
 
+                // Generator state is strictly transient: a preset load always
+                // silences it (audio is already muted here, so no fade).
+                siggen_stop_immediate(SIGGEN_STOP_PRESET);
+
                 extern uint8_t output_types[];
 
                 // Snapshot current output types BEFORE load so we can detect
@@ -2189,6 +2201,9 @@ int main(void) {
             if (factory_reset_pending && pipeline_reset_ready()) {
                 factory_reset_pending = false;
                 __dmb();
+
+                // Transient generator state: factory reset silences it.
+                siggen_stop_immediate(SIGGEN_STOP_PRESET);
 
                 extern uint8_t output_types[];
 

@@ -31,6 +31,7 @@
 #include "i2c_control.h"
 #include "control_surfaces.h"
 #include "pdm_generator.h"
+#include "siggen.h"
 #include "usb_descriptors.h"
 #include "tusb.h"
 #include "pico/audio_spdif.h"
@@ -1131,6 +1132,14 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
         }
+
+        case REQ_SIGGEN_SET_CONFIG:
+            // siggen_stage_config validates type, mask and params; STALL on
+            // reject so external transports report ERROR, not a false OK.
+            if (!siggen_stage_config(vendor_rx_buf, buffer->data_len)) {
+                handled = false;
+            }
+            break;
 
         default:
             // No SET case for this bRequest (unknown command, or a
@@ -2505,6 +2514,53 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     status = PIN_CONFIG_SUCCESS;
                 }
                 resp_buf[0] = status;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SIGGEN_GET_CONFIG: {
+                SiggenConfig tmp;
+                siggen_get_config(&tmp);
+                memcpy(resp_buf, &tmp, sizeof(SiggenConfig));
+                vendor_send_response(resp_buf, sizeof(SiggenConfig));
+                return true;
+            }
+
+            case REQ_SIGGEN_GET_STATUS: {
+                SiggenStatus tmp;
+                siggen_get_status(&tmp);
+                memcpy(resp_buf, &tmp, sizeof(SiggenStatus));
+                vendor_send_response(resp_buf, sizeof(SiggenStatus));
+                return true;
+            }
+
+            case REQ_SIGGEN_GET_CAPS: {
+                // wValue = 0xFFFF -> capabilities header; else a type index.
+                if (setup->wValue == 0xFFFF) {
+                    memcpy(resp_buf, siggen_caps_header(), sizeof(SiggenCapsHeader));
+                    vendor_send_response(resp_buf, sizeof(SiggenCapsHeader));
+                    return true;
+                }
+                // Reject a set high byte instead of aliasing it to type 0.
+                if (setup->wValue > 0xFF) {
+                    return false;
+                }
+                const SiggenTypeDesc *d = siggen_caps_type((uint8_t)setup->wValue);
+                if (d == NULL) {
+                    return false;
+                }
+                memcpy(resp_buf, d, sizeof(SiggenTypeDesc));
+                vendor_send_response(resp_buf, sizeof(SiggenTypeDesc));
+                return true;
+            }
+
+            case REQ_SIGGEN_CONTROL: {
+                // Parameterless action carried in wValue (SIGGEN_CTL_*);
+                // acknowledged with a single status byte like OUTPUT_TYPE.
+                if (!siggen_control((uint8_t)(setup->wValue & 0xFF))) {
+                    return false;
+                }
+                resp_buf[0] = 1;
                 vendor_send_response(resp_buf, 1);
                 return true;
             }

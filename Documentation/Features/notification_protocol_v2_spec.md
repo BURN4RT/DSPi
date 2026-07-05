@@ -1,7 +1,7 @@
 # Notification Protocol v2 Specification
 
 *Status: implemented*
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-05*
 
 ## 1. Motivation
 
@@ -65,9 +65,17 @@ Bytes 4..N are event-specific. Host MUST size its read by `actual_length`, not b
 | 0x02 | `NOTIFY_EVT_PARAM_CHANGED`    | Coalesceable | See §3.4. The primary v2 event. |
 | 0x03 | `NOTIFY_EVT_BULK_INVALIDATED` | Discrete     | See §3.5. Host should `REQ_GET_ALL_PARAMS`. |
 | 0x04 | `NOTIFY_EVT_PRESET_LOADED`    | Discrete     | Payload: `uint8_t slot` (byte 4), followed by `NOTIFY_EVT_BULK_INVALIDATED`. |
-| 0x05 | `NOTIFY_EVT_ERROR`            | Discrete     | Reserved for future use (ring overflow report, etc.). |
-| 0x06..0x7F | reserved (coalesceable) |              | |
+| 0x05 | `NOTIFY_EVT_INPUT_FORMAT`     | Discrete     | Active USB/pipeline input channel count changed. Payload: `uint8_t channels` (byte 4). |
+| 0x06 | reserved (coalesceable)      |              | Reserved for batched `PARAM_CHANGED` (see §10.5). |
+| 0x07 | `NOTIFY_EVT_SIGGEN_STATE`     | Discrete     | Test-signal generator start/stop/completion. See §3.8. |
+| 0x08..0x7F | reserved (coalesceable) |              | |
 | 0x80..0xFF | reserved (discrete)     |              | |
+
+> **Note on discrete IDs below 0x80.** The original design reserved `0x80..0xFF`
+> for discrete events, but the discrete `INPUT_FORMAT` (0x05) and `SIGGEN_STATE`
+> (0x07) events were assigned low IDs in practice. Hosts must classify by event ID,
+> not by range. `NOTIFY_EVT_ERROR` (formerly penciled in at 0x05) was never wired
+> up.
 
 ### 3.4 PARAM_CHANGED Layout
 
@@ -139,6 +147,51 @@ typedef enum : uint8_t {
 The source is set by a scoped bracket in the caller (analogous to today's `notify_master_vol_host_initiated`). See §4.4.
 
 Hosts must treat unknown source values as "changed by someone else" rather than erroring: the range grows when new control transports are added (values 8 and 9 arrived with the UART/I2C control interfaces; see `control_interfaces_spec.md`). Do not index a fixed-size array by this byte without a bounds check.
+
+### 3.8 SIGGEN_STATE Layout (event 0x07)
+
+The onboard test signal generator (see `test_signals_spec.md`) pushes a discrete
+event on start, stop, completion, and reconfigure. Fixed 8-byte packet:
+
+```
+Offset  Size  Field         Description
+------  ----  ------------  -----------------------------------------------
+0       1     version       2
+1       1     event_id      0x07
+2       1     flags         0
+3       1     seq           monotonic
+4       1     state         SiggenState (see below)
+5       1     reason        SIGGEN_STOP_* (see below)
+6       1     signal_type   SiggenType of the active/last config (0..14)
+7       1     channel       walk channel index, or 0xFF when not walking
+```
+
+`SiggenState` (`state` byte):
+
+| Value | Constant | Meaning |
+|-------|----------|---------|
+| 0 | `SIGGEN_STATE_IDLE` | Generator stopped/idle |
+| 1 | `SIGGEN_STATE_FADE_IN` | Ramping up (start / restart fade-in) |
+| 2 | `SIGGEN_STATE_RUN` | Actively rendering the signal |
+| 3 | `SIGGEN_STATE_GAP` | Silent gap between cycles/sweeps |
+| 4 | `SIGGEN_STATE_FADE_OUT` | Ramping down (stop / restart fade-out) |
+
+`SIGGEN_STOP_*` (`reason` byte):
+
+| Value | Constant | Meaning |
+|-------|----------|---------|
+| 0 | `SIGGEN_STOP_NONE` | No stop (a `RUN` event marks a start) |
+| 1 | `SIGGEN_STOP_HOST` | Explicit `REQ_SIGGEN_CONTROL` stop (STOP or STOP_NOW) |
+| 2 | `SIGGEN_STOP_COMPLETED` | Duration or repeat count exhausted |
+| 3 | `SIGGEN_STOP_PRESET` | Preset load or factory reset stopped it |
+| 4 | `SIGGEN_STOP_RECONFIG` | SET_CONFIG / START while running: fade-out for a restart |
+
+In practice the emitted `state` is `SIGGEN_STATE_RUN` (with `reason =
+SIGGEN_STOP_NONE`) on start, and `SIGGEN_STATE_IDLE` (with the stop reason) on
+stop/completion. The event is pushed from `siggen_service()` in the main loop, not
+from the audio render path. The generator's run state is transient (never
+persisted); hosts should not infer generator state across a reconnect without
+re-reading `REQ_SIGGEN_GET_STATUS`.
 
 ## 4. Firmware Architecture
 

@@ -107,6 +107,32 @@ COMMON = [
     ("leveller_process_block", False),
     ("update_buffer_watermarks", True),
     ("get_slot_consumer_fill", False),
+    # Signal generator: siggen_render runs in the block pipeline; the synth
+    # helpers below are file-static and may be inlined (static_ok).
+    ("siggen_render", False),
+    ("osc_sin", True),
+    ("blep", True),
+    ("synth_sine", True),
+    ("synth_square", True),
+    ("synth_white", True),
+    ("synth_pink", True),
+    ("synth_sweep", True),
+    ("synth_click", True),
+    ("synth_polarity", True),
+    ("synth_burst", True),
+    ("synth_tone_pair", True),
+    ("synth_multitone", True),
+    ("synth_isp", True),
+    ("synth_channel_id", True),
+    ("mark_stopped", True),
+    ("segment_finished", True),
+    ("synth_reset_cycle", True),
+    ("current_cycle_samples", True),
+    ("window_gain_at", True),
+    ("fade_gain_of", True),
+    ("next_boundary", True),
+    ("plan_block", True),
+    ("synth_segment", True),
 ]
 
 RP2350_EXTRA = [

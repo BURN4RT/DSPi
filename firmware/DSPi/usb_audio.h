@@ -260,6 +260,7 @@ void usb_notify_tick(void);
 // USB audio ring buffer — main-loop entry points for decoupled DSP processing
 void usb_audio_drain_ring(void);   // Process all pending USB audio packets
 void usb_audio_flush_ring(void);   // Discard stale ring data + reset gap timestamp
+bool usb_audio_stream_active(void); // Packets arriving within the gap threshold
 
 // Exposed in usb_descriptors.h (populated by main.c from the chip unique ID).
 

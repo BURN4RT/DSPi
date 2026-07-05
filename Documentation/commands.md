@@ -1010,6 +1010,11 @@ with no OUT data, issued as an IN transfer (returns a status/echo byte).
 | 0xA1 | SET_ALL_PARAMS | W | payload -> `bulk_param_buf` (chunked); `bulk_params_pending` -> `bulk_params_apply()` + `dsp_recalculate_all_filters()` + reset (gated) |
 | 0xA2 | GET_ALL_PARAMS_CHUNK | R | wValue = byte offset; offset 0 snapshots under the bulk lock; USB-only (WinUSB 4 KB cap; see `Features/bulk_params_chunking.md`) |
 | 0xA3 | SET_ALL_PARAMS_CHUNK | W | wValue = byte offset, sequential from 0 into `bulk_param_buf`; final byte sets `bulk_params_pending`; USB-only |
+| 0xA4 | SIGGEN_SET_CONFIG | W | payload = `SiggenConfig` (36 B) -> `siggen_stage_config()` (validate + stage; restarts if running, never auto-starts); STALL on reject. See section 23 |
+| 0xA5 | SIGGEN_GET_CONFIG | R | returns applied `SiggenConfig` (36 B) |
+| 0xA6 | SIGGEN_CONTROL | W-as-R | wValue = `SIGGEN_CTL_*` (0 stop, 1 start, 2 stop-now) -> `siggen_control()`; returns 1-byte ack; STALL on reject |
+| 0xA7 | SIGGEN_GET_STATUS | R | returns `SiggenStatus` (16 B) |
+| 0xA8 | SIGGEN_GET_CAPS | R | wValue = 0xFFFF -> `SiggenCapsHeader` (8 B); wValue = type index -> `SiggenTypeDesc` (62 B) |
 | 0xB0 | GET_BUFFER_STATS | R | `BufferStatsPacket` from consumer stats / watermarks / PDM fill |
 | 0xB1 | RESET_BUFFER_STATS | W-as-R | `reset_buffer_watermarks()` if wValue&1 |
 | 0xB2 | GET_USB_ERROR_STATS | R | returns zeroed `UsbErrorStatsPacket` (TinyUSB exposes no counters) |
@@ -1346,3 +1351,130 @@ or one `SET_ALL_PARAMS`), confirm via readback, **then** `PRESET_SAVE` to a slot
   host side. Expect the device handle to disappear immediately after the ACK; the host must
   release it and wait for the mass-storage device (to drive the update) and, later, for the DSPi
   to re-enumerate. Do not issue any further vendor command after the ACK.
+
+---
+
+## 23. Test signal generator (siggen)
+
+The onboard **test signal generator** synthesizes measurement and diagnostic
+signals (sines, sweeps, noise, tone bursts, IMD pairs, inter-sample-peak patterns,
+channel-ID melodies) directly into the output pipeline, with no host audio stream
+required. Full reference: `Documentation/Features/test_signals_spec.md`.
+
+State is **transient**: off at boot, never persisted, and stopped by preset load
+and factory reset. Injection replaces routed audio on masked output channels
+between the matrix mix and per-output processing, so inter-slot sample alignment is
+preserved.
+
+### 23.1 Commands
+
+| ID | Name | Dir | wValue | Payload / Response |
+|----|------|-----|--------|--------------------|
+| 0xA4 | `SIGGEN_SET_CONFIG` | write (`0x41`) | 0 | Payload: `SiggenConfig` (36 B). Validates and stages; STALL on reject |
+| 0xA5 | `SIGGEN_GET_CONFIG` | read (`0xC1`) | 0 | Response: `SiggenConfig` (36 B) |
+| 0xA6 | `SIGGEN_CONTROL` | write-as-read (`0xC1`) | `SIGGEN_CTL_*` | Response: 1-byte ack (1); STALL on reject |
+| 0xA7 | `SIGGEN_GET_STATUS` | read (`0xC1`) | 0 | Response: `SiggenStatus` (16 B) |
+| 0xA8 | `SIGGEN_GET_CAPS` | read (`0xC1`) | 0xFFFF or type index | Response: `SiggenCapsHeader` (8 B) or `SiggenTypeDesc` (62 B) |
+
+`0xA6` is **write-as-read**: issue it as an IN transfer even though it mutates
+state. `SIGGEN_CTL_*` values: `0` = STOP (5 ms fade out), `1` = START (or restart
+if running), `2` = STOP_NOW (hard stop). `SET_CONFIG` never auto-starts; a `SET`
+while running restarts the generator (fade-out, apply, fade-in). Opcodes
+`0xA9..0xAF` are reserved. All five commands are also reachable over the UART and
+I2C target transports.
+
+### 23.2 `SiggenConfig` (36 bytes, little-endian)
+
+| Offset | Type | Field | Meaning |
+|-------:|------|-------|---------|
+| 0 | u8 | `version` | `SIGGEN_CFG_VERSION` = 1 (mismatch rejected) |
+| 1 | u8 | `signal_type` | `SiggenType` 0..14 (see 23.5) |
+| 2 | u16 | `channel_mask` | output-channel select, bit i = output i (clamped to valid outputs) |
+| 4 | u16 | `invert_mask` | polarity-inverted subset of `channel_mask` |
+| 6 | u8 | `flags` | bit0 RAW (bypass crossover+PEQ), bit1 DECORR (noise: per-channel), bit2 WALK |
+| 7 | u8 | `reserved0` | 0 |
+| 8 | f32 | `level_db` | peak dBFS, -120..0 (clamped) |
+| 12 | u32 | `duration_ms` | timing-model dependent (23.4) |
+| 16 | u16 | `repeat` | timing-model dependent (23.4) |
+| 18 | u16 | `gap_ms` | inter-cycle silence |
+| 20 | f32 | `p1` | per-type parameter |
+| 24 | f32 | `p2` | per-type parameter |
+| 28 | f32 | `p3` | per-type parameter |
+| 32 | f32 | `p4` | per-type parameter |
+
+A channel emits only if it is **both** in `channel_mask` **and** enabled in the
+matrix mixer (the enabled-intersection rule). RAW mode bypasses only crossover +
+PEQ on generator channels; output trim, master volume, mute, and delay still apply.
+
+### 23.3 `SiggenStatus` (16 bytes, `0xA7` response)
+
+| Offset | Type | Field |
+|-------:|------|-------|
+| 0 | u8 | `version` (1) |
+| 1 | u8 | `state` (0 IDLE, 1 FADE_IN, 2 RUN, 3 GAP, 4 FADE_OUT) |
+| 2 | u8 | `signal_type` |
+| 3 | u8 | `active_channel` (walk channel, or 0xFF) |
+| 4 | u32 | `elapsed_ms` |
+| 8 | u16 | `cycles_done` (saturates 0xFFFF) |
+| 10 | u8 | `stop_reason` (0 NONE, 1 HOST, 2 COMPLETED, 3 PRESET, 4 RECONFIG) |
+| 11 | u8 | `reserved0` |
+| 12 | f32 | `current_freq` (sweep Hz, else 0) |
+
+### 23.4 `SiggenCapsHeader` (8 B) and `SiggenTypeDesc` (62 B) (`0xA8`)
+
+`wValue = 0xFFFF` returns the header: `u8 version; u8 type_count; u8
+output_channels; u8 multitone_max (8 RP2040 / 16 RP2350); u16 valid_channel_mask;
+u16 reserved0`.
+
+`wValue = 0..type_count-1` returns a type descriptor: `u8 id; char name[8]; u8
+timing_model (0 continuous / 1 sweep / 2 pattern); SiggenParamDesc p[4]`, where each
+`SiggenParamDesc` is `u8 semantic; f32 min; f32 max; f32 def` (13 B). Semantic
+codes: 0 unused, 1 FREQ_HZ, 2 MS, 3 CYCLES, 4 COUNT, 5 RATIO, 6 PATTERN. The caps
+are the authoritative per-platform parameter ranges; prefer them over hard-coded
+tables.
+
+### 23.5 Signal types and timing
+
+Timing model reinterprets `duration_ms` / `repeat` / `gap_ms`: **continuous**
+(`duration_ms` = total, 0 = until stopped; with WALK it is the per-channel dwell
+and `repeat` = passes over the mask); **sweep** (`duration_ms` = one sweep, must be
+> 0; `repeat` = sweep count, 0 = infinite; `gap_ms` between sweeps); **pattern**
+(`repeat` = periods, 0 = infinite; `gap_ms` extra silence per period).
+
+| ID | Type | Timing | p1 | p2 | p3 | p4 |
+|----|------|--------|----|----|----|----|
+| 0 | SINE | continuous | freq Hz | - | - | - |
+| 1 | SQUARE | continuous | freq Hz | - | - | - |
+| 2 | WHITE | continuous | - | - | - | - |
+| 3 | PINK | continuous | - | - | - | - |
+| 4 | SWEEP_LOG | sweep | f1 Hz | f2 Hz | - | - |
+| 5 | SWEEP_LIN | sweep | f1 Hz | f2 Hz | - | - |
+| 6 | SWEEP_STEP | sweep | f1 Hz | f2 Hz | steps/oct | dwell ms |
+| 7 | IMPULSE | pattern | period ms | - | - | - |
+| 8 | CLICKS_ALT | pattern | period ms | - | - | - |
+| 9 | POLARITY | pattern | pulse ms | period ms | - | - |
+| 10 | TONE_BURST | pattern | freq Hz | on cyc | off cyc | edge cyc |
+| 11 | TONE_PAIR | continuous | f1 Hz | f2 Hz | amp ratio A1/A2 | - |
+| 12 | MULTITONE | continuous | tone count | f_lo Hz | f_hi Hz | - |
+| 13 | ISP | continuous | pattern 0/1 | - | - | - |
+| 14 | CHANNEL_ID | pattern | blip ms | - | - | - |
+
+### 23.6 State notifications
+
+Start / stop / completion / reconfigure are pushed as `NOTIFY_EVT_SIGGEN_STATE`
+(0x07) on the notification endpoint (see section 18):
+`[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (8 bytes).
+
+### 23.7 Example: 1 kHz sine at -20 dBFS on channels 0 and 1
+
+`SET_CONFIG` (0xA4, OUT) 36-byte payload, then `CONTROL` START (0xA6, `wValue=1`):
+
+```
+01 00 03 00 00 00 00 00  00 00 A0 C1 00 00 00 00
+00 00 00 00 00 00 7A 44  00 00 00 00 00 00 00 00
+00 00 00 00
+```
+
+(`type=SINE mask=0x0003 level=-20.0 duration=0 p1=1000.0`.) See
+`test_signals_spec.md` section 13 for out-of-phase, log-sweep, and channel-ID walk
+examples.
