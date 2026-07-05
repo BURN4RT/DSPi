@@ -1162,7 +1162,21 @@ void siggen_pump(void) {
     // Never pump while the pipeline is owned by someone else: an input
     // source actively delivering blocks, a pending source change, an output
     // type switch mutating the pools, or a flash operation (preset mute).
-    if (preset_loading || input_source_change_pending ||
+    //
+    // preset_loading needs care: it is only ever cleared by the block path
+    // consuming preset_mute_counter (preset_mute_gain_step), which needs
+    // blocks to flow.  In USB mode with no host stream the pump is the only
+    // block source, so refusing on preset_loading would deadlock - boot (or
+    // a stream-restart resync) leaves preset_loading latched until the next
+    // host stream, and a started generator sits in FADE_IN forever, silent.
+    // Pump through the mute instead: blocks render muted until the counter
+    // clears, then the generator fades in.  (Actual preset loads stop the
+    // generator via siggen_stop_immediate, so !siggen_running already gates
+    // those.)  Non-USB sources keep the refusal: their preset_loading
+    // doubles as the lock-acquisition / prefill handshake signal
+    // (main-loop SPDIF/I2S blocks) and must not be consumed by the pump.
+    if (preset_loading && active_input_source != INPUT_SOURCE_USB) return;
+    if (input_source_change_pending ||
         output_type_switch_in_progress || producer_pool_1 == NULL)
         return;
     bool streaming =
