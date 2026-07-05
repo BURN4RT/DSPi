@@ -100,16 +100,17 @@ SECTIONS
     /* DSPi: control-path code executes from flash (XIP) instead of RAM.
        The RP2040 copy-to-RAM image is within a few KB of the 264 KB limit;
        these objects (vendor-command dispatcher, UART/I2C control transports,
-       bulk params, LG sound sync, USB descriptors) are not audio-path code,
-       contain no DSP_TIME_CRITICAL sections, and never run inside the
-       IRQs-off flash-write window, and none of it may ever be called from
-       core 1 (which is not always a lockout victim while flash is being
-       written), so XIP execution is safe.  Reclaims
+       control surfaces, bulk params, LG sound sync, USB descriptors) are not
+       audio-path code, contain no DSP_TIME_CRITICAL sections, and never run
+       inside the IRQs-off flash-write window, and none of it may ever be
+       called from core 1 (which is not always a lockout victim while flash
+       is being written), so XIP execution is safe.  Reclaims
        ~25 KB of RAM; the XIP cache keeps the hot paths near RAM speed. */
     .xip_ctrl_text : {
         *vendor_commands.c.o(.text* .rodata*)
         *uart_control.c.o(.text* .rodata*)
         *i2c_control.c.o(.text* .rodata*)
+        *control_surfaces.c.o(.text* .rodata*)
         *bulk_params.c.o(.text* .rodata*)
         *lg_sound_sync.c.o(.text* .rodata*)
         *usb_descriptors.c.o(.text* .rodata*)
@@ -117,7 +118,7 @@ SECTIONS
     } > FLASH
     /* An unmatched object wildcard is silent; if a listed file is renamed,
        its code moves back to RAM and the budget erodes unnoticed.  Trip the
-       build instead: the six objects total well over 16 KB. */
+       build instead: the seven objects total well over 16 KB. */
     ASSERT(SIZEOF(.xip_ctrl_text) > 16K,
            "DSPi: .xip_ctrl_text lost objects (renamed source file?); update memmap_dspi_rp2040_copy_to_ram.ld")
 

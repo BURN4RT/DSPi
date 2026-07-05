@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "config.h"
-#include "dac_hw_mute.h"   // DacHwMuteConfig (stored in PresetDirectory)
+#include "dac_hw_mute.h"        // DacHwMuteConfig (stored in PresetDirectory)
+#include "control_surfaces.h"   // CsFlashConfig (stored in PresetDirectory)
 
 // Legacy result codes (used by flash_save_params and the preset/boot API)
 #define FLASH_OK            0
@@ -108,6 +109,12 @@ void preset_get_dac_hw_mute(DacHwMuteConfig *out);
 // interface's stored config unchanged.  Getter copies out; either may be NULL.
 void preset_set_ctrl_iface(const UartCtrlConfig *uart, const I2cCtrlConfig *i2c);
 void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out);
+
+// Control Surfaces bindings (board-level, directory-stored, V7+).  Setter is
+// synchronous and main-loop only; caller must have validated the config
+// (control_surfaces_apply_binding does this).  Getter copies out.
+void preset_set_cs_config(const CsFlashConfig *cfg);
+void preset_get_cs_config(CsFlashConfig *out);
 
 // Get the currently active preset slot (always 0-9).
 uint8_t preset_get_active(void);

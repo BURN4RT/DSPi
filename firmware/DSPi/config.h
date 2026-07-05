@@ -192,6 +192,13 @@ extern volatile uint32_t nominal_feedback_10_14;
 // Clip Detection Commands
 #define REQ_CLEAR_CLIPS             0x83
 
+// Control Surfaces Commands (physical controls/indicators on user GPIOs).
+// See control_surfaces.h and Documentation/Features/control_surfaces_spec.md.
+#define REQ_SET_CS_BINDING          0x84  // wValue = slot (0-7), payload = 16-byte CsBinding
+#define REQ_GET_CS_BINDING          0x85  // wValue = slot, returns 16-byte CsBinding
+#define REQ_GET_CS_CAPS             0x86  // wValue = 0xFFFF: header + type table; wValue = noun: 8-byte noun descriptor
+#define REQ_GET_CS_STATUS           0x87  // returns 12-byte CsStatusPacket
+
 // Preset System Commands
 #define REQ_PRESET_SAVE             0x90
 #define REQ_PRESET_LOAD             0x91

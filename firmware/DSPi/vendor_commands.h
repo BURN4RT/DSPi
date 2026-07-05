@@ -36,6 +36,10 @@ typedef enum {
     CTRL_SOURCE_USB  = 0,
     CTRL_SOURCE_UART = 1,
     CTRL_SOURCE_I2C  = 2,
+    CTRL_SOURCE_GPIO = 3,   // internal Control Surfaces engine (main loop); not a
+                            // wire transport.  The Control Surfaces tick dispatches
+                            // through vendor_dispatch_get/set with this source so its
+                            // writes are tagged PARAM_SRC_GPIO.
 } CtrlSource;
 
 typedef enum {

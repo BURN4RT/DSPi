@@ -26,6 +26,7 @@
 20. [Memory Layout](#memory-layout)
 21. [Performance Characteristics](#performance-characteristics)
 22. [External Control Interfaces (UART / I2C Target)](#external-control-interfaces-uart--i2c-target)
+23. [Control Surfaces (User-Wired Physical Controls)](#control-surfaces-user-wired-physical-controls)
 
 ---
 
@@ -1158,10 +1159,10 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 6)
-*Last updated: 2026-07-04*
+### Preset Directory Fields (Version 7)
+*Last updated: 2026-07-05 (V7 appends the Control Surfaces config)*
 
-`DIR_VERSION_CURRENT` = 6. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 7. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
 device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
 I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
@@ -1173,9 +1174,16 @@ as V6. On every load, `dir_sanitize_ctrl_iface()` bounds-checks the two structs
 (enabled 0/1, pins <= 29, baud in range, I2C address 0x08..0x77) and resets any
 implausible one to defaults; deeper mux/collision checks run at apply time. Both
 blocks are device-level (a listening profile, not per-preset) and **survive a
-factory reset**, exactly like `dac_hw_mute`. See
-`Documentation/Features/output_config_independent_load.md` and
-`Documentation/Features/control_interfaces_spec.md`.
+factory reset**, exactly like `dac_hw_mute`. V7 appends a 132-byte
+`CsFlashConfig` (Control Surfaces bindings): the V6-to-V7 step validates the V6
+CRC, copies every field, leaves the new block zeroed (every slot `CS_TYPE_NONE`
+= feature idle), and reflushes as V7. `dir_sanitize_cs_config()` bounds-checks it
+on load (an implausible blob version resets the whole block; an implausible
+binding resets that slot; action-mask/pin-collision checks run at apply time).
+Like the other board-level blocks it survives factory reset. See
+`Documentation/Features/output_config_independent_load.md`,
+`Documentation/Features/control_interfaces_spec.md`, and
+`Documentation/Features/control_surfaces_spec.md`.
 
 | Field | Description |
 |-------|-------------|
@@ -1192,6 +1200,7 @@ factory reset**, exactly like `dac_hw_mute`. See
 | output_config | Device-global `FlashOutputConfig` (V4+, +3 bytes at V5): output pins/types, I2S BCK/MCK pin/enable/multiplier, SPDIF RX pin, I2S RX multichannel pins; the source of truth in independent mode |
 | uart_ctrl | UART control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
 | i2c_ctrl | I2C target control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
+| cs_config | Control Surfaces bindings (V7+, 132-byte `CsFlashConfig`: version + 8x 16-byte `CsBinding`; all-zero = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-04-09*
@@ -1525,7 +1534,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-04 (RP2040 control-path objects kept in flash XIP)*
+*Last updated: 2026-07-05 (Control Surfaces: control_surfaces.c.o added to RP2040 XIP list; ~400 B engine BSS; directory +132 B within its sector)*
 
 > **DSPI_LOOPBACK debug build (2026-06-24).** The numbers below describe the
 > normal (release) build. The optional `DSPI_LOOPBACK` build adds ~8.7 KB BSS on
@@ -1549,21 +1558,27 @@ masked, and PDM claims its channel once at init.
 > as a parameter. Producer pools remain heap (allocated once at boot, never churn).
 > Per-instance silence buffers are likewise static (embedded in the instance struct).
 
-> **RP2040 control-path code in flash XIP (2026-07-04).** The RP2040 uses a
+> **RP2040 control-path code in flash XIP (2026-07-05).** The RP2040 uses a
 > custom copy-to-RAM linker script
 > (`memmap_dspi_rp2040_copy_to_ram.ld`, selected only for `rp2040`) that keeps
-> six objects executing from flash (XIP) instead of being copied to RAM:
+> seven objects executing from flash (XIP) instead of being copied to RAM:
 > `vendor_commands.c.o`, `uart_control.c.o`, `i2c_control.c.o`,
-> `bulk_params.c.o`, `lg_sound_sync.c.o`, and `usb_descriptors.c.o` (their
-> `.text` and `.rodata`, a `.xip_ctrl_text` output section). Together they are
-> roughly 26 KB of code+rodata, keeping the copy-to-RAM image under the 264 KB
-> budget after the external-control feature with ~13 KB of headroom (~4.6 KB
-> in the loopback debug build). This is safe because none of it is audio-path
+> `control_surfaces.c.o`, `bulk_params.c.o`, `lg_sound_sync.c.o`, and
+> `usb_descriptors.c.o` (their `.text` and `.rodata`, a `.xip_ctrl_text` output
+> section). Together they keep the copy-to-RAM image under the 264 KB budget
+> after the control-path features. This is safe because none of it is audio-path
 > code, none of it contains `DSP_TIME_CRITICAL` sections, and none of it runs
 > inside the IRQs-off flash-write window; the XIP cache keeps the hot paths
 > near RAM speed. RP2350 has RAM headroom and uses the SDK's stock copy-to-RAM
-> script (all six objects run from RAM there); its layout is unchanged by this
+> script (all seven objects run from RAM there); its layout is unchanged by this
 > feature.
+
+> **Control Surfaces footprint (2026-07-05).** The engine adds ~400 bytes of
+> BSS on both platforms (`s_cfg` 132 B live config, `s_rt[8]` runtime state,
+> `s_slot_status[8]`, and small cursors); its code+rodata rides the RP2040 XIP
+> list (above) so it does not consume the copy-to-RAM budget. In flash, the
+> preset directory grows by the 132-byte `CsFlashConfig` (V7) but stays well
+> within its existing 4 KB sector, so the flash layout is unchanged.
 
 ### RP2040 (264 KB SRAM)
 
@@ -1841,8 +1856,76 @@ format version is unchanged by this feature.
 
 ---
 
+## Control Surfaces (User-Wired Physical Controls)
+*Last updated: 2026-07-05*
+
+User-wired push buttons, toggle switches, potentiometers, quadrature rotary
+encoders, and indicator LEDs on spare GPIOs, configured over vendor commands
+`0x84`-`0x87`. A binding attaches one component (`CsType`) to one firmware
+parameter (`CsNoun`) through one operation (`CsAction`), on one or two GPIOs. The
+full integrator spec is `Documentation/Features/control_surfaces_spec.md`.
+
+### File layout
+
+- `control_surfaces.c` / `.h`: the engine and the wire/flash data model
+  (`CsBinding` 16 B, `CsFlashConfig` 132 B, `CsCapsHeader` 28 B, `CsNounDesc` 8 B,
+  `CsStatusPacket` 12 B). Capability tables (`s_caps` type table, `s_noun_desc`
+  noun table) are the single source of truth for the validity model and are
+  served verbatim by `REQ_GET_CS_CAPS`, so host UIs and firmware can never
+  disagree about which type/noun/action combinations are legal.
+- `vendor_commands.c`: the `0x84`-`0x87` handlers; `REQ_SET_CS_BINDING` latches a
+  deferred SET, the three GETs return live accessor data.
+  `control_surfaces_owns_pin()` is wired into `pin_used_by_fixed_peripheral()`.
+- `flash_storage.c`: directory V7 persistence (`preset_set/get_cs_config`,
+  `dir_sanitize_cs_config`, the V6->V7 migration).
+
+### Dispatcher reuse via `CTRL_SOURCE_GPIO`
+
+Every control action is applied by dispatching the same vendor command a host
+would send, through `vendor_dispatch_set` / `vendor_dispatch_get` with a fourth
+control source, `CTRL_SOURCE_GPIO` (3). This reuses all existing validation,
+deferred pipeline-safe apply (e.g. preset load stops SPDIF RX and fences Core 1),
+and output-slot alignment; nothing in the apply path is duplicated. Dispatches
+are tagged `PARAM_SRC_GPIO` (5), so a knob turn emits the normal `PARAM_CHANGED`
+notification. Because the engine runs from main-loop context it honors the same
+`CTRL_DISPATCH_BUSY` back-pressure (a USB control SET mid-flight); it latches the
+resolved **absolute** target and retries next tick, so a BUSY stall can never
+double-apply a toggle.
+
+### 1 kHz tick placement
+
+`control_surfaces_tick()` runs every main-loop iteration (after
+`dac_hw_mute_tick`), self-throttled to 1 kHz via `time_us_64` and an immediate
+no-op while no binding is active. Per tick it debounces buttons/switches (10 ms),
+decodes encoders with a quadrature transition table (one detent = 4 quarter-
+steps), reads at most one pot ADC channel (round-robin, EMA + 12-count deadband +
+half-dB quantization + a ~50 ms boot-sync immediate takeover), and re-evaluates
+LEDs. No PIO and no GPIO IRQs are used.
+
+### Deferred SET and boot bring-up
+
+`REQ_SET_CS_BINDING` only validates the slot index and latches the 16-byte
+binding (`cs_set_binding_pending`), mirroring `ctrl_set_uart_pending`. The main
+loop runs `control_surfaces_apply_binding` (pin release/claim + runtime seed),
+records `cs_last_status` / `cs_last_slot` (read via `REQ_GET_CS_STATUS`), and
+persists the whole table to the directory **only on** `PIN_CONFIG_SUCCESS`, so a
+bad SET never clobbers a good stored config. `control_surfaces_init()` runs last
+in `core0_init()` (after all pin claims and `notify_init`); a stored binding whose
+pins now collide is kept down but preserved, with the failure visible in
+`slot_status[]`.
+
+### Persistence and platform placement
+
+The binding table is device-global in the preset directory (V7, 132-byte
+`CsFlashConfig`), board-level like `dac_hw_mute` and the control-interface config;
+it survives preset changes and factory reset and is not part of `WireBulkParams`.
+On RP2040 `control_surfaces.c.o` executes from flash XIP (see Memory Layout).
+Behavior is identical on both platforms (same 8 bindings, same ADC pins 26-28).
+
+---
+
 ## Vendor Command Reference
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-05 (Control Surfaces commands 0x84-0x87)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -1907,6 +1990,10 @@ format version is unchanged by this feature.
 | REQ_GET_SERIAL | 0x7E | IN | Get unique board serial |
 | REQ_GET_PLATFORM | 0x7F | IN | Get platform ID (0=RP2040, 1=RP2350) |
 | REQ_CLEAR_CLIPS | 0x83 | IN | Read-then-clear clip flags (see Clip Detection) |
+| REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-7, payload=16-byte CsBinding); deferred apply, poll 0x87 for result (see Control Surfaces) |
+| REQ_GET_CS_BINDING | 0x85 | IN | Get the live 16-byte CsBinding for a slot (wValue=slot) |
+| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 28-byte header+type table; wValue=noun: 8-byte CsNounDesc) |
+| REQ_GET_CS_STATUS | 0x87 | IN | Get 12-byte CsStatusPacket (last SET result + per-slot apply status) |
 | REQ_PRESET_SAVE | 0x90 | IN | Save live state to preset slot (wValue=slot) |
 | REQ_PRESET_LOAD | 0x91 | IN | Load preset slot to live state (wValue=slot) |
 | REQ_PRESET_DELETE | 0x92 | IN | Delete preset slot (wValue=slot) |

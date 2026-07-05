@@ -29,6 +29,7 @@
 #include "notify.h"
 #include "uart_control.h"
 #include "i2c_control.h"
+#include "control_surfaces.h"
 #include "pdm_generator.h"
 #include "usb_descriptors.h"
 #include "tusb.h"
@@ -332,6 +333,7 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
     if (dac_hw_mute_owns_pin(pin)) return true;               // DAC hardware-mute
     if (uart_ctrl_owns_pin(pin)) return true;                 // UART control (if live)
     if (i2c_ctrl_owns_pin(pin)) return true;                  // I2C control (if live)
+    if (control_surfaces_owns_pin(pin)) return true;         // Control Surfaces (live bindings)
     return false;
 }
 
@@ -1033,6 +1035,27 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                        sizeof(I2cCtrlConfig));
                 __dmb();
                 ctrl_set_i2c_pending = true;
+            }
+            break;
+        }
+
+        case REQ_SET_CS_BINDING: {
+            // Deferred to main loop: apply does GPIO/ADC work and the
+            // persist is a directory flash write.  Result lands in
+            // cs_last_status, readable via REQ_GET_CS_STATUS.
+            uint8_t slot = vendor_last_wValue & 0xFF;
+            if (slot >= CS_MAX_BINDINGS) {
+                cs_last_status = CS_STATUS_INVALID_SLOT;
+                cs_last_slot = slot;
+            } else if (buffer->data_len >= sizeof(CsBinding)) {
+                memcpy((void *)&cs_set_binding_val, vendor_rx_buf, sizeof(CsBinding));
+                cs_set_binding_slot = slot;
+                // "Accepted, not yet applied"; the main-loop apply
+                // overwrites this with the real result.
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = slot;
+                __dmb();
+                cs_set_binding_pending = true;
             }
             break;
         }
@@ -1881,6 +1904,39 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 return true;
             }
 
+            case REQ_GET_CS_BINDING: {
+                // wValue = slot; returns the live 16-byte binding.
+                if (setup->wValue >= CS_MAX_BINDINGS) return false;
+                uint8_t slot = (uint8_t)setup->wValue;
+                const CsBinding *b = control_surfaces_get_binding(slot);
+                if (b == NULL) return false;
+                vendor_send_response(b, sizeof(CsBinding));
+                return true;
+            }
+
+            case REQ_GET_CS_CAPS: {
+                // wValue = 0xFFFF: capability header + type table; else the
+                // per-noun descriptor.  Accessor pointers are static/const.
+                if (setup->wValue == 0xFFFF) {
+                    const CsCapsHeader *h = control_surfaces_caps_header();
+                    vendor_send_response(h, sizeof(CsCapsHeader));
+                    return true;
+                }
+                if (setup->wValue >= CS_NOUN_COUNT) return false;
+                const CsNounDesc *d = control_surfaces_noun_desc((uint8_t)setup->wValue);
+                if (d == NULL) return false;
+                vendor_send_response(d, sizeof(CsNounDesc));
+                return true;
+            }
+
+            case REQ_GET_CS_STATUS: {
+                // 12-byte snapshot: last SET result + per-slot apply status.
+                CsStatusPacket pkt;
+                control_surfaces_get_status(&pkt);
+                vendor_send_response(&pkt, sizeof(pkt));
+                return true;
+            }
+
             case REQ_GET_ALL_PARAMS_CHUNK: {
                 // USB-only workaround for the WinUSB 4 KB control cap:
                 // wValue = byte offset, wLength = chunk size.  Offset 0
@@ -2686,7 +2742,9 @@ CtrlDispatchResult vendor_dispatch_get(CtrlSource src, uint8_t bRequest,
     _active_source = src;
     _ext_resp_data = NULL;
     _ext_resp_len  = 0;
-    _dispatch_src  = (src == CTRL_SOURCE_UART) ? PARAM_SRC_UART : PARAM_SRC_I2C;
+    _dispatch_src  = (src == CTRL_SOURCE_UART) ? PARAM_SRC_UART
+                   : (src == CTRL_SOURCE_I2C)  ? PARAM_SRC_I2C
+                   : PARAM_SRC_GPIO;   // CTRL_SOURCE_GPIO (Control Surfaces)
     bool ok = vendor_handle_get(&req);
     notify_set_source(PARAM_SRC_UNKNOWN);
     _active_source = CTRL_SOURCE_USB;
@@ -2742,7 +2800,9 @@ CtrlDispatchResult vendor_dispatch_set(CtrlSource src, uint8_t bRequest,
         .wLength  = wLength,
     };
     _active_source = src;
-    _dispatch_src  = (src == CTRL_SOURCE_UART) ? PARAM_SRC_UART : PARAM_SRC_I2C;
+    _dispatch_src  = (src == CTRL_SOURCE_UART) ? PARAM_SRC_UART
+                   : (src == CTRL_SOURCE_I2C)  ? PARAM_SRC_I2C
+                   : PARAM_SRC_GPIO;   // CTRL_SOURCE_GPIO (Control Surfaces)
     bool handled = vendor_handle_set_data(&req);
     _active_source = CTRL_SOURCE_USB;
     _dispatch_src  = PARAM_SRC_HOST_SET;

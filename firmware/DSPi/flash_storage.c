@@ -257,6 +257,9 @@ typedef struct __attribute__((packed)) {
 // control ports).  Like the DAC hardware-mute block these are board-level
 // attributes (which pins/baud/address the control link uses), not a listening
 // profile, so they live device-global in the directory rather than per-preset.
+//
+// V7 appends the Control Surfaces binding config (which physical controls /
+// indicators are wired to which GPIOs); board-level for the same reason.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -286,6 +289,10 @@ typedef struct __attribute__((packed)) {
     // V6 addition: device-level external control-interface config (board-level).
     UartCtrlConfig uart_ctrl;                // 8 bytes; enabled=0 by default
     I2cCtrlConfig  i2c_ctrl;                 // 8 bytes; enabled=0 by default
+
+    // V7 addition: Control Surfaces bindings (board-level).  All-zero =
+    // every slot CS_TYPE_NONE = feature idle.
+    CsFlashConfig cs_config;                 // 132 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -330,7 +337,35 @@ typedef struct __attribute__((packed)) {
     FlashOutputConfig output_config;         // 23 bytes
 } PresetDirectory_v5;
 
-#define DIR_VERSION_CURRENT  6
+// Historical directory layout at V6, before the V7 Control Surfaces config.
+// Read only by the V6→V7 migration in load_directory(); identical to
+// PresetDirectory except it lacks the trailing cs_config block.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+} PresetDirectory_v6;
+
+#define DIR_VERSION_CURRENT  7
+
+// The directory occupies exactly one flash sector; growth past it would
+// silently overrun into preset slot 0.
+_Static_assert(sizeof(PresetDirectory) <= FLASH_SECTOR_SIZE,
+               "PresetDirectory must fit the single directory sector");
 
 // --- Preset Slot (sectors 1-10) ---
 typedef struct __attribute__((packed)) {
@@ -510,6 +545,7 @@ static inline void dir_apply_dac_hw_mute_defaults(void);  // defined below
 static void io_config_defaults(FlashOutputConfig *cfg);    // defined below (IO config section)
 static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i);  // defined below
 static void dir_sanitize_ctrl_iface(void);                            // defined below
+static void dir_sanitize_cs_config(void);                             // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
 // VALIDATION section.  collect_live_state() and migrate_legacy() use it
 // to compute the CRC byte range that matches whatever version they're
@@ -658,7 +694,39 @@ static bool dir_load_cache(void) {
         // Defense against corrupt/hand-edited flash: bound-check the control
         // interface structs, resetting any implausible one to defaults.
         dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
         dir_cache_valid = true;
+        return true;
+    }
+
+    if (flash_dir->version == 6) {
+        // V6 → V7 migration.  V7 appends the Control Surfaces config.
+        // Validate the v6 CRC, copy every field forward, and leave the new
+        // block zeroed (every slot CS_TYPE_NONE = feature idle).
+        const PresetDirectory_v6 *v6 = (const PresetDirectory_v6 *)flash_dir;
+        const uint8_t *v6_data_start = (const uint8_t *)&v6->startup_mode;
+        size_t v6_data_len = sizeof(PresetDirectory_v6) - offsetof(PresetDirectory_v6, startup_mode);
+        if (crc32(v6_data_start, v6_data_len) != v6->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v6->startup_mode;
+        dir_cache.default_slot       = v6->default_slot;
+        dir_cache.last_active_slot   = v6->last_active_slot;
+        dir_cache.output_config_mode = v6->output_config_mode;
+        dir_cache.slot_occupied      = v6->slot_occupied;
+        dir_cache.master_volume_mode = v6->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v6->spdif_rx_pin;
+        dir_cache.master_volume_db   = v6->master_volume_db;
+        memcpy(dir_cache.slot_names, v6->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v6->dac_hw_mute;
+        dir_cache.output_config      = v6->output_config;
+        dir_cache.uart_ctrl          = v6->uart_ctrl;
+        dir_cache.i2c_ctrl           = v6->i2c_ctrl;
+        dir_cache.cs_config.version  = CS_CONFIG_VERSION;
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -687,7 +755,7 @@ static bool dir_load_cache(void) {
         dir_cache.output_config      = v5->output_config;
         ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);
         dir_cache_valid = true;
-        (void)dir_flush();   // persist as V6
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -885,6 +953,30 @@ static void dir_sanitize_ctrl_iface(void) {
         i->address < I2C_CTRL_ADDRESS_MIN || i->address > I2C_CTRL_ADDRESS_MAX) {
         ctrl_iface_defaults(NULL, i);
     }
+}
+
+// Bound-check the directory's Control Surfaces config.  An implausible blob
+// version resets the whole block; an implausible binding resets that slot.
+// Deeper checks (action masks, pin collisions) run at apply time in
+// control_surfaces_apply_binding.
+static void dir_sanitize_cs_config(void) {
+    CsFlashConfig *c = &dir_cache.cs_config;
+    if (c->version > CS_CONFIG_VERSION) {
+        memset(c, 0, sizeof(*c));
+        c->version = CS_CONFIG_VERSION;
+        return;
+    }
+    for (int s = 0; s < CS_MAX_BINDINGS; s++) {
+        CsBinding *b = &c->bindings[s];
+        if (b->type >= CS_TYPE_COUNT ||
+            (b->type != CS_TYPE_NONE &&
+             (b->noun >= CS_NOUN_COUNT || b->action >= CS_ACT_COUNT))) {
+            memset(b, 0, sizeof(*b));
+        }
+    }
+    // Normalize the version byte; pre-V7 migration paths leave it 0 (same
+    // layout, all slots NONE).
+    c->version = CS_CONFIG_VERSION;
 }
 
 // Write the RAM-cached directory back to flash.
@@ -1889,6 +1981,23 @@ void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out) {
     dir_ensure();
     if (uart_out) memcpy(uart_out, &dir_cache.uart_ctrl, sizeof(*uart_out));
     if (i2c_out)  memcpy(i2c_out,  &dir_cache.i2c_ctrl,  sizeof(*i2c_out));
+}
+
+// Control Surfaces persistence.  Mirrors preset_set_ctrl_iface: synchronous,
+// main-loop only, one directory-sector write.  Caller (main loop deferred
+// apply) has already validated the bindings.
+void preset_set_cs_config(const CsFlashConfig *cfg) {
+    if (!cfg) return;
+    dir_ensure();
+    memcpy(&dir_cache.cs_config, cfg, sizeof(dir_cache.cs_config));
+    dir_cache.cs_config.version = CS_CONFIG_VERSION;
+    dir_flush();
+}
+
+void preset_get_cs_config(CsFlashConfig *out) {
+    if (!out) return;
+    dir_ensure();
+    memcpy(out, &dir_cache.cs_config, sizeof(*out));
 }
 
 // Copy the live master volume into the directory's independent field and

@@ -34,6 +34,7 @@
 #include "notify.h"
 #include "uart_control.h"
 #include "i2c_control.h"
+#include "control_surfaces.h"
 #include "loudness.h"
 #include "crossfeed.h"
 #include "leveller.h"
@@ -1457,6 +1458,13 @@ void core0_init() {
         ctrl_uart_last_status = uart_ctrl_init(&ucfg);
         ctrl_i2c_last_status  = i2c_ctrl_init(&icfg);
     }
+
+    // Control Surfaces (physical controls/indicators on user GPIOs).  Last of
+    // all: after every other pin claim (a stored binding whose pins now
+    // collide is kept down, visible via REQ_GET_CS_STATUS) and after
+    // notify_init so its dispatched writes notify normally.  Pot/switch
+    // boot-sync dispatches fire from the first main-loop ticks, not here.
+    control_surfaces_init();
 }
 
 int main(void) {
@@ -1505,6 +1513,11 @@ int main(void) {
         // and post-clock-restart release holds on schedule.  Two loads +
         // branches when no deadline is in flight (the steady state).
         dac_hw_mute_tick();
+
+        // Control Surfaces poll: debounce buttons/switches, decode encoders,
+        // read pots, drive LEDs.  Internally throttled to 1 kHz; immediate
+        // no-op while no binding is active.
+        control_surfaces_tick();
 
         // Drain USB audio ring — highest priority (only when USB is active input).
         // USB ISR pushes raw packets into the ring; we run the full DSP
@@ -1734,6 +1747,28 @@ int main(void) {
                 if (status == PIN_CONFIG_SUCCESS) {
                     prepare_flash_write_operation();
                     preset_set_ctrl_iface(NULL, &cfg);
+                    complete_flash_write_operation_light();
+                }
+            }
+
+            // Control Surfaces binding SET (deferred).  Live apply first
+            // (GPIO/ADC claims, no flash); persist the whole binding table
+            // only when the new binding validated, so a bad SET can never
+            // clobber a good stored config.
+            if (cs_set_binding_pending) {
+                CsBinding b;
+                uint8_t slot;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&b, (const void *)&cs_set_binding_val, sizeof(b));
+                slot = cs_set_binding_slot;
+                cs_set_binding_pending = false;
+                restore_interrupts(f);
+                uint8_t status = control_surfaces_apply_binding(slot, &b);
+                cs_last_status = status;
+                cs_last_slot = slot;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    prepare_flash_write_operation();
+                    preset_set_cs_config(control_surfaces_config());
                     complete_flash_write_operation_light();
                 }
             }

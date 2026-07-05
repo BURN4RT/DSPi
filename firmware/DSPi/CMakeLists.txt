@@ -17,6 +17,8 @@ add_executable(DSPi
     bulk_params.c
     bulk_params.h
     config.h
+    control_surfaces.c
+    control_surfaces.h
     crossfeed.c
     crossfeed.h
     crossover.c
