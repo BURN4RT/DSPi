@@ -381,7 +381,9 @@ short.
   asynchronous notification channel on I2C** (that requires the target to
   initiate a transfer, which it cannot): an I2C controller stays **poll-only**
   and re-reads the relevant GET commands for state. The `0x40` notification
-  frame (3.6) is UART-only.
+  frame (3.6) is UART-only. A poll-based notification drain is the first
+  planned use of the reserved read-channel-select verbs; see the reserved
+  write-frame types note in 4.2.
 - **Addressing:** 7-bit. Configurable address 0x08 .. 0x77; default 0x42.
 - **Speed:** up to **400 kHz** (Fast-mode). The device does not restrict the SCL
   rate itself; keep the master at or below 400 kHz.
@@ -415,6 +417,28 @@ Response (I2C read):
 There is no sync byte and no CRC on I2C; the bus provides framing and ACK-level
 integrity. The header layout matches the UART frame body (type through wLen), so
 the same request-builder code can serve both transports.
+
+**Reserved write-frame types (0x03 and above).** Only `0x01` and `0x02` are
+defined at protocol version 1. Every other type value is reserved for future
+read-channel-select verbs: a write frame whose verb, instead of carrying a
+request, selects which logical read channel subsequent I2C read transactions
+drain. The read frame layout above carries no type byte by design; under this
+register-pointer model (the classic I2C idiom: write a pointer, then read) the
+controller always knows what it selected, so the read layout never needs to
+change. Today there is exactly one implicit channel, the response to the most
+recent request, and that remains the default forever: clients that never send
+a select verb are unaffected by any future extension. Planned semantics for
+when channels are added: a normal SET/GET request write resets the selection
+back to the response channel (its whole purpose is to read its own reply); a
+select verb persists until the next select or request. The first anticipated
+channel is a notification drain, giving I2C poll-based delivery of the same
+v2 notification packets UART carries in its type `0x40` frames.
+
+Current firmware rejects any write frame with an unknown type byte by parking
+a `CTRL_STATUS_FRAME_ERROR` response, so a client probing for a verb the
+device does not implement gets a clean, detectable refusal. When new verbs
+are introduced, `CtrlIfaceStatus.proto_version` (command `0xF9`) will be
+bumped; gate any use of types 0x03+ on reading a version above 1.
 
 ### 4.3 The BUSY-retry pattern and repeated-START
 
