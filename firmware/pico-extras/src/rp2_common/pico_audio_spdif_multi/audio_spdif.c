@@ -618,7 +618,14 @@ void audio_spdif_teardown(audio_spdif_instance_t *inst) {
 // audio_spdif_enable_sync -- synchronized start for multiple instances
 // ---------------------------------------------------------------------------
 
-void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count) {
+// Prepare-only half of the synchronized start: IRQ refcounts, DMA priming
+// and enabled-flag bookkeeping, WITHOUT starting the SMs.  Returns the SM
+// mask for the (single, shared) PIO block; the caller performs the
+// pio_enable_sm_mask_in_sync.  Lets a caller prime BOTH output types first
+// and then start every slot in one mask write (the I2S clock-slave path
+// gates that write on an external LRCLK edge; hoisting the priming keeps
+// the gate-to-start latency to a few hundred nanoseconds).
+uint32_t audio_spdif_enable_sync_prepare(audio_spdif_instance_t *instances[], uint count) {
     assert(count > 0 && count <= PICO_AUDIO_SPDIF_MAX_INSTANCES);
 
     // Enable DMA IRQ and prime DMA for all instances
@@ -629,32 +636,26 @@ void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count) {
         audio_start_dma_transfer(inst);
     }
 
-    // Build per-PIO-block SM bitmasks
-    uint32_t pio_sm_mask[3] = {0, 0, 0};
+    // All instances share one PIO block (asserted); build its SM mask
+    uint32_t sm_mask = 0;
     for (uint i = 0; i < count; i++) {
-        audio_spdif_instance_t *inst = instances[i];
-        for (uint p = 0; p < 3; p++) {
-            PIO block = pio_block_from_index(p);
-            if (inst->pio == block) {
-                pio_sm_mask[p] |= (1u << inst->pio_sm);
-                break;
-            }
-        }
+        assert(instances[i]->pio == instances[0]->pio);
+        sm_mask |= (1u << instances[i]->pio_sm);
     }
 
-    // Disable interrupts briefly and start all PIO blocks synchronously
-    uint32_t save = save_and_disable_interrupts();
-    for (uint p = 0; p < 3; p++) {
-        if (pio_sm_mask[p]) {
-            pio_enable_sm_mask_in_sync(pio_block_from_index(p), pio_sm_mask[p]);
-        }
-    }
-    restore_interrupts(save);
-
-    // Mark all instances enabled
     for (uint i = 0; i < count; i++) {
         instances[i]->enabled = true;
     }
+    return sm_mask;
+}
+
+void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count) {
+    uint32_t sm_mask = audio_spdif_enable_sync_prepare(instances, count);
+
+    // Disable interrupts briefly and start all SMs synchronously
+    uint32_t save = save_and_disable_interrupts();
+    pio_enable_sm_mask_in_sync(instances[0]->pio, sm_mask);
+    restore_interrupts(save);
 }
 
 void audio_spdif_set_starvation_monitoring(bool enabled) {

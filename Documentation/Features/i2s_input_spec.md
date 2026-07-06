@@ -9,7 +9,13 @@
 
 I2S input adds a third selectable audio input source (`INPUT_SOURCE_I2S = 2`) alongside USB (0) and SPDIF (1). An external I2S source (typically an ADC or another digital audio device) feeds stereo 24-bit audio into the DSP pipeline through a GPIO data pin.
 
-The defining property: **the DSPi is the I2S clock master.** The external source must be configured as an I2S *slave*; it receives BCK and LRCLK from the DSPi (the same shared clock pair the I2S outputs use) and returns data aligned to them. Consequences an app should internalize:
+> **Clock mode note (2026-07-06):** this document describes the default
+> MASTER clock mode (`REQ_GET_I2S_CLOCK_MODE` = 0). A SLAVE clock mode now
+> exists in which an external master drives BCK/LRCLK and the rate is
+> auto-detected; see `Documentation/Features/i2s_slave_input_spec.md`.
+> Everything below applies unchanged while the mode is MASTER.
+
+The defining property in master mode: **the DSPi is the I2S clock master.** The external source must be configured as an I2S *slave*; it receives BCK and LRCLK from the DSPi (the same shared clock pair the I2S outputs use) and returns data aligned to them. Consequences an app should internalize:
 
 - The input is sample-synchronous with the outputs. There is no clock servo, no drift, and no resampling.
 - There is **no lock state machine and no signal detection**. Unlike SPDIF, the device cannot tell whether a source is actually connected; if nothing drives the data pin, the input simply reads silence (or noise on a floating pin).

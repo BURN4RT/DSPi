@@ -220,6 +220,8 @@ void bulk_params_collect(WireBulkParams *out) {
     out->input_config.spdif_rx_pin_ext[0] = spdif_rx_pin_ext[0];
     out->input_config.spdif_rx_pin_ext[1] = spdif_rx_pin_ext[1];
     out->input_config.spdif_rx_enabled_ext_p1 = (uint8_t)(spdif_rx_enabled_ext + 1);
+    // I2S clock master/slave mode (V21+).
+    out->input_config.i2s_clock_mode = i2s_clock_mode;
 
     // LG Sound Sync (V8+).  All four fields are filled here so a single
     // GET round-trips both the user toggle and the runtime observation.
@@ -640,6 +642,16 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // owns triggering a deferred rate change after it restarts the input, and
     // an input-source switch picks the rate up on its own.
     i2s_input_rate = i2s_rate_decode(in->input_config.i2s_input_rate);
+
+    // I2S clock master/slave mode (V21+).  Deferred, same semantics as the
+    // vendor path: the main loop rebuilds I2S clocking when the source is live.
+    if (in->input_config.i2s_clock_mode <= 1 &&
+        (in->input_config.i2s_clock_mode != i2s_clock_mode ||
+         i2s_clock_mode_change_pending)) {
+        pending_i2s_clock_mode = in->input_config.i2s_clock_mode;
+        __dmb();
+        i2s_clock_mode_change_pending = true;
+    }
 
     // LG Sound Sync (V8+ payloads).  Only `enabled` is honored — the
     // other three fields are runtime observations the host cannot push.

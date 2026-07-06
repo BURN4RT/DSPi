@@ -49,12 +49,15 @@
 #include "config.h"
 #include "dsp_pipeline.h"
 #include "usb_audio.h"
+#include "notify.h"
 
 #include "hardware/clocks.h"
 #include "hardware/dma.h"
 #include "hardware/gpio.h"
 #include "hardware/pio.h"
 #include "pico/stdlib.h"
+#include "pico/audio_spdif.h"
+#include "adat_output.h"
 
 #include "i2s_input.pio.h"
 
@@ -145,6 +148,11 @@ static uint8_t i2s_n_pairs;
 
 static volatile I2sInputState i2s_state = I2S_INPUT_INACTIVE;
 static bool i2s_role_master = false;
+
+// External-clock slave role (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE at
+// start): an external master drives BCK/LRCLK, both pads are inputs, and
+// the i2s_slave_* section below owns rate detection and the output servo.
+static bool i2s_role_extclk = false;
 
 // Loaded PIO program offsets (-1 = not loaded).  The clkmaster program is
 // loaded only in the master role (pair 0); the slave program is shared by all
@@ -299,9 +307,20 @@ void i2s_input_init(void) {
     }
 }
 
+// Forward decl: (re)arm the slave-mode measurement state (defined in the
+// external-clock slave section below).
+static void i2s_slave_arm(void);
+static void i2s_slave_disarm(void);
+
 void i2s_input_start(bool clock_master) {
     // Guard against double-start (would panic on resource re-claim).
     if (i2s_state != I2S_INPUT_INACTIVE) return;
+
+    // External-clock slave role overrides the master election: an external
+    // device owns BCK/LRCLK, so the input SM never generates clocks (the
+    // caller already passes clock_master == false; this is defensive).
+    i2s_role_extclk = (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE);
+    if (i2s_role_extclk) clock_master = false;
 
     // Number of stereo pairs = active channels / 2, clamped to the platform
     // maximum.  Each pair claims one SM, two DMA channels and one data pin.
@@ -365,9 +384,17 @@ void i2s_input_start(bool clock_master) {
             }
         }
     } else {
-        // Clocks come from the I2S TX master (another PIO block).  Make sure
-        // the BCK/LRCLK input buffers are on (gpio_set_function set IE already;
-        // this is belt and braces), then run the slave program on every pair.
+        // Clocks come from elsewhere: the I2S TX clock master (another PIO
+        // block), or an EXTERNAL master in the extclk role.  In the extclk
+        // role nothing on-chip owns the pads yet, so configure them as plain
+        // inputs first (SIO function clears the RP2350 pad isolation latch,
+        // direction stays input; idempotent with the extclk TX output setup).
+        if (i2s_role_extclk) {
+            gpio_init(i2s_active_bck_pin);
+            gpio_init(i2s_active_bck_pin + 1);
+        }
+        // Make sure the BCK/LRCLK input buffers are on (belt and braces in
+        // the on-chip slave role), then run the slave program on every pair.
         gpio_set_input_enabled(i2s_active_bck_pin, true);
         gpio_set_input_enabled(i2s_active_bck_pin + 1, true);
 
@@ -423,10 +450,15 @@ void i2s_input_start(bool clock_master) {
     if (clock_master && pairs > 1)
         i2s_pairs[0].rd_word = 2;
 
+    // Slave role: arm the rate measurement / lock state machine against the
+    // freshly anchored pair-0 ring.
+    if (i2s_role_extclk) i2s_slave_arm();
+
     i2s_state = I2S_INPUT_RUNNING;
     printf("I2S RX: started %u channel(s) on GPIO", (unsigned)(pairs * 2u));
     for (uint8_t p = 0; p < pairs; p++) printf(" %u", i2s_pairs[p].data_pin);
-    printf(" (%s)\n", clock_master ? "clock master" : "slave");
+    printf(" (%s)\n", clock_master ? "clock master"
+                                   : (i2s_role_extclk ? "external-clock slave" : "slave"));
 }
 
 void i2s_input_stop(void) {
@@ -469,16 +501,19 @@ void i2s_input_stop(void) {
         dma_channel_unclaim(pr->dma_reload);
     }
 
+    if (i2s_role_extclk) i2s_slave_disarm();
+
     i2s_state = I2S_INPUT_INACTIVE;
     printf("I2S RX: stopped\n");
 }
 
 void i2s_input_resync(void) {
-    // Only running SLAVES need re-phasing: the TX clock master restarts from
-    // its PIO entry point during synchronized output starts, which resets
-    // LRCLK phase under our bit counters.  The master role generates its own
-    // clocks and is unaffected.
-    if (i2s_state != I2S_INPUT_RUNNING || i2s_role_master) return;
+    // Only running ON-CHIP slaves need re-phasing: the TX clock master
+    // restarts from its PIO entry point during synchronized output starts,
+    // which resets LRCLK phase under our bit counters.  The master role
+    // generates its own clocks; the external-clock role's LRCLK never
+    // glitches on an output restart.  Both are unaffected.
+    if (i2s_state != I2S_INPUT_RUNNING || i2s_role_master || i2s_role_extclk) return;
 
     // Disable every pair, let DMA drain what each SM already pushed, then
     // anchor each read pointer at its current write position: the next word the
@@ -618,6 +653,316 @@ void i2s_input_prefill_silence(uint32_t frames) {
 }
 
 // ============================================================================
+// EXTERNAL-CLOCK SLAVE MODE: rate measurement, lock state machine, servo
+// ============================================================================
+//
+// The external master owns BCK/LRCLK, so the device must (a) discover the
+// sample rate, (b) notice the clocks stopping or changing, and (c) keep the
+// sys_clk-domain outputs (SPDIF, ADAT) rate-matched to the external clock
+// domain.  All three derive from one observable: pair 0's DMA write pointer,
+// which advances at exactly 2 words per frame of external LRCLK.
+//
+// Fast window (~32 ms): rate snap and lock/loss decisions, ~30 ppm precision.
+// Long window (8-16 s dual anchor): servo rate reference, ~0.1 ppm; precise
+// enough that ADAT stays rate-locked even with no SPDIF slot fill to observe.
+// Fill trim: proportional trim from the first SPDIF-type slot's consumer
+// fill.  Edge-locked I2S slots consume at exactly the external rate, so
+// their fill can never expose SPDIF divider error; slot 0 alone is NOT a
+// valid reference here, unlike the SPDIF input servo.
+
+#define I2S_SLAVE_WINDOW_US         32000u     // fast measurement window
+#define I2S_SLAVE_CLOCK_TIMEOUT_US  5000u      // no words this long = clocks gone
+#define I2S_SLAVE_LOCK_WINDOWS      2          // agreeing windows needed to lock
+#define I2S_SLAVE_LONG_HALF_US      8000000ull // long-window anchor rotation
+#define I2S_SLAVE_SERVO_INTERVAL    1000       // main-loop iterations (~20 ms)
+#define I2S_SLAVE_SERVO_FILL_KP     0.0005f    // mirrors the SPDIF input servo
+
+static volatile I2sSlaveState i2s_slave_state = I2S_SLAVE_INACTIVE;
+static uint8_t  i2s_slave_lock_count = 0;      // cumulative since boot
+static uint8_t  i2s_slave_loss_count = 0;
+static uint32_t i2s_slave_detected_rate = 0;   // snapped Hz, valid when LOCKED
+
+// Word accumulation (pair 0)
+static uint32_t meas_last_word;
+static uint64_t meas_total_words;
+static uint64_t meas_last_advance_us;
+
+// Fast window
+static uint64_t meas_win_us;
+static uint64_t meas_win_words;
+static float    meas_hz_smooth;                // EMA of fast windows
+static uint32_t meas_measured_hz;              // last fast-window result
+static uint32_t lock_candidate;
+static uint8_t  lock_agree;
+
+// Long window: [0] = older anchor, [1] = newer; rate measured [0] -> now
+static uint64_t long_us[2];
+static uint64_t long_words[2];
+static bool     long_valid;
+static float    meas_hz_long;
+
+// Servo
+static uint32_t i2s_slave_servo_skip = 0;
+static uint32_t i2s_slave_last_div = 0;
+
+// Poll-gap watchdog: a main-loop stall longer than the ring-fill time can
+// wrap the DMA write pointer a whole ring between polls, silently losing
+// words from the accumulator (flash ops suspend the input, but a heavy
+// bulk apply or preset load does not).  Above this gap, re-anchor instead
+// of measuring through it.  4 ms is under the worst ring fill (~5.3 ms:
+// RP2040 ring at 96 kHz stereo).
+#define I2S_SLAVE_POLL_GAP_US  4000u
+static uint64_t meas_last_poll_us;
+
+// (Re)arm measurement against the freshly anchored pair-0 ring.  Lock/loss
+// counters deliberately persist (cumulative diagnostics, like SPDIF's).
+static void i2s_slave_arm(void) {
+    uint64_t now = time_us_64();
+    meas_last_word = pair_write_word(&i2s_pairs[0]);
+    meas_total_words = 0;
+    meas_last_advance_us = now;
+    meas_last_poll_us = now;
+    meas_win_us = now;
+    meas_win_words = 0;
+    meas_hz_smooth = 0.0f;
+    meas_measured_hz = 0;
+    i2s_slave_detected_rate = 0;
+    lock_candidate = 0;
+    lock_agree = 0;
+    long_valid = false;
+    i2s_slave_servo_skip = 0;
+    i2s_slave_last_div = 0;
+    i2s_slave_state = I2S_SLAVE_ACQUIRING;
+    notify_push_i2s_slave_state(I2S_SLAVE_ACQUIRING, 0);
+}
+
+static void i2s_slave_disarm(void) {
+    i2s_slave_state = I2S_SLAVE_INACTIVE;
+    i2s_slave_detected_rate = 0;
+    meas_measured_hz = 0;
+    i2s_slave_last_div = 0;
+    notify_push_i2s_slave_state(I2S_SLAVE_INACTIVE, 0);
+}
+
+// Snap a measured rate to a supported one (2% tolerance; supported rates
+// are >8% apart so the windows can never overlap). 0 = no match.
+static uint32_t i2s_slave_snap_rate(float hz) {
+    static const uint32_t rates[3] = {44100, 48000, 96000};
+    for (int i = 0; i < 3; i++) {
+        float r = (float)rates[i];
+        float d = hz - r;
+        if (d < 0) d = -d;
+        if (d <= r * 0.02f) return rates[i];
+    }
+    return 0;
+}
+
+// Common lock-drop bookkeeping (clock loss or rate change while LOCKED)
+static void i2s_slave_drop_lock(void) {
+    i2s_slave_state = I2S_SLAVE_RELOCKING;
+    if (i2s_slave_loss_count < 255) i2s_slave_loss_count++;
+    i2s_slave_detected_rate = 0;
+    long_valid = false;
+    lock_candidate = 0;
+    lock_agree = 0;
+    notify_push_i2s_slave_state(I2S_SLAVE_RELOCKING, 0);
+}
+
+DSP_TIME_CRITICAL
+void i2s_slave_poll(void) {
+    if (i2s_slave_state == I2S_SLAVE_INACTIVE || i2s_state != I2S_INPUT_RUNNING)
+        return;
+
+    uint64_t now = time_us_64();
+    uint32_t w = pair_write_word(&i2s_pairs[0]);
+
+    // Poll-gap watchdog: after a stall the word delta is ambiguous (the DMA
+    // pointer may have lapped the ring), so re-anchor everything and skip
+    // this poll's judgements rather than risk a spurious lock drop.  The
+    // long window is word-count based, so it must reset too; the servo
+    // falls back to the fast-window EMA until it re-fills (~8 s).
+    uint64_t poll_gap = now - meas_last_poll_us;
+    meas_last_poll_us = now;
+    if (poll_gap > I2S_SLAVE_POLL_GAP_US) {
+        meas_last_word = w;
+        meas_last_advance_us = now;
+        meas_win_us = now;
+        meas_win_words = meas_total_words;
+        long_us[0] = long_us[1] = now;
+        long_words[0] = long_words[1] = meas_total_words;
+        long_valid = false;
+        return;
+    }
+
+    uint32_t delta = (w + I2S_RX_RING_WORDS - meas_last_word) % I2S_RX_RING_WORDS;
+    meas_last_word = w;
+    meas_total_words += delta;
+    if (delta) meas_last_advance_us = now;
+
+    // Clock-presence timeout: even 44.1 kHz pushes a word every ~11 us, so
+    // 5 ms of silence is unambiguous loss.  The main loop reacts to
+    // RELOCKING exactly like a SPDIF lock loss (mute, drain, wait).
+    if (i2s_slave_state == I2S_SLAVE_LOCKED &&
+        (now - meas_last_advance_us) > I2S_SLAVE_CLOCK_TIMEOUT_US) {
+        i2s_slave_drop_lock();
+        meas_measured_hz = 0;
+        meas_win_us = now;              // fresh window after the gap
+        meas_win_words = meas_total_words;
+        return;
+    }
+
+    uint64_t span = now - meas_win_us;
+    if (span < I2S_SLAVE_WINDOW_US) return;
+
+    // Fast-window rate: words/2 frames over the elapsed span
+    float hz = (float)(uint32_t)(meas_total_words - meas_win_words) *
+               (1e6f / 2.0f) / (float)span;
+    meas_win_us = now;
+    meas_win_words = meas_total_words;
+    meas_measured_hz = (uint32_t)(hz + 0.5f);
+
+    uint32_t snapped = i2s_slave_snap_rate(hz);
+
+    if (i2s_slave_state == I2S_SLAVE_LOCKED) {
+        if (snapped != i2s_slave_detected_rate) {
+            // Rate changed or the window was disturbed (glitch burst):
+            // drop the lock and re-acquire.
+            i2s_slave_drop_lock();
+            return;
+        }
+        meas_hz_smooth += 0.25f * (hz - meas_hz_smooth);
+
+        // Long dual-anchor window: rotate the anchor every 8 s, measure
+        // from the older anchor (8-16 s span).
+        if (now - long_us[1] >= I2S_SLAVE_LONG_HALF_US) {
+            long_us[0] = long_us[1];       long_words[0] = long_words[1];
+            long_us[1] = now;              long_words[1] = meas_total_words;
+        }
+        uint64_t long_span = now - long_us[0];
+        if (long_span >= I2S_SLAVE_LONG_HALF_US) {
+            meas_hz_long = (float)(meas_total_words - long_words[0]) *
+                           (1e6f / 2.0f) / (float)long_span;
+            long_valid = true;
+        }
+    } else {
+        // ACQUIRING / RELOCKING: need consecutive agreeing windows
+        if (snapped && snapped == lock_candidate) {
+            if (++lock_agree >= I2S_SLAVE_LOCK_WINDOWS) {
+                // Re-anchor every pair's read pointer to the freshest frame
+                // boundary before audio processing starts: the poll is
+                // lock-gated, so the rings free-ran (and lapped) during
+                // acquisition and the stale backlog would front-load the
+                // prefill with lap-garbled audio.  One shared anchor keeps
+                // the pairs on the same frame index (even index = LEFT);
+                // a pair a word behind the anchor self-corrects via the
+                // modulo avail math within a word-time.
+                uint32_t anchor = pair_write_word(&i2s_pairs[0]) & ~1u;
+                for (uint8_t p = 0; p < i2s_n_pairs; p++)
+                    i2s_pairs[p].rd_word = anchor;
+                i2s_slave_state = I2S_SLAVE_LOCKED;
+                i2s_slave_detected_rate = snapped;
+                if (i2s_slave_lock_count < 255) i2s_slave_lock_count++;
+                meas_hz_smooth = hz;
+                long_us[0] = long_us[1] = now;
+                long_words[0] = long_words[1] = meas_total_words;
+                long_valid = false;
+                i2s_slave_last_div = 0;   // force a full divider rewrite
+                notify_push_i2s_slave_state(I2S_SLAVE_LOCKED, snapped);
+            }
+        } else {
+            lock_candidate = snapped;
+            lock_agree = snapped ? 1 : 0;
+        }
+    }
+}
+
+bool i2s_slave_check_rate_change(void) {
+    if (i2s_slave_state != I2S_SLAVE_LOCKED) return false;
+    uint32_t rate = i2s_slave_detected_rate;
+    if (rate == 0) return false;
+    if (rate != audio_state.freq) {
+        // Same deferred mechanism as USB/SPDIF rate changes
+        pending_rate = rate;
+        __dmb();
+        rate_change_pending = true;
+        return true;
+    }
+    return false;
+}
+
+DSP_TIME_CRITICAL
+void i2s_slave_update_clock_servo(void) {
+    if (i2s_slave_state != I2S_SLAVE_LOCKED) return;
+
+    if (++i2s_slave_servo_skip < I2S_SLAVE_SERVO_INTERVAL) return;
+    i2s_slave_servo_skip = 0;
+
+    float actual = long_valid ? meas_hz_long : meas_hz_smooth;
+    if (actual < 20000.0f || actual > 200000.0f) return;
+
+    uint32_t sys_clk = clock_get_hz(clk_sys);
+    float spdif_div_f = (float)sys_clk / actual;
+
+    extern uint8_t output_types[];
+    extern struct audio_spdif_instance *spdif_instance_ptrs[];
+
+    // Fill trim from the first SPDIF-type slot (see section comment).
+    // All SPDIF slots share one divider and consume in lockstep, so one
+    // slot's fill represents them all.  With no SPDIF slot the long-window
+    // rate alone holds ADAT (~0.1 ppm).
+    float fill_trim = 0.0f;
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_SPDIF && spdif_instance_ptrs[i]) {
+            int32_t fill_error = (int32_t)get_slot_consumer_fill(i) - 8;
+            if (fill_error > 2 || fill_error < -2)
+                fill_trim = -(float)fill_error / 16.0f * I2S_SLAVE_SERVO_FILL_KP;
+            break;
+        }
+    }
+
+    uint32_t spdif_div = (uint32_t)(spdif_div_f * (1.0f + fill_trim) + 0.5f);
+    if (spdif_div == i2s_slave_last_div) return;
+    i2s_slave_last_div = spdif_div;
+
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_SPDIF && spdif_instance_ptrs[i]) {
+            pio_sm_set_clkdiv_int_frac(spdif_instance_ptrs[i]->pio,
+                                       spdif_instance_ptrs[i]->pio_sm,
+                                       spdif_div >> 8, spdif_div & 0xFF);
+        }
+    }
+
+#if PICO_RP2350
+    // ADAT runs the same 256*Fs PIO clock as SPDIF TX; identical divider.
+    adat_output_servo_divider(spdif_div);
+#endif
+    // No I2S output divider writes (external-clock SMs are edge-driven at
+    // divider 1.0) and no MCK servo (MCK output is forced off in slave mode).
+}
+
+I2sSlaveState i2s_slave_get_state(void) {
+    return i2s_slave_state;
+}
+
+uint32_t i2s_slave_get_detected_rate(void) {
+    return i2s_slave_detected_rate;
+}
+
+uint32_t i2s_slave_current_tx_divider(void) {
+    return (i2s_slave_state == I2S_SLAVE_LOCKED) ? i2s_slave_last_div : 0;
+}
+
+void i2s_slave_get_status(I2sSlaveStatusPacket *out) {
+    memset(out, 0, sizeof(*out));
+    out->state = (uint8_t)i2s_slave_state;
+    out->clock_mode = i2s_clock_mode;
+    out->lock_count = i2s_slave_lock_count;
+    out->loss_count = i2s_slave_loss_count;
+    out->detected_rate = i2s_slave_detected_rate;
+    out->measured_hz = meas_measured_hz;
+}
+
+// ============================================================================
 // STATUS
 // ============================================================================
 
@@ -627,4 +972,10 @@ I2sInputState i2s_input_get_state(void) {
 
 bool i2s_input_is_clock_master(void) {
     return (i2s_state == I2S_INPUT_RUNNING) && i2s_role_master;
+}
+
+uint8_t i2s_input_active_bck_pin(void) {
+    // The pin the running session was actually configured with; falls back
+    // to the live global when the input is stopped (next start will use it).
+    return (i2s_state == I2S_INPUT_RUNNING) ? i2s_active_bck_pin : i2s_bck_pin;
 }

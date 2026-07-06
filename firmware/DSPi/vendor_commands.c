@@ -15,6 +15,7 @@
 #include "usb_audio.h"
 #include "audio_input.h"
 #include "spdif_input.h"
+#include "i2s_input.h"
 #include "lg_sound_sync.h"
 #include "dac_hw_mute.h"
 #include "audio_pipeline.h"
@@ -1230,6 +1231,27 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             break;
         }
 
+        case REQ_SET_I2S_CLOCK_MODE: {
+            // Payload: 1 byte = 0 (master) or 1 (slave).
+            // Deferred to main loop; switching clock mode restarts the I2S
+            // RX with the pins reconfigured as inputs (slave) or outputs
+            // (master). Notification is emitted at apply time (main.c), not
+            // here; the shadow tracks active state, not requested state.
+            if (buffer->data_len >= 1) {
+                uint8_t v = vendor_rx_buf[0];
+                if (v <= 1) {
+                    if (v == i2s_clock_mode && !i2s_clock_mode_change_pending) {
+                        // Already in this mode with nothing armed; no-op.
+                    } else {
+                        pending_i2s_clock_mode = v;
+                        __dmb();
+                        i2s_clock_mode_change_pending = true;
+                    }
+                }
+            }
+            break;
+        }
+
         case REQ_SET_INPUT_RATE: {
             // Payload: uint32_t Hz (44100 / 48000 / 96000). The device is
             // the rate authority in I2S input mode, so the selection is
@@ -1245,7 +1267,11 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                     notify_param_write(offsetof(WireBulkParams,
                                                 input_config.i2s_input_rate),
                                        1, &enc);
+                    // In slave mode the external master defines the rate
+                    // (auto-detected); the stored rate applies only once we
+                    // are back in master mode, so don't arm a live change here.
                     if (active_input_source == INPUT_SOURCE_I2S &&
+                        !i2s_slave_mode_active() &&
                         rate != audio_state.freq) {
                         pending_rate = rate;
                         __dmb();
@@ -2635,6 +2661,20 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_INPUT_SOURCE: {
                 resp_buf[0] = active_input_source;
                 vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_I2S_CLOCK_MODE: {
+                // Live mode; a pending SET is not reflected until applied.
+                resp_buf[0] = i2s_clock_mode;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_I2S_SLAVE_STATUS: {
+                I2sSlaveStatusPacket status;
+                i2s_slave_get_status(&status);
+                vendor_send_response(&status, sizeof(status));
                 return true;
             }
 

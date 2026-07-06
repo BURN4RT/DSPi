@@ -401,6 +401,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_I2S_INPUT_CHANNELS  0xF3  // wValue = channel count (2/4/6/8); returns status byte
 #define REQ_GET_I2S_INPUT_CHANNELS  0xF4  // returns uint8_t (active count)
 
+// I2S Clock Mode Commands. Slave mode makes BCK/LRCLK inputs driven by an
+// external master; the incoming rate is auto-detected (44.1/48/96 kHz) rather
+// than commanded. Only meaningful while the input source is I2S; in master
+// mode (default) the device drives the clocks and REQ_SET_INPUT_RATE selects
+// the rate. SET is deferred: the change applies in the main loop, not live.
+#define REQ_SET_I2S_CLOCK_MODE      0x88  // payload = uint8_t (0=master, 1=slave); deferred apply
+#define REQ_GET_I2S_CLOCK_MODE      0x89  // returns uint8_t live mode (pending change not reflected)
+#define REQ_GET_I2S_SLAVE_STATUS    0x8A  // returns 16-byte I2sSlaveStatusPacket
+
 // LG Sound Sync (optical) Commands.  Per-preset feature: gate is stored in
 // PresetSlot, vendor SET only updates live state — flash persistence happens
 // on REQ_SAVE_PRESET (matching loudness/crossfeed/leveller toggle semantics).

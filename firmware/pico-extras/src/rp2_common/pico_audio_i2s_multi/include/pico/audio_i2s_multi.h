@@ -73,6 +73,8 @@ typedef struct audio_i2s_instance {
     uint8_t data_pin;           // Serial audio data GPIO
     uint8_t clock_pin_base;     // BCK GPIO; LRCLK = clock_pin_base + 1
     bool    clock_master;       // true = drives BCK/LRCLK, false = data only
+    bool    external_clock;     // true = wait-driven on external BCK/LRCLK inputs
+                                // (clock_master must be false; divider fixed 1.0)
 
     // Runtime state
     audio_buffer_t *playing_buffer;
@@ -110,6 +112,9 @@ typedef struct audio_i2s_config {
     uint8_t pio;                // PIO block index (0, 1, or 2 on RP2350)
     uint8_t dma_irq;            // DMA IRQ index (0 or 1)
     bool    clock_master;       // true = drive BCK/LRCLK (master), false = data only (slave)
+    bool    external_clock;     // true = slave to EXTERNAL BCK/LRCLK (pads are inputs;
+                                // clock_master ignored).  Wait-driven at divider 1.0;
+                                // rate changes do not touch these SMs' dividers.
 } audio_i2s_config_t;
 
 // ---------------------------------------------------------------------------
@@ -188,6 +193,17 @@ void audio_i2s_change_data_pin(audio_i2s_instance_t *inst, uint new_pin);
  * \param count     Number of instances
  */
 void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count);
+
+/** \brief Prepare-only half of audio_i2s_enable_sync
+ * \ingroup pico_audio_i2s_multi
+ *
+ * Rewinds each SM to its program entry, primes DMA / IRQ refcounts and
+ * marks the instances enabled without starting the SMs; returns the SM
+ * mask for the shared PIO block so the caller can perform one combined
+ * pio_enable_sm_mask_in_sync together with the SPDIF slots (used by the
+ * I2S clock-slave path to gate the start on an external LRCLK edge).
+ */
+uint32_t audio_i2s_enable_sync_prepare(audio_i2s_instance_t *instances[], uint count);
 
 /** \brief Enable/disable DMA-starvation monitoring
  * \ingroup pico_audio_i2s_multi

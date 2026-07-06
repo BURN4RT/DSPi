@@ -107,6 +107,36 @@ extern volatile uint8_t pending_input_source;
 extern volatile bool i2s_rx_pin_change_pending;
 extern volatile bool i2s_input_restart_pending;
 
+// I2S clock mode: who owns BCK/LRCLK while I2S is the input source.
+// MASTER (default) = the device generates BCK/LRCLK and is the rate
+// authority (selected via REQ_SET_INPUT_RATE).  SLAVE = an external master
+// drives BCK/LRCLK (both pins become inputs); the rate is auto-detected
+// from the external clocks and every output is slaved to them (I2S slots
+// edge-driven, SPDIF/ADAT servo rate-matched, MCK forced off).  Has no
+// effect while the input source is not I2S.
+typedef enum {
+    I2S_CLOCK_MODE_MASTER = 0,
+    I2S_CLOCK_MODE_SLAVE  = 1,
+} I2sClockMode;
+
+extern uint8_t i2s_clock_mode;
+
+// Deferred clock-mode apply: a mode change while I2S input is live needs a
+// full input restart plus an output-side rebuild (I2S output SMs switch
+// between clkout/dataout and the external-clock program), handled in the
+// main loop.  The handler copies pending_i2s_clock_mode into i2s_clock_mode
+// at apply time; boot/preset paths may also write the global directly when
+// nothing I2S is live (dormant apply).
+extern volatile bool i2s_clock_mode_change_pending;
+extern volatile uint8_t pending_i2s_clock_mode;
+
+// True when I2S slave clocking is in force (SLAVE selected AND I2S is the
+// active input source)
+static inline bool i2s_slave_mode_active(void) {
+    return i2s_clock_mode == I2S_CLOCK_MODE_SLAVE &&
+           active_input_source == INPUT_SOURCE_I2S;
+}
+
 // Structurally valid input source value (3 is the reserved ADAT gap)
 static inline bool input_source_valid(uint8_t src) {
     return src <= INPUT_SOURCE_MAX && src != 3;

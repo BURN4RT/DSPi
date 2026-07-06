@@ -110,7 +110,10 @@ static bool spdif_prefilling;
 // I2S input role election: the input SM is the clock master only when no
 // output slot is I2S; otherwise the lowest-index I2S output drives BCK and
 // LRCLK (process_type_switches) and the input slaves to those pads.
+// In I2S clock-slave mode an EXTERNAL master owns BCK/LRCLK, so the input
+// is never the master (i2s_input_start derives the external role itself).
 static bool i2s_input_should_be_master(void) {
+    if (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) return false;
     extern uint8_t output_types[];
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (output_types[i] == OUTPUT_TYPE_I2S) return false;
@@ -240,7 +243,11 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
 static void i2s_input_bringup_prefill(void) {
     bool master = i2s_input_should_be_master();
 
-    if (i2s_input_rate != audio_state.freq) {
+    // Clock-slave mode: the external master defines the rate; stay at the
+    // current pipeline rate until the lock machinery detects the real one
+    // (i2s_slave_check_rate_change arms the change before the prefill).
+    if (i2s_clock_mode != I2S_CLOCK_MODE_SLAVE &&
+        i2s_input_rate != audio_state.freq) {
         // Eventual input is I2S; the main-loop I2S prefill block owns the
         // output drain/re-enable/mute-release, so defer rather than letting
         // complete_pipeline_reset() release the mute before that drain.
@@ -357,11 +364,43 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
         }
     }
 
+    // Deterministic master policy: lowest-index active I2S slot is master.
+    // In I2S clock-slave mode NO slot is master; every I2S slot runs the
+    // external-clock program against the externally driven BCK/LRCLK.
+    const bool want_extclk = i2s_slave_mode_active();
+    int target_master_slot = -1;
+    if (!want_extclk) {
+        for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+            if (target_types[i] == OUTPUT_TYPE_I2S) {
+                target_master_slot = i;
+                break;
+            }
+        }
+    }
+
     bool any_change = false;
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (target_types[i] != current_types[i]) {
             any_change = true;
             break;
+        }
+    }
+    // Same-type I2S slots still count as a change when their live clocking
+    // (master election / external-clock mode / BCK pin) no longer matches
+    // the target; clock-mode and input-source transitions, and bulk/preset
+    // restores that install a new i2s_bck_pin without a type change, call in
+    // with an unchanged type map precisely to trigger this rebuild.
+    if (!any_change) {
+        for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+            if (target_types[i] != OUTPUT_TYPE_I2S) continue;
+            audio_i2s_instance_t *inst = i2s_instance_ptrs[i];
+            if (!inst || !inst->consumer_pool) continue;
+            if (inst->external_clock != want_extclk ||
+                inst->clock_master != (i == target_master_slot) ||
+                inst->clock_pin_base != i2s_bck_pin) {
+                any_change = true;
+                break;
+            }
         }
     }
     if (!any_change) return;
@@ -371,17 +410,16 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     const bool usb_irq_was_enabled = irq_is_enabled(USBCTRL_IRQ);
     irq_set_enabled(USBCTRL_IRQ, false);
 
-    // Deterministic master policy: lowest-index active I2S slot is master.
-    int target_master_slot = -1;
-    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
-        if (target_types[i] == OUTPUT_TYPE_I2S) {
-            target_master_slot = i;
-            break;
-        }
-    }
-
     usb_audio_drain_ring();
     prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+
+    // If the caller entered with the DAC hardware mute RELEASED (e.g. a
+    // BCK-only restore rebuild discovered after a completed reset already
+    // released it on the USB path), the assert above armed a fresh hold;
+    // wait it out so the teardown below never stops clocks before the DAC's
+    // analog ramp.  Instant for every pre-gated caller (hold already
+    // elapsed), so existing paths are unaffected.
+    while (!dac_hw_mute_hold_elapsed()) tight_loop_contents();
 
     // Suspend SPDIF RX across the type-switch window.  The DMA IRQ disable
     // below kills DMA_IRQ_1 servicing (which RX shares with SPDIF TX), and
@@ -478,7 +516,9 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
 
             if (had_i2s) {
                 audio_i2s_instance_t *inst = i2s_instance_ptrs[i];
-                if (!inst->consumer_pool || inst->clock_master != want_master) {
+                if (!inst->consumer_pool || inst->clock_master != want_master ||
+                    inst->external_clock != want_extclk ||
+                    inst->clock_pin_base != i2s_bck_pin) {
                     if (inst->enabled) {
                         audio_i2s_set_enabled(inst, false);
                     }
@@ -499,6 +539,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
                     .pio = PICO_AUDIO_SPDIF_PIO,
                     .dma_irq = PICO_AUDIO_I2S_DMA_IRQ,
                     .clock_master = want_master,
+                    .external_clock = want_extclk,
                 };
                 audio_i2s_setup(i2s_instance_ptrs[i], &audio_format_48k, &i2s_cfg);
                 // Re-formats the slot's shared static consumer pool for I2S (no alloc).
@@ -556,12 +597,16 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
 
     // Start/stop MCK based on whether any slot is now I2S, or I2S is the
     // active input (the external source may need MCK regardless of the
-    // output types)
+    // output types).  In I2S clock-slave mode MCK is forced off: a locally
+    // generated MCK would be asynchronous to the external BCK/LRCLK, which
+    // is invalid for downstream converters.
     bool any_i2s = (active_input_source == INPUT_SOURCE_I2S);
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (output_types[i] == OUTPUT_TYPE_I2S) { any_i2s = true; break; }
     }
-    if (any_i2s && i2s_mck_enabled) {
+    if (want_extclk) {
+        audio_i2s_mck_set_enabled(false);
+    } else if (any_i2s && i2s_mck_enabled) {
         // Set divider BEFORE enabling the GPOUTn block so MCK starts at the
         // correct frequency.  Reversed order would briefly run MCK at the
         // previous divider, causing a transient PLL relock chirp on
@@ -602,6 +647,25 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     }
 
     printf("Type switch complete: mask=0x%02x\n", change_mask);
+}
+
+// Rebuild every I2S output slot's clocking without changing types: called
+// when a transition crosses the I2S clock-slave boundary (mode change, or a
+// source switch into/out of slave-clocked I2S), so the slots swap between
+// the internal clkout/dataout programs and the external-clock program, and
+// after bulk/preset restores, which can install a new i2s_bck_pin with an
+// unchanged type map.  process_type_switches detects the clocking mismatch
+// (master election / external-clock mode / BCK pin) against the live
+// instances and does all the heavy lifting (quiesce, rebuild, MCK policy,
+// synchronized restart); with nothing mismatched it returns without
+// disruption.  No-op when no slot is I2S.
+static void rebuild_i2s_output_clocking(void) {
+    extern uint8_t output_types[];
+    uint8_t mask = 0;
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_I2S) mask |= (uint8_t)(1u << i);
+    }
+    if (mask) process_type_switches(mask, output_types);
 }
 
 // ---------------------------------------------------------------------------
@@ -854,6 +918,29 @@ static void teardown_output_slot(int slot_idx) {
     }
 }
 
+// In I2S clock-slave mode, gate the synchronized output start on an external
+// LRCLK falling edge so the SPDIF-vs-I2S inter-slot offset is identical
+// across every reset: SPDIF slots begin emitting sample 0 within nanoseconds
+// of the gate edge (all priming is hoisted before the gate; only the
+// pio_enable_sm_mask_in_sync write follows it), and the external-clock I2S
+// program self-frames on the next falling edge having discarded exactly one
+// frame (see audio_i2s_dataout_extclk.pio), landing both types on the same
+// sample index.  Bounded wait (worst case one frame period, 22.7 us at
+// 44.1 kHz, plus margin); on timeout (external clocks absent) it just
+// returns; the slave lock machinery re-runs the synchronized start when
+// clocks return.  Callers skip the gate when no output slot is I2S (SPDIF
+// inter-slot alignment needs only the mask start; input-to-output phase is
+// not sample-indexed).  Called with interrupts disabled.
+static void i2s_slave_gate_on_lrclk(void) {
+    if (!i2s_slave_mode_active()) return;
+    // Poll the pin the running RX session was patched with, not the live
+    // global (they diverge briefly across a deferred BCK pin change).
+    const uint lrclk = (uint)i2s_input_active_bck_pin() + 1;
+    const uint64_t deadline = time_us_64() + 35;
+    while (!gpio_get(lrclk)) { if (time_us_64() > deadline) return; }
+    while (gpio_get(lrclk))  { if (time_us_64() > deadline) return; }
+}
+
 // Three-phase pipeline reset.  The IRQ-disabled critical section in
 // Phase 2 is intentionally tiny — only the synchronized PIO SM start
 // needs atomicity (preserves CLAUDE.md's slot-alignment invariant for
@@ -915,9 +1002,31 @@ static void complete_pipeline_reset(void) {
 
     // Phase 2: tiny IRQ-disabled section — synchronized PIO start.
     // See block comment above for why this wraps BOTH enable_sync calls.
+    //
+    // I2S clock-slave mode instead primes both output types first, gates on
+    // an external LRCLK edge (only when an extclk I2S slot exists; up to
+    // ~35 us with IRQs off), and starts every slot in ONE mask write, so the
+    // gate-to-start latency cannot smear the extclk program's one-frame
+    // discard across a frame boundary at 96 kHz.  Both types share
+    // PICO_AUDIO_SPDIF_PIO, so a combined mask is valid.
     uint32_t flags = save_and_disable_interrupts();
-    if (spdif_count) audio_spdif_enable_sync(spdif_sync, spdif_count);
-    if (i2s_count) audio_i2s_enable_sync(i2s_sync, i2s_count);
+    if (i2s_slave_mode_active()) {
+        uint32_t mask = 0;
+        PIO out_pio = NULL;
+        if (spdif_count) {
+            mask |= audio_spdif_enable_sync_prepare(spdif_sync, spdif_count);
+            out_pio = spdif_sync[0]->pio;
+        }
+        if (i2s_count) {
+            mask |= audio_i2s_enable_sync_prepare(i2s_sync, i2s_count);
+            out_pio = i2s_sync[0]->pio;
+            i2s_slave_gate_on_lrclk();
+        }
+        if (mask) pio_enable_sm_mask_in_sync(out_pio, mask);
+    } else {
+        if (spdif_count) audio_spdif_enable_sync(spdif_sync, spdif_count);
+        if (i2s_count) audio_i2s_enable_sync(i2s_sync, i2s_count);
+    }
     restore_interrupts(flags);
 
     // Phase 3: USB feedback reset.  See B1 note in block comment above
@@ -930,18 +1039,21 @@ static void complete_pipeline_reset(void) {
     // and returns; dac_hw_mute_tick() deasserts it later so the input
     // pipeline keeps draining while the DAC remains muted.
     //
-    // EXCEPTION — I2S input with a pending prefill (preset_loading still set):
-    // the main-loop I2S prefill block (gated on preset_loading) will DRAIN and
-    // disable the outputs again after this returns, then re-enable in sync and
-    // own the release (right after its enable_outputs_in_sync()).  Releasing
-    // here would un-mute before that drain stops the clocks — and with the
-    // default release_ms == 0 the pin deasserts immediately, so the clock-stop
-    // click is fully exposed.  Defer to the prefill block in that case.  (SPDIF
-    // input is already handled by its callers skipping complete_pipeline_reset()
-    // entirely; USB has no such prefill drain, so it releases here as before.
-    // The prefill block always runs while active_input_source == I2S and
-    // preset_loading is set, so the mute is never left stuck asserted.)
-    if (!(active_input_source == INPUT_SOURCE_I2S && preset_loading)) {
+    // EXCEPTION: I2S or SPDIF input with a pending prefill (preset_loading
+    // still set): the main-loop prefill block for that source (gated on
+    // preset_loading) will DRAIN and disable the outputs again after this
+    // returns, then re-enable in sync and own the release (right after its
+    // enable_outputs_in_sync()).  Releasing here would un-mute before that
+    // drain stops the clocks, and with the default release_ms == 0 the pin
+    // deasserts immediately, so the clock-stop click is fully exposed.  Defer
+    // to the prefill block in those cases.  (USB has no such prefill drain,
+    // so it releases here as before.  The prefill blocks always run while
+    // their source is active and preset_loading is set; SPDIF holds the
+    // mute until lock, which is the intended mute-until-lock behavior, so
+    // the mute is never left stuck asserted.)
+    if (!(preset_loading &&
+          (active_input_source == INPUT_SOURCE_I2S ||
+           active_input_source == INPUT_SOURCE_SPDIF))) {
         dac_hw_mute_release();
     }
 
@@ -1001,8 +1113,25 @@ static void enable_outputs_in_sync(void) {
         }
     }
 
-    if (spdif_count) audio_spdif_enable_sync(spdif_sync, spdif_count);
-    if (i2s_count) audio_i2s_enable_sync(i2s_sync, i2s_count);
+    // Slave-mode gated combined start: same rationale and structure as
+    // complete_pipeline_reset Phase 2.
+    if (i2s_slave_mode_active()) {
+        uint32_t mask = 0;
+        PIO out_pio = NULL;
+        if (spdif_count) {
+            mask |= audio_spdif_enable_sync_prepare(spdif_sync, spdif_count);
+            out_pio = spdif_sync[0]->pio;
+        }
+        if (i2s_count) {
+            mask |= audio_i2s_enable_sync_prepare(i2s_sync, i2s_count);
+            out_pio = i2s_sync[0]->pio;
+            i2s_slave_gate_on_lrclk();
+        }
+        if (mask) pio_enable_sm_mask_in_sync(out_pio, mask);
+    } else {
+        if (spdif_count) audio_spdif_enable_sync(spdif_sync, spdif_count);
+        if (i2s_count) audio_i2s_enable_sync(i2s_sync, i2s_count);
+    }
 
     restore_interrupts(flags);
 
@@ -1632,11 +1761,81 @@ int main(void) {
             spdif_input_update_clock_servo();
         }
 
-        // Poll I2S input when active.  No lock handling and no clock servo
-        // (the input is synchronous to our own clock domain), but it DOES use
-        // the same prefill handshake as SPDIF so outputs start against a 50%
-        // consumer fill instead of whatever low level the startup transient
-        // leaves.  Trigger is preset_loading (set by every disruptive op via
+        // Poll I2S input when active.
+        else if (active_input_source == INPUT_SOURCE_I2S &&
+                 i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) {
+            // Clock-slave mode: SPDIF-style lock-gated flow.  The external
+            // master owns BCK/LRCLK, so outputs stay muted/drained until the
+            // measured external rate locks; the input keeps producing during
+            // the prefill (its clocks never stop), so the pools fill with
+            // real audio like the SPDIF path.
+            i2s_slave_poll();
+            I2sSlaveState sl_state = i2s_slave_get_state();
+
+            if (sl_state == I2S_SLAVE_LOCKED && preset_loading && !i2s_prefilling
+                    && dac_hw_mute_hold_elapsed()) {
+                if (!i2s_slave_check_rate_change()) {
+                    drain_and_disable_outputs();
+                    preset_loading = false;
+                    preset_mute_counter = 0;
+                    i2s_prefilling = true;
+                }
+                // else: the deferred rate change restarts the input; prefill
+                // re-triggers when it re-locks at the new pipeline rate.
+            }
+
+            // The LOCKED gate matters: if clocks drop mid-prefill the fill
+            // must not re-enable outputs against a possibly misframed RX;
+            // the RELOCKING restart below re-frames everything first.  This
+            // enable is a deliberate second start after the one inside any
+            // preceding complete_pipeline_reset(): the reset's start may
+            // have been ungated (clocks absent), so the gated re-enable
+            // here is what actually re-establishes the inter-type offset.
+            // Do not "optimize" it away.
+            if (i2s_prefilling && sl_state == I2S_SLAVE_LOCKED &&
+                get_slot_consumer_fill(0) >= SPDIF_CONSUMER_BUFFER_COUNT / 2) {
+                enable_outputs_in_sync();
+                i2s_prefilling = false;
+                // Release the DAC hardware mute now that clocks are running
+                // (Phase 4 ordering, same as the SPDIF prefill path).
+                dac_hw_mute_release();
+            }
+
+            // Clock loss or external rate change: mute (if not already
+            // muted), then ALWAYS restart the receiver so its SMs (possibly
+            // stalled mid-word) re-frame on the returning clocks; the
+            // prefill's enable_outputs_in_sync() re-frames the external-clock
+            // TX SMs the same way.  The restart must not be skipped while
+            // preset_loading is set (startup mute hold, armed rate change):
+            // RELOCKING could otherwise re-acquire straight to LOCKED with a
+            // misframed receiver.  Covers loss during an in-flight prefill
+            // too (prepare_pipeline_reset clears i2s_prefilling).  One-shot:
+            // the restart re-arms measurement into ACQUIRING.
+            if (sl_state == I2S_SLAVE_RELOCKING) {
+                if (!preset_loading) {
+                    prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+                    pipeline_reset_cpu_metering();
+                }
+                i2s_input_stop();
+                i2s_input_start(i2s_input_should_be_master());
+            }
+
+            // Process audio only when LOCKED (mirrors the SPDIF poll's lock
+            // gate): pre-lock the measured rate may not match the pipeline
+            // rate, and producing would also drain the soft-mute counter
+            // before the prefill drain runs.  The RX DMA ring free-runs and
+            // self-wraps meanwhile; the prefill starts from freshly drained
+            // pools, so nothing stale is played.
+            if (sl_state == I2S_SLAVE_LOCKED) {
+                i2s_input_poll();
+            }
+            i2s_slave_update_clock_servo();
+        }
+        // Master clock mode: no lock handling and no clock servo (the input
+        // is synchronous to our own clock domain), but it DOES use the same
+        // prefill handshake as SPDIF so outputs start against a 50% consumer
+        // fill instead of whatever low level the startup transient leaves.
+        // Trigger is preset_loading (set by every disruptive op via
         // prepare_pipeline_reset); there is no lock to wait for, so prefill
         // begins as soon as the DAC-mute hold has elapsed.
         else if (active_input_source == INPUT_SOURCE_I2S) {
@@ -2191,6 +2390,16 @@ int main(void) {
                     complete_pipeline_reset();
                 }
 
+                // BCK-only restore: a bulk/preset restore can install a new
+                // i2s_bck_pin with an unchanged type map, which the mask above
+                // cannot see.  rebuild_i2s_output_clocking() re-invokes
+                // process_type_switches over the I2S slots; its clocking
+                // mismatch detection (master election / external-clock mode /
+                // BCK pin) rebuilds only when something actually differs, so
+                // this is a cheap no-op in the common case (including when the
+                // type switch above already rebuilt everything).
+                rebuild_i2s_output_clocking();
+
                 // Restart SPDIF RX once, after all type-switch / pipeline
                 // work is done.  Skipped if the preset switched the input
                 // source — input_source_change_pending will manage RX
@@ -2218,7 +2427,17 @@ int main(void) {
                     // deferred restart (and its extra mute).
                     i2s_rx_pin_change_pending = false;
                     i2s_input_restart_pending = false;
-                    if (i2s_input_rate != audio_state.freq) {
+                    // Master mode only: in slave mode the stored rate is
+                    // dormant (the external master defines the rate; the lock
+                    // machinery re-rates as needed).  Check the EFFECTIVE
+                    // mode: this apply may itself have deferred a flip to
+                    // slave, in which case the live global still reads
+                    // master here.
+                    uint8_t eff_mode = i2s_clock_mode_change_pending
+                                           ? pending_i2s_clock_mode
+                                           : i2s_clock_mode;
+                    if (eff_mode != I2S_CLOCK_MODE_SLAVE &&
+                        i2s_input_rate != audio_state.freq) {
                         pending_rate = i2s_input_rate;
                         __dmb();
                         rate_change_pending = true;
@@ -2300,6 +2519,16 @@ int main(void) {
                 } else {
                     complete_flash_write_operation_full();
                 }
+
+                // BCK-only restore: a bulk/preset restore can install a new
+                // i2s_bck_pin with an unchanged type map, which the mask above
+                // cannot see.  rebuild_i2s_output_clocking() re-invokes
+                // process_type_switches over the I2S slots; its clocking
+                // mismatch detection (master election / external-clock mode /
+                // BCK pin) rebuilds only when something actually differs, so
+                // this is a cheap no-op in the common case (including when the
+                // type switch above already rebuilt everything).
+                rebuild_i2s_output_clocking();
             }
 
             extern volatile bool factory_reset_pending;
@@ -2389,6 +2618,16 @@ int main(void) {
                 } else {
                     complete_pipeline_reset();
                 }
+
+                // BCK-only restore: a bulk/preset restore can install a new
+                // i2s_bck_pin with an unchanged type map, which the mask above
+                // cannot see.  rebuild_i2s_output_clocking() re-invokes
+                // process_type_switches over the I2S slots; its clocking
+                // mismatch detection (master election / external-clock mode /
+                // BCK pin) rebuilds only when something actually differs, so
+                // this is a cheap no-op in the common case (including when the
+                // type switch above already rebuilt everything).
+                rebuild_i2s_output_clocking();
 
                 // Restart SPDIF RX if we suspended it above (skip if an input-
                 // source change is pending — that handler manages RX).
@@ -2564,6 +2803,16 @@ int main(void) {
                     // restart is sample-aligned across all slots.
                     complete_pipeline_reset();
                 }
+
+                // BCK-only restore: a bulk/preset restore can install a new
+                // i2s_bck_pin with an unchanged type map, which the mask above
+                // cannot see.  rebuild_i2s_output_clocking() re-invokes
+                // process_type_switches over the I2S slots; its clocking
+                // mismatch detection (master election / external-clock mode /
+                // BCK pin) rebuilds only when something actually differs, so
+                // this is a cheap no-op in the common case (including when the
+                // type switch above already rebuilt everything).
+                rebuild_i2s_output_clocking();
             }
 
             // Restart SPDIF RX if we suspended it above (outside the err==0
@@ -2587,11 +2836,97 @@ int main(void) {
                 i2s_input_start(i2s_input_should_be_master());
                 i2s_rx_pin_change_pending = false;
                 i2s_input_restart_pending = false;
-                if (i2s_input_rate != audio_state.freq) {
+                // Master mode only: in slave mode the stored rate is dormant
+                // (the external master defines the rate; the lock machinery
+                // re-rates as needed).  Check the EFFECTIVE mode: this apply
+                // may itself have deferred a flip to slave, in which case the
+                // live global still reads master here.
+                uint8_t eff_mode = i2s_clock_mode_change_pending
+                                       ? pending_i2s_clock_mode
+                                       : i2s_clock_mode;
+                if (eff_mode != I2S_CLOCK_MODE_SLAVE &&
+                    i2s_input_rate != audio_state.freq) {
                     pending_rate = i2s_input_rate;
                     __dmb();
                     rate_change_pending = true;
                 }
+            }
+        }
+
+        // Handle deferred I2S clock-mode change (master <-> slave).  Runs
+        // BEFORE the input-source switch so a combined apply (preset / bulk
+        // params changing both) records the mode dormantly first and the
+        // source switch below brings everything up in one reset.  Only a
+        // live I2S source needs work: restart the input with the new role,
+        // rebuild the I2S output slots' clocking (process_type_switches also
+        // applies the slave-mode MCK policy), and handle MCK for the
+        // no-I2S-output case here.
+        if (i2s_clock_mode_change_pending) {
+            if (active_input_source != INPUT_SOURCE_I2S) {
+                // Dormant apply: the mode only matters while I2S is the
+                // source, so just record it for the next switch into I2S.
+                i2s_clock_mode_change_pending = false;
+                __dmb();
+                if (i2s_clock_mode != pending_i2s_clock_mode) {
+                    i2s_clock_mode = pending_i2s_clock_mode;
+                    uint8_t wire_mode = i2s_clock_mode;
+                    notify_param_write(offsetof(WireBulkParams,
+                                                input_config.i2s_clock_mode),
+                                       1, &wire_mode);
+                }
+            } else if (pending_i2s_clock_mode == i2s_clock_mode) {
+                // Redundant request (e.g. a slave-then-master toggle pair
+                // consumed in one go): the live hardware already matches;
+                // consume without a spurious muted rebuild.  Every path that
+                // arms the flag with an unchanged value relies on this (the
+                // preset/bulk apply paths defer without pre-setting the
+                // global, so a real change always differs here).
+                i2s_clock_mode_change_pending = false;
+                __dmb();
+            } else if (pipeline_reset_ready()) {
+                i2s_clock_mode_change_pending = false;
+                __dmb();
+                prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+                if (i2s_input_get_state() != I2S_INPUT_INACTIVE) {
+                    i2s_input_stop();
+                }
+                i2s_clock_mode = pending_i2s_clock_mode;
+                rebuild_i2s_output_clocking();
+
+                extern bool i2s_mck_enabled;
+                extern uint16_t i2s_mck_multiplier;
+                if (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) {
+                    // External master owns all clocks; a locally generated
+                    // MCK would be asynchronous to them.
+                    audio_i2s_mck_set_enabled(false);
+                    // Drop any pending stored-rate change that raced the flip
+                    // (e.g. armed by a restore mirror or vendor 0xED just
+                    // before this handler ran): in slave mode the lock
+                    // machinery re-detects and re-arms the external rate.
+                    rate_change_pending = false;
+                } else {
+                    // Back to master mode: return to the selected rate (the
+                    // external rate may differ; slave-servo divider trim is
+                    // ppm-level and normalizes like the SPDIF-input path).
+                    if (i2s_input_rate != audio_state.freq) {
+                        perform_rate_change(i2s_input_rate, true);
+                    }
+                    if (i2s_mck_enabled && i2s_input_should_be_master()) {
+                        audio_i2s_mck_update_frequency(i2s_input_rate,
+                                                       i2s_mck_multiplier);
+                        audio_i2s_mck_set_enabled(true);
+                    }
+                }
+
+                i2s_input_start(i2s_input_should_be_master());
+                // The I2S main-loop block owns the drain/prefill/enable and
+                // the DAC-mute release (preset_loading is set).
+
+                // Notify at apply time (mirrors the input-source pattern).
+                uint8_t wire_mode = i2s_clock_mode;
+                notify_param_write(offsetof(WireBulkParams,
+                                            input_config.i2s_clock_mode),
+                                   1, &wire_mode);
             }
         }
 
@@ -2635,7 +2970,10 @@ int main(void) {
                     // filter coefficients, and resets the feedback loop.
                     // When the new source is I2S, go straight to its selected
                     // rate so the switch costs a single reset instead of two.
-                    uint32_t target_rate = (new_source == INPUT_SOURCE_I2S)
+                    // In slave clock mode the stored I2S rate is dormant
+                    // (auto-detected after lock), so stay at the current rate.
+                    uint32_t target_rate = (new_source == INPUT_SOURCE_I2S &&
+                                            i2s_clock_mode != I2S_CLOCK_MODE_SLAVE)
                                                ? i2s_input_rate
                                                : audio_state.freq;
                     // Switching INTO I2S: defer the output restart + mute release
@@ -2698,6 +3036,18 @@ int main(void) {
                 // handles vol_mul on USB transitions); on a switch into
                 // SPDIF it re-arms the streaks for fresh detection.
                 lg_sound_sync_on_input_source_change(active_input_source);
+
+                // I2S output slots change clocking at the slave-mode boundary
+                // (internal clkout/dataout <-> external-clock program), and
+                // MCK policy flips with them.  Rebuild whenever a source
+                // switch crosses into or out of slave-clocked I2S.  active
+                // source is already the NEW one, so process_type_switches
+                // elects the correct clocking; the extra reset it performs
+                // stays muted (preset_loading is set).
+                if (i2s_clock_mode == I2S_CLOCK_MODE_SLAVE &&
+                    (old_source == INPUT_SOURCE_I2S || new_source == INPUT_SOURCE_I2S)) {
+                    rebuild_i2s_output_clocking();
+                }
 
                 // Start new source hardware
                 if (input_source_is_spdif(new_source)) {

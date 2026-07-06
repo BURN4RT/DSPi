@@ -41,6 +41,7 @@
 #include "pico/audio_i2s_multi.h"
 #include "usb_audio.h"
 #include "spdif_input.h"
+#include "i2s_input.h"
 #include "notify.h"
 
 #define ADAT_PIO                pio1   // PDM owns SM 0 on this block
@@ -352,13 +353,15 @@ void adat_output_resync(void) {
         pio_gpio_init(ADAT_PIO, adat_hw_pin);
         pio_sm_set_consecutive_pindirs(ADAT_PIO, ADAT_SM, adat_hw_pin, 1, true);
     }
-    // Pick up the SPDIF-input clock servo's current divider (0 when the servo
-    // is not locked); adat_update_divider() sanity-bounds it against nominal.
+    // Pick up the active input servo's current divider (0 when no servo is
+    // locked; at most one of the two can be nonzero since input sources are
+    // exclusive); adat_update_divider() sanity-bounds it against nominal.
     {
         uint32_t sys = clock_get_hz(clk_sys);
         adat_nom_div = sys / adat_cur_freq + (sys % adat_cur_freq != 0);
     }
     adat_servo_div = spdif_input_current_tx_divider();
+    if (adat_servo_div == 0) adat_servo_div = i2s_slave_current_tx_divider();
     adat_sm_configure();
 
     // Line starts low: force the pin and seed the NRZI encoder to match.

@@ -367,6 +367,19 @@ void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin) {
     restore_interrupts(flags);
 }
 
+// Implemented unconditionally so it links on both platforms.
+void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_I2S_SLAVE_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = state;
+    memcpy(&e.value[1], &rate_hz, 4);
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 void notify_push_siggen_state(uint8_t state, uint8_t reason,
                               uint8_t signal_type, uint8_t channel) {
     uint32_t flags = save_and_disable_interrupts();
@@ -559,6 +572,18 @@ uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_l
             out_buf[6] = e.value[2];
             out_buf[7] = 0;
             return 8;
+        }
+
+        case NOTIFY_EVT_I2S_SLAVE_STATE: {
+            // 9 bytes: state in byte 4, detected rate (Hz, LE) in bytes 5..8.
+            if (max_len < 9) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_I2S_SLAVE_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            memcpy(&out_buf[5], &e.value[1], 4);
+            return 9;
         }
 
         case NOTIFY_EVT_SIGGEN_STATE: {

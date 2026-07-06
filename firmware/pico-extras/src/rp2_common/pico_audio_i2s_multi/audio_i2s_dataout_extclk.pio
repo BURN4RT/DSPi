@@ -1,0 +1,92 @@
+;
+; Copyright (c) 2026 WeebLabs
+;
+; SPDX-License-Identifier: BSD-3-Clause
+;
+
+; I2S external-clock slave output - 24-bit audio, data-only, clocked by an
+; EXTERNAL master's BCK/LRCLK (both GPIO inputs).  Used when the DSPi runs
+; in I2S clock-slave mode (external device supplies all clocks).
+;
+; Unlike audio_i2s_dataout.pio (which is cycle-identical to the on-chip
+; clkout master and free-runs on the shared divider), this program is
+; wait-driven at divider 1.0: it frames itself on the external LRCLK, then
+; shifts one bit out per external BCK falling edge (standard I2S: data
+; transitions on the falling edge, receiver samples on the rising edge).
+;
+; The BCK/LRCLK `wait gpio` instructions are assembled with GPIO 0
+; placeholders; the C layer copies the program to RAM and patches the 5-bit
+; GPIO index of each wait before loading (i2s_bck_pin is runtime
+; configurable).  Patch map (instruction index -> pin):
+;   2, 3    -> LRCLK (bck_pin + 1)
+;   4, 5, 6 -> BCK   (bck_pin)
+;
+; Alignment: the two `out null, 32` discards make an external-slave I2S slot
+; land on the same sample index as SPDIF slots started at the same LRCLK
+; edge.  The synchronized output start gates on an LRCLK falling edge, so a
+; SPDIF slot begins emitting sample 0 at that edge; this program's preamble
+; cannot begin output until the NEXT falling edge (one frame later), where
+; it emits sample 1 - having discarded sample 0 here.  Both slot types are
+; then emitting sample N in the same frame window, preserving the firmware's
+; inviolable inter-slot alignment.
+;
+; After the preamble the bit loop free-runs at 64 BCK/frame (matching the
+; fixed 24-in-32 wire format; the external master must run BCK = 64 x Fs).
+;
+; Autopull enabled, threshold 32, shift left (MSB-first).  TX FIFO joined.
+
+.program audio_i2s_dataout_extclk
+
+public entry_point:
+    out null, 32                ; discard frame 0 L (see alignment note)
+    out null, 32                ; discard frame 0 R
+    wait 1 gpio 0               ; [patched: LRCLK] ensure right-channel phase
+    wait 0 gpio 0               ; [patched: LRCLK] falling edge = left frame boundary
+    wait 0 gpio 0               ; [patched: BCK] skew guard: LRCLK and BCK fall
+                                ; together through independent pad synchronizers,
+                                ; so BCK can still read high for a cycle after
+                                ; LRCLK reads low; without this the next wait
+                                ; passes on the stale level and shifts the whole
+                                ; session one bit early (mirrors i2s_input.pio)
+.wrap_target
+    wait 1 gpio 0               ; [patched: BCK] rising edge (receiver samples)
+    wait 0 gpio 0               ; [patched: BCK] falling edge: transition data
+    out pins, 1
+.wrap
+
+; Total: 8 instructions.
+
+% c-sdk {
+
+// ---------------------------------------------------------------------------
+// audio_i2s_dataout_extclk_program_init - configure a PIO SM as an
+// external-clock I2S slave output (data pin only; clocks are inputs owned
+// by the I2S clock-slave input path).
+//
+//   pio      - PIO block
+//   sm       - state machine index
+//   offset   - from pio_add_program() of the PATCHED program copy
+//   data_pin - GPIO for serial audio data OUT
+//
+// Divider is forced to 1.0 (wait-driven).  Caller owns input enables on the
+// BCK/LRCLK pads and starts execution at entry_point.
+// ---------------------------------------------------------------------------
+static inline void audio_i2s_dataout_extclk_program_init(PIO pio, uint sm, uint offset,
+                                                         uint data_pin) {
+    pio_sm_config sm_config = audio_i2s_dataout_extclk_program_get_default_config(offset);
+
+    sm_config_set_out_pins(&sm_config, data_pin, 1);
+    sm_config_set_out_shift(&sm_config, false, true, 32);
+    sm_config_set_fifo_join(&sm_config, PIO_FIFO_JOIN_TX);
+
+    pio_sm_init(pio, sm, offset, &sm_config);
+    pio_sm_set_clkdiv_int_frac(pio, sm, 1, 0);
+
+    // Data pin output; BCK/LRCLK pindirs untouched (they are inputs)
+    pio_sm_set_consecutive_pindirs(pio, sm, data_pin, 1, true);
+    pio_sm_set_pins_with_mask(pio, sm, 0, 1u << data_pin);
+
+    pio_sm_exec(pio, sm, pio_encode_jmp(offset + audio_i2s_dataout_extclk_offset_entry_point));
+}
+
+%}

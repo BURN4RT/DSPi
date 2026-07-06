@@ -42,9 +42,16 @@ uint8_t i2s_input_channels = 2;
 // authority in I2S input mode)
 uint32_t i2s_input_rate = 48000;
 
+// I2S clock mode (master by default; slave only meaningful with I2S input)
+uint8_t i2s_clock_mode = I2S_CLOCK_MODE_MASTER;
+
 // Deferred input source switch
 volatile bool input_source_change_pending = false;
 volatile uint8_t pending_input_source = INPUT_SOURCE_USB;
+
+// Deferred I2S clock-mode apply (handled in main loop)
+volatile bool i2s_clock_mode_change_pending = false;
+volatile uint8_t pending_i2s_clock_mode = I2S_CLOCK_MODE_MASTER;
 
 // Deferred I2S RX hot-swaps (handled in main loop)
 volatile bool i2s_rx_pin_change_pending = false;

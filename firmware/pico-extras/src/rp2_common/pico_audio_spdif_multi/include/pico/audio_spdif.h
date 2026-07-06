@@ -206,6 +206,16 @@ void audio_spdif_teardown(audio_spdif_instance_t *inst);
  */
 void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count);
 
+/*! \brief Prepare-only half of audio_spdif_enable_sync
+ * \ingroup pico_audio_spdif_multi
+ *
+ * Primes DMA / IRQ refcounts and marks the instances enabled without
+ * starting the SMs; returns the SM mask for the shared PIO block so the
+ * caller can perform one combined pio_enable_sm_mask_in_sync (used by the
+ * I2S clock-slave path to gate the start on an external LRCLK edge).
+ */
+uint32_t audio_spdif_enable_sync_prepare(audio_spdif_instance_t *instances[], uint count);
+
 /** \brief Enable/disable DMA-starvation monitoring
  * \ingroup audio_spdif
  *

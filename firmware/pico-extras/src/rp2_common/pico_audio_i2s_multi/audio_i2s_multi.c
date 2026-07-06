@@ -30,6 +30,7 @@
 #include "pico/audio_i2s_multi.h"
 #include "audio_i2s_clkout.pio.h"
 #include "audio_i2s_dataout.pio.h"
+#include "audio_i2s_dataout_extclk.pio.h"
 // MCK is no longer PIO-driven (audio_mck.pio is gone) — see the MCK section
 // below for the CLK_GPOUTn-based replacement.
 #include "hardware/pio.h"
@@ -51,6 +52,18 @@
 // PIO program offsets per PIO block — loaded once per block, persist forever
 static int i2s_pio_program_offset[3] = {-1, -1, -1};          // Master program
 static int i2s_slave_pio_program_offset[3] = {-1, -1, -1};    // Slave program
+
+// External-clock slave program: BCK/LRCLK GPIO numbers are patched into its
+// `wait gpio` instructions at load time (the clock pins are runtime config),
+// so unlike the two programs above it must be reloaded if the pin changes.
+static int i2s_extclk_pio_program_offset[3] = {-1, -1, -1};
+static uint8_t i2s_extclk_patched_bck[3] = {0xFF, 0xFF, 0xFF};
+static uint16_t i2s_extclk_prog_ram[8];
+static struct pio_program i2s_extclk_prog = {
+    .instructions = i2s_extclk_prog_ram,
+    .length = 8,
+    .origin = -1,
+};
 
 // Which registered I2S instance index is the clock master (-1 = none).
 // Only the master SM runs the master PIO program (side-set drives BCK/LRCLK).
@@ -133,6 +146,43 @@ static PIO i2s_pio_block_from_index(uint8_t idx) {
 //   At 307.2 MHz / 48 kHz: divider = 12800 → integer 50, fractional 0
 //   (zero PIO clock jitter)
 
+// Patch the 5-bit GPIO index field of a `wait gpio` instruction.
+static inline uint16_t i2s_patch_wait_gpio(uint16_t instr, uint8_t pin) {
+    return (uint16_t)((instr & ~0x1Fu) | (pin & 0x1Fu));
+}
+
+// (Re)load the external-clock slave program on a PIO block with the current
+// BCK/LRCLK GPIOs patched into its wait instructions.  Reloads (remove + add)
+// only when the patched pin differs; no extclk SM on the block may be enabled
+// during a reload (every enable path re-jumps SMs to the entry point, so a
+// relocated offset cannot strand a disabled SM's PC).
+// Patch map per audio_i2s_dataout_extclk.pio: instr 2,3 = LRCLK; 4,5,6 = BCK.
+static uint i2s_extclk_load_program(PIO pio, uint8_t bck_pin) {
+    uint idx = pio_get_index(pio);
+    if (i2s_extclk_pio_program_offset[idx] >= 0) {
+        if (i2s_extclk_patched_bck[idx] == bck_pin)
+            return (uint)i2s_extclk_pio_program_offset[idx];
+        // Load-bearing invariant: reload only with every extclk SM disabled.
+        for (uint i = 0; i < i2s_instance_count; i++) {
+            assert(!(i2s_instances[i]->external_clock &&
+                     i2s_instances[i]->pio == pio && i2s_instances[i]->enabled));
+        }
+        pio_remove_program(pio, &i2s_extclk_prog,
+                           (uint)i2s_extclk_pio_program_offset[idx]);
+        i2s_extclk_pio_program_offset[idx] = -1;
+    }
+    memcpy(i2s_extclk_prog_ram, audio_i2s_dataout_extclk_program_instructions,
+           sizeof(i2s_extclk_prog_ram));
+    i2s_extclk_prog_ram[2] = i2s_patch_wait_gpio(i2s_extclk_prog_ram[2], (uint8_t)(bck_pin + 1));
+    i2s_extclk_prog_ram[3] = i2s_patch_wait_gpio(i2s_extclk_prog_ram[3], (uint8_t)(bck_pin + 1));
+    i2s_extclk_prog_ram[4] = i2s_patch_wait_gpio(i2s_extclk_prog_ram[4], bck_pin);
+    i2s_extclk_prog_ram[5] = i2s_patch_wait_gpio(i2s_extclk_prog_ram[5], bck_pin);
+    i2s_extclk_prog_ram[6] = i2s_patch_wait_gpio(i2s_extclk_prog_ram[6], bck_pin);
+    i2s_extclk_patched_bck[idx] = bck_pin;
+    i2s_extclk_pio_program_offset[idx] = pio_add_program(pio, &i2s_extclk_prog);
+    return (uint)i2s_extclk_pio_program_offset[idx];
+}
+
 // Compute the I2S clock divider in 24.8 fixed-point for a given sample rate.
 static uint32_t i2s_compute_divider(uint32_t sample_freq) {
     uint32_t system_clock_frequency = clock_get_hz(clk_sys);
@@ -147,7 +197,9 @@ static uint32_t i2s_compute_divider(uint32_t sample_freq) {
 
 // Update clock divider for a single instance AND all other I2S instances on
 // the same PIO block.  All I2S SMs must run at the same rate because they
-// share BCK/LRCLK timing from the master.
+// share BCK/LRCLK timing from the master.  External-clock slave SMs are
+// wait-driven at divider 1.0; their dividers are never touched, but freq
+// is still tracked for bookkeeping.
 static void i2s_update_pio_frequency(audio_i2s_instance_t *inst, uint32_t sample_freq) {
     uint32_t divider = i2s_compute_divider(sample_freq);
 
@@ -159,14 +211,18 @@ static void i2s_update_pio_frequency(audio_i2s_instance_t *inst, uint32_t sample
     for (uint i = 0; i < i2s_instance_count; i++) {
         audio_i2s_instance_t *other = i2s_instances[i];
         if (other && other->pio == inst->pio) {
-            pio_sm_set_clkdiv_int_frac(other->pio, other->pio_sm,
-                                        divider >> 8u, divider & 0xffu);
+            if (!other->external_clock) {
+                pio_sm_set_clkdiv_int_frac(other->pio, other->pio_sm,
+                                            divider >> 8u, divider & 0xffu);
+            }
             other->freq = sample_freq;
         }
     }
     // Also update the triggering instance (it may not be registered yet during setup)
-    pio_sm_set_clkdiv_int_frac(inst->pio, inst->pio_sm,
-                                divider >> 8u, divider & 0xffu);
+    if (!inst->external_clock) {
+        pio_sm_set_clkdiv_int_frac(inst->pio, inst->pio_sm,
+                                    divider >> 8u, divider & 0xffu);
+    }
     inst->freq = sample_freq;
 }
 
@@ -290,7 +346,8 @@ const audio_format_t *audio_i2s_setup(audio_i2s_instance_t *inst,
     inst->dma_irq = config->dma_irq;
     inst->data_pin = config->data_pin;
     inst->clock_pin_base = config->clock_pin_base;
-    inst->clock_master = config->clock_master;
+    inst->external_clock = config->external_clock;
+    inst->clock_master = config->external_clock ? false : config->clock_master;
     inst->playing_buffer = NULL;
     inst->freq = 0;
     inst->enabled = false;
@@ -314,7 +371,26 @@ const audio_format_t *audio_i2s_setup(audio_i2s_instance_t *inst,
     // Claim SM
     pio_sm_claim(inst->pio, inst->pio_sm);
 
-    if (config->clock_master) {
+    if (inst->external_clock) {
+        // ---- EXTERNAL-CLOCK SLAVE: waits on BCK/LRCLK driven by an
+        // external master; both clock pads are inputs, nothing on-chip
+        // drives them ----
+
+        // Make the clock pads readable: SIO function clears the RP2350 pad
+        // isolation latch, direction stays input.  Idempotent with the I2S
+        // clock-slave input path, which shares the same pads.
+        gpio_init(config->clock_pin_base);
+        gpio_set_input_enabled(config->clock_pin_base, true);
+        gpio_init(config->clock_pin_base + 1);
+        gpio_set_input_enabled(config->clock_pin_base + 1, true);
+
+        uint offset = i2s_extclk_load_program(inst->pio, config->clock_pin_base);
+        audio_i2s_dataout_extclk_program_init(inst->pio, inst->pio_sm, offset,
+                                              config->data_pin);
+
+        printf("I2S setup: SM%d as EXT-CLK SLAVE (data GPIO %d, BCK GPIO %d)\n",
+               inst->pio_sm, inst->data_pin, inst->clock_pin_base);
+    } else if (config->clock_master) {
         // ---- MASTER: drives BCK/LRCLK via side-set ----
 
         // GPIO init for clock pins (master only)
@@ -593,7 +669,11 @@ void audio_i2s_change_data_pin(audio_i2s_instance_t *inst, uint new_pin) {
 
     // Reinitialize SM with new data pin using the correct program for role
     uint pio_idx = pio_get_index(inst->pio);
-    if (inst->clock_master) {
+    if (inst->external_clock) {
+        assert(i2s_extclk_pio_program_offset[pio_idx] >= 0);
+        audio_i2s_dataout_extclk_program_init(inst->pio, inst->pio_sm,
+                (uint)i2s_extclk_pio_program_offset[pio_idx], new_pin);
+    } else if (inst->clock_master) {
         assert(i2s_pio_program_offset[pio_idx] >= 0);
         uint offset = (uint)i2s_pio_program_offset[pio_idx];
         audio_i2s_clkout_program_init(inst->pio, inst->pio_sm, offset,
@@ -634,7 +714,13 @@ void audio_i2s_change_data_pin(audio_i2s_instance_t *inst, uint new_pin) {
 // audio_i2s_enable_sync — synchronized start for multiple instances
 // ---------------------------------------------------------------------------
 
-void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count) {
+// Prepare-only half of the synchronized start: SM rewind, IRQ refcounts, DMA
+// priming and enabled-flag bookkeeping, WITHOUT starting the SMs.  Returns
+// the SM mask for the (single, shared) PIO block; the caller performs the
+// pio_enable_sm_mask_in_sync.  Lets a caller prime BOTH output types first
+// and then start every slot in one mask write (the I2S clock-slave path
+// gates that write on an external LRCLK edge).
+uint32_t audio_i2s_enable_sync_prepare(audio_i2s_instance_t *instances[], uint count) {
     assert(count > 0 && count <= PICO_AUDIO_I2S_MAX_INSTANCES);
 
     // Rewind each SM to a known program entry state before synchronous start.
@@ -647,7 +733,11 @@ void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count) {
         uint pio_idx = pio_get_index(inst->pio);
         uint entry_pc;
 
-        if (inst->clock_master) {
+        if (inst->external_clock) {
+            assert(i2s_extclk_pio_program_offset[pio_idx] >= 0);
+            entry_pc = (uint)i2s_extclk_pio_program_offset[pio_idx] +
+                       audio_i2s_dataout_extclk_offset_entry_point;
+        } else if (inst->clock_master) {
             assert(i2s_pio_program_offset[pio_idx] >= 0);
             entry_pc = (uint)i2s_pio_program_offset[pio_idx] + audio_i2s_clkout_offset_entry_point;
         } else {
@@ -668,32 +758,26 @@ void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count) {
         i2s_audio_start_dma_transfer(inst);
     }
 
-    // Build per-PIO-block SM bitmasks
-    uint32_t pio_sm_mask[3] = {0, 0, 0};
+    // All instances share one PIO block (asserted); build its SM mask
+    uint32_t sm_mask = 0;
     for (uint i = 0; i < count; i++) {
-        audio_i2s_instance_t *inst = instances[i];
-        for (uint p = 0; p < 3; p++) {
-            PIO block = i2s_pio_block_from_index(p);
-            if (inst->pio == block) {
-                pio_sm_mask[p] |= (1u << inst->pio_sm);
-                break;
-            }
-        }
+        assert(instances[i]->pio == instances[0]->pio);
+        sm_mask |= (1u << instances[i]->pio_sm);
     }
 
-    // Disable interrupts briefly and start all PIO blocks synchronously
-    uint32_t save = save_and_disable_interrupts();
-    for (uint p = 0; p < 3; p++) {
-        if (pio_sm_mask[p]) {
-            pio_enable_sm_mask_in_sync(i2s_pio_block_from_index(p), pio_sm_mask[p]);
-        }
-    }
-    restore_interrupts(save);
-
-    // Mark all instances enabled
     for (uint i = 0; i < count; i++) {
         instances[i]->enabled = true;
     }
+    return sm_mask;
+}
+
+void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count) {
+    uint32_t sm_mask = audio_i2s_enable_sync_prepare(instances, count);
+
+    // Disable interrupts briefly and start all SMs synchronously
+    uint32_t save = save_and_disable_interrupts();
+    pio_enable_sm_mask_in_sync(instances[0]->pio, sm_mask);
+    restore_interrupts(save);
 }
 
 void audio_i2s_set_starvation_monitoring(bool enabled) {
@@ -853,8 +937,10 @@ void audio_i2s_update_all_frequencies(uint32_t sample_freq) {
             active[active_count++] = inst;
         }
 
-        pio_sm_set_clkdiv_int_frac(inst->pio, inst->pio_sm,
-                                    divider >> 8u, divider & 0xffu);
+        if (!inst->external_clock) {
+            pio_sm_set_clkdiv_int_frac(inst->pio, inst->pio_sm,
+                                        divider >> 8u, divider & 0xffu);
+        }
         inst->freq = sample_freq;
         all_sm_mask |= (1u << inst->pio_sm);
         pio = inst->pio;
