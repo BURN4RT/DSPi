@@ -189,6 +189,32 @@ void audio_i2s_change_data_pin(audio_i2s_instance_t *inst, uint new_pin);
  */
 void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count);
 
+/** \brief Enable/disable DMA-starvation monitoring
+ * \ingroup pico_audio_i2s_multi
+ *
+ * When enabled, the driver counts consumer-empty DMA starts (silence
+ * fallback).  Mirrors audio_spdif_set_starvation_monitoring().
+ */
+void audio_i2s_set_starvation_monitoring(bool enabled);
+
+/** \brief Reset DMA-starvation counters
+ * \ingroup pico_audio_i2s_multi
+ */
+void audio_i2s_reset_dma_starvations(void);
+
+/** \brief Get total DMA-starvation events across all instances
+ * \ingroup pico_audio_i2s_multi
+ */
+uint32_t audio_i2s_get_dma_starvations(void);
+
+/** \brief Get DMA-starvation events for one instance index (0..3)
+ * \ingroup pico_audio_i2s_multi
+ *
+ * Index is the slot index (== dma_channel, same convention as the S/PDIF
+ * library's instance_index).
+ */
+uint32_t audio_i2s_get_dma_starvations_instance(uint index);
+
 /** \brief Tear down an I2S instance, releasing all hardware resources
  * \ingroup pico_audio_i2s_multi
  *

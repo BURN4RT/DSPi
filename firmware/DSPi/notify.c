@@ -352,6 +352,21 @@ void notify_push_input_format(uint8_t channels) {
     restore_interrupts(flags);
 }
 
+// Implemented unconditionally so it links on RP2040 (where ADAT is absent and
+// this is never called).
+void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_ADAT_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = enabled;
+    e.value[1] = active;
+    e.value[2] = pin;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 void notify_push_siggen_state(uint8_t state, uint8_t reason,
                               uint8_t signal_type, uint8_t channel) {
     uint32_t flags = save_and_disable_interrupts();
@@ -512,6 +527,20 @@ uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_l
             out_buf[4] = e.value[0];
             out_buf[5] = 0;
             out_buf[6] = 0;
+            out_buf[7] = 0;
+            return 8;
+        }
+
+        case NOTIFY_EVT_ADAT_STATE: {
+            // 8 bytes: enabled, active, data pin in bytes 4..6.
+            if (max_len < 8) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_ADAT_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = e.value[1];
+            out_buf[6] = e.value[2];
             out_buf[7] = 0;
             return 8;
         }

@@ -53,6 +53,11 @@
 // state = SiggenState, reason = SIGGEN_STOP_*, channel = walk channel or 0xFF.
 #define NOTIFY_EVT_SIGGEN_STATE      0x07
 
+// v2 ADAT bulk-output state event (RP2350): stream started/stopped, including
+// rate-policy auto-suspend/resume (see adat_output.h).
+// Packet: [ver=2, evt=0x08, flags=0, seq, enabled, active, pin, 0]
+#define NOTIFY_EVT_ADAT_STATE        0x08
+
 // v2 protocol version byte (first byte of every v2 packet)
 #define NOTIFY_V2_VERSION            0x02
 
@@ -121,6 +126,8 @@ void notify_push_input_format(uint8_t channels);
 // Test-signal generator started/stopped/completed (see siggen.h).
 void notify_push_siggen_state(uint8_t state, uint8_t reason,
                               uint8_t signal_type, uint8_t channel);
+// ADAT bulk-output stream state changed (RP2350; see adat_output.h).
+void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin);
 
 // ---------------------------------------------------------------------------
 // Consumers

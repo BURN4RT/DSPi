@@ -61,6 +61,13 @@ static int8_t i2s_clock_master_index = -1;
 static audio_i2s_instance_t *i2s_instances[PICO_AUDIO_I2S_MAX_INSTANCES];
 static uint i2s_instance_count = 0;
 
+// DMA-starvation monitoring (mirrors pico_audio_spdif_multi): counts
+// consumer-empty DMA starts (silence fallback), per instance by slot index
+// (== dma_channel, same convention as the S/PDIF library).
+static volatile bool i2s_starvation_monitor_enabled = false;
+static volatile uint32_t i2s_dma_starvations = 0;
+static volatile uint32_t i2s_dma_starvations_by_inst[PICO_AUDIO_I2S_MAX_INSTANCES] = {0};
+
 // Track whether shared IRQ handler is installed per DMA IRQ line
 static bool i2s_irq_handler_installed[2] = {false, false};
 
@@ -487,6 +494,13 @@ static void __time_critical_func(i2s_audio_start_dma_transfer)(audio_i2s_instanc
         // Play silence on underrun
         ab = &inst->silence_buffer;
 
+        if (i2s_starvation_monitor_enabled) {
+            i2s_dma_starvations++;
+            if (inst->dma_channel < PICO_AUDIO_I2S_MAX_INSTANCES) {
+                i2s_dma_starvations_by_inst[inst->dma_channel]++;
+            }
+        }
+
         extern int overruns;
         extern volatile bool preset_loading;
         if (!preset_loading)
@@ -680,6 +694,26 @@ void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count) {
     for (uint i = 0; i < count; i++) {
         instances[i]->enabled = true;
     }
+}
+
+void audio_i2s_set_starvation_monitoring(bool enabled) {
+    i2s_starvation_monitor_enabled = enabled;
+}
+
+void audio_i2s_reset_dma_starvations(void) {
+    i2s_dma_starvations = 0;
+    for (uint i = 0; i < PICO_AUDIO_I2S_MAX_INSTANCES; i++) {
+        i2s_dma_starvations_by_inst[i] = 0;
+    }
+}
+
+uint32_t audio_i2s_get_dma_starvations(void) {
+    return i2s_dma_starvations;
+}
+
+uint32_t audio_i2s_get_dma_starvations_instance(uint index) {
+    if (index >= PICO_AUDIO_I2S_MAX_INSTANCES) return 0;
+    return i2s_dma_starvations_by_inst[index];
 }
 
 // ---------------------------------------------------------------------------

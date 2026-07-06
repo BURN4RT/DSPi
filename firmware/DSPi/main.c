@@ -29,6 +29,7 @@
 #include "flash_clkdiv.h"
 #include "flash_storage.h"
 #include "pico/audio_i2s_multi.h"
+#include "adat_output.h"
 #include "pdm_generator.h"
 #include "siggen.h"
 #include "usb_audio.h"
@@ -173,6 +174,13 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
     crossfeed_update_pending = true;  // Recalculate crossfeed coefficients for new sample rate
     leveller_update_pending = true;   // Recalculate leveller coefficients for new sample rate
     pdm_update_clock(new_freq);
+
+#if PICO_RP2350
+    // ADAT rate policy: suspend above 48 kHz, divider refresh otherwise.  The
+    // complete_pipeline_reset() below restarts the stream when the rate is
+    // valid and the output is configured enabled.
+    adat_output_on_rate_change(new_freq);
+#endif
 
     // Atomically update all I2S instances and restart in sync (avoids brief
     // master/slave divider mismatch from lazy per-instance callbacks)
@@ -943,6 +951,15 @@ static void complete_pipeline_reset(void) {
     // the input would misframe and swap L/R permanently.  No-op unless the
     // input is RUNNING in the slave role.
     i2s_input_resync();
+
+#if PICO_RP2350
+    // Phase 6: restart the ADAT bulk output against current config.  ADAT is
+    // deliberately NOT in the Phase 2 sync start: its alignment comes from
+    // stream tracking behind a fixed silence cushion, so restarting it here
+    // re-establishes the constant ADAT-to-slot offset each epoch without
+    // widening the IRQ-disabled section.
+    adat_output_resync();
+#endif
 }
 
 // Disable all outputs, abort DMA, drain consumer pipelines. Outputs stay
@@ -955,6 +972,9 @@ static void drain_and_disable_outputs(void) {
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         teardown_output_slot(i);
     }
+#if PICO_RP2350
+    adat_output_stream_stop();
+#endif
 }
 
 // Enable all outputs in sync. Call after consumer buffers have been prefilled.
@@ -989,6 +1009,10 @@ static void enable_outputs_in_sync(void) {
     // Re-phase a slave-role I2S input after the TX master restart (see
     // complete_pipeline_reset Phase 5 for the rationale)
     i2s_input_resync();
+
+#if PICO_RP2350
+    adat_output_resync();
+#endif
 }
 
 // Flash writes disable interrupts for tens of milliseconds. Even when DSP
@@ -1266,6 +1290,12 @@ void core0_init() {
     // If PDM inits first, it steals Ch 0 via dma_claim_unused_channel(), causing SPDIF to panic/crash.
     usb_sound_card_init();
 
+#if PICO_RP2350
+    // Templates only, no hardware; must precede the first adat_output_resync()
+    // (reachable via process_type_switches -> complete_pipeline_reset below).
+    adat_output_init();
+#endif
+
     // Initialize feedback controller and nominal rate
     fb_ctrl_init(&fb_ctrl);
     nominal_feedback_10_14 = ((uint64_t)audio_state.freq << 14) / 1000;
@@ -1346,6 +1376,12 @@ void core0_init() {
                 process_type_switches(boot_mask, boot_types);
         }
     }
+
+#if PICO_RP2350
+    // Start the ADAT bulk output if the loaded config enables it.  Boot paths
+    // that ran complete_pipeline_reset() above already did this; idempotent.
+    adat_output_resync();
+#endif
 
     // Initial loudness table computation (uses loaded or default params)
     loudness_recompute_table(loudness_ref_spl, loudness_intensity_pct, 48000.0f);
@@ -2323,6 +2359,20 @@ int main(void) {
                 process_type_switches(mask, (const uint8_t *)pending_output_types);
             }
         }
+
+#if PICO_RP2350
+        // ADAT bulk-output service: silence top-up every pass; deferred config
+        // apply (vendor enable/pin change) through the same muted-restart
+        // bracket the other output config paths use.  Reset paths that already
+        // ran complete_pipeline_reset() cleared the dirty flag on the way.
+        // Serviced BEFORE process_pin_changes so an ADAT disable releases its
+        // GPIO before a queued slot re-pin can be installed on it.
+        adat_output_task();
+        if (adat_output_config_dirty && pipeline_reset_ready()) {
+            prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+            complete_pipeline_reset();
+        }
+#endif
 
         // Handle deferred output data-pin reassignment (SPDIF/I2S slots).
         // Gated on the DAC hardware-mute hold like the other reset handlers;

@@ -19,6 +19,7 @@
 #include "leveller.h"
 #include "lg_sound_sync.h"
 #include "dac_hw_mute.h"
+#include "adat_output.h"
 #include "notify.h"
 #include "uart_control.h"
 #include "i2c_control.h"
@@ -261,6 +262,13 @@ void bulk_params_collect(WireBulkParams *out) {
             wb->gain_db = xover_recipes[ch][b].gain_db;
         }
     }
+
+    // ADAT output configuration (V17+).  RP2350 only; the whole section (including
+    // reserved) stays zeroed on RP2040 from the memset above.
+#if PICO_RP2350
+    out->adat_config.enabled = adat_output_config_enabled() ? 1 : 0;
+    out->adat_config.pin     = adat_output_pin();
+#endif
 }
 
 // ============================================================================
@@ -608,6 +616,23 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         }
     }
     // Caller invokes dsp_recalculate_all_filters() after this returns.
+
+    // ADAT output configuration (V17+).  RP2350 only; RP2040 ignores the section.
+    // ADAT is a push-pull output driver, so the pin gets the full ownership
+    // check (adat_pin_acceptable) and a bad pin is rejected-and-kept-live.
+    // pin == 0 means the platform default.
+#if PICO_RP2350
+    {
+        uint8_t enabled = (in->adat_config.enabled != 0) ? 1 : 0;
+        uint8_t pin = (in->adat_config.pin != 0) ? in->adat_config.pin : PICO_ADAT_PIN;
+        if (!adat_pin_acceptable(pin)) {
+            printf("Bulk apply: ADAT pin %u rejected (invalid/conflict); kept %u\n",
+                   (unsigned)pin, (unsigned)adat_output_pin());
+            pin = adat_output_pin();
+        }
+        adat_output_set_config(enabled != 0, pin);
+    }
+#endif
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).
     notify_end_bulk();

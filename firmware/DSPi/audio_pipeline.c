@@ -23,6 +23,7 @@
 #include "flash_storage.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "adat_output.h"
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
@@ -1002,6 +1003,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             give_audio_buffer(pool, audio_buf[b]);
         }
     }
+
+    // ADAT bulk output tap: buf_out[0..7] are finalized post-gain for every
+    // pipeline variant here, and pushing AFTER the (blocking) gives keeps the
+    // ADAT ring lead bounded by the slot-0 consumer fill; see adat_output.c.
+    adat_output_push_block((const float (*)[192])buf_out, sample_count);
 #else
     if (audio_buf[0]) give_audio_buffer(producer_pool_1, audio_buf[0]);
     if (audio_buf[1]) give_audio_buffer(producer_pool_2, audio_buf[1]);

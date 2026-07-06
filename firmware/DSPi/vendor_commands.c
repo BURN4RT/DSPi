@@ -32,6 +32,7 @@
 #include "control_surfaces.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "adat_output.h"
 #include "usb_descriptors.h"
 #include "tusb.h"
 #include "pico/audio_spdif.h"
@@ -330,6 +331,10 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
         if (output_pins[i] == pin) return true;
     }
     if (i2s_mck_enabled && pin == i2s_mck_pin) return true;   // MCK (if enabled)
+#if PICO_RP2350
+    // ADAT data pin: claimed only while ADAT is config-enabled (mirrors MCK).
+    if (adat_output_config_enabled() && pin == adat_output_pin()) return true;
+#endif
     if (pin == spdif_rx_pin) return true;                     // SPDIF RX input
     if (dac_hw_mute_owns_pin(pin)) return true;               // DAC hardware-mute
     if (uart_ctrl_owns_pin(pin)) return true;                 // UART control (if live)
@@ -426,6 +431,17 @@ bool i2s_bck_pin_acceptable(uint8_t bck_pin) {
     if (pin_used_by_fixed_peripheral(lrck, 0xFF)) return false;
     return true;
 }
+
+#if PICO_RP2350
+// True if `pin` is acceptable as the ADAT data GPIO for the bulk/preset
+// restore paths.  ADAT is a push-pull output driver, so a collision with any
+// owned pin is driver contention; ADAT's own current claim never blocks it.
+bool adat_pin_acceptable(uint8_t pin) {
+    if (!is_valid_gpio_pin(pin)) return false;
+    if (adat_output_config_enabled() && pin == adat_output_pin()) return true;
+    return !is_pin_in_use(pin, 0xFF);
+}
+#endif
 
 // PIN_CONFIG_* status for claiming `pin` as a UART/I2C control-interface
 // GPIO.  Like check_i2s_rx_pin, the I2S BCK/LRCLK pair is treated as ALWAYS
@@ -2286,6 +2302,107 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_MCK_MULTIPLIER: {
                 resp_buf[0] = mck_encode(i2s_mck_multiplier);
                 vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            // ---- ADAT Bulk Output Commands (RP2350 only) ----
+
+            case REQ_SET_ADAT_ENABLE: {
+#if !PICO_RP2350
+                resp_buf[0] = PIN_CONFIG_INVALID_OUTPUT;
+#else
+                uint8_t value = setup->wValue & 0xFF;
+                uint8_t status;
+                if (value > 1) {
+                    status = PIN_CONFIG_INVALID_PARAM;
+                } else if (value == (adat_output_config_enabled() ? 1 : 0)) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op: already in this state
+                } else if (value != 0) {
+                    // Enabling from disabled: validate the configured ADAT pin.
+                    // ADAT is not yet config-enabled, so it never blocks itself.
+                    uint8_t pin = adat_output_pin();
+                    if (!is_valid_gpio_pin(pin)) {
+                        status = PIN_CONFIG_INVALID_PIN;
+                    } else if (is_pin_in_use(pin, 0xFF)) {
+                        status = PIN_CONFIG_PIN_IN_USE;
+                    } else {
+                        adat_output_set_config(true, pin);
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                } else {
+                    // Disabling: always allowed.
+                    adat_output_set_config(false, adat_output_pin());
+                    status = PIN_CONFIG_SUCCESS;
+                }
+                if (status == PIN_CONFIG_SUCCESS) {
+                    uint8_t v = adat_output_config_enabled() ? 1 : 0;
+                    notify_param_write(offsetof(WireBulkParams, adat_config.enabled), 1, &v);
+                }
+                resp_buf[0] = status;
+#endif
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_ENABLE: {
+#if PICO_RP2350
+                resp_buf[0] = adat_output_config_enabled() ? 1 : 0;
+#else
+                resp_buf[0] = 0;
+#endif
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_ADAT_PIN: {
+#if !PICO_RP2350
+                resp_buf[0] = PIN_CONFIG_INVALID_OUTPUT;
+#else
+                uint8_t pin = setup->wValue & 0xFF;
+                uint8_t status;
+                if (pin == 0) pin = PICO_ADAT_PIN;  // 0 = reset to default (matches flash/bulk)
+                if (!is_valid_gpio_pin(pin)) {
+                    status = PIN_CONFIG_INVALID_PIN;
+                } else if (pin == adat_output_pin()) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op
+                } else if (is_pin_in_use(pin, 0xFF)) {
+                    // New pin differs from the current ADAT pin, so the ADAT
+                    // pin itself can never self-block this change.
+                    status = PIN_CONFIG_PIN_IN_USE;
+                } else {
+                    // Re-route allowed even while enabled; the deferred apply
+                    // moves the stream under mute.
+                    adat_output_set_config(adat_output_config_enabled(), pin);
+                    status = PIN_CONFIG_SUCCESS;
+                }
+                if (status == PIN_CONFIG_SUCCESS) {
+                    uint8_t p = adat_output_pin();
+                    notify_param_write(offsetof(WireBulkParams, adat_config.pin), 1, &p);
+                }
+                resp_buf[0] = status;
+#endif
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_PIN: {
+#if PICO_RP2350
+                resp_buf[0] = adat_output_pin();
+#else
+                resp_buf[0] = 0;
+#endif
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_STATUS: {
+                AdatStatus s;
+#if PICO_RP2350
+                adat_output_get_status(&s);
+#else
+                memset(&s, 0, sizeof(s));  // ADAT unavailable: 8 zero bytes
+#endif
+                vendor_send_response(&s, sizeof(s));
                 return true;
             }
 

@@ -44,6 +44,13 @@ extern volatile uint32_t nominal_feedback_10_14;
 // PDM Subwoofer Output Pin (PIO1)
 #define PICO_PDM_PIN           10   // PDM sub (Out 9)
 
+// ADAT bulk output default pin (RP2350 only).  GPIO 12 is the only default-free
+// pin adjacent to the output cluster (5 = SPDIF RX, 6-9 = SPDIF TX, 10 = PDM,
+// 11 = DAC mute, 13 = MCK, 14-19 = I2S/UART/I2C).
+#if PICO_RP2350
+#define PICO_ADAT_PIN          12
+#endif
+
 // Legacy aliases
 #define PICO_AUDIO_SPDIF_SUB_PIN PICO_PDM_PIN
 
@@ -251,6 +258,16 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_MCK_PIN             0xC7
 #define REQ_SET_MCK_MULTIPLIER      0xC8
 #define REQ_GET_MCK_MULTIPLIER      0xC9
+
+// ADAT Bulk Output Commands (RP2350 only; RP2040 SETs return
+// PIN_CONFIG_INVALID_OUTPUT, GETs return zeros).  The ADAT stream carries all
+// 8 post-gain output channels; it only runs at 44.1/48 kHz and auto-suspends
+// at higher rates (see adat_output.h).
+#define REQ_SET_ADAT_ENABLE         0xCA  // wValue = 0/1, returns status byte
+#define REQ_GET_ADAT_ENABLE         0xCB  // returns uint8_t configured enable
+#define REQ_SET_ADAT_PIN            0xCC  // wValue = GPIO, returns status byte
+#define REQ_GET_ADAT_PIN            0xCD  // returns uint8_t
+#define REQ_GET_ADAT_STATUS         0xCE  // returns AdatStatus (8 B)
 
 // Buffer statistics
 #define REQ_GET_BUFFER_STATS        0xB0

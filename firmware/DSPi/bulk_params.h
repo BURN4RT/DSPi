@@ -31,7 +31,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      16   // V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
+#define WIRE_FORMAT_VERSION      17   // V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -288,6 +288,20 @@ typedef struct __attribute__((packed)) {
 } WireCrossoverConfig;                                              // 1088 bytes (input rows unused)
 
 // ============================================================================
+// Section 20: ADAT Output Configuration (8 bytes); V17+
+// ============================================================================
+//
+// ADAT lightpipe output (RP2350 only); streams the 8 post-gain output channels
+// as one ADAT frame per sample (see adat_output.h).  Zeroed on collect and
+// ignored on apply on RP2040.  `pin == 0` on apply means the platform default
+// (PICO_ADAT_PIN).
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1 configured enable (persisted intent)
+    uint8_t  pin;                    // data GPIO (0 = platform default on apply)
+    uint8_t  reserved[6];            // Pad to 8 bytes (future fields here)
+} WireAdatConfig;                    // 8 bytes
+
+// ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
@@ -310,19 +324,20 @@ typedef struct __attribute__((packed)) {
     WireUserVolume      user_volume;     //   16
     WireDacHwMute       dac_hw_mute;     //   16
     WireCrossoverConfig crossovers;      // 1088 (17×4; input rows unused)
-} WireBulkParams;                        // Total: 5864 bytes (V16)
+    WireAdatConfig      adat_config;     //    8
+} WireBulkParams;                        // Total: 5872 bytes (V17)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
 // Backward compatibility is intentionally broken at V16 (unified channel model).
-// Only the current full-size V16 layout is accepted — there are no legacy size
+// Only the current full-size V17 layout is accepted; there are no legacy size
 // anchors or per-section version gates; every section is always present.
-// bulk_params_apply() rejects any payload whose format_version != V16 or whose
+// bulk_params_apply() rejects any payload whose format_version != V17 or whose
 // length != sizeof(WireBulkParams).
 #define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
 // Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
-// V16 is 5864 bytes (17-channel EQ/names/crossover); 8192 is the next power of 2.
+// V17 is 5872 bytes (17-channel EQ/names/crossover + ADAT); 8192 is the next power of 2.
 // Shared by both platforms (the wire format is platform-independent).
 #define WIRE_BULK_BUF_SIZE     8192
 

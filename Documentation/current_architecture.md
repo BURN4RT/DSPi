@@ -1318,7 +1318,8 @@ Default channel names are derived from current device state, not hard-coded:
 ---
 
 ## Pin Configuration
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-06 (ADAT bulk output default GPIO 12 added; the ADAT pin
+is reserved in `is_pin_in_use` while ADAT is config-enabled)*
 
 The debug UART was removed entirely (stdio_uart off), freeing GPIO 16/17; they
 are no longer reserved and are now the default pins for the UART control
@@ -1338,6 +1339,7 @@ section.
 | 8 | S/PDIF 3 | Outputs 5-6 |
 | 9 | S/PDIF 4 | Outputs 7-8 |
 | 10 | PDM Sub | Output 9 |
+| 12 | ADAT bulk output (when enabled) | Outputs 1-8 mirror |
 | 16 | UART control TX (default; disabled until enabled over USB) | Control |
 | 17 | UART control RX (default) | Control |
 | 18 | I2C control SDA (default; disabled until enabled over USB) | Control |
@@ -1446,7 +1448,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-05*
+*Last updated: 2026-07-06*
 
 ### Hardware
 
@@ -1483,11 +1485,12 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Per-input EQ + metering | 2 inputs | up to 8 inputs (active count) |
 | Matrix outputs | 5 | 9 |
 | S/PDIF outputs | 2 pairs | 4 pairs |
+| ADAT bulk output | No | Yes (8 ch mirror of outputs 1-8; 44.1/48 kHz, auto-suspends above) |
 | USB input channels | 2 (stereo) | 2 / 4 / 6 / 8 |
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V16 / V21 | V16 / V21 |
+| Wire / slot version | V17 / V23 | V17 / V23 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
@@ -1529,6 +1532,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | I2S RX channels | CH4, CH5 (1 pair; shared with SPDIF RX) | CH5/6 + 7/8 + 9/10 + 11/12 (up to 4 pairs; pair 0 shared with SPDIF RX) |
 | I2S RX IRQ | IRQ-less (chained ring) | IRQ-less (chained rings) |
 | PDM channel | Dynamic (`dma_claim_unused_channel`) | Dynamic (`dma_claim_unused_channel`) |
+| ADAT channels | N/A | CH13 (data) + CH14 (control), IRQ-less chained ring |
 
 **Per-slot DMA channel sharing (2026-06-27).** Each output slot owns exactly one
 DMA channel (channel index == slot index), used by whichever output type is
@@ -1560,7 +1564,15 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-05 (XIP migration: binary type `default` on both platforms; only the hot audio/USB set is RAM-resident; RAM .data drops to 44,376 B RP2040 / 48,688 B RP2350; free RAM rises to ~80,596 / ~182,228 B; siggen BSS note added)*
+*Last updated: 2026-07-06 (ADAT bulk output BSS note added)*
+
+> **ADAT bulk output (2026-07-06, RP2350 only).** The ADAT engine adds a fixed
+> 28 KB BSS frame ring (896 frames x 32 bytes, `adat_ring` in adat_output.c)
+> plus small state; the ring is sized to cover the alignment cushion (96
+> frames) plus the blocking-give fill cap (16 x 48 samples) so overwrite of
+> unplayed frames is structurally impossible. Only `adat_output_push_block()`
+> is RAM-resident (`DSP_TIME_CRITICAL`); all control paths stay cold in flash.
+> RP2040 compiles the engine out entirely (zero cost). See "ADAT Bulk Output".
 
 > **Test signal generator (2026-07-05).** The siggen subsystem adds a small amount
 > of BSS (well under 1 KB: applied + staged `SiggenConfig`, three 44.1/48/96 kHz
@@ -2015,7 +2027,7 @@ Behavior is identical on both platforms (same 8 bindings, same ADC pins 26-28).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-05 (Control Surfaces commands 0x84-0x87)*
+*Last updated: 2026-07-06 (ADAT bulk output commands 0xCA-0xCE)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2130,6 +2142,11 @@ Behavior is identical on both platforms (same 8 bindings, same ADC pins 26-28).
 | GET_MCK_PIN | 0xC7 | IN | Get MCK pin |
 | SET_MCK_MULTIPLIER | 0xC8 | OUT | Set MCK multiplier (0=128x, 1=256x) |
 | GET_MCK_MULTIPLIER | 0xC9 | IN | Get MCK multiplier |
+| REQ_SET_ADAT_ENABLE | 0xCA | OUT | Enable/disable ADAT bulk output (wValue 0/1; RP2350 only, RP2040 returns INVALID_OUTPUT) |
+| REQ_GET_ADAT_ENABLE | 0xCB | IN | Get configured ADAT enable |
+| REQ_SET_ADAT_PIN | 0xCC | OUT | Set ADAT data GPIO (wValue = pin; 0 = reset to default 12) |
+| REQ_GET_ADAT_PIN | 0xCD | IN | Get ADAT data GPIO |
+| REQ_GET_ADAT_STATUS | 0xCE | IN | Get 8-byte AdatStatus (enabled, active, pin, rate_ok, resync/slip counters) |
 | REQ_SET_PREAMP_CH | 0xD0 | OUT | Set per-channel preamp gain (wValue=channel) |
 | REQ_GET_PREAMP_CH | 0xD1 | IN | Get per-channel preamp gain (wValue=channel) |
 | REQ_SET_MASTER_VOLUME | 0xD2 | OUT | Set master volume (-128 to 0 dB, -128=mute) |
@@ -2293,6 +2310,60 @@ MCK is driven directly by **CLK_GPOUTn** (hardware clock peripheral output) — 
 | RP2350 | +528 bytes |
 
 Full specification: `Documentation/Features/i2s_output_spec.md`
+
+---
+
+## ADAT Bulk Output
+*Last updated: 2026-07-06*
+
+RP2350 only. Streams all 8 main output channels (post-matrix, post per-output
+EQ/gain/delay/mute, the same finalized samples the SPDIF/I2S slots receive) as
+one ADAT lightpipe signal on a single GPIO (default 12), fully concurrent with
+the four output slots and PDM. 44.1/48 kHz only; the stream auto-suspends at
+higher rates and auto-resumes when the rate returns. RP2040 compiles the
+feature out (2 output channel pairs only).
+
+**Engine** (`adat_output.c/h`): a 4-instruction NRZI PIO program on PIO1 SM1 at
+512 x Fs (2 cycles/bit; same structure as the S/PDIF TX program, shift-left).
+The clkdiv is `ceil(sys / (2 * Fs))` in 1/256 steps, exactly half the S/PDIF TX
+divider at both supported rates, so ADAT is rate-locked to the slots with zero
+long-term drift. Frames (256 bits: `[1][10x0][1][u3..u0]` then 8 x 6 x
+`[1][nibble]`, user bits 0) are stuffed on Core 0 in `process_input_block()`
+after the slot gives and written into a 896-frame (28 KB BSS) ring drained by
+DMA CH13, with CH14 as an IRQ-less control channel that rewrites the read
+address at the ring end.
+
+**Alignment:** pushing after the blocking gives makes the ring lead track the
+slot-0 consumer fill plus a constant 96-frame cushion; the blocking-give cap
+(16 x 48 samples) bounds the lead under the ring size, so overwrite of unplayed
+frames is impossible. The 96-sample (2 ms at 48 kHz) ADAT-to-slot offset is
+re-established at every synchronized output restart (`complete_pipeline_reset`
+Phase 6, `enable_outputs_in_sync`). During host underruns silence frames are
+inserted slaved 1:1 to slot 0's DMA starvation counter (SPDIF or I2S; the I2S
+multi library gained matching counters), so the offset survives underruns while
+a USB stream is open; counter resets are detected by delta bounds and only
+re-baseline. The existing slots' sync-start machinery is untouched: ADAT is a
+PDM-style independent consumer, never a member of the Phase 2 sync start.
+
+**Config/state machine:** vendor commands 0xCA-0xCE (see reference table)
+record intent and set `adat_output_config_dirty`; the main loop applies it
+inside the standard muted `prepare/complete_pipeline_reset` bracket (serviced
+before `process_pin_changes` so a released ADAT GPIO cannot be clobbered).
+`perform_rate_change()` drives the rate policy; `adat_output_resync()`
+re-derives rate validity from `audio_state.freq` so a boot preset at 44.1 kHz
+is handled without a rate-change event. The ADAT pin participates in
+`is_pin_in_use` while config-enabled; the bulk/preset restore paths validate
+it via `adat_pin_acceptable()`.
+
+**Persistence:** identical to the other physical IO config, honoring
+`output_config_mode`: per-preset fields in `PresetSlot` (SLOT_DATA_VERSION 23)
+and device-global fields in `FlashOutputConfig` (directory V8; the pre-growth
+23-byte layout is frozen as `FlashOutputConfig_v7` for the V5/V6/V7 directory
+snapshots). Bulk params carry `WireAdatConfig` as the final section
+(WIRE_FORMAT_VERSION 17, 5872 bytes). Notify event `NOTIFY_EVT_ADAT_STATE`
+(0x08) reports enabled/active/pin on every state change.
+
+Full specification: `Documentation/Features/adat_output_spec.md`
 
 ---
 
