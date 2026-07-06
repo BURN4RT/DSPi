@@ -212,6 +212,30 @@ typedef struct __attribute__((packed)) {
     uint8_t i2s_rx_pin_ext[3];
 } FlashOutputConfig_v7;              // 23 bytes
 
+// Frozen pre-V9 Control Surfaces layout (config format v1); read only by the
+// V8→V9 directory migration (and the V7→V9 path, whose V7 flash also carries
+// this old blob).  The live CsBinding / CsFlashConfig in control_surfaces.h
+// have since grown (24-byte bindings with event/target/index, 16 slots), so
+// these frozen copies keep the old on-flash geometry stable for the migration.
+typedef struct __attribute__((packed)) {
+    uint8_t type;
+    uint8_t noun;
+    uint8_t action;
+    uint8_t flags;
+    uint8_t gpio[2];
+    uint8_t reserved[2];
+    int16_t value;
+    int16_t step;
+    int16_t range_min;
+    int16_t range_max;
+} CsBinding_v1;                      // 16 bytes
+
+typedef struct __attribute__((packed)) {
+    uint8_t       version;          // == 1
+    uint8_t       reserved[3];
+    CsBinding_v1  bindings[8];
+} CsFlashConfig_v1;                 // 132 bytes
+
 // --- Preset Directory v1 (legacy — kept only for upgrade migration) ---
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -290,6 +314,12 @@ typedef struct __attribute__((packed)) {
 // V8 grows the device-global output_config by 2 bytes (ADAT bulk output:
 // adat_enabled + adat_pin); board-level, same INDEPENDENT/WITH_PRESET model as
 // the rest of the physical IO config.
+//
+// V9 upgrades the embedded Control Surfaces config from format v1 to v2: each
+// binding grows from 16 to 24 bytes (adds explicit event / target / index
+// fields) and the slot count grows from 8 to 16, so cs_config grows from 132 to
+// 388 bytes.  The V8→V9 migration copies each of the 8 old bindings' shared
+// fields forward and zeroes the new ones; slots 8..15 start empty.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -322,8 +352,9 @@ typedef struct __attribute__((packed)) {
     I2cCtrlConfig  i2c_ctrl;                 // 8 bytes; enabled=0 by default
 
     // V7 addition: Control Surfaces bindings (board-level).  All-zero =
-    // every slot CS_TYPE_NONE = feature idle.
-    CsFlashConfig cs_config;                 // 132 bytes
+    // every slot CS_TYPE_NONE = feature idle.  V9 grew this from 132 to 388
+    // bytes (config format v2: 24-byte bindings, 16 slots).
+    CsFlashConfig cs_config;                 // 388 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -392,9 +423,10 @@ typedef struct __attribute__((packed)) {
 } PresetDirectory_v6;
 
 // Historical directory layout at V7, before the ADAT bulk-output fields grew
-// the device-global output_config.  Read only by the V7→V8 migration in
+// the device-global output_config.  Read only by the V7→V9 migration in
 // load_directory(); identical to PresetDirectory except output_config is the
-// frozen 23-byte FlashOutputConfig_v7 (no adat_enabled / adat_pin).
+// frozen 23-byte FlashOutputConfig_v7 (no adat_enabled / adat_pin) and cs_config
+// is the frozen 132-byte CsFlashConfig_v1 (config format v1, 8 bindings).
 typedef struct __attribute__((packed)) {
     uint32_t magic;
     uint16_t version;
@@ -413,10 +445,35 @@ typedef struct __attribute__((packed)) {
     FlashOutputConfig_v7 output_config;      // 23 bytes
     UartCtrlConfig uart_ctrl;
     I2cCtrlConfig  i2c_ctrl;
-    CsFlashConfig cs_config;
+    CsFlashConfig_v1 cs_config;              // 132 bytes (frozen format v1)
 } PresetDirectory_v7;
 
-#define DIR_VERSION_CURRENT  8
+// Historical directory layout at V8, before the Control Surfaces config grew
+// from format v1 to v2.  Read only by the V8→V9 migration in load_directory();
+// identical to the current PresetDirectory except cs_config is the frozen
+// 132-byte CsFlashConfig_v1 (8 x 16-byte bindings) rather than the 388-byte v2.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 25 bytes
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig_v1 cs_config;              // 132 bytes (frozen format v1)
+} PresetDirectory_v8;
+
+#define DIR_VERSION_CURRENT  9
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -609,6 +666,7 @@ static void io_config_defaults(FlashOutputConfig *cfg);    // defined below (IO 
 static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i);  // defined below
 static void dir_sanitize_ctrl_iface(void);                            // defined below
 static void dir_sanitize_cs_config(void);                             // defined below
+static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src);  // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
 // VALIDATION section.  collect_live_state() and migrate_legacy() use it
 // to compute the CRC byte range that matches whatever version they're
@@ -764,13 +822,47 @@ static bool dir_load_cache(void) {
         return true;
     }
 
+    if (flash_dir->version == 8) {
+        // V8 → V9 migration.  V9 upgrades the embedded Control Surfaces config
+        // from format v1 (132 bytes: 8 x 16-byte bindings) to v2 (388 bytes:
+        // 16 x 24-byte bindings).  Everything else is unchanged, so validate the
+        // v8 CRC, copy every field forward, and translate cs_config field-by-
+        // field via cs_config_from_v1().
+        const PresetDirectory_v8 *v8 = (const PresetDirectory_v8 *)flash_dir;
+        const uint8_t *v8_data_start = (const uint8_t *)&v8->startup_mode;
+        size_t v8_data_len = sizeof(PresetDirectory_v8) - offsetof(PresetDirectory_v8, startup_mode);
+        if (crc32(v8_data_start, v8_data_len) != v8->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v8->startup_mode;
+        dir_cache.default_slot       = v8->default_slot;
+        dir_cache.last_active_slot   = v8->last_active_slot;
+        dir_cache.output_config_mode = v8->output_config_mode;
+        dir_cache.slot_occupied      = v8->slot_occupied;
+        dir_cache.master_volume_mode = v8->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v8->spdif_rx_pin;
+        dir_cache.master_volume_db   = v8->master_volume_db;
+        memcpy(dir_cache.slot_names, v8->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v8->dac_hw_mute;
+        dir_cache.output_config      = v8->output_config;   // already 25-byte v8 layout
+        dir_cache.uart_ctrl          = v8->uart_ctrl;
+        dir_cache.i2c_ctrl           = v8->i2c_ctrl;
+        cs_config_from_v1(&dir_cache.cs_config, &v8->cs_config);
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist as V9
+        return true;
+    }
+
     if (flash_dir->version == 7) {
-        // V7 → V8 migration.  V8 grows the device-global output_config by 2
-        // bytes (ADAT bulk output: adat_enabled + adat_pin).  Validate the v7
-        // CRC, copy every field forward, and copy the 23-byte v7 output_config
-        // into the 25-byte field; the new adat bytes stay zero from the memset,
-        // then adat_pin is seeded to the platform default (PICO_ADAT_PIN on
-        // RP2350, 0 on RP2040) with the feature disabled.
+        // V7 → V9 migration.  V8 grew the device-global output_config by 2 bytes
+        // (ADAT bulk output: adat_enabled + adat_pin) and V9 upgraded the
+        // Control Surfaces config from format v1 to v2 (see the V8 branch).
+        // Validate the v7 CRC, copy every field forward, widen the 23-byte v7
+        // output_config into the 25-byte field (new adat bytes stay zero from
+        // the memset, then adat_pin is seeded to the platform default with the
+        // feature disabled), and translate cs_config via cs_config_from_v1().
         const PresetDirectory_v7 *v7 = (const PresetDirectory_v7 *)flash_dir;
         const uint8_t *v7_data_start = (const uint8_t *)&v7->startup_mode;
         size_t v7_data_len = sizeof(PresetDirectory_v7) - offsetof(PresetDirectory_v7, startup_mode);
@@ -798,9 +890,9 @@ static bool dir_load_cache(void) {
 #endif
         dir_cache.uart_ctrl          = v7->uart_ctrl;
         dir_cache.i2c_ctrl           = v7->i2c_ctrl;
-        dir_cache.cs_config          = v7->cs_config;
+        cs_config_from_v1(&dir_cache.cs_config, &v7->cs_config);
         dir_cache_valid = true;
-        (void)dir_flush();   // persist as V8
+        (void)dir_flush();   // persist as V9
         return true;
     }
 
@@ -1062,6 +1154,35 @@ static void dir_sanitize_ctrl_iface(void) {
     }
 }
 
+// Translate a frozen format-v1 Control Surfaces blob (8 x 16-byte bindings)
+// into the current v2 layout (16 x 24-byte bindings).  Read only by the V7→V9
+// and V8→V9 directory migrations.  Each old binding's shared fields carry
+// forward verbatim; the v2-only fields (event / target / index / reserved)
+// start zero, so a migrated button defaults to CS_EVT_PRESS and an untargeted
+// noun to target/index 0.  The old two reserved bytes are dropped, and slots
+// 8..15 start empty (CS_TYPE_NONE).  Full validation still happens at boot in
+// control_surfaces_apply_binding.
+static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->version = CS_CONFIG_VERSION;
+    for (int s = 0; s < 8; s++) {
+        const CsBinding_v1 *o = &src->bindings[s];
+        CsBinding *n = &dst->bindings[s];
+        n->type      = o->type;
+        n->noun      = o->noun;
+        n->action    = o->action;
+        n->flags     = o->flags;
+        n->gpio[0]   = o->gpio[0];
+        n->gpio[1]   = o->gpio[1];
+        n->value     = o->value;
+        n->step      = o->step;
+        n->range_min = o->range_min;
+        n->range_max = o->range_max;
+        // event / target / index / reserved / reserved2 stay zero.
+    }
+    // slots 8..15 stay zero (CS_TYPE_NONE) from the memset.
+}
+
 // Bound-check the directory's Control Surfaces config.  An implausible blob
 // version resets the whole block; an implausible binding resets that slot.
 // Deeper checks (action masks, pin collisions) run at apply time in
@@ -1075,9 +1196,14 @@ static void dir_sanitize_cs_config(void) {
     }
     for (int s = 0; s < CS_MAX_BINDINGS; s++) {
         CsBinding *b = &c->bindings[s];
+        // Shallow enum-range check, same philosophy as the v1 layout: reset a
+        // slot whose persisted type/noun/action/event is out of its enum range.
+        // event joins the set as a v2 addition; target/index are channel/band
+        // indices with no static bound here and are validated at apply time.
         if (b->type >= CS_TYPE_COUNT ||
             (b->type != CS_TYPE_NONE &&
-             (b->noun >= CS_NOUN_COUNT || b->action >= CS_ACT_COUNT))) {
+             (b->noun >= CS_NOUN_COUNT || b->action >= CS_ACT_COUNT ||
+              b->event >= CS_EVT_COUNT))) {
             memset(b, 0, sizeof(*b));
         }
     }

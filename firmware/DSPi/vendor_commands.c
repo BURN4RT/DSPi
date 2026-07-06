@@ -1064,6 +1064,12 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             if (slot >= CS_MAX_BINDINGS) {
                 cs_last_status = CS_STATUS_INVALID_SLOT;
                 cs_last_slot = slot;
+            } else if (cs_set_binding_pending) {
+                // The single-deep handoff still holds an unapplied SET;
+                // overwriting it would silently drop that binding.  Report
+                // BUSY for this one and leave the pending SET untouched.
+                cs_last_status = CS_STATUS_BUSY;
+                cs_last_slot = slot;
             } else if (buffer->data_len >= sizeof(CsBinding)) {
                 memcpy((void *)&cs_set_binding_val, vendor_rx_buf, sizeof(CsBinding));
                 cs_set_binding_slot = slot;
@@ -1073,6 +1079,11 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                 cs_last_slot = slot;
                 __dmb();
                 cs_set_binding_pending = true;
+            } else {
+                // Short payload (e.g. a host still sending the 16-byte v1
+                // binding); report it rather than leaving PENDING stale.
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = slot;
             }
             break;
         }
@@ -1930,7 +1941,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_CS_BINDING: {
-                // wValue = slot; returns the live 16-byte binding.
+                // wValue = slot; returns the live 24-byte binding.
                 if (setup->wValue >= CS_MAX_BINDINGS) return false;
                 uint8_t slot = (uint8_t)setup->wValue;
                 const CsBinding *b = control_surfaces_get_binding(slot);
@@ -1955,7 +1966,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_CS_STATUS: {
-                // 12-byte snapshot: last SET result + per-slot apply status.
+                // 22-byte snapshot: last SET result + per-slot apply status.
                 CsStatusPacket pkt;
                 control_surfaces_get_status(&pkt);
                 vendor_send_response(&pkt, sizeof(pkt));
