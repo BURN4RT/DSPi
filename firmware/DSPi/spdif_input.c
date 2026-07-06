@@ -24,6 +24,7 @@
 #include "pico/stdlib.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
+#include "adat_output.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -193,6 +194,9 @@ void spdif_input_start(void) {
     servo_skip_counter = 0;
     spdif_tx_base_divider = 0;
     i2s_tx_base_divider = 0;
+    last_spdif_div = 0;   // force a full divider rewrite after (re)lock
+    last_i2s_div = 0;
+    last_mck_div = 0;
     lock_debounce_polls = 0;
 
     printf("SPDIF RX: started on GPIO %u\n", spdif_rx_pin);
@@ -415,6 +419,12 @@ void spdif_input_update_clock_servo(void) {
         }
     }
 
+#if PICO_RP2350
+    // ADAT bulk output runs the same 256*Fs PIO clock as the S/PDIF TX SMs;
+    // apply the identical divider so it stays rate-locked to the slots.
+    adat_output_servo_divider(spdif_div);
+#endif
+
     // MCK servo: keep master clock frequency-locked to the servoed I2S data rate.
     // MCK is now driven by CLK_GPOUTn, so the divider is the direct 24.8 form
     // (no ÷2 for a PIO toggle — see audio_i2s_multi.c MCK section):
@@ -431,6 +441,10 @@ void spdif_input_update_clock_servo(void) {
             audio_i2s_mck_set_divider(mck_div);
         }
     }
+}
+
+uint32_t spdif_input_current_tx_divider(void) {
+    return (spdif_state == SPDIF_INPUT_LOCKED) ? last_spdif_div : 0;
 }
 
 // ============================================================================

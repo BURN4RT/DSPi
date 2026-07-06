@@ -3,10 +3,13 @@
 //
 // One 256-bit ADAT frame per sample carries all 8 post-gain output channels:
 //   [1][10x0][1][u3..u0]  then 8 x ( 6 x [1][nibble] ), nibbles MSB-first,
-// NRZI on the wire (1 = level transition).  The PIO program transmits at
-// 2 cycles/bit, so PIO clock = 512*Fs and the clkdiv is exactly half
-// the S/PDIF TX divider at 44.1/48 kHz; the effective sample rate matches
-// the output slots bit-for-bit, so ADAT can never drift against them.
+// NRZI on the wire (1 = level transition).  NRZI is encoded on the CPU
+// (prefix-XOR per word) so the PIO is a single out-pins instruction at
+// 1 cycle/bit: PIO clock = 256*Fs, making the ADAT clkdiv IDENTICAL to the
+// S/PDIF TX divider.  The SPDIF-input clock servo therefore rate-locks ADAT
+// by writing it the same divider it writes the slots (see spdif_input.c);
+// in USB/I2S modes both run the same nominal divider.  Either way ADAT can
+// never drift against the output slots.
 //
 // Buffering: a single 896-frame ring (28 KB BSS) drained by a free-running
 // DMA data channel; a chained control channel rewrites the read address at
@@ -37,6 +40,7 @@
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
 #include "usb_audio.h"
+#include "spdif_input.h"
 #include "notify.h"
 
 #define ADAT_PIO                pio1   // PDM owns SM 0 on this block
@@ -48,21 +52,22 @@
 #define ADAT_ALIGN_LEAD_FRAMES  96     // constant ADAT-vs-slot lead; underrun cushion
 #define ADAT_SYNC_HEADER        0x8010u // [1][10x0][1][0000]; user bits always 0
 
-// NRZI TX, 2 cycles/bit: stay in the low/high bank while bits are 0, cross
-// banks on 1 (side-set drives the pin).  Same structure as the S/PDIF TX
-// program; pio_add_program relocates the JMP targets.
-//   0: out x,1  side 0      1: jmp !x,0  side 0
-//   2: out x,1  side 1      3: jmp !x,2  side 1
-static const uint16_t adat_pio_instr[] = { 0x6021, 0x0020, 0x7021, 0x1022 };
+// The wire data is pre-NRZI-encoded line levels, so the program is a bare
+// 1 cycle/bit shifter (same as the PDM program): out pins, 1.
+static const uint16_t adat_pio_instr[] = { 0x6001 };
 static const struct pio_program adat_pio_program = {
-    .instructions = adat_pio_instr, .length = 4, .origin = -1,
+    .instructions = adat_pio_instr, .length = 1, .origin = -1,
 };
 
 static uint32_t adat_ring[ADAT_RING_FRAMES * ADAT_FRAME_WORDS];
 // Read by the control DMA channel to re-point the data channel at wrap.
 static uint32_t adat_ring_base_holder;
 
-static uint32_t adat_stuffed_silence[ADAT_FRAME_WORDS];
+// NRZI-encoded silence frames, one per line-entry level, plus each variant's
+// exit level (entry XOR the frame's ones-parity).
+static uint32_t adat_silence_nrzi[2][ADAT_FRAME_WORDS];
+static uint32_t adat_silence_exit[2];
+static uint32_t adat_line_level;   // line level after the last ring write
 
 static uint32_t adat_wr_frame;
 static bool     adat_running;
@@ -78,6 +83,9 @@ static bool     adat_need_local_resync;
 static volatile uint8_t adat_cfg_enabled;
 static volatile uint8_t adat_cfg_pin = PICO_ADAT_PIN;
 volatile bool adat_output_config_dirty;
+
+// Servo-supplied divider (0 = none); same 16.8 value the SPDIF TX SMs run.
+static volatile uint32_t adat_servo_div;
 
 static uint16_t adat_resync_count;
 static uint16_t adat_slip_count;
@@ -111,6 +119,18 @@ static inline void adat_pack_frame(uint32_t *w, const uint32_t c[8]) {
     w[7] = (c[6] << 30) |  c[7];
 }
 
+// NRZI-encode one transmit word (MSB first): each output bit is the line
+// level during that bit; a 1 in the input toggles the level.  The shift-right
+// cascade makes bit j the XOR of input bits 31..j (cumulative from the MSB);
+// XOR with the broadcast entry level yields the level stream.  *level (0/1)
+// is updated to the level after the word's last bit.
+static inline uint32_t adat_nrzi_word(uint32_t x, uint32_t *level) {
+    x ^= x >> 1; x ^= x >> 2; x ^= x >> 4; x ^= x >> 8; x ^= x >> 16;
+    x ^= (uint32_t)0 - *level;
+    *level = x & 1u;
+    return x;
+}
+
 // ---------------------------------------------------------------------------
 // Ring bookkeeping
 // ---------------------------------------------------------------------------
@@ -129,11 +149,14 @@ static inline uint32_t adat_lead_frames(void) {
 
 static void adat_write_silence(uint32_t frames) {
     uint32_t wf = adat_wr_frame;
+    uint32_t lvl = adat_line_level;
     for (uint32_t i = 0; i < frames; i++) {
-        memcpy(&adat_ring[wf * ADAT_FRAME_WORDS], adat_stuffed_silence,
+        memcpy(&adat_ring[wf * ADAT_FRAME_WORDS], adat_silence_nrzi[lvl],
                ADAT_FRAME_WORDS * sizeof(uint32_t));
+        lvl = adat_silence_exit[lvl];
         if (++wf == ADAT_RING_FRAMES) wf = 0;
     }
+    adat_line_level = lvl;
     adat_wr_frame = wf;
 }
 
@@ -141,14 +164,23 @@ static void adat_write_silence(uint32_t frames) {
 // Hardware bring-up / teardown
 // ---------------------------------------------------------------------------
 
+// Nominal 16.8 clkdiv for PIO clock = 256*Fs: the SAME formula and value as
+// the S/PDIF TX library, so ADAT consumes at the identical rate in every
+// mode.  Computed at resync (adat_update_divider must stay flash-free for
+// the servo path).
+static uint32_t adat_nom_div;
+
+DSP_TIME_CRITICAL
 static void adat_update_divider(void) {
-    // 16.8 clkdiv for PIO clock = 512*Fs, i.e. ceil(sys / (2*Fs)) in 1/256
-    // steps; exactly half the S/PDIF TX divider at 44.1/48 kHz (6966 and 6400
-    // are even), so both interfaces consume samples at the identical rate.
-    uint32_t fs = adat_cur_freq;
-    uint32_t div248 = (clock_get_hz(clk_sys) + 2 * fs - 1) / (2 * fs);
+    // While the SPDIF-input clock servo is trimming the slot dividers it
+    // supplies the servoed value; sanity-bounded against nominal so a stale
+    // value from a previous rate can never be applied.
+    uint32_t div = adat_nom_div;
+    uint32_t servo = adat_servo_div;
+    if (servo && servo > div - div / 128 && servo < div + div / 128)
+        div = servo;
     pio_sm_set_clkdiv_int_frac(ADAT_PIO, ADAT_SM,
-                               (uint16_t)(div248 >> 8), (uint8_t)(div248 & 0xFF));
+                               (uint16_t)(div >> 8), (uint8_t)(div & 0xFF));
 }
 
 static void adat_hw_init_once(void) {
@@ -163,9 +195,8 @@ static void adat_hw_init_once(void) {
 
 static void adat_sm_configure(void) {
     pio_sm_config c = pio_get_default_sm_config();
-    sm_config_set_wrap(&c, adat_pio_offset, adat_pio_offset + 3);
-    sm_config_set_sideset(&c, 1, false, false);
-    sm_config_set_sideset_pins(&c, adat_hw_pin);
+    sm_config_set_wrap(&c, adat_pio_offset, adat_pio_offset);
+    sm_config_set_out_pins(&c, adat_hw_pin, 1);
     sm_config_set_set_pins(&c, adat_hw_pin, 1);      // lets stop force the pin low
     sm_config_set_out_shift(&c, false, true, 32);    // shift left: MSB first
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_TX);
@@ -247,9 +278,15 @@ static void adat_notify_if_changed(void) {
 // ---------------------------------------------------------------------------
 
 void adat_output_init(void) {
-    uint32_t c[8];
+    uint32_t c[8], raw[ADAT_FRAME_WORDS];
     for (int i = 0; i < 8; i++) c[i] = adat_stuff30(0);
-    adat_pack_frame(adat_stuffed_silence, c);
+    adat_pack_frame(raw, c);
+    for (uint32_t lvl = 0; lvl < 2; lvl++) {
+        uint32_t l = lvl;
+        for (int w = 0; w < ADAT_FRAME_WORDS; w++)
+            adat_silence_nrzi[lvl][w] = adat_nrzi_word(raw[w], &l);
+        adat_silence_exit[lvl] = l;
+    }
 }
 
 void adat_output_set_config(bool enabled, uint8_t pin) {
@@ -275,9 +312,17 @@ void adat_output_get_status(AdatStatus *out) {
 void adat_output_on_rate_change(uint32_t freq) {
     adat_cur_freq = freq;
     adat_rate_ok = (freq <= 48000);
+    adat_servo_div = 0;   // stale for the new rate; servo re-pushes if locked
     // Caller (perform_rate_change) holds the mute; the following
     // complete_pipeline_reset() restarts the stream via resync if valid.
     if (!adat_rate_ok && adat_running) adat_stop_hw();
+}
+
+// Called from the RAM-pinned SPDIF-input clock servo; keep it RAM-resident.
+DSP_TIME_CRITICAL
+void adat_output_servo_divider(uint32_t div_16_8) {
+    adat_servo_div = div_16_8;
+    if (adat_running && div_16_8) adat_update_divider();
 }
 
 void adat_output_stream_stop(void) {
@@ -307,7 +352,18 @@ void adat_output_resync(void) {
         pio_gpio_init(ADAT_PIO, adat_hw_pin);
         pio_sm_set_consecutive_pindirs(ADAT_PIO, ADAT_SM, adat_hw_pin, 1, true);
     }
+    // Pick up the SPDIF-input clock servo's current divider (0 when the servo
+    // is not locked); adat_update_divider() sanity-bounds it against nominal.
+    {
+        uint32_t sys = clock_get_hz(clk_sys);
+        adat_nom_div = sys / adat_cur_freq + (sys % adat_cur_freq != 0);
+    }
+    adat_servo_div = spdif_input_current_tx_divider();
     adat_sm_configure();
+
+    // Line starts low: force the pin and seed the NRZI encoder to match.
+    pio_sm_exec(ADAT_PIO, ADAT_SM, pio_encode_set(pio_pins, 0));
+    adat_line_level = 0;
 
     // Alignment cushion: the constant ADAT-vs-slot lead, re-established at
     // every synchronized output restart.
@@ -376,16 +432,21 @@ void adat_output_push_block(const float (*bufs)[192], uint32_t sample_count) {
     }
 
     uint32_t wf = adat_wr_frame;
+    uint32_t lvl = adat_line_level;
     for (uint32_t i = 0; i < sample_count; i++) {
-        uint32_t c[8];
+        uint32_t c[8], raw[ADAT_FRAME_WORDS];
         for (int ch = 0; ch < 8; ch++) {
             float x = bufs[ch][i];
             x = fmaxf(-1.0f, fminf(1.0f, x));
             c[ch] = adat_stuff30((int32_t)(x * 8388607.0f));
         }
-        adat_pack_frame(&adat_ring[wf * ADAT_FRAME_WORDS], c);
+        adat_pack_frame(raw, c);
+        uint32_t *dst = &adat_ring[wf * ADAT_FRAME_WORDS];
+        for (int w = 0; w < ADAT_FRAME_WORDS; w++)
+            dst[w] = adat_nrzi_word(raw[w], &lvl);
         if (++wf == ADAT_RING_FRAMES) wf = 0;
     }
+    adat_line_level = lvl;
     adat_wr_frame = wf;
 }
 

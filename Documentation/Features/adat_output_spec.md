@@ -32,9 +32,11 @@ ADAT channel N is bit-identical in level to what goes to slot output N.
 
 Alignment guarantees:
 
-- ADAT cannot drift against the output slots. Its PIO clock divider is derived
-  from the same fixed 307.2 MHz system clock such that the effective sample
-  rate is bit-identical to the SPDIF TX rate at both supported rates.
+- ADAT cannot drift against the output slots. Its PIO clock is 256 x Fs, the
+  same as SPDIF TX, and its clock divider is the identical value: nominal in
+  USB/I2S modes, and in SPDIF-input mode the clock servo (which trims the
+  output dividers to track the source) writes ADAT the same divider it writes
+  the SPDIF slots.
 - ADAT runs a constant 96-sample lead cushion (2 ms at 48 kHz) relative to the
   slot outputs. The offset is fixed and is re-established at every synchronized
   output restart (rate change, preset load, output type/pin change, input
@@ -186,10 +188,12 @@ extremes); no hardware ADAT receiver has confirmed interop yet.
 
 ## Firmware internals (summary)
 
-- Engine: `firmware/DSPi/adat_output.c`; 4-instruction NRZI PIO program on
-  PIO1 SM1 at 512 x Fs (2 PIO cycles per bit); DMA channels 13 (data) + 14
-  (control) run a free-running 896-frame (28 KB) ring with an IRQ-less
-  chained wrap.
+- Engine: `firmware/DSPi/adat_output.c`; NRZI is encoded on the CPU (prefix-XOR
+  per word with line-level state carried across frames), so the PIO program is
+  a single `out pins, 1` at 256 x Fs and the clkdiv is identical to the SPDIF
+  TX divider (servo-tracked in SPDIF-input mode). DMA channels 13 (data) + 14
+  (control) run a free-running 896-frame (28 KB) ring with an IRQ-less chained
+  wrap.
 - The DSP pushes stuffed frames from `process_input_block()` after the slot
   buffer gives; the blocking give bounds the ring lead, so overwrite of
   unplayed frames is structurally impossible while the DMA runs.

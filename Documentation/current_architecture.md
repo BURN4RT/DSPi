@@ -2323,15 +2323,19 @@ the four output slots and PDM. 44.1/48 kHz only; the stream auto-suspends at
 higher rates and auto-resumes when the rate returns. RP2040 compiles the
 feature out (2 output channel pairs only).
 
-**Engine** (`adat_output.c/h`): a 4-instruction NRZI PIO program on PIO1 SM1 at
-512 x Fs (2 cycles/bit; same structure as the S/PDIF TX program, shift-left).
-The clkdiv is `ceil(sys / (2 * Fs))` in 1/256 steps, exactly half the S/PDIF TX
-divider at both supported rates, so ADAT is rate-locked to the slots with zero
-long-term drift. Frames (256 bits: `[1][10x0][1][u3..u0]` then 8 x 6 x
-`[1][nibble]`, user bits 0) are stuffed on Core 0 in `process_input_block()`
-after the slot gives and written into a 896-frame (28 KB BSS) ring drained by
-DMA CH13, with CH14 as an IRQ-less control channel that rewrites the read
-address at the ring end.
+**Engine** (`adat_output.c/h`): NRZI is encoded on the CPU (prefix-XOR per
+word, line-level state carried across frames; per-entry-level silence
+templates), so the PIO program is a single `out pins, 1` at 256 x Fs and the
+clkdiv is the IDENTICAL value the S/PDIF TX SMs run. In USB/I2S modes both use
+the nominal `ceil(sys / Fs)`; in SPDIF-input mode the clock servo
+(`spdif_input_update_clock_servo`) writes ADAT the same servoed divider it
+writes the SPDIF slots (`adat_output_servo_divider`, sanity-bounded against
+nominal; resync pulls `spdif_input_current_tx_divider()`), so ADAT is
+rate-locked to the slots with zero long-term drift in every input mode.
+Frames (256 bits: `[1][10x0][1][u3..u0]` then 8 x 6 x `[1][nibble]`, user bits
+0) are stuffed on Core 0 in `process_input_block()` after the slot gives and
+written into a 896-frame (28 KB BSS) ring drained by DMA CH13, with CH14 as an
+IRQ-less control channel that rewrites the read address at the ring end.
 
 **Alignment:** pushing after the blocking gives makes the ring lead track the
 slot-0 consumer fill plus a constant 96-frame cushion; the blocking-give cap
