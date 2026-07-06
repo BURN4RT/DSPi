@@ -470,7 +470,7 @@ typedef struct __attribute__((packed)) {
 // Firmware version (BCD encoded: major in high byte, minor.patch in low byte)
 #define FW_VERSION_MAJOR            1
 #define FW_VERSION_MINOR            1
-#define FW_VERSION_PATCH            4
+#define FW_VERSION_PATCH            5
 #define FW_VERSION_BCD              ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
 
 // Pin config status codes (shared by S/PDIF, I2S, and MCK pin commands)
