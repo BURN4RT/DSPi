@@ -58,6 +58,14 @@
 // Packet: [ver=2, evt=0x08, flags=0, seq, enabled, active, pin, 0]
 #define NOTIFY_EVT_ADAT_STATE        0x08
 
+// 0x09 reserved (claimed by the I2S slave-mode branch)
+
+// v2 Control Surfaces IR learn completion: capture or timeout.
+// Packet: [ver=2, evt=0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]
+// state = CS_IR_LEARN_DONE or CS_IR_LEARN_TIMEOUT; protocol/code are valid
+// only for DONE (CS_IR_PROTO_* / the learned code).
+#define NOTIFY_EVT_CS_IR_LEARN       0x0A
+
 // v2 protocol version byte (first byte of every v2 packet)
 #define NOTIFY_V2_VERSION            0x02
 
@@ -128,6 +136,8 @@ void notify_push_siggen_state(uint8_t state, uint8_t reason,
                               uint8_t signal_type, uint8_t channel);
 // ADAT bulk-output stream state changed (RP2350; see adat_output.h).
 void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin);
+// Control Surfaces IR learn finished (state = CS_IR_LEARN_DONE / _TIMEOUT).
+void notify_push_cs_ir_learn(uint8_t state, uint8_t protocol, uint32_t code);
 
 // ---------------------------------------------------------------------------
 // Consumers

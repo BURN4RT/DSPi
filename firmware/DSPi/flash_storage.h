@@ -110,11 +110,18 @@ void preset_get_dac_hw_mute(DacHwMuteConfig *out);
 void preset_set_ctrl_iface(const UartCtrlConfig *uart, const I2cCtrlConfig *i2c);
 void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out);
 
-// Control Surfaces bindings (board-level, directory-stored, V7+).  Setter is
-// synchronous and main-loop only; caller must have validated the config
-// (control_surfaces_apply_binding does this).  Getter copies out.
-void preset_set_cs_config(const CsFlashConfig *cfg);
+// Control Surfaces bindings (board-level, directory-stored, V7+).  Getter
+// copies out of the RAM cache; bindings persist only through
+// preset_set_cs_all below (the REQ_CS_SAVE path).
 void preset_get_cs_config(CsFlashConfig *out);
+
+// Control Surfaces IR command table (board-level, directory-stored, V11+).
+// Getter copies out of the RAM cache.  preset_set_cs_all persists bindings
+// and IR commands together in one directory-sector write (the REQ_CS_SAVE
+// path); synchronous and main-loop only, caller has validated both.
+// Returns PRESET_OK or PRESET_ERR_*.
+void preset_get_cs_ir_config(CsIrConfig *out);
+uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir);
 
 // Control Surfaces slot names (board-level, directory-stored, V10+).  User
 // labels for what each control slot is for; independent of the bindings

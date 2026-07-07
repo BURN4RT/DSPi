@@ -30,6 +30,13 @@
  * actions; encoders support acceleration; nouns carry a unit so frequency
  * and Q step logarithmically.
  *
+ * Caps v3 adds the IR remote component: one CS_TYPE_IR binding holds the
+ * receiver GPIO and up to CS_MAX_IR_COMMANDS learned remote buttons live in
+ * a separate command table (commands 0x8D-0x8F), each dispatching through
+ * the same noun/action machinery as a physical button.  Binding and IR
+ * command SETs are apply-live-only previews; REQ_CS_SAVE persists the whole
+ * live config and REQ_CS_REVERT reloads the stored one.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -50,6 +57,8 @@ typedef enum {
     CS_TYPE_ENCODER = 4,   // quadrature rotary encoder (2 GPIOs)
     CS_TYPE_LED     = 5,   // indicator LED (1 GPIO, output)
     CS_TYPE_LED_PWM = 6,   // PWM-dimmed LED (1 GPIO, hardware PWM slice)
+    CS_TYPE_IR      = 7,   // IR remote receiver (1 GPIO); a container slot
+                           // whose commands live in the IrCommand table
     CS_TYPE_COUNT
 } CsType;
 
@@ -168,6 +177,29 @@ typedef enum {
 #define CS_MAX_BINDINGS  16
 #define CS_GPIO_UNUSED   0xFF
 
+// IR remote control.  One CS_TYPE_IR binding (the receiver) may be live at a
+// time; its remote-button commands live in a separate table of sub-slots so
+// eight commands cost one binding slot and one GPIO.
+#define CS_MAX_IR_COMMANDS  8
+
+// IR code protocols (IrCommand.protocol).  Wire/flash-persistent values.
+// NONE marks an empty sub-slot.  NEC and RC5/RC6 are decoded properly (NEC
+// repeat frames drive hold-to-repeat; the RC5/RC6 toggle bit is masked so a
+// learned button matches every press); everything else falls back to a
+// timing-signature hash, matched by exact re-transmission.
+#define CS_IR_PROTO_NONE   0
+#define CS_IR_PROTO_NEC    1
+#define CS_IR_PROTO_RC5    2
+#define CS_IR_PROTO_RC6    3
+#define CS_IR_PROTO_HASH   4
+#define CS_IR_PROTO_COUNT  5
+
+// Learn state (CsStatusPacket.ir_learn_state / REQ_CS_IR_LEARN result read)
+#define CS_IR_LEARN_IDLE     0
+#define CS_IR_LEARN_ARMED    1   // listening; next decoded press is captured
+#define CS_IR_LEARN_DONE     2   // result available (protocol + code)
+#define CS_IR_LEARN_TIMEOUT  3   // nothing received within the learn window
+
 // Per-slot user label ("Sub Level", "Mute All", ...), NUL-terminated, set by
 // the host app and persisted device-global in the preset directory (V10+)
 // so external MCUs and apps on other hosts can read what each control is
@@ -183,6 +215,9 @@ typedef enum {
 // One binding; 24 bytes, identical on the wire (REQ_SET/GET_CS_BINDING
 // payload) and in flash.  value/step/range encoding follows the noun's unit
 // (CS_UNIT_*); bool/enum values are plain integers.
+// A CS_TYPE_IR binding is a container: gpio[0] is the receiver pin, INVERT
+// selects an idle-low receiver (default is idle-high, e.g. TSOP38xx), and
+// every other field must be 0.  Its commands live in the IrCommand table.
 typedef struct __attribute__((packed)) {
     uint8_t type;          // CsType
     uint8_t noun;          // CsNoun
@@ -200,6 +235,25 @@ typedef struct __attribute__((packed)) {
     uint8_t reserved2[6];  // write 0
 } CsBinding;
 
+// One IR remote command; 16 bytes, identical on the wire (REQ_SET/GET_CS_IR_CMD
+// payload) and in flash.  Semantically a button-shaped binding: the same noun /
+// action / target / value / step rules apply (actions INC/DEC/TOGGLE/SET/
+// TRIGGER/MOMENTARY; flags WRAP and REPEAT), fired by the learned code instead
+// of a GPIO edge.  protocol == CS_IR_PROTO_NONE marks the sub-slot empty (all
+// other fields must then be 0).
+typedef struct __attribute__((packed)) {
+    uint8_t  noun;         // CsNoun
+    uint8_t  action;       // CsAction (button subset)
+    uint8_t  flags;        // CS_FLAG_WRAP | CS_FLAG_REPEAT
+    uint8_t  target;       // channel index for targeted nouns (else 0)
+    uint8_t  index;        // filter band for CS_TARGET_DSP_BAND nouns (else 0)
+    uint8_t  protocol;     // CS_IR_PROTO_*
+    int16_t  value;        // SET/MOMENTARY target
+    int16_t  step;         // INC/DEC size; 0 = per-unit default
+    uint8_t  reserved[2];  // write 0
+    uint32_t code;         // learned code (encoding per protocol; see spec)
+} IrCommand;
+
 // Directory-persisted blob (device-global, V9+).  All-zero = every slot
 // CS_TYPE_NONE = feature idle; a fresh directory needs no special seeding.
 #define CS_CONFIG_VERSION  2
@@ -208,6 +262,16 @@ typedef struct __attribute__((packed)) {
     uint8_t   reserved[3];
     CsBinding bindings[CS_MAX_BINDINGS];
 } CsFlashConfig;           // 388 bytes
+
+// IR command table, directory-persisted (device-global, V11+) beside
+// cs_config.  All-zero = every sub-slot empty; a fresh directory needs no
+// seeding (protocol 0 = CS_IR_PROTO_NONE).
+#define CS_IR_CONFIG_VERSION  1
+typedef struct __attribute__((packed)) {
+    uint8_t   version;     // CS_IR_CONFIG_VERSION
+    uint8_t   reserved[3];
+    IrCommand cmds[CS_MAX_IR_COMMANDS];
+} CsIrConfig;              // 132 bytes
 
 // Capability descriptors (REQ_GET_CS_CAPS).  wValue = 0xFFFF returns the
 // header + type table; wValue = noun index returns that noun's descriptor.
@@ -218,12 +282,17 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (2)
+    uint8_t  caps_version; // capability format version (3)
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
     uint8_t  noun_count;   // CS_NOUN_COUNT
     CsTypeDesc types[CS_TYPE_COUNT];
-} CsCapsHeader;            // 4 + 4*CS_TYPE_COUNT = 32 bytes
+    // v3 additions (hosts locate these at offset 4 + 4*type_count).  The
+    // CS_TYPE_IR type descriptor's action mask describes what its COMMANDS
+    // may do; the container binding itself carries noun/action 0.
+    uint8_t  max_ir_commands;  // CS_MAX_IR_COMMANDS
+    uint8_t  reserved[3];
+} CsCapsHeader;            // 4 + 4*CS_TYPE_COUNT + 4 = 40 bytes
 
 typedef struct __attribute__((packed)) {
     uint8_t  kind;         // CS_KIND_*
@@ -238,15 +307,21 @@ typedef struct __attribute__((packed)) {
     uint8_t  dflags;       // CS_NDF_*
 } CsNounDesc;              // 12 bytes
 
-// REQ_GET_CS_STATUS response
+// REQ_GET_CS_STATUS response.  last_status / last_slot report the most
+// recent deferred SET of any CS kind (binding, name, IR command, save,
+// revert); IR command slots are reported as 0x80 | sub-slot.
 typedef struct __attribute__((packed)) {
-    uint8_t  last_status;  // result of the most recent REQ_SET_CS_BINDING
-    uint8_t  last_slot;    // slot that SET targeted
+    uint8_t  last_status;  // result of the most recent deferred CS SET
+    uint8_t  last_slot;    // slot that SET targeted (0x80 | n = IR sub-slot)
     uint8_t  max_bindings; // CS_MAX_BINDINGS
-    uint8_t  reserved;
+    uint8_t  dirty;        // 1 = live config differs from flash (unsaved preview)
     uint16_t active_mask;  // bit N = binding N live
     uint8_t  slot_status[CS_MAX_BINDINGS];  // per-slot apply status
-} CsStatusPacket;          // 22 bytes
+    // v3 additions
+    uint8_t  ir_active_mask;   // bit N = IR command N live (component up)
+    uint8_t  ir_learn_state;   // CS_IR_LEARN_*
+    uint8_t  ir_cmd_status[CS_MAX_IR_COMMANDS];  // per-sub-slot apply status
+} CsStatusPacket;          // 32 bytes
 
 // Status codes.  0x00..0x05 reuse the shared PIN_CONFIG_* namespace
 // (config.h); Control Surfaces extends it from 0x10.
@@ -265,7 +340,12 @@ typedef struct __attribute__((packed)) {
                                         // this GPIO+event pair
 #define CS_STATUS_BUSY            0x1B  // a previous binding SET is still
                                         // queued for apply; retry shortly
-#define CS_STATUS_FLASH_ERROR     0x1C  // directory persist failed (name SET)
+#define CS_STATUS_FLASH_ERROR     0x1C  // directory persist failed (name SET,
+                                        // REQ_CS_SAVE)
+#define CS_STATUS_IR_IN_USE       0x1D  // another slot already holds the IR
+                                        // component (one receiver per device)
+#define CS_STATUS_NO_IR           0x1E  // IR command/learn needs a live
+                                        // CS_TYPE_IR binding first
 
 // ---------------------------------------------------------------------------
 // Public API (all main-loop context)
@@ -294,13 +374,35 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *b);
 // pin_used_by_fixed_peripheral so no other subsystem can take a CS pin.
 bool control_surfaces_owns_pin(uint8_t pin);
 
-// Live config (the persistence source for preset_set_cs_config) and
-// read-only accessors for the vendor GET handlers.
+// Live config (the persistence source for REQ_CS_SAVE) and read-only
+// accessors for the vendor GET handlers.
 const CsFlashConfig *control_surfaces_config(void);
+const CsIrConfig *control_surfaces_ir_config(void);
 const CsBinding *control_surfaces_get_binding(uint8_t slot);  // NULL if bad slot
+const IrCommand *control_surfaces_get_ir_cmd(uint8_t sub);    // NULL if bad sub-slot
 void control_surfaces_get_status(CsStatusPacket *out);
 const CsCapsHeader *control_surfaces_caps_header(void);
 const CsNounDesc *control_surfaces_noun_desc(uint8_t noun);   // NULL if bad noun
+
+// Validate and apply one IR command (protocol CS_IR_PROTO_NONE clears the
+// sub-slot).  Live-only, like apply_binding; the caller marks the config
+// dirty.  Commands may be set before the IR component exists; they activate
+// when it comes up.  Returns PIN_CONFIG_* / CS_STATUS_*.
+uint8_t control_surfaces_apply_ir_cmd(uint8_t sub, const IrCommand *c);
+
+// Re-apply the persisted config (bindings + IR commands) from the directory
+// cache, discarding the live preview.  Per-slot failures land in slot_status
+// exactly as at boot.  Main-loop only (releases and reclaims GPIOs).
+void control_surfaces_revert(void);
+
+// Preview dirty flag: set when a live apply diverges from flash, cleared by
+// save / revert (main.c owns the transitions around the flash write).
+bool control_surfaces_dirty(void);
+void control_surfaces_set_dirty(bool dirty);
+
+// Learn result snapshot for the REQ_CS_IR_LEARN result read:
+// {state, protocol, 0, 0, code_le32}, 8 bytes.
+void control_surfaces_get_ir_learn(uint8_t out[8]);
 
 // Deferred SET (written by the vendor handler, consumed by the main loop;
 // same shape as ctrl_set_uart_pending).  cs_last_status / cs_last_slot feed
@@ -316,6 +418,27 @@ extern volatile uint8_t cs_last_slot;
 extern volatile bool    cs_set_name_pending;
 extern uint8_t          cs_set_name_slot;
 extern char             cs_set_name_val[CS_NAME_LEN];
+
+// Deferred IR-command SET (REQ_SET_CS_IR_CMD); same single-deep handoff
+// shape as the binding SET.  Results land in cs_last_status with
+// cs_last_slot = 0x80 | sub-slot, plus the per-sub-slot status array.
+extern volatile bool    cs_set_ir_cmd_pending;
+extern uint8_t          cs_set_ir_cmd_slot;
+extern IrCommand        cs_set_ir_cmd_val;
+
+// Deferred save / revert (REQ_CS_SAVE / REQ_CS_REVERT).  Save persists the
+// whole live CS config (bindings + IR commands) in one directory write;
+// revert re-applies the stored config.  Results land in cs_last_status
+// (cs_last_slot = 0xFF).
+extern volatile bool    cs_save_pending;
+extern volatile bool    cs_revert_pending;
+
+// Learn control (REQ_CS_IR_LEARN): op 1 = arm, anything else = cancel.
+// Direct call; every dispatch transport runs on the core0 main loop.
+// Returns PIN_CONFIG_SUCCESS or CS_STATUS_NO_IR (arm without a live IR
+// component).  Completion is pushed on the notify EP and readable via
+// control_surfaces_get_ir_learn.
+uint8_t control_surfaces_ir_learn_control(uint8_t op);
 
 // ---------------------------------------------------------------------------
 // Internal interface between the engine (control_surfaces.c) and the noun

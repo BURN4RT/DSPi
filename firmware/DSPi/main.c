@@ -1795,10 +1795,10 @@ int main(void) {
                 }
             }
 
-            // Control Surfaces binding SET (deferred).  Live apply first
-            // (GPIO/ADC claims, no flash); persist the whole binding table
-            // only when the new binding validated, so a bad SET can never
-            // clobber a good stored config.
+            // Control Surfaces binding SET (deferred).  Live-only preview:
+            // apply does the GPIO/ADC claims but no flash; a successful apply
+            // just marks the live config dirty.  REQ_CS_SAVE persists the
+            // whole config later; REQ_CS_REVERT discards the preview.
             if (cs_set_binding_pending) {
                 CsBinding b;
                 uint8_t slot;
@@ -1811,9 +1811,7 @@ int main(void) {
                 cs_last_status = status;
                 cs_last_slot = slot;
                 if (status == PIN_CONFIG_SUCCESS) {
-                    prepare_flash_write_operation();
-                    preset_set_cs_config(control_surfaces_config());
-                    complete_flash_write_operation_light();
+                    control_surfaces_set_dirty(true);
                 }
             }
 
@@ -1834,6 +1832,57 @@ int main(void) {
                 cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
                                                    : CS_STATUS_FLASH_ERROR;
                 cs_last_slot = slot;
+            }
+
+            // Control Surfaces IR-command SET (deferred).  Live-only preview
+            // like the binding SET: apply the command, mark dirty on success,
+            // no flash.  Sub-slot is reported as 0x80 | slot in cs_last_slot.
+            if (cs_set_ir_cmd_pending) {
+                IrCommand c;
+                uint8_t slot;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(&c, (const void *)&cs_set_ir_cmd_val, sizeof(c));
+                slot = cs_set_ir_cmd_slot;
+                cs_set_ir_cmd_pending = false;
+                restore_interrupts(f);
+                uint8_t status = control_surfaces_apply_ir_cmd(slot, &c);
+                cs_last_status = status;
+                cs_last_slot = 0x80 | slot;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    control_surfaces_set_dirty(true);
+                }
+            }
+
+            // Control Surfaces SAVE (deferred).  Persist the whole live
+            // config (bindings + IR commands) in one directory flash write,
+            // then clear the dirty preview flag on success.
+            if (cs_save_pending) {
+                uint32_t f = save_and_disable_interrupts();
+                cs_save_pending = false;
+                restore_interrupts(f);
+                prepare_flash_write_operation();
+                uint8_t rc = preset_set_cs_all(control_surfaces_config(),
+                                               control_surfaces_ir_config());
+                complete_flash_write_operation_light();
+                cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
+                                                   : CS_STATUS_FLASH_ERROR;
+                cs_last_slot = 0xFF;
+                if (rc == PRESET_OK) {
+                    control_surfaces_set_dirty(false);
+                }
+            }
+
+            // Control Surfaces REVERT (deferred).  Re-apply the stored config
+            // from the directory RAM cache (GPIO reclaims, no flash) and drop
+            // the dirty preview flag.
+            if (cs_revert_pending) {
+                uint32_t f = save_and_disable_interrupts();
+                cs_revert_pending = false;
+                restore_interrupts(f);
+                control_surfaces_revert();
+                control_surfaces_set_dirty(false);
+                cs_last_status = PIN_CONFIG_SUCCESS;
+                cs_last_slot = 0xFF;
             }
 
             // DAC hardware mute config update (deferred from USB ISR).

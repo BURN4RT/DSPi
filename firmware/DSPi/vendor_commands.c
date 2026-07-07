@@ -1088,6 +1088,34 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             break;
         }
 
+        case REQ_SET_CS_IR_CMD: {
+            // Deferred to main loop, same single-deep handoff as the binding
+            // SET.  Apply is live-only (no flash); REQ_CS_SAVE persists.  IR
+            // sub-slots are tagged 0x80 | slot in cs_last_slot to keep them
+            // distinct from binding slots.
+            uint8_t slot = vendor_last_wValue & 0xFF;
+            if (slot >= CS_MAX_IR_COMMANDS) {
+                cs_last_status = CS_STATUS_INVALID_SLOT;
+                cs_last_slot = 0x80 | slot;
+            } else if (cs_set_ir_cmd_pending) {
+                // Single-deep handoff still holds an unapplied SET;
+                // overwriting it would silently drop that command.
+                cs_last_status = CS_STATUS_BUSY;
+                cs_last_slot = 0x80 | slot;
+            } else if (buffer->data_len >= sizeof(IrCommand)) {
+                memcpy((void *)&cs_set_ir_cmd_val, vendor_rx_buf, sizeof(IrCommand));
+                cs_set_ir_cmd_slot = slot;
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = 0x80 | slot;
+                __dmb();
+                cs_set_ir_cmd_pending = true;
+            } else {
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = 0x80 | slot;
+            }
+            break;
+        }
+
         case REQ_SET_CS_NAME: {
             // wValue = slot, payload = 1-32 bytes of name (a single NUL
             // byte clears it).  Deferred to main loop: the persist is a
@@ -1997,7 +2025,8 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_CS_STATUS: {
-                // 22-byte snapshot: last SET result + per-slot apply status.
+                // 32-byte snapshot: last SET result, dirty flag, per-slot
+                // apply status, IR command status and learn state.
                 CsStatusPacket pkt;
                 control_surfaces_get_status(&pkt);
                 vendor_send_response(&pkt, sizeof(pkt));
@@ -2014,6 +2043,78 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 }
                 memcpy(resp_buf, name, CS_NAME_LEN);
                 vendor_send_response(resp_buf, CS_NAME_LEN);
+                return true;
+            }
+
+            case REQ_GET_CS_IR_CMD: {
+                // wValue = sub-slot; returns the live 16-byte IR command.
+                if (setup->wValue >= CS_MAX_IR_COMMANDS) return false;
+                const IrCommand *c = control_surfaces_get_ir_cmd((uint8_t)setup->wValue);
+                if (c == NULL) return false;
+                vendor_send_response(c, sizeof(IrCommand));
+                return true;
+            }
+
+            case REQ_CS_IR_LEARN: {
+                // GET-style action.  wValue 2 reads the last learn result
+                // (8 bytes); 1 arms and 0 cancels, each acknowledged with a
+                // single status byte.  Arm/cancel run on the main loop, so
+                // control_surfaces_ir_learn_control is safe to call here.
+                if (setup->wValue == 2) {
+                    uint8_t buf[8];
+                    control_surfaces_get_ir_learn(buf);
+                    memcpy(resp_buf, buf, sizeof(buf));
+                    vendor_send_response(resp_buf, sizeof(buf));
+                    return true;
+                }
+                if (setup->wValue == 1 || setup->wValue == 0) {
+                    uint8_t rc = control_surfaces_ir_learn_control(setup->wValue == 1 ? 1 : 0);
+                    if (rc == CS_STATUS_NO_IR) {
+                        // No live IR component to learn on; stall and report.
+                        cs_last_status = CS_STATUS_NO_IR;
+                        cs_last_slot = 0xFF;
+                        return false;
+                    }
+                    resp_buf[0] = 1;
+                    vendor_send_response(resp_buf, 1);
+                    return true;
+                }
+                return false;
+            }
+
+            case REQ_CS_SAVE: {
+                // Deferred: persisting the whole live CS config is a
+                // directory flash write, done on the main loop.  Result
+                // lands in cs_last_status, readable via REQ_GET_CS_STATUS.
+                if (cs_save_pending || cs_revert_pending) {
+                    cs_last_status = CS_STATUS_BUSY;
+                    cs_last_slot = 0xFF;
+                    return false;
+                }
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = 0xFF;
+                __dmb();
+                cs_save_pending = true;
+                resp_buf[0] = 1;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_CS_REVERT: {
+                // Deferred: re-applying the stored config touches GPIOs, so
+                // it runs on the main loop like the save.  Result lands in
+                // cs_last_status, readable via REQ_GET_CS_STATUS.
+                if (cs_save_pending || cs_revert_pending) {
+                    cs_last_status = CS_STATUS_BUSY;
+                    cs_last_slot = 0xFF;
+                    return false;
+                }
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = 0xFF;
+                __dmb();
+                cs_revert_pending = true;
+                resp_buf[0] = 1;
+                vendor_send_response(resp_buf, 1);
                 return true;
             }
 

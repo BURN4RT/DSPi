@@ -261,7 +261,7 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 **Persistence (compat-breaking).** Wire `WIRE_FORMAT_VERSION=16` (direct 8-input matrix/preamp + 17-channel EQ; no tail-append/version gates; 5864 B). Flash `SLOT_DATA_VERSION=21` (direct layout; the slot spans **2 flash sectors** on RP2350; 1 on RP2040). No migration — pre-version data loads factory defaults.
 
 ### Notification Endpoint (device→host push)
-*Last updated: 2026-07-04 (multi-consumer ring: UART transport added as a second consumer; push-time seq)*
+*Last updated: 2026-07-07 (NOTIFY_EVT_CS_IR_LEARN 0x0A added)*
 
 The vendor interface carries one **bulk IN** endpoint (EP 0x83, wMaxPacketSize = 64) for out-of-band device→host notifications. The transport runs two protocol versions in parallel: v1 (8-byte `MASTER_VOLUME` packets, kept for existing host apps) and v2 (generic `PARAM_CHANGED` + discrete events, the primary protocol going forward). `USB_BCD_DEVICE = 0x0201` so Windows re-reads descriptors after the 8→64 byte EP bump.
 
@@ -294,7 +294,7 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 
 **Bulk operations** (preset load, factory reset, bulk SET): wrapped in `notify_begin_bulk(source)` / `notify_end_bulk()`. Per-field writes don't flood the ring; the host sees one `BULK_INVALIDATED` and reads `REQ_GET_ALL_PARAMS` for the full state. Preset load also emits `NOTIFY_EVT_PRESET_LOADED(slot)` before the bulk opens.
 
-**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), and `NOTIFY_EVT_SIGGEN_STATE` (0x07). The last announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator").
+**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), `NOTIFY_EVT_SIGGEN_STATE` (0x07), and `NOTIFY_EVT_CS_IR_LEARN` (0x0A). Siggen announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator"). CS_IR_LEARN announces IR learn completion as a 12-byte packet `[ver=2, 0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]` (state = `CS_IR_LEARN_DONE`/`_TIMEOUT`), pushed from the Control Surfaces tick (0x09 stays reserved for the I2S slave-mode branch).
 
 **Drain:** each consumer drains its own tail via `notify_peek_next_for(consumer, ...)` / `notify_commit_pop_for(consumer)`. The USB consumer (`usb_notify_drain` in usb_audio.c) claims EP 0x83 via `usbd_edpt_claim`, formats the next packet into the stable TX buffer, and submits via `usbd_edpt_xfer`; on success `notify_commit_pop_for(USB)` advances the USB tail, and on xfer rejection the entry stays queued for the next tick. The UART consumer drains from `uart_ctrl_poll` (see "Multi-consumer ring").
 
@@ -1181,10 +1181,10 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 10)
-*Last updated: 2026-07-07 (V10 appends per-slot Control Surfaces names)*
+### Preset Directory Fields (Version 11)
+*Last updated: 2026-07-07 (V11 appends the Control Surfaces IR command table)*
 
-`DIR_VERSION_CURRENT` = 10. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 11. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
 device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
 I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
@@ -1217,9 +1217,18 @@ user labels set via `REQ_SET_CS_NAME` (0x8B) and read via `REQ_GET_CS_NAME`
 changes; may be set before a binding exists). The V9->V10 step validates the
 V9 CRC (frozen `PresetDirectory_v9` snapshot), copies every field forward, and
 leaves the new block zeroed (all slots unnamed); `dir_sanitize_cs_config()`
-additionally forces NUL termination on every name at load. This growth makes
-`sizeof(PresetDirectory)` 1301 bytes (789 at V9), still within the
-single 4 KB directory sector. See
+additionally forces NUL termination on every name at load. V11
+appends the Control Surfaces IR command table (132-byte `CsIrConfig`: version
++ 8x 16-byte `IrCommand`), device-global beside `cs_config` for the same
+board-level reasons; the V10->V11 step validates the V10 CRC (frozen
+`PresetDirectory_v10` snapshot), copies every field forward, and leaves the
+new block zeroed (every sub-slot empty = feature idle).
+`dir_sanitize_cs_ir()` bounds-checks it on load like `dir_sanitize_cs_config`.
+The Control Surfaces bindings and IR table are persisted together in one
+write by `preset_set_cs_all` (the `REQ_CS_SAVE` path; per-binding SETs no
+longer persist). This growth makes
+`sizeof(PresetDirectory)` 1433 bytes (1301 at V10, 789 at V9), still within
+the single 4 KB directory sector. See
 `Documentation/Features/output_config_independent_load.md`,
 `Documentation/Features/control_interfaces_spec.md`, and
 `Documentation/Features/control_surfaces_spec.md`.
@@ -1241,6 +1250,7 @@ single 4 KB directory sector. See
 | i2c_ctrl | I2C target control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
 | cs_config | Control Surfaces bindings (V7 format v1 = 132 B / 8x 16-byte; V9 format v2 = 388-byte `CsFlashConfig`: version + 16x 24-byte `CsBinding`; all-zero = idle; board-level, survives factory reset) |
 | cs_names[16][32] | Per-slot Control Surfaces names (V10+): 32-byte NUL-terminated user labels, independent of the bindings; all-zero = unnamed; board-level, survives factory reset |
+| cs_ir | Control Surfaces IR command table (V11+, 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-04-09*
@@ -1983,12 +1993,13 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-07-07 (per-slot persistent names, cmds 0x8B/0x8C, dir V10)*
+*Last updated: 2026-07-07 (IR remote component + learn, cmds 0x8D-0x8F; Apply/Save/Revert preview model, cmds 0x9D/0x9E; caps v3, dir V11)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
-encoders, plain indicator LEDs, and PWM-dimmed LEDs on spare GPIOs, configured
-over vendor commands `0x84`-`0x87` plus `0x8B`/`0x8C` (per-slot names). A
-binding attaches one component (`CsType`)
+encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
+spare GPIOs, configured over vendor commands `0x84`-`0x87`, `0x8B`/`0x8C`
+(per-slot names), `0x8D`-`0x8F` (IR commands and learn), and `0x9D`/`0x9E`
+(save/revert). A binding attaches one component (`CsType`)
 to one firmware parameter (`CsNoun`) through one operation (`CsAction`), on one
 or two GPIOs. The full integrator spec is
 `Documentation/Features/control_surfaces_spec.md`.
@@ -2018,13 +2029,15 @@ offers it and no binding to it validates there.
 ### File layout
 
 - `control_surfaces.c` / `.h`: the engine and the wire/flash data model
-  (`CsBinding` 24 B, `CsFlashConfig` 388 B, `CsCapsHeader` 32 B, `CsNounDesc`
-  12 B, `CsStatusPacket` 22 B, with a `uint16_t active_mask` for the 16 slots).
+  (`CsBinding` 24 B, `CsFlashConfig` 388 B, `IrCommand` 16 B, `CsIrConfig`
+  132 B, `CsCapsHeader` 40 B, `CsNounDesc` 12 B, `CsStatusPacket` 32 B, with a
+  `uint16_t active_mask` for the 16 slots and a `uint8_t ir_active_mask` for
+  the 8 IR sub-slots).
   The type-capability table and the noun-descriptor table (`cs_noun_table`, in
   `control_surfaces_nouns.c`) are the single source of truth for the validity
   model and are served verbatim by `REQ_GET_CS_CAPS`, so host UIs and firmware
   can never disagree about which type/noun/action combinations are legal.
-- `control_surfaces_nouns.c` (new file): the noun catalog. `cs_noun_table` is
+- `control_surfaces_nouns.c`: the noun catalog. `cs_noun_table` is
   the descriptor table; `cs_noun_get` reads a noun's live value in natural units;
   `cs_noun_dispatch` applies a resolved absolute target through the shared vendor
   surface; `cs_noun_validate_target` bounds-checks a binding's target/index
@@ -2032,13 +2045,27 @@ offers it and no binding to it validates there.
   through `REQ_SET_EQ_PARAM` behind an `eq_update_pending` BUSY guard;
   `CS_NOUN_FILTER_BYPASS` uses `REQ_SET_BAND_BYPASS`. Like `control_surfaces.c`,
   this file executes from flash XIP on RP2040 (not in the RAM pull list).
-- `vendor_commands.c`: the `0x84`-`0x87` and `0x8B`/`0x8C` handlers;
-  `REQ_SET_CS_BINDING` and `REQ_SET_CS_NAME` latch deferred SETs, the GETs
-  return live accessor data.
+- `control_surfaces_ir.c` / `.h` (engine-internal): IR remote capture and
+  decode for the `CS_TYPE_IR` component. A RAM-resident, lowest-priority
+  IO_IRQ_BANK0 edge handler (the firmware's only GPIO interrupt) timestamps
+  mark/space durations into a 128-entry SPSC ring; `cs_ir_poll()` (called
+  from the CS tick) assembles frames (a >10 ms space terminates one) and
+  decodes NEC/NECext including the dedicated repeat frame, RC5 and RC6 mode 0
+  with the toggle bit masked, and a stable FNV-1a timing-signature hash for
+  everything else, surfacing press / repeat / release events plus the learn
+  state machine (arm, 10 s window, capture-first-press).
+- `vendor_commands.c`: the `0x84`-`0x87`, `0x8B`-`0x8F`, `0x9D`/`0x9E`
+  handlers; `REQ_SET_CS_BINDING`, `REQ_SET_CS_NAME`, and `REQ_SET_CS_IR_CMD`
+  latch deferred SETs, `REQ_CS_SAVE`/`REQ_CS_REVERT` latch deferred flags,
+  `REQ_CS_IR_LEARN` arms/cancels/reads the learner, the GETs return live
+  accessor data.
   `control_surfaces_owns_pin()` is wired into `pin_used_by_fixed_peripheral()`.
-- `flash_storage.c`: directory V10 persistence (`preset_set/get_cs_config`,
-  `preset_set/get_cs_name`, `dir_sanitize_cs_config`, the fan-in V7->V10 and
-  V8->V10 migrations via `cs_config_from_v1()`, and the V9->V10 name append).
+- `flash_storage.c`: directory V11 persistence (`preset_get_cs_config`,
+  `preset_get_cs_ir_config`, the combined single-write setter
+  `preset_set_cs_all`, `preset_set/get_cs_name`, `dir_sanitize_cs_config`,
+  `dir_sanitize_cs_ir`, the fan-in V7->current and V8->current migrations via
+  `cs_config_from_v1()`, the V9->V10 name append, and the V10->V11 IR-table
+  append).
 
 ### Dispatcher reuse via `CTRL_SOURCE_GPIO`
 
@@ -2067,31 +2094,71 @@ reads at most one pot ADC channel (round-robin, EMA + deadband + boot-sync
 immediate takeover), drives plain and PWM LEDs, and dispatches resulting changes.
 Stepping is unit-aware: dB and percent step linearly (default 1 dB / 1 %), Hz and
 Q step in octaves (default one-twelfth octave). Deferred nouns (`CS_NDF_DEFERRED`)
-are stepped from a per-binding float target shadow rather than re-read each tick.
-Read-only indicator nouns are evaluated only every 8 ticks, staggered by slot to
-spread the cost. No PIO and no GPIO IRQs are used.
+are stepped from a per-op float target shadow rather than re-read each tick (the
+shadow/retry state was factored into a `CsOpState` shared by binding slots and IR
+commands). Read-only indicator nouns are evaluated only every 8 ticks, staggered
+by slot to spread the cost. No PIO is used; the IR receiver's edge interrupt is
+the engine's only non-polled input (decode still runs on the tick).
 
 PWM LEDs use a hardware PWM slice (wrap 4095 at `sysclk`/16) with a squared
 perceptual-brightness curve; two PWM LEDs that would collide on the same slice +
 channel are rejected at apply time (`CS_STATUS_PWM_CONFLICT`).
 
-### Deferred SET and boot bring-up
+### Deferred SET, Apply/Save/Revert, and boot bring-up
 
 `REQ_SET_CS_BINDING` requires the full 24-byte payload; a short payload records
 `CS_STATUS_INVALID_VALUE` and is dropped. It otherwise validates only the slot
 index and latches the binding (`cs_set_binding_pending`), mirroring
 `ctrl_set_uart_pending`. The main loop runs `control_surfaces_apply_binding`
-(target validation + pin release/claim + runtime seed), records `cs_last_status`
-/ `cs_last_slot` (read via `REQ_GET_CS_STATUS`), and persists the whole table to
-the directory **only on** `PIN_CONFIG_SUCCESS`, so a bad SET never clobbers a
-good stored config. `control_surfaces_init()` runs last in `core0_init()` (after
+(target validation + pin release/claim + runtime seed) and records
+`cs_last_status` / `cs_last_slot` (read via `REQ_GET_CS_STATUS`).
+`REQ_SET_CS_IR_CMD` follows the identical single-deep deferred shape for a
+16-byte `IrCommand` sub-slot, reported as `cs_last_slot = 0x80 | sub`.
+
+**Apply-live-only preview (v3):** neither SET persists to flash. A successful
+apply marks the live config dirty (`CsStatusPacket.dirty`, the former reserved
+byte). `REQ_CS_SAVE` (0x9D, deferred via `cs_save_pending`) persists the
+bindings and the IR table together in one directory write
+(`preset_set_cs_all`) inside the usual `prepare_flash_write_operation`
+brackets and clears dirty; `REQ_CS_REVERT` (0x9E, `cs_revert_pending`)
+re-applies the stored config from the directory cache
+(`control_surfaces_revert`: clears every slot through the normal
+release/claim path, then re-runs the boot loader `cs_load_stored`) with no
+flash write. A reboot is an implicit revert. Per-slot names stay outside the
+preview and persist immediately as before.
+
+`control_surfaces_init()` runs last in `core0_init()` (after
 all pin claims and `notify_init`); a stored binding whose pins now collide is
-kept down but preserved, with the failure visible in `slot_status[]`. New v2
+kept down but preserved, with the failure visible in `slot_status[]` (stored
+IR commands behave the same via `ir_cmd_status[]`). v2
 status codes: `CS_STATUS_INVALID_TARGET` (0x17), `CS_STATUS_INVALID_EVENT`
 (0x18), `CS_STATUS_PWM_CONFLICT` (0x19), `CS_STATUS_EVENT_IN_USE` (0x1A, a
 GPIO+event pair already claimed by another button binding), and
 `CS_STATUS_BUSY` (0x1B, a SET arrived while a previous SET was still queued
-for the main-loop apply; the new SET is dropped and the host retries).
+for the main-loop apply; the new SET is dropped and the host retries). v3
+adds `CS_STATUS_IR_IN_USE` (0x1D, a second IR component) and
+`CS_STATUS_NO_IR` (0x1E, learn armed without a live IR component);
+`CS_STATUS_FLASH_ERROR` (0x1C) now also reports a failed save.
+
+### IR remote component (`CS_TYPE_IR`, 0x8D-0x8F)
+
+One binding slot holds the receiver (one GPIO; `CS_FLAG_INVERT` = idle-low
+module; every other binding field must be 0; single instance). Its remote
+buttons are up to 8 `IrCommand` sub-slots in a separate table: button-subset
+noun/action records (INC/DEC/TOGGLE/SET/TRIGGER/MOMENTARY, WRAP/REPEAT flags)
+fired by a learned `{protocol, code}` pair instead of a GPIO edge, validated
+against the same caps masks and dispatched through the same `cs_noun_dispatch`
+path with per-command `CsOpState` (BUSY retry, deferred-noun shadow,
+momentary restore). Multiple commands may share one code (one button, several
+actions). Hold semantics mirror physical buttons: a NEC repeat frame or a
+re-transmission of the same code within 250 ms extends the hold (REPEAT
+events, gated to the button feel of 400 ms delay then 12.5 Hz); 250 ms of
+silence releases (restoring MOMENTARY). Learn (`REQ_CS_IR_LEARN`: wValue 1
+arm / 0 cancel / 2 read result) captures the next decoded press within 10 s,
+suppressing dispatch while armed, and completion is pushed as notify event
+`NOTIFY_EVT_CS_IR_LEARN` (0x0A: state, protocol, code) as well as being
+readable synchronously. Commands may be stored before the component exists
+and activate when it comes up.
 
 ### Per-slot names (0x8B/0x8C, V10)
 
@@ -2116,16 +2183,23 @@ The binding table is device-global in the preset directory (388-byte
 `CsFlashConfig`: version + 16x 24-byte `CsBinding`), board-level like
 `dac_hw_mute` and the control-interface config; it survives preset changes and
 factory reset and is not part of `WireBulkParams`. The per-slot names live
-next to it (V10, `cs_names[16][32]`) with the same lifetime. On RP2040
-`control_surfaces.c.o` and `control_surfaces_nouns.c.o` execute from flash XIP
-(see Memory Layout). Behavior is identical on both platforms (same 16 bindings,
+next to it (V10, `cs_names[16][32]`) and the IR command table follows (V11,
+132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`), all with the same
+lifetime. On RP2040
+`control_surfaces.c.o`, `control_surfaces_nouns.c.o`, and the decode side of
+`control_surfaces_ir.c.o` execute from flash XIP
+(see Memory Layout); only the IR edge ISR is RAM-pinned
+(`__not_in_flash_func`). Behavior is identical on both platforms (same 16
+bindings, 8 IR sub-slots,
 same ADC pins 26-28) except that `CS_NOUN_ADAT_ACTIVE` is RP2350-only (empty
-action mask on RP2040).
+action mask on RP2040). New BSS for the IR feature is roughly 0.9 KB on both
+platforms (capture ring 256 B, frame buffer 224 B, command table plus per-command
+op state ~400 B).
 
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-07 (Control Surfaces slot names: 0x8B/0x8C)*
+*Last updated: 2026-07-07 (Control Surfaces IR remote 0x8D-0x8F, save/revert 0x9D/0x9E; caps 40 B, status 32 B)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2190,12 +2264,15 @@ action mask on RP2040).
 | REQ_GET_SERIAL | 0x7E | IN | Get unique board serial |
 | REQ_GET_PLATFORM | 0x7F | IN | Get platform ID (0=RP2040, 1=RP2350) |
 | REQ_CLEAR_CLIPS | 0x83 | IN | Read-then-clear clip flags (see Clip Detection) |
-| REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-15, payload=24-byte CsBinding, required; short payload = INVALID_VALUE); deferred apply, poll 0x87 for result (see Control Surfaces) |
+| REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-15, payload=24-byte CsBinding, required; short payload = INVALID_VALUE); apply-live-only preview, deferred, poll 0x87; persist via REQ_CS_SAVE (see Control Surfaces) |
 | REQ_GET_CS_BINDING | 0x85 | IN | Get the live 24-byte CsBinding for a slot (wValue=slot) |
-| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 32-byte header+type table; wValue=noun: 12-byte CsNounDesc) |
-| REQ_GET_CS_STATUS | 0x87 | IN | Get 22-byte CsStatusPacket (last SET result + 16-bit active_mask + per-slot apply status) |
+| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v3; wValue=noun: 12-byte CsNounDesc) |
+| REQ_GET_CS_STATUS | 0x87 | IN | Get 32-byte CsStatusPacket (last SET result, dirty flag, active_mask, per-slot status, ir_active_mask, learn state, per-sub-slot IR status) |
 | REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); deferred persist, poll 0x87 for result |
 | REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated) |
+| REQ_SET_CS_IR_CMD | 0x8D | OUT | Set a Control Surfaces IR remote command (wValue=sub-slot 0-7, payload=16-byte IrCommand); apply-live-only, deferred; poll 0x87 (last_slot = 0x80\|sub) |
+| REQ_GET_CS_IR_CMD | 0x8E | IN | Get an IR remote command (wValue=sub-slot, returns 16-byte IrCommand) |
+| REQ_CS_IR_LEARN | 0x8F | IN | IR learn control: wValue 1=arm (10 s window), 0=cancel, 2=read result (8 bytes: state, protocol, 0, 0, code_LE32); completion also pushed as notify 0x0A |
 | REQ_PRESET_SAVE | 0x90 | IN | Save live state to preset slot (wValue=slot) |
 | REQ_PRESET_LOAD | 0x91 | IN | Load preset slot to live state (wValue=slot) |
 | REQ_PRESET_DELETE | 0x92 | IN | Delete preset slot (wValue=slot) |
@@ -2209,6 +2286,8 @@ action mask on RP2040).
 | REQ_PRESET_GET_ACTIVE | 0x9A | IN | Get active preset slot (1 byte, always 0-9) |
 | REQ_SET_CHANNEL_NAME | 0x9B | OUT | Set channel name (wValue=channel, payload=1-32 bytes) |
 | REQ_GET_CHANNEL_NAME | 0x9C | IN | Get channel name (wValue=channel, returns 32 bytes) |
+| REQ_CS_SAVE | 0x9D | IN | Persist the whole live Control Surfaces config (bindings + IR commands) in one directory write; deferred, poll 0x87 (last_slot=0xFF); clears the dirty flag |
+| REQ_CS_REVERT | 0x9E | IN | Discard the live Control Surfaces preview and re-apply the stored config; deferred, poll 0x87 (last_slot=0xFF); no flash write |
 | REQ_GET_ALL_PARAMS | 0xA0 | IN | Get complete DSP state (3664 bytes at V11, multi-packet control transfer) |
 | REQ_SET_ALL_PARAMS | 0xA1 | OUT | Set complete DSP state (3664 bytes at V11, multi-packet control transfer) |
 | REQ_GET_ALL_PARAMS_CHUNK | 0xA2 | IN | Read WireBulkParams in <= 4 KB chunks (wValue = offset); USB-only, WinUSB 4 KB cap workaround |

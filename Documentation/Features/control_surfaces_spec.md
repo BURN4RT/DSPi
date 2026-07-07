@@ -1,14 +1,15 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 2*
-*Config (flash) version: 2*
-*Directory version: 10*
+*Firmware capability format version: 3*
+*Config (flash) version: 2; IR config version: 1*
+*Directory version: 11*
 
 This document is the complete, self-contained specification for the DSPi
 Control Surfaces feature: user-wired push buttons, toggle switches,
-potentiometers, quadrature rotary encoders, indicator LEDs, and PWM-dimmed
-LEDs on spare GPIOs, configured over vendor commands `0x84`-`0x87` plus
-`0x8B`/`0x8C` (per-slot names). It is
+potentiometers, quadrature rotary encoders, indicator LEDs, PWM-dimmed
+LEDs, and an IR remote receiver on spare GPIOs, configured over vendor
+commands `0x84`-`0x87`, `0x8B`/`0x8C` (per-slot names), `0x8D`-`0x8F`
+(IR remote commands and learn), and `0x9D`/`0x9E` (save / revert). It is
 written for a host-app developer (e.g. DSPi Console) or an LLM adding Control
 Surfaces support to an app, or extending the firmware feature itself. No DSPi
 source is required to implement a host client.
@@ -16,6 +17,18 @@ source is required to implement a host client.
 Format v2 supersedes the v1 (16-byte binding, 8 slots, 9 nouns) format
 described by earlier revisions of this document; see section 11 for the
 compatibility story.
+
+Caps v3 adds two things on top of v2 (section 11.1):
+
+- **The IR remote component** (`CS_TYPE_IR`): one binding slot holds a
+  demodulating IR receiver on one GPIO, and up to 8 learned remote-button
+  **commands** live in a separate sub-slot table, each dispatching through
+  the same noun/action machinery as a physical button. Codes are learned
+  from any remote by pressing its button at the device. Sections 2.7, 3.6,
+  6.8, 7.5.
+- **The Apply / Save / Revert preview model**: binding and IR command SETs
+  now apply live only; `REQ_CS_SAVE` persists the whole live config in one
+  flash write and `REQ_CS_REVERT` reloads the stored one. Section 3.5.
 
 Writing style note: this doc avoids em-dashes per project convention.
 
@@ -106,6 +119,28 @@ same directory (V10), as slot metadata alongside the binding table rather than
 inside it: a name describes the physical control ("Sub Level"), so it survives
 binding edits and slot clears, and may be set before a binding exists.
 
+The **IR command table** (section 2.8) lives in the same directory (V11),
+beside the binding table. It is board-level for the same reason: which remote
+buttons the device answers to does not change with the listening profile.
+
+### 1.4 Why IR is one component slot with sub-slots
+
+Binding slots are sized and validated around **GPIO occupancy**: one slot, one
+physical component, one or two pins. All of a remote's buttons arrive on one
+receiver pin, so modelling each button as a binding would burn a slot's worth
+of bookkeeping per button for no extra hardware. Instead `CS_TYPE_IR` occupies
+**one** binding slot (the receiver: pin plus idle sense) and its buttons are
+**commands** in a separate table of `CS_MAX_IR_COMMANDS` (8) sub-slots. A
+command is semantically a button-shaped binding (same nouns, same actions
+`INC`/`DEC`/`TOGGLE`/`SET`/`TRIGGER`/`MOMENTARY`, same value/step rules) fired
+by a learned code instead of a GPIO edge, and it dispatches through exactly
+the same shared vendor-command path (section 1.2). The slot's name (section
+3.4) then naturally names the component ("Living Room Remote").
+
+One IR component may be live at a time (a second `CS_TYPE_IR` binding is
+rejected with `CS_STATUS_IR_IN_USE`): one receiver, one capture engine, one
+un-partitioned command table.
+
 ---
 
 ## 2. Wire reference (byte-by-byte)
@@ -183,7 +218,7 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 | 1 | 3 | `reserved[3]` | 0 |
 | 4 | 384 | `bindings[16]` | sixteen 24-byte `CsBinding` records |
 
-### 2.4 `CsTypeDesc` (4 bytes) and `CsCapsHeader` (32 bytes)
+### 2.4 `CsTypeDesc` (4 bytes) and `CsCapsHeader` (40 bytes)
 
 `CsTypeDesc`:
 
@@ -197,13 +232,22 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (2) |
+| 0 | 1 | `caps_version` | capability format version (3) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
-| 2 | 1 | `type_count` | `CS_TYPE_COUNT` (7); the type table has this many entries, indexed by `CsType` |
+| 2 | 1 | `type_count` | `CS_TYPE_COUNT` (8); the type table has this many entries, indexed by `CsType` |
 | 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (35) |
-| 4 | 28 | `types[7]` | seven `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
+| 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
+| 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (8) |
+| 37 | 3 | `reserved[3]` | 0 |
 
-Total `4 + 4*7 = 32` bytes.
+Total `4 + 4*8 + 4 = 40` bytes. The v3 tail fields sit **after** the
+variable-length type table; a host locates them at offset
+`4 + 4*type_count`, so a future type-table growth does not move them
+relative to the table end.
+
+The `CS_TYPE_IR` type descriptor's action mask describes what its
+**commands** may do (the button action set); the container binding itself
+carries `noun = action = 0` (section 2.7).
 
 ### 2.5 `CsNounDesc` (12 bytes)
 
@@ -221,31 +265,94 @@ Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-34).
 | 10 | 1 | `target_count` | valid `target` values `0..target_count-1`; 0 when untargeted |
 | 11 | 1 | `dflags` | `CS_NDF_DEFERRED` (`0x01`): apply is deferred; the engine steps from a target shadow (7.2) |
 
-### 2.6 `CsStatusPacket` (22 bytes)
+### 2.6 `CsStatusPacket` (32 bytes)
 
 Returned by `REQ_GET_CS_STATUS`.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `last_status` | result of the most recent `REQ_SET_CS_BINDING` (`PIN_CONFIG_*` / `CS_STATUS_*`) |
-| 1 | 1 | `last_slot` | slot the last SET targeted |
+| 0 | 1 | `last_status` | result of the most recent deferred CS SET of any kind: binding, name, IR command, save, revert (`PIN_CONFIG_*` / `CS_STATUS_*`) |
+| 1 | 1 | `last_slot` | slot the last SET targeted; `0x80 \| n` = IR sub-slot n, `0xFF` = save/revert |
 | 2 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
-| 3 | 1 | `reserved` | 0 |
+| 3 | 1 | `dirty` | 1 = the live config differs from flash (an unsaved preview; section 3.5) |
 | 4 | 2 | `active_mask` (uint16) | bit N = binding N is live |
 | 6 | 16 | `slot_status[16]` | per-slot apply status; `PIN_CONFIG_SUCCESS` (0) when live, else the failure code |
+| 22 | 1 | `ir_active_mask` | bit N = IR command N is live (valid, learned, and the IR component is up) |
+| 23 | 1 | `ir_learn_state` | `CS_IR_LEARN_*`: 0 idle, 1 armed (listening), 2 done (result available), 3 timeout |
+| 24 | 8 | `ir_cmd_status[8]` | per-sub-slot apply status, same codes as `slot_status` |
+
+### 2.7 `IrCommand` (16 bytes)
+
+One learned remote-button command; identical on the wire (the
+`REQ_SET`/`GET_CS_IR_CMD` payload) and in flash. Semantically a button-shaped
+binding: the noun / action / target / value / step fields follow exactly the
+`CsBinding` rules of the same names (sections 2.1, 2.2, 4), fired by the
+learned `code` instead of a GPIO edge.
+
+| Off | Size | Field | Meaning |
+|----|------|-------|---------|
+| 0 | 1 | `noun` | `CsNoun` (0-34) |
+| 1 | 1 | `action` | `CsAction`; button subset only: `INC`, `DEC`, `TOGGLE`, `SET`, `TRIGGER`, `MOMENTARY` |
+| 2 | 1 | `flags` | `CS_FLAG_WRAP` and `CS_FLAG_REPEAT` only (REPEAT: INC/DEC only); any other bit is `CS_STATUS_INVALID_VALUE` |
+| 3 | 1 | `target` | channel address for targeted nouns (section 4.4); 0 otherwise |
+| 4 | 1 | `index` | filter band for `CS_TARGET_DSP_BAND` nouns; 0 otherwise |
+| 5 | 1 | `protocol` | `CS_IR_PROTO_*` (see below); `0` (`NONE`) = empty sub-slot |
+| 6 | 2 | `value` (int16) | `SET`/`MOMENTARY` target; unit-encoded (2.1) |
+| 8 | 2 | `step` (int16) | `INC`/`DEC` size; `0` = the unit default (2.1) |
+| 10 | 2 | `reserved[2]` | write 0 (rejected non-zero) |
+| 12 | 4 | `code` (uint32) | the learned code, little-endian; `0` = never learned (rejected for an occupied sub-slot; no decoder can produce 0) |
+
+An **empty** sub-slot is protocol `CS_IR_PROTO_NONE` with every other byte 0
+(a non-zero remainder is rejected, like the binding reserved fields). Clear a
+sub-slot by sending 16 zero bytes.
+
+Protocols and code encodings (a host treats `protocol`+`code` as an opaque
+pair; the encodings are documented for display and diagnostics):
+
+| Protocol | Value | Code encoding |
+|----------|-------|---------------|
+| `CS_IR_PROTO_NONE` | 0 | (empty sub-slot) |
+| `CS_IR_PROTO_NEC` | 1 | The 32 data bits in transmission order, bit 0 first: byte 0 = address, byte 1 = ~address (or address high for extended NEC), byte 2 = command, byte 3 = ~command. NEC repeat frames drive hold-to-repeat (7.5). |
+| `CS_IR_PROTO_RC5` | 2 | The 14-bit frame in bits 13..0 (S1 at bit 13, always 1; S2/RC5X field bit at 12; address bits 10..6; command bits 5..0), with the toggle bit (bit 11) forced to 0 so a learned button matches every press. |
+| `CS_IR_PROTO_RC6` | 3 | `(mode + 1) << 16 \| control << 8 \| information` for RC6 mode 0 (mode+1 keeps address 0 / command 0 away from the 0 sentinel); the toggle bit is checked for shape and excluded. |
+| `CS_IR_PROTO_HASH` | 4 | An opaque FNV-1a hash of the frame's timing signature. Stable per button per remote; matches any remote whose protocol is not decoded above (repeat works by re-transmission). |
+
+Two occupied sub-slots may carry the **same** protocol+code: one remote
+button then fires several commands at once (e.g. set a preset and switch the
+input). This is deliberate.
+
+### 2.8 `CsIrConfig` (132 bytes)
+
+The device-global persisted IR command table (directory V11), beside
+`CsFlashConfig`. Not sent by any single command.
+
+| Off | Size | Field | Meaning |
+|----|------|-------|---------|
+| 0 | 1 | `version` | `CS_IR_CONFIG_VERSION` (1) |
+| 1 | 3 | `reserved[3]` | 0 |
+| 4 | 128 | `cmds[8]` | eight 16-byte `IrCommand` records |
+
+All-zero = every sub-slot empty = feature idle; a fresh directory needs no
+seeding. Like the binding table it survives preset changes and factory reset
+and is not part of `WireBulkParams`.
 
 ---
 
-## 3. Command reference (`0x84`-`0x87`, `0x8B`-`0x8C`)
+## 3. Command reference (`0x84`-`0x87`, `0x8B`-`0x8F`, `0x9D`-`0x9E`)
 
 | Command | Code | Dir | wValue | wLength / payload | Response |
 |---------|------|-----|--------|-------------------|----------|
 | `REQ_SET_CS_BINDING` | `0x84` | OUT | slot (0-15) | 24-byte `CsBinding` | none (deferred; poll `0x87`) |
 | `REQ_GET_CS_BINDING` | `0x85` | IN | slot (0-15) | - | 24-byte `CsBinding` (live) |
-| `REQ_GET_CS_CAPS` | `0x86` | IN | `0xFFFF` = header+types; else noun index | - | 32-byte `CsCapsHeader` or 12-byte `CsNounDesc` |
-| `REQ_GET_CS_STATUS` | `0x87` | IN | - | - | 22-byte `CsStatusPacket` |
+| `REQ_GET_CS_CAPS` | `0x86` | IN | `0xFFFF` = header+types; else noun index | - | 40-byte `CsCapsHeader` or 12-byte `CsNounDesc` |
+| `REQ_GET_CS_STATUS` | `0x87` | IN | - | - | 32-byte `CsStatusPacket` |
 | `REQ_SET_CS_NAME` | `0x8B` | OUT | slot (0-15) | 1-32 byte name | none (deferred; poll `0x87`) |
 | `REQ_GET_CS_NAME` | `0x8C` | IN | slot (0-15) | - | 32-byte NUL-terminated name |
+| `REQ_SET_CS_IR_CMD` | `0x8D` | OUT | sub-slot (0-7) | 16-byte `IrCommand` | none (deferred; poll `0x87`) |
+| `REQ_GET_CS_IR_CMD` | `0x8E` | IN | sub-slot (0-7) | - | 16-byte `IrCommand` (live) |
+| `REQ_CS_IR_LEARN` | `0x8F` | IN | 1 = arm, 0 = cancel, 2 = read result | - | 1 ack byte (arm/cancel) or 8-byte result (3.6.1) |
+| `REQ_CS_SAVE` | `0x9D` | IN | - | - | 1 ack byte (deferred; poll `0x87`) |
+| `REQ_CS_REVERT` | `0x9E` | IN | - | - | 1 ack byte (deferred; poll `0x87`) |
 
 (`0x88`-`0x8A` are reserved for another feature branch.)
 
@@ -253,10 +360,13 @@ Returned by `REQ_GET_CS_STATUS`.
 
 Every one of these commands works identically over USB, UART, and I2C (the
 transport-neutral dispatcher). On the external transports, the direction bit
-matters: `0x85`, `0x86`, `0x87`, `0x8C` are IN (GET-type) frames; `0x84` and
-`0x8B` are OUT (SET-type) frames carrying their payload.
+matters: `0x85`, `0x86`, `0x87`, `0x8C`, `0x8E`, `0x8F`, `0x9D`, `0x9E` are IN
+(GET-type) frames; `0x84`, `0x8B`, and `0x8D` are OUT (SET-type) frames
+carrying their payload. `0x8F`, `0x9D`, and `0x9E` are GET-type action
+commands in the mold of `REQ_SIGGEN_CONTROL`: the "GET" carries the action in
+`wValue` and returns an acknowledgement byte.
 
-### 3.2 Deferred-apply model (`REQ_SET_CS_BINDING`)
+### 3.2 Deferred-apply model (`REQ_SET_CS_BINDING`, `REQ_SET_CS_IR_CMD`)
 
 `REQ_SET_CS_BINDING` does **not** apply synchronously. The USB/transport handler
 only validates the slot index and payload length and latches the 24-byte binding
@@ -266,22 +376,35 @@ loop then:
 1. Runs `control_surfaces_apply_binding` (releases the slot's old pins, validates
    the new binding, claims the new pins, seeds runtime state).
 2. Records the result in `last_status` / `last_slot`.
-3. **Persists the whole binding table to flash only on `PIN_CONFIG_SUCCESS`**, so
-   a rejected SET can never clobber a good stored config.
+3. **Marks the live config dirty on `PIN_CONFIG_SUCCESS`.** Nothing is written
+   to flash; the apply is a live preview until `REQ_CS_SAVE` (section 3.5).
+
+`REQ_SET_CS_IR_CMD` follows the identical model for a 16-byte `IrCommand`
+into a sub-slot, reported in `last_slot` as `0x80 | sub-slot`. A rejected SET
+of either kind leaves the previous binding/command intact and the dirty flag
+untouched.
 
 On accept, the handler immediately records `CS_STATUS_PENDING` (`0x16`) in
 `last_status` / `last_slot`; the main-loop apply then overwrites it with the
 real result. The host learns the outcome by polling `REQ_GET_CS_STATUS` until
 `last_status != CS_STATUS_PENDING` for the slot named in `last_slot`. A short
-poll (a few ms) is ample; the apply is a directory sector flash write.
+poll (a few ms) is ample; the apply is GPIO/engine work only.
 
-If the slot index in `wValue` is `>= 16`, the handler records
-`CS_STATUS_INVALID_SLOT` immediately (no main-loop round trip) and no apply is
-queued. A payload shorter than 24 bytes (e.g. a v1 host still sending 16)
-records `CS_STATUS_INVALID_VALUE` immediately. A SET arriving while a previous
-SET is still queued for the main-loop apply is dropped and records
-`CS_STATUS_BUSY` (`0x1B`); a host that polls for the PENDING result before
-sending the next SET (as this section prescribes) never sees it.
+If the slot index in `wValue` is out of range (binding slot `>= 16`, IR
+sub-slot `>= 8`), the handler records `CS_STATUS_INVALID_SLOT` immediately (no
+main-loop round trip) and no apply is queued. A payload shorter than the
+record size (24 or 16 bytes) records `CS_STATUS_INVALID_VALUE` immediately. A
+SET arriving while a previous SET of the same kind is still queued for the
+main-loop apply is dropped and records `CS_STATUS_BUSY` (`0x1B`); a host that
+polls for the PENDING result before sending the next SET (as this section
+prescribes) never sees it.
+
+Because binding SETs, IR command SETs, name SETs, save, and revert all report
+through the single `last_status` / `last_slot` channel, a host should let each
+deferred operation resolve (PENDING clears) before issuing the next one of
+**any** kind; otherwise the later operation's result overwrites the earlier
+one's in the shared channel (the per-slot `slot_status[]` / `ir_cmd_status[]`
+arrays still hold each slot's verdict).
 
 ### 3.3 Status codes
 
@@ -307,8 +430,10 @@ Surfaces extends it from `0x10`.
 | `0x18` | `CS_STATUS_INVALID_EVENT` | bad `event` value, an event on a non-button, or MOMENTARY/REPEAT bound to a non-press event |
 | `0x19` | `CS_STATUS_PWM_CONFLICT` | PWM LED collides with another PWM LED on the same PWM slice+channel |
 | `0x1A` | `CS_STATUS_EVENT_IN_USE` | another button binding already has this GPIO+event pair |
-| `0x1B` | `CS_STATUS_BUSY` | SET dropped; a previous binding SET is still queued for apply (retry after polling) |
-| `0x1C` | `CS_STATUS_FLASH_ERROR` | name SET accepted but the directory persist failed |
+| `0x1B` | `CS_STATUS_BUSY` | SET dropped; a previous SET of the same kind is still queued for apply (retry after polling); also a save/revert while one is already queued |
+| `0x1C` | `CS_STATUS_FLASH_ERROR` | the directory persist failed (name SET or `REQ_CS_SAVE`) |
+| `0x1D` | `CS_STATUS_IR_IN_USE` | another slot already holds the IR component (one receiver per device) |
+| `0x1E` | `CS_STATUS_NO_IR` | learn was armed with no live `CS_TYPE_IR` binding |
 
 ### 3.4 Per-slot names (`REQ_SET_CS_NAME` / `REQ_GET_CS_NAME`)
 
@@ -341,6 +466,73 @@ Semantics:
 - Names are **not** part of `WireBulkParams` and emit **no notification**;
   a host that cares about cross-host renames re-reads the 16 names on
   connect (16 GETs, one round trip each).
+- Names are **outside the Apply/Save/Revert preview** (section 3.5): a name
+  SET persists immediately, is never part of the dirty state, and is not
+  touched by `REQ_CS_REVERT`.
+
+### 3.5 Apply / Save / Revert (`REQ_CS_SAVE` / `REQ_CS_REVERT`)
+
+Binding and IR command SETs are **live-only previews**: they claim pins and
+start behaving immediately, but nothing is written to flash. This lets a host
+wire up a panel or a remote, try it, and only then commit:
+
+- **Apply** = `REQ_SET_CS_BINDING` / `REQ_SET_CS_IR_CMD`. Each successful
+  apply sets the `dirty` flag in the status packet.
+- **Save** = `REQ_CS_SAVE`: persists the **whole live config** (the 16
+  bindings and the 8 IR commands together) in one directory-sector flash
+  write, then clears `dirty`. Deferred like a SET: the handler acknowledges
+  with one status byte, records `CS_STATUS_PENDING` with `last_slot = 0xFF`,
+  and the main loop overwrites it with `PIN_CONFIG_SUCCESS` or
+  `CS_STATUS_FLASH_ERROR`.
+- **Revert** = `REQ_CS_REVERT`: discards the preview by re-applying the
+  stored config from the directory cache (releases and reclaims GPIOs, PWM
+  slices, and the IR receiver exactly as at boot), then clears `dirty`. Same
+  deferred acknowledgement shape (`last_slot = 0xFF`); no flash write.
+- A save or revert issued while either is still queued records
+  `CS_STATUS_BUSY` and does nothing.
+- **A reboot is an implicit revert**: unsaved changes do not survive power
+  loss. That is the preview semantics, not a defect.
+- Per-slot **names are outside the preview** (section 3.4): they persist on
+  their own SET and revert does not touch them.
+
+Hosts should surface `dirty` ("unsaved changes") and offer Save / Revert
+whenever it is set. Serialize SETs against save/revert per section 3.2.
+
+### 3.6 IR commands and learning (`0x8D`-`0x8F`)
+
+Prerequisite: a live `CS_TYPE_IR` binding (the receiver; sections 2.7, 6.8).
+Commands may be SET before the component exists; they validate and store, and
+activate the moment the component comes up (`ir_active_mask` tracks this).
+
+`REQ_SET_CS_IR_CMD` / `REQ_GET_CS_IR_CMD` write and read one 16-byte
+`IrCommand` sub-slot (deferred model, section 3.2). A command whose
+`protocol` is `NONE` (all-zero record) clears the sub-slot.
+
+#### 3.6.1 Learn flow (`REQ_CS_IR_LEARN`)
+
+1. Host sends `GET 0x8F, wValue = 1` (arm). With no live IR component the
+   request STALLs (USB) / returns ERROR (UART/I2C) and records
+   `CS_STATUS_NO_IR`; otherwise it acknowledges with one byte and the
+   firmware listens on the receiver for up to **10 seconds**.
+2. The user presses the desired button on the remote. The first cleanly
+   decoded press is captured (NEC repeat frames and undecodable noise are
+   ignored); normal command dispatch is suppressed while armed, and a button
+   held into the arm is released first, so teaching a code never actuates
+   anything.
+3. Completion is pushed on the notification stream as event `0x0A`
+   (section 7.5.1) with the state (`2` = done, `3` = timeout), the protocol,
+   and the code. Hosts without the notify stream (e.g. I2C) poll
+   `GET 0x8F, wValue = 2`, which returns 8 bytes:
+   `{state, protocol, 0, 0, code_le32}`; `ir_learn_state` in the status
+   packet carries the same state.
+4. The host writes the captured protocol+code into an `IrCommand` along with
+   the chosen noun/action and sends it via `REQ_SET_CS_IR_CMD`, then
+   `REQ_CS_SAVE` when the user commits.
+
+`GET 0x8F, wValue = 0` cancels an armed learn (state returns to idle, no
+notification). Re-arming replaces a previous result. Removing the IR
+component while armed aborts the learn as a timeout (with the notification),
+since it can never complete without a receiver.
 
 ---
 
@@ -364,8 +556,9 @@ pins -> PWM slice.
 
 ### 4.1 Reading the caps responses
 
-- `REQ_GET_CS_CAPS`, `wValue = 0xFFFF` -> 32-byte `CsCapsHeader`: version, limits,
-  and the 7-entry type table (indexed by `CsType`).
+- `REQ_GET_CS_CAPS`, `wValue = 0xFFFF` -> 40-byte `CsCapsHeader`: version, limits,
+  the 8-entry type table (indexed by `CsType`), and the v3 tail
+  (`max_ir_commands`).
 - `REQ_GET_CS_CAPS`, `wValue = 0..34` (a noun index) -> 12-byte `CsNounDesc` for
   that noun. An out-of-range noun STALLs (USB) / returns ERROR (UART/I2C).
 - A noun whose `actions == 0` is unavailable on this platform (currently only
@@ -382,10 +575,21 @@ pins -> PWM slice.
 | `CS_TYPE_ENCODER` | 4 | `STEP` | `0x0002` | 2 | ANY |
 | `CS_TYPE_LED` | 5 | `IND_EQUALS`, `IND_ABOVE` | `0x0500` | 1 | ANY |
 | `CS_TYPE_LED_PWM` | 6 | `IND_EQUALS`, `IND_ABOVE`, `IND_LEVEL` | `0x0D00` | 1 | ANY |
+| `CS_TYPE_IR` | 7 | `INC`, `DEC`, `TOGGLE`, `SET`, `TRIGGER`, `MOMENTARY` (its **commands**; the container binding carries `noun = action = 0`) | `0x02BC` | 1 | ANY |
 
 Action bit positions (`CS_ACT_BIT(a) = 1 << a`): `ADJUST`=0, `STEP`=1, `INC`=2,
 `DEC`=3, `TOGGLE`=4, `SET`=5, `FOLLOW`=6, `TRIGGER`=7, `IND_EQUALS`=8,
 `MOMENTARY`=9, `IND_ABOVE`=10, `IND_LEVEL`=11.
+
+The `CS_TYPE_IR` container binding itself is validated differently from every
+other type: `noun`, `action`, `event`, `target`, `index`, `value`, `step`,
+and both range fields must all be 0 (`CS_STATUS_INVALID_VALUE` otherwise),
+`CS_FLAG_INVERT` is the only legal flag, and a second live IR binding is
+`CS_STATUS_IR_IN_USE`. Its action mask exists for the host UI and for
+validating its **commands**: an `IrCommand` is valid iff its action bit is in
+both this mask and the noun's mask, exactly like a button binding (the noun
+table, targets, units, and value/step bounds of sections 4.3, 4.4, and 2.1
+apply unchanged).
 
 ### 4.3 Noun table (`CsNoun` -> kind, unit, range, target, allowed actions)
 
@@ -655,6 +859,34 @@ Pots are read **one ADC conversion per tick, round-robin** across active pots, s
 with the maximum useful three pots each is sampled every ~3 ms; ample for a fader.
 Buttons debounce per **pin group**, not per binding, so sharing costs nothing.
 
+### 6.8 IR remote receiver (1 GPIO)
+
+- **Use a demodulating IR receiver module** (e.g. TSOP38238 or any 36-40 kHz
+  AGC receiver): VCC to 3V3, GND to GND, OUT to the chosen GPIO. These
+  modules idle **high** and pull the line **low during a mark** (carrier
+  present); that is the default sense. **`CS_FLAG_INVERT`** selects an
+  idle-low / active-high receiver. The firmware enables the internal pull-up
+  (pull-down under INVERT), so an open-collector output needs no external
+  resistor.
+- Any GPIO works (`CS_PINCLASS_ANY`); the receiver is the only Control
+  Surfaces component captured by interrupt rather than polled. Both edges on
+  the pin are timestamped by a tiny, lowest-priority, RAM-resident interrupt
+  handler into a private ring; all decoding still happens on the 1 kHz tick.
+  The handler only records timestamps, so it cannot disturb the audio path,
+  and IR reception has no polling cost when the line is idle.
+- **Carrier frequency tolerance.** A 38 kHz receiver demodulates 36-40 kHz
+  remotes with reduced range; virtually every consumer remote works. The
+  decoders match on demodulated mark/space timing with about 25 % tolerance.
+- **Protocols.** NEC and extended NEC decode natively, including the
+  dedicated repeat frame (so hold-to-repeat volume works exactly like a held
+  button). RC5 and RC6 mode 0 (Philips and MCE-style remotes) decode
+  natively with the **toggle bit masked**; without that, every second press
+  of the same button would carry a different code and a learned button would
+  only work half the time. Every other protocol falls back to a stable
+  timing-signature hash, so **any remote can be learned**; such remotes
+  repeat by re-transmission, which the hold model treats as repeats
+  (section 7.5).
+
 ---
 
 ## 7. Runtime behavior details
@@ -707,6 +939,58 @@ overwriting a not-yet-applied host write, but interleaved host and knob edits
 of two different fields of the same band within one apply window resolve to
 the later packet. This matches the existing multi-host behavior of the EQ
 command surface.
+
+### 7.5 IR runtime model (capture, hold, repeat, momentary)
+
+Capture and decode: the receiver's edges are timestamped by the interrupt
+handler; on each 1 kHz tick the engine drains them, and a space longer than
+10 ms terminates a frame. The frame is tried against NEC (a 3-period frame
+matching 9 ms / 2.25 ms / 560 us is the NEC repeat frame), then RC5, then
+RC6 mode 0, then the hash fallback (frames of fewer than 8 periods that
+match no protocol are discarded as ambient noise). The decoded
+protocol+code fires every live command learned to it.
+
+**Hold model (one button at a time).** A decoded frame marks its code as
+held. The hold extends while frames keep arriving within **250 ms** of each
+other: a NEC repeat frame, or a full re-transmission of the same code (how
+RC5/RC6/Sony and most hash-protocol remotes signal a held button). Silence
+past 250 ms is the release. A different code releases the old button and
+presses the new one.
+
+- **Press actions** (`INC`, `DEC`, `TOGGLE`, `SET`, `TRIGGER`) fire once on
+  the initial frame.
+- **Hold-to-repeat** (`CS_FLAG_REPEAT` on `INC`/`DEC`): repeats gate on the
+  same feel as a physical button: nothing for the first **400 ms** of the
+  hold, then at most one step per **80 ms** (12.5 Hz), clocked by the
+  remote's own repeat cadence (NEC ~108 ms, RC5 ~114 ms). Remotes that send
+  a fixed burst per tap (e.g. Sony SIRC transmits 3 frames per press) fall
+  inside the 400 ms delay and do not spuriously step.
+- **`MOMENTARY`** engages on the press and restores on the release, which is
+  detected by the 250 ms silence, so an IR momentary releases about a
+  quarter-second after the finger leaves the button. Removing or rebinding
+  the IR component (including a revert) restores any engaged momentary
+  first.
+- Every dispatch is the same absolute-target, BUSY-retried, shadow-stepped
+  path as a physical button (7.1, 5.3), tagged `PARAM_SRC_GPIO`.
+
+While a **learn** is armed (section 3.6.1), decoded frames are captured
+instead of dispatched, and the 250 ms hold state is force-released at arm
+time so nothing stays engaged into the learn.
+
+#### 7.5.1 Learn notification (event `0x0A`)
+
+Learn completion is pushed on the notification stream (USB EP `0x83` and
+UART type-`0x40` frames; see notification_protocol_v2_spec.md):
+
+```
+[ver=2, evt=0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]   (12 bytes)
+```
+
+`state` = 2 (`CS_IR_LEARN_DONE`, protocol/code valid) or 3
+(`CS_IR_LEARN_TIMEOUT`, protocol/code zero). Exactly one event is pushed per
+armed learn that completes; a cancel pushes nothing. Binding and IR command
+**config** changes still push nothing (7.3); parameter changes an IR command
+makes push the normal `PARAM_CHANGED` with `source = PARAM_SRC_GPIO`.
 
 ---
 
@@ -820,6 +1104,40 @@ SET 0x84, wValue=<slot>, payload = 24 x 00
   notification stream and watch for `PARAM_CHANGED` events with
   `source == PARAM_SRC_GPIO` (5).
 
+### 8.5 IR remote walk-through (component, learn, commands, save)
+
+The full Console flow for "volume up/down plus mute on the living-room
+remote", receiver on GPIO 22:
+
+1. **Create the component.** Binding with `type=IR(7)`, `gpio[0]=22`,
+   everything else zero, to a free slot:
+   ```
+   07 00 00 00 16 FF 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+   ```
+   `SET 0x84, wValue=<slot>`, poll `0x87` until not PENDING. Optionally name
+   the slot ("Living Room Remote") via `0x8B`.
+2. **Learn the first button.** `GET 0x8F, wValue=1`, then prompt the user to
+   press volume-up on the remote. Wait for notify event `0x0A` (or poll
+   `GET 0x8F, wValue=2` until `state != 1`). Suppose the result is
+   `protocol=1 (NEC), code=0xE718FF00`.
+3. **Write the command.** Sub-slot 0: `noun=USER_VOLUME(0)`, `action=INC(2)`,
+   `flags=REPEAT(0x10)` so holding the button ramps, `step=0x0100` (1 dB):
+   ```
+   00 02 10 00 00 01 00 00 00 01 00 00 00 FF 18 E7
+   ```
+   `SET 0x8D, wValue=0`, poll `0x87` (`last_slot` reads `0x80`).
+4. **Repeat** for volume-down (`action=DEC`) into sub-slot 1 and mute
+   (`action=TOGGLE`, `noun=USER_MUTE`) into sub-slot 2, learning each button
+   first.
+5. The commands are already live (that is the Apply); the user tries the
+   remote. When happy: `GET 0x9D` (**Save**), poll `0x87` until not PENDING
+   with `last_slot=0xFF`. To abandon instead: `GET 0x9E` (**Revert**).
+
+To display the component later: `GET 0x85` per slot to find `type=7`,
+`GET 0x8E` per sub-slot for the commands (protocol `0` = empty),
+`GET 0x87` for `ir_active_mask` / `ir_cmd_status` health, and `GET 0x8C`
+for the component name.
+
 ---
 
 ## 9. Extension guide (firmware)
@@ -862,6 +1180,16 @@ does not break existing hosts.
    type/pins/event/target/value, and hosts pick up the new type from the caps
    header automatically.
 
+`CS_TYPE_IR` is the template for a **container** type whose events arrive
+out-of-band rather than by polling its pin: the binding validates with its
+own rules (`cs_validate_ir_container`), claim/release attach and detach a
+capture module (control_surfaces_ir.c), and per-event work happens in a
+dedicated tick hook (`cs_tick_ir`) that funnels into the shared op helpers
+(`cs_button_press` and friends) through a binding-shaped view of each
+command. New decode protocols slot into `ir_frame_complete` in
+control_surfaces_ir.c: append a `CS_IR_PROTO_*` value (never renumber; codes
+are flash-persistent) and try the decoder before the hash fallback.
+
 ### 9.4 Versioning rules
 
 - **Append-only** enum values; **never renumber** an existing `CsType`, `CsNoun`,
@@ -882,7 +1210,9 @@ does not break existing hosts.
 ## 10. Limits and constraints
 
 - **16 bindings** (`CS_MAX_BINDINGS`). Slots are independent; a slot holds one
-  component (or one gesture of a shared button).
+  component (or one gesture of a shared button). The IR component occupies
+  one slot and carries its own **8 command sub-slots** (`CS_MAX_IR_COMMANDS`);
+  one IR component per device.
 - **Pin conflicts** use the shared `ctrl_iface_check_pin()`: a pin must be a valid
   GPIO, not already claimed by an output, MCK, SPDIF/I2S RX, ADAT, DAC
   hardware-mute, a UART/I2C control interface, or another live binding (the one
@@ -892,15 +1222,22 @@ does not break existing hosts.
   `pin_used_by_fixed_peripheral()`, so no other subsystem can take a live CS pin.
 - **One ADC conversion per tick** (round-robin), so pots share the single ADC
   fairly without stalling the 1 kHz loop.
-- **No PIO and no GPIO IRQs** are used; the engine is pure main-loop polling. It
-  is a cheap no-op when no binding is active. PWM LEDs use the otherwise unused
-  hardware PWM slices.
+- **No PIO** is used. The engine is main-loop polling with one exception: the
+  IR receiver's edges are timestamped by the firmware's only GPIO interrupt
+  (IO_IRQ_BANK0, lowest priority, RAM-resident, core 0); decoding still runs
+  on the tick. The engine is a cheap no-op when no binding is active. PWM
+  LEDs use the otherwise unused hardware PWM slices.
 - **Indicator evaluation is decimated** to 8 ms and staggered across slots, so
   many LEDs (including status-struct reads and the meter dB conversion) stay
   cheap on the RP2040's software float.
-- **RP2040 XIP placement**: control_surfaces.c and control_surfaces_nouns.c
-  execute from flash (XIP); they contain no `DSP_TIME_CRITICAL` code and never
-  run inside the IRQs-off flash-write window.
+- **RP2040 XIP placement**: control_surfaces.c, control_surfaces_nouns.c, and
+  the decode side of control_surfaces_ir.c execute from flash (XIP); they
+  contain no `DSP_TIME_CRITICAL` code and never run inside the IRQs-off
+  flash-write window. The IR edge interrupt handler is RAM-resident
+  (`__not_in_flash_func`) and touches only registers and its own RAM ring,
+  so it survives the flash blackout; edges arriving while interrupts are
+  disabled during a flash write are lost and the partial frame is discarded
+  by the decoder (press the button again).
 - **Platform differences** are carried entirely by the caps tables:
   `target_count` reflects the platform's channel counts, and `ADAT_ACTIVE`
   has an empty action mask on RP2040. Everything else is identical on RP2040
@@ -912,7 +1249,28 @@ does not break existing hosts.
 
 ---
 
-## 11. v1 -> v2 compatibility
+## 11. Compatibility
+
+### 11.1 v2 -> v3 (caps version 3, directory V11)
+
+- **Stored configs migrate automatically.** A V10 directory migrates to V11
+  on first boot by appending the (empty) IR command table; bindings and
+  names are untouched. All v2 types, nouns, actions, flags, and status
+  codes kept their numeric values.
+- **Response sizes grew.** `REQ_GET_CS_CAPS` (`wValue = 0xFFFF`) now returns
+  40 bytes (8 type entries plus the v3 tail) and `REQ_GET_CS_STATUS` returns
+  32 bytes. Hosts must read `caps_version` (3) and use the v3 sizes; the
+  first 22 status bytes kept their v2 layout except that the reserved byte
+  at offset 3 became `dirty`.
+- **`REQ_SET_CS_BINDING` semantics changed: it no longer persists.** A v2
+  host that writes bindings and never sends `REQ_CS_SAVE` will find them
+  gone after a reboot. This is the one breaking behavioral change of v3;
+  hosts must add Save (and should surface `dirty` / offer Revert).
+- Firmware downgrade: an older firmware reading a V11 directory fails the
+  version check and rebuilds a fresh directory (presets and CS config are
+  lost); it does not misparse.
+
+### 11.2 v1 -> v2
 
 - **Stored configs migrate automatically.** A device with a V8 directory (v1
   16-byte bindings, 8 slots) migrates on first boot: the 8 bindings carry
@@ -923,6 +1281,6 @@ does not break existing hosts.
 - **The control wire format is NOT backward compatible.** `REQ_SET_CS_BINDING`
   requires 24 bytes (a 16-byte payload gets `CS_STATUS_INVALID_VALUE`);
   `REQ_GET_CS_BINDING`, `REQ_GET_CS_CAPS`, and `REQ_GET_CS_STATUS` responses
-  grew. Hosts must read `caps_version` (2) and use the v2 sizes.
+  grew. Hosts must read `caps_version` and use the current sizes.
 - v1's `IND_EQUALS`-only LED bindings behave identically after migration; the
   `CLIP` noun's semantics are unchanged.

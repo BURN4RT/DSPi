@@ -326,6 +326,13 @@ typedef struct __attribute__((packed)) {
 // external MCUs / other hosts via REQ_GET_CS_NAME.  Slot metadata independent
 // of the bindings (a name may exist before its binding and survives binding
 // changes), hence a directory field rather than a cs_config format bump.
+//
+// V11 appends the Control Surfaces IR command table (learned remote-button
+// commands for the CS_TYPE_IR component): a device-global CsIrConfig beside
+// cs_config, board-level for the same reason.  All-zero = every sub-slot empty
+// (protocol 0 = CS_IR_PROTO_NONE) = feature idle, so a fresh directory needs no
+// seeding.  The V10->V11 migration copies every field forward and leaves the
+// new block zeroed.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -365,6 +372,11 @@ typedef struct __attribute__((packed)) {
     // V10 addition: per-slot Control Surfaces names (user labels, NUL-
     // terminated).  All-zero = unnamed; a fresh directory needs no seeding.
     char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+
+    // V11 addition: Control Surfaces IR command table (learned remote-button
+    // commands for the CS_TYPE_IR component).  Board-level / device-global like
+    // cs_config; all-zero = every sub-slot empty (feature idle).
+    CsIrConfig cs_ir;                        // 132 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -508,7 +520,32 @@ typedef struct __attribute__((packed)) {
     CsFlashConfig cs_config;                 // 388 bytes (current format v2)
 } PresetDirectory_v9;
 
-#define DIR_VERSION_CURRENT  10
+// Historical directory layout at V10, before the IR command table was appended.
+// Read only by the V10->V11 migration in load_directory(); identical to the
+// current PresetDirectory except it lacks the trailing cs_ir block.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 25 bytes
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+} PresetDirectory_v10;
+
+#define DIR_VERSION_CURRENT  11
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -701,6 +738,7 @@ static void io_config_defaults(FlashOutputConfig *cfg);    // defined below (IO 
 static void ctrl_iface_defaults(UartCtrlConfig *u, I2cCtrlConfig *i);  // defined below
 static void dir_sanitize_ctrl_iface(void);                            // defined below
 static void dir_sanitize_cs_config(void);                             // defined below
+static void dir_sanitize_cs_ir(void);                                 // defined below
 static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src);  // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
 // VALIDATION section.  collect_live_state() and migrate_legacy() use it
@@ -853,7 +891,44 @@ static bool dir_load_cache(void) {
         // interface structs, resetting any implausible one to defaults.
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
         dir_cache_valid = true;
+        return true;
+    }
+
+    if (flash_dir->version == 10) {
+        // V10 -> V11 migration.  V11 appends the Control Surfaces IR command
+        // table (132 bytes).  Validate the v10 CRC, copy every field forward,
+        // and leave the new block zeroed (every sub-slot empty = feature idle).
+        const PresetDirectory_v10 *v10 = (const PresetDirectory_v10 *)flash_dir;
+        const uint8_t *v10_data_start = (const uint8_t *)&v10->startup_mode;
+        size_t v10_data_len = sizeof(PresetDirectory_v10) - offsetof(PresetDirectory_v10, startup_mode);
+        if (crc32(v10_data_start, v10_data_len) != v10->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v10->startup_mode;
+        dir_cache.default_slot       = v10->default_slot;
+        dir_cache.last_active_slot   = v10->last_active_slot;
+        dir_cache.output_config_mode = v10->output_config_mode;
+        dir_cache.slot_occupied      = v10->slot_occupied;
+        dir_cache.master_volume_mode = v10->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v10->spdif_rx_pin;
+        dir_cache.master_volume_db   = v10->master_volume_db;
+        memcpy(dir_cache.slot_names, v10->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v10->dac_hw_mute;
+        dir_cache.output_config      = v10->output_config;
+        dir_cache.uart_ctrl          = v10->uart_ctrl;
+        dir_cache.i2c_ctrl           = v10->i2c_ctrl;
+        dir_cache.cs_config          = v10->cs_config;   // already format v2
+        memcpy(dir_cache.cs_names, v10->cs_names, sizeof(dir_cache.cs_names));
+        // cs_ir stays zeroed from the memset (all sub-slots empty).
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -883,8 +958,10 @@ static bool dir_load_cache(void) {
         dir_cache.uart_ctrl          = v9->uart_ctrl;
         dir_cache.i2c_ctrl           = v9->i2c_ctrl;
         dir_cache.cs_config          = v9->cs_config;   // already format v2
+        // cs_ir stays zeroed from the memset (all sub-slots empty).
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
         return true;
@@ -1283,6 +1360,34 @@ static void dir_sanitize_cs_config(void) {
     for (int s = 0; s < CS_MAX_BINDINGS; s++) {
         dir_cache.cs_names[s][CS_NAME_LEN - 1] = '\0';
     }
+}
+
+// Bound-check the directory's Control Surfaces IR command table.  An implausible
+// blob version (or a dirty reserved field) resets the whole block; an
+// implausible command resets that sub-slot.  Deeper checks run at apply time in
+// control_surfaces_apply_ir_cmd.  Mirrors dir_sanitize_cs_config.
+static void dir_sanitize_cs_ir(void) {
+    CsIrConfig *c = &dir_cache.cs_ir;
+    if (c->version > CS_IR_CONFIG_VERSION ||
+        c->reserved[0] || c->reserved[1] || c->reserved[2]) {
+        memset(c, 0, sizeof(*c));
+        c->version = CS_IR_CONFIG_VERSION;
+        return;
+    }
+    for (int s = 0; s < CS_MAX_IR_COMMANDS; s++) {
+        IrCommand *cmd = &c->cmds[s];
+        // Shallow enum-range check: reset a sub-slot whose persisted protocol is
+        // out of range, or whose noun/action is out of range while occupied.
+        // protocol == CS_IR_PROTO_NONE marks the sub-slot empty.
+        if (cmd->protocol >= CS_IR_PROTO_COUNT ||
+            (cmd->protocol != CS_IR_PROTO_NONE &&
+             (cmd->noun >= CS_NOUN_COUNT || cmd->action >= CS_ACT_COUNT))) {
+            memset(cmd, 0, sizeof(*cmd));
+        }
+    }
+    // Normalize the version byte; a fresh/migrated all-zero block leaves it 0
+    // (still idle, every sub-slot empty).
+    c->version = CS_IR_CONFIG_VERSION;
 }
 
 // Write the RAM-cached directory back to flash.
@@ -2348,21 +2453,34 @@ void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out) {
     if (i2c_out)  memcpy(i2c_out,  &dir_cache.i2c_ctrl,  sizeof(*i2c_out));
 }
 
-// Control Surfaces persistence.  Mirrors preset_set_ctrl_iface: synchronous,
-// main-loop only, one directory-sector write.  Caller (main loop deferred
-// apply) has already validated the bindings.
-void preset_set_cs_config(const CsFlashConfig *cfg) {
-    if (!cfg) return;
-    dir_ensure();
-    memcpy(&dir_cache.cs_config, cfg, sizeof(dir_cache.cs_config));
-    dir_cache.cs_config.version = CS_CONFIG_VERSION;
-    dir_flush();
-}
-
+// Control Surfaces persistence.  The getter reads the RAM cache; writes go
+// through preset_set_cs_all below (bindings persist only via REQ_CS_SAVE).
 void preset_get_cs_config(CsFlashConfig *out) {
     if (!out) return;
     dir_ensure();
     memcpy(out, &dir_cache.cs_config, sizeof(*out));
+}
+
+// Control Surfaces IR command table (V11).  Getter reads the RAM cache; setter
+// persists bindings and the IR table together in one directory-sector write
+// (the REQ_CS_SAVE path).  Caller has validated both blobs.
+void preset_get_cs_ir_config(CsIrConfig *out) {
+    if (!out) return;
+    dir_ensure();
+    memcpy(out, &dir_cache.cs_ir, sizeof(*out));
+}
+
+uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir) {
+    if (!cfg || !ir) return PRESET_ERR_INVALID_SLOT;
+    dir_ensure();
+    memcpy(&dir_cache.cs_config, cfg, sizeof(dir_cache.cs_config));
+    dir_cache.cs_config.version = CS_CONFIG_VERSION;
+    memcpy(&dir_cache.cs_ir, ir, sizeof(dir_cache.cs_ir));
+    dir_cache.cs_ir.version = CS_IR_CONFIG_VERSION;
+    if (dir_flush() != 0) {
+        return PRESET_ERR_FLASH_WRITE;
+    }
+    return PRESET_OK;
 }
 
 // Control Surfaces slot names (V10).  Setter mirrors preset_set_name:

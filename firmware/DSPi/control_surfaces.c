@@ -19,10 +19,13 @@
  * validation) live in control_surfaces_nouns.c behind cs_noun_get /
  * cs_noun_dispatch / cs_noun_validate_target and the cs_noun_table.
  *
- * No GPIO IRQs and no PIO resources are used; polling at 1 kHz comfortably
- * tracks hand-operated detented encoders (a fast spin is ~250 quarter-steps
- * per second, 4 samples per transition).  PWM LEDs use the otherwise-unused
- * hardware PWM slices.
+ * No PIO resources are used; polling at 1 kHz comfortably tracks
+ * hand-operated detented encoders (a fast spin is ~250 quarter-steps per
+ * second, 4 samples per transition).  PWM LEDs use the otherwise-unused
+ * hardware PWM slices.  The one interrupt user is the IR component:
+ * control_surfaces_ir.c timestamps receiver edges from IO_IRQ_BANK0 into a
+ * private ring, decoded here on the tick; remote buttons then act exactly
+ * like physical buttons through the shared op helpers.
  *
  * Serialization assumption (load-bearing): this tick, the host command
  * handlers (tud_task), and the binding-apply handler all run on the core0
@@ -31,9 +34,11 @@
  */
 
 #include "control_surfaces.h"
+#include "control_surfaces_ir.h"
 #include "config.h"
 #include "vendor_commands.h"
 #include "flash_storage.h"
+#include "notify.h"
 
 #include "hardware/adc.h"
 #include "hardware/gpio.h"
@@ -96,6 +101,13 @@ volatile bool    cs_set_name_pending = false;
 uint8_t          cs_set_name_slot = 0;
 char             cs_set_name_val[CS_NAME_LEN];
 
+// Deferred IR command SET / save / revert handoffs
+volatile bool    cs_set_ir_cmd_pending = false;
+uint8_t          cs_set_ir_cmd_slot = 0;
+IrCommand        cs_set_ir_cmd_val;
+volatile bool    cs_save_pending = false;
+volatile bool    cs_revert_pending = false;
+
 // ---------------------------------------------------------------------------
 // Type capability table; the per-noun half lives in control_surfaces_nouns.c.
 // REQ_GET_CS_CAPS serves these verbatim, so host UIs and the firmware can
@@ -103,7 +115,7 @@ char             cs_set_name_val[CS_NAME_LEN];
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 2,
+    .caps_version = 3,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -120,12 +132,39 @@ static const CsCapsHeader s_caps = {
                               1, CS_PINCLASS_ANY },
         [CS_TYPE_LED_PWM] = { CS_ACT_BIT(CS_ACT_IND_EQUALS) | CS_ACT_BIT(CS_ACT_IND_ABOVE) |
                               CS_ACT_BIT(CS_ACT_IND_LEVEL), 1, CS_PINCLASS_ANY },
+        // The IR mask describes what its COMMANDS may do (button semantics);
+        // the container binding itself carries noun/action 0.
+        [CS_TYPE_IR]      = { CS_ACT_BIT(CS_ACT_INC) | CS_ACT_BIT(CS_ACT_DEC) |
+                              CS_ACT_BIT(CS_ACT_TOGGLE) | CS_ACT_BIT(CS_ACT_SET) |
+                              CS_ACT_BIT(CS_ACT_TRIGGER) | CS_ACT_BIT(CS_ACT_MOMENTARY),
+                              1, CS_PINCLASS_ANY },
     },
+    .max_ir_commands = CS_MAX_IR_COMMANDS,
+    .reserved = {0},
 };
 
 // ---------------------------------------------------------------------------
 // Live state
 // ---------------------------------------------------------------------------
+
+// Per-operation dispatch state, shared by binding slots and IR commands
+// (both step, retry-on-BUSY, shadow deferred nouns and support momentary).
+typedef struct {
+    // deferred dispatch (retried while the command surface reports BUSY)
+    bool     pending;
+    float    value;
+    // deferred-apply nouns (CS_NDF_DEFERRED): step from the last dispatched
+    // target while the live value catches up, so rapid detents are not
+    // coalesced against a stale current value
+    bool     shadow_active;
+    float    shadow;
+    int32_t  shadow_q;      // quantized target, cached so the confirm check
+                            // costs one cs_quantize, not two (RP2040 softfloat)
+    uint16_t shadow_age;    // ticks since dispatch (timeout guard)
+    // momentary
+    bool     mom_engaged;
+    float    mom_restore;   // value captured at press, restored at release
+} CsOpState;
 
 typedef struct {
     bool     active;
@@ -145,20 +184,7 @@ typedef struct {
     // LEDs
     uint8_t  led_lit;       // CS_LEVEL_UNKNOWN forces the first write
     uint16_t pwm_level;     // last written PWM compare level
-    // deferred dispatch (retried while the command surface reports BUSY)
-    bool     op_pending;
-    float    op_value;
-    // deferred-apply nouns (CS_NDF_DEFERRED): step from the last dispatched
-    // target while the live value catches up, so rapid detents are not
-    // coalesced against a stale current value
-    bool     shadow_active;
-    float    shadow;
-    int32_t  shadow_q;      // quantized target, cached so the confirm check
-                            // costs one cs_quantize, not two (RP2040 softfloat)
-    uint16_t shadow_age;    // ticks since dispatch (timeout guard)
-    // momentary
-    bool     mom_engaged;
-    float    mom_restore;   // value captured at press, restored at release
+    CsOpState op;
 } CsRuntime;
 
 // Per-pin gesture state for buttons.  All button bindings sharing a GPIO
@@ -180,7 +206,7 @@ typedef struct {
     uint16_t repeat_ticks;
 } CsBtnGroup;
 
-static CsFlashConfig s_cfg;                      // live (and persisted) config
+static CsFlashConfig s_cfg;                      // live config (flash on save)
 static CsRuntime     s_rt[CS_MAX_BINDINGS];
 static CsBtnGroup    s_btn[CS_MAX_BINDINGS];
 static uint8_t       s_slot_status[CS_MAX_BINDINGS];
@@ -188,6 +214,21 @@ static bool          s_any_active = false;
 static uint8_t       s_pot_rr = 0;               // round-robin pot cursor
 static uint32_t      s_tick_ct = 0;              // decimation phase
 static uint64_t      s_last_tick_us = 0;
+static bool          s_dirty = false;            // live config != flash
+
+// IR component state.  One CS_TYPE_IR binding (s_ir_slot) owns the receiver;
+// commands fire by learned code.  Hold bookkeeping mirrors the button
+// auto-repeat feel: repeats gate on the same delay and rate.
+static CsIrConfig    s_ir;                       // live IR command table
+static CsOpState     s_ir_op[CS_MAX_IR_COMMANDS];
+static uint8_t       s_ir_cmd_status[CS_MAX_IR_COMMANDS];
+static uint8_t       s_ir_slot = 0xFF;           // slot of the live IR binding
+static bool          s_ir_hold = false;          // a remote button is down
+static uint16_t      s_ir_hold_ticks = 0;
+static uint16_t      s_ir_fire_gap = 0;
+
+// Defined in the IR command section below; used by cs_release_pins.
+static void cs_ir_release_momentary(uint8_t sub);
 
 // Standard quadrature transition table, indexed by (prev << 2) | curr.
 // Invalid two-bit jumps decode as 0 (skipped sample, no movement credited).
@@ -259,33 +300,34 @@ static float cs_unquantize(const CsNounDesc *nd, int32_t q) {
 
 // True once the live value has caught up with a dispatched deferred target
 // (within half a quantization step), so the shadow can retire.  Compares
-// against the quantized target cached at dispatch time (rt->shadow_q).
+// against the quantized target cached at dispatch time (op->shadow_q).
 static bool cs_shadow_confirmed(const CsNounDesc *nd, float live,
-                                const CsRuntime *rt) {
+                                const CsOpState *op) {
     if (nd->kind != CS_KIND_CONTINUOUS)
-        return (int)live == (int)rt->shadow;
-    return cs_quantize(nd, live) == rt->shadow_q;
+        return (int)live == (int)op->shadow;
+    return cs_quantize(nd, live) == op->shadow_q;
 }
 
 // ---------------------------------------------------------------------------
 // Dispatch plumbing
 // ---------------------------------------------------------------------------
 
-static void cs_queue_op(uint8_t slot, float value) {
-    CsRuntime *rt = &s_rt[slot];
-    const CsBinding *b = &s_cfg.bindings[slot];
+// The op-state helpers take (binding, op) pairs so binding slots and IR
+// commands (which present a binding-shaped view) share them unchanged.
+
+static void cs_queue_op(const CsBinding *b, CsOpState *op, float value) {
     const CsNounDesc *nd = &cs_noun_table[b->noun];
     if (nd->dflags & CS_NDF_DEFERRED) {
-        rt->shadow_active = true;
-        rt->shadow = value;
-        rt->shadow_q = cs_quantize(nd, value);
-        rt->shadow_age = 0;
+        op->shadow_active = true;
+        op->shadow = value;
+        op->shadow_q = cs_quantize(nd, value);
+        op->shadow_age = 0;
     }
     if (cs_noun_dispatch(b->noun, b->target, b->index, value)) {
-        rt->op_pending = false;
+        op->pending = false;
     } else {
-        rt->op_pending = true;
-        rt->op_value = value;
+        op->pending = true;
+        op->value = value;
     }
 }
 
@@ -293,11 +335,9 @@ static void cs_queue_op(uint8_t slot, float value) {
 // when one is pending, else the target shadow for deferred-apply nouns,
 // else the live value.  Keeps rapid detents accumulating correctly across
 // BUSY retries and across a preset load / EQ apply still in flight.
-static float cs_base_value(uint8_t slot) {
-    const CsRuntime *rt = &s_rt[slot];
-    const CsBinding *b = &s_cfg.bindings[slot];
-    if (rt->op_pending) return rt->op_value;
-    if (rt->shadow_active) return rt->shadow;
+static float cs_base_value(const CsBinding *b, const CsOpState *op) {
+    if (op->pending) return op->value;
+    if (op->shadow_active) return op->shadow;
     return cs_noun_get(b->noun, b->target, b->index);
 }
 
@@ -308,11 +348,10 @@ static float cs_base_value(uint8_t slot) {
 // Step an enum noun by dir (+1/-1).  Presets step across OCCUPIED slots
 // only; an empty device is a no-op.  Returns the target index or -1 for
 // no movement.
-static int cs_enum_step(uint8_t slot, int dir) {
-    const CsBinding *b = &s_cfg.bindings[slot];
+static int cs_enum_step(const CsBinding *b, const CsOpState *op, int dir) {
     const CsNounDesc *nd = &cs_noun_table[b->noun];
     int count = nd->enum_count;
-    int cur = (int)cs_base_value(slot);
+    int cur = (int)cs_base_value(b, op);
     bool wrap = (b->flags & CS_FLAG_WRAP) != 0;
 
     if (b->noun == CS_NOUN_PRESET) {
@@ -337,53 +376,48 @@ static int cs_enum_step(uint8_t slot, int dir) {
 // Apply `steps` relative steps (encoder detents or INC/DEC presses).
 // `steps` carries the acceleration multiplier for continuous nouns; enums
 // always move one position per event.
-static void cs_apply_step(uint8_t slot, int dir, int steps) {
-    const CsBinding *b = &s_cfg.bindings[slot];
+static void cs_apply_step(const CsBinding *b, CsOpState *op, int dir, int steps) {
     const CsNounDesc *nd = &cs_noun_table[b->noun];
     if (nd->kind == CS_KIND_CONTINUOUS) {
         float lo = cs_decode(nd->unit, nd->min_q);
         float hi = cs_decode(nd->unit, nd->max_q);
         float d = (float)(dir * steps) * cs_step_size(b, nd->unit);
-        float base = cs_base_value(slot);
+        float base = cs_base_value(b, op);
         float v = cs_unit_is_log(nd->unit) ? base * exp2f(d) : base + d;
-        cs_queue_op(slot, cs_clampf(v, lo, hi));
+        cs_queue_op(b, op, cs_clampf(v, lo, hi));
     } else {
-        int t = cs_enum_step(slot, dir);
-        if (t >= 0) cs_queue_op(slot, (float)t);
+        int t = cs_enum_step(b, op, dir);
+        if (t >= 0) cs_queue_op(b, op, (float)t);
     }
 }
 
-static void cs_button_press(uint8_t slot) {
-    const CsBinding *b = &s_cfg.bindings[slot];
+static void cs_button_press(const CsBinding *b, CsOpState *op) {
     switch (b->action) {
-        case CS_ACT_INC:     cs_apply_step(slot, +1, 1); break;
-        case CS_ACT_DEC:     cs_apply_step(slot, -1, 1); break;
-        case CS_ACT_TOGGLE:  cs_queue_op(slot, cs_base_value(slot) >= 0.5f ? 0.0f : 1.0f); break;
-        case CS_ACT_TRIGGER: cs_queue_op(slot, 0.0f); break;
+        case CS_ACT_INC:     cs_apply_step(b, op, +1, 1); break;
+        case CS_ACT_DEC:     cs_apply_step(b, op, -1, 1); break;
+        case CS_ACT_TOGGLE:  cs_queue_op(b, op, cs_base_value(b, op) >= 0.5f ? 0.0f : 1.0f); break;
+        case CS_ACT_TRIGGER: cs_queue_op(b, op, 0.0f); break;
         case CS_ACT_SET: {
             const CsNounDesc *nd = &cs_noun_table[b->noun];
             float v = (nd->kind == CS_KIND_CONTINUOUS)
                     ? cs_decode(nd->unit, b->value) : (float)b->value;
-            cs_queue_op(slot, v);
+            cs_queue_op(b, op, v);
             break;
         }
         default: break;
     }
 }
 
-static void cs_momentary_engage(uint8_t slot) {
-    CsRuntime *rt = &s_rt[slot];
-    const CsBinding *b = &s_cfg.bindings[slot];
-    rt->mom_restore = cs_base_value(slot);
-    rt->mom_engaged = true;
-    cs_queue_op(slot, (float)b->value);
+static void cs_momentary_engage(const CsBinding *b, CsOpState *op) {
+    op->mom_restore = cs_base_value(b, op);
+    op->mom_engaged = true;
+    cs_queue_op(b, op, (float)b->value);
 }
 
-static void cs_momentary_release(uint8_t slot) {
-    CsRuntime *rt = &s_rt[slot];
-    if (!rt->mom_engaged) return;
-    rt->mom_engaged = false;
-    cs_queue_op(slot, rt->mom_restore);
+static void cs_momentary_release(const CsBinding *b, CsOpState *op) {
+    if (!op->mom_engaged) return;
+    op->mom_engaged = false;
+    cs_queue_op(b, op, op->mom_restore);
 }
 
 // ---------------------------------------------------------------------------
@@ -459,7 +493,7 @@ static void cs_group_fire(const CsBtnGroup *g, uint8_t event, bool is_repeat) {
         if (b->action == CS_ACT_MOMENTARY) continue;
         if (b->event != event) continue;
         if (is_repeat && !(b->flags & CS_FLAG_REPEAT)) continue;
-        cs_button_press(s);
+        cs_button_press(b, &s_rt[s].op);
     }
 }
 
@@ -469,8 +503,8 @@ static void cs_group_momentary(const CsBtnGroup *g, bool engage) {
         const CsBinding *b = &s_cfg.bindings[s];
         if (b->type != CS_TYPE_BUTTON || b->gpio[0] != g->pin) continue;
         if (b->action != CS_ACT_MOMENTARY) continue;
-        if (engage) cs_momentary_engage(s);
-        else        cs_momentary_release(s);
+        if (engage) cs_momentary_engage(b, &s_rt[s].op);
+        else        cs_momentary_release(b, &s_rt[s].op);
     }
 }
 
@@ -584,7 +618,7 @@ static void cs_tick_switch(uint8_t slot) {
     rt->sw_stable = rt->sw_candidate;
     // A switch is authoritative, including at claim/boot (matches the
     // pot's immediate-takeover semantics).
-    cs_queue_op(slot, (float)rt->sw_stable);
+    cs_queue_op(b, &rt->op, (float)rt->sw_stable);
 }
 
 static void cs_tick_encoder(uint8_t slot) {
@@ -611,7 +645,7 @@ static void cs_tick_encoder(uint8_t slot) {
         else if (gap < CS_ACCEL_GAP_X2) steps = 2;
     }
     rt->enc_gap = 0;
-    cs_apply_step(slot, dir, steps);
+    cs_apply_step(b, &rt->op, dir, steps);
 }
 
 // Map a filtered ADC reading onto the binding's span, quantized per unit.
@@ -645,7 +679,7 @@ static void cs_tick_pot(uint8_t slot) {
         if (--rt->pot_settle == 0) {
             rt->pot_sent_q = cs_pot_map(b, nd, rt->pot_filt);
             rt->pot_sent_raw = rt->pot_filt;
-            cs_queue_op(slot, cs_unquantize(nd, rt->pot_sent_q));
+            cs_queue_op(b, &rt->op, cs_unquantize(nd, rt->pot_sent_q));
         }
         return;
     }
@@ -657,7 +691,7 @@ static void cs_tick_pot(uint8_t slot) {
     if (q != rt->pot_sent_q) {
         rt->pot_sent_q = q;
         rt->pot_sent_raw = rt->pot_filt;
-        cs_queue_op(slot, cs_unquantize(nd, q));
+        cs_queue_op(b, &rt->op, cs_unquantize(nd, q));
     }
 }
 
@@ -765,7 +799,7 @@ static void cs_claim_pins(uint8_t slot) {
             pwm_set_enabled(slice, true);
             break;
         }
-        default:  // button / switch / encoder inputs (idempotent re-claims OK)
+        default:  // button / switch / encoder / IR inputs (idempotent re-claims OK)
             for (int i = 0; i < cs_pin_count(b->type); i++) {
                 gpio_init(b->gpio[i]);
                 gpio_set_dir(b->gpio[i], GPIO_IN);
@@ -780,6 +814,22 @@ static void cs_claim_pins(uint8_t slot) {
 // active binding still uses them; a PWM slice is stopped only when no other
 // CS PWM LED remains on it.  Caller has already marked the slot inactive.
 static void cs_release_pins(uint8_t slot, const CsBinding *b) {
+    if (b->type == CS_TYPE_IR) {
+        cs_ir_detach();
+        s_ir_slot = 0xFF;
+        s_ir_hold = false;
+        // Restore any engaged momentary before its state is discarded, so a
+        // remote key held through a rebind/revert cannot leave a parameter
+        // stuck at the engaged value.  Then pending dispatches die with the
+        // receiver.
+        for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++)
+            cs_ir_release_momentary(sub);
+        memset(s_ir_op, 0, sizeof(s_ir_op));
+        // Detach aborts a learn in progress; tell the waiting host now,
+        // since the tick no longer runs IR work without a component.
+        if (cs_ir_learn_take_change())
+            notify_push_cs_ir_learn(cs_ir_learn_state(), 0, 0);
+    }
     for (int i = 0; i < cs_pin_count(b->type); i++) {
         uint8_t pin = b->gpio[i];
         if (cs_pin_used_by_other(pin, slot)) continue;
@@ -825,6 +875,12 @@ static void cs_seed_runtime(uint8_t slot) {
         case CS_TYPE_LED_PWM:
             rt->pwm_level = 0xFFFF;   // force the first write
             break;
+        case CS_TYPE_IR:
+            cs_ir_attach(b->gpio[0], (b->flags & CS_FLAG_INVERT) != 0);
+            s_ir_slot = slot;
+            s_ir_hold = false;
+            memset(s_ir_op, 0, sizeof(s_ir_op));
+            break;
         default:   // buttons keep their state in the pin group
             break;
     }
@@ -837,45 +893,9 @@ static void cs_recount_active(void) {
         if (s_rt[i].active) { s_any_active = true; break; }
 }
 
-// Full validity check for a proposed binding.  Pin checks run against the
-// live device with this slot's own pins already released by the caller.
-static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
-    if (b->type >= CS_TYPE_COUNT) return CS_STATUS_INVALID_TYPE;
-    if (b->noun >= CS_NOUN_COUNT) return CS_STATUS_INVALID_NOUN;
-    if (b->action >= CS_ACT_COUNT) return CS_STATUS_INVALID_ACTION;
-
-    if (b->flags & (uint8_t)~CS_FLAG_ALL) return CS_STATUS_INVALID_VALUE;
-    if (b->reserved != 0) return CS_STATUS_INVALID_VALUE;
-    for (int i = 0; i < (int)sizeof(b->reserved2); i++)
-        if (b->reserved2[i] != 0) return CS_STATUS_INVALID_VALUE;
-
-    const CsTypeDesc *td = &s_caps.types[b->type];
-    const CsNounDesc *nd = &cs_noun_table[b->noun];
-    uint16_t bit = CS_ACT_BIT(b->action);
-    if (!(td->actions & bit) || !(nd->actions & bit)) return CS_STATUS_INVALID_ACTION;
-
-    // Events are a button concept; everything else must carry 0.
-    if (b->type == CS_TYPE_BUTTON) {
-        if (b->event >= CS_EVT_COUNT) return CS_STATUS_INVALID_EVENT;
-        // Hold-to-repeat and hold-to-engage both own the hold; they only
-        // make sense on the short-press event.
-        if ((b->action == CS_ACT_MOMENTARY || (b->flags & CS_FLAG_REPEAT)) &&
-            b->event != CS_EVT_PRESS)
-            return CS_STATUS_INVALID_EVENT;
-    } else if (b->event != 0) {
-        return CS_STATUS_INVALID_EVENT;
-    }
-    if ((b->flags & CS_FLAG_REPEAT) &&
-        (b->type != CS_TYPE_BUTTON ||
-         (b->action != CS_ACT_INC && b->action != CS_ACT_DEC)))
-        return CS_STATUS_INVALID_VALUE;
-    if ((b->flags & CS_FLAG_ACCEL) && b->type != CS_TYPE_ENCODER)
-        return CS_STATUS_INVALID_VALUE;
-
-    uint8_t tst = cs_noun_validate_target(b);
-    if (tst != PIN_CONFIG_SUCCESS) return tst;
-
-    // Value / step / range bounds per kind
+// Value / step / range bounds per noun kind; shared by binding and IR
+// command validation.
+static uint8_t cs_validate_values(const CsBinding *b, const CsNounDesc *nd) {
     switch (nd->kind) {
         case CS_KIND_CONTINUOUS:
             if ((b->action == CS_ACT_SET || b->action == CS_ACT_IND_ABOVE) &&
@@ -902,6 +922,76 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
             break;
         default:
             break;
+    }
+    return PIN_CONFIG_SUCCESS;
+}
+
+// The IR binding is a container: the receiver pin and its idle sense are
+// the only payload; nouns/actions belong to the commands.
+static uint8_t cs_validate_ir_container(const CsBinding *b, uint8_t slot) {
+    if (b->noun != 0 || b->action != 0 || b->event != 0 ||
+        b->target != 0 || b->index != 0 ||
+        b->value != 0 || b->step != 0 ||
+        b->range_min != 0 || b->range_max != 0)
+        return CS_STATUS_INVALID_VALUE;
+    if (b->flags & (uint8_t)~CS_FLAG_INVERT) return CS_STATUS_INVALID_VALUE;
+    // One receiver per device: a second IR slot would need its own capture
+    // engine and a partitioned command table.
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++) {
+        if (s == slot || !s_rt[s].active) continue;
+        if (s_cfg.bindings[s].type == CS_TYPE_IR) return CS_STATUS_IR_IN_USE;
+    }
+    return PIN_CONFIG_SUCCESS;
+}
+
+// Full validity check for a proposed binding.  Pin checks run against the
+// live device with this slot's own pins already released by the caller.
+static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
+    if (b->type >= CS_TYPE_COUNT) return CS_STATUS_INVALID_TYPE;
+    if (b->noun >= CS_NOUN_COUNT) return CS_STATUS_INVALID_NOUN;
+    if (b->action >= CS_ACT_COUNT) return CS_STATUS_INVALID_ACTION;
+
+    if (b->flags & (uint8_t)~CS_FLAG_ALL) return CS_STATUS_INVALID_VALUE;
+    if (b->reserved != 0) return CS_STATUS_INVALID_VALUE;
+    for (int i = 0; i < (int)sizeof(b->reserved2); i++)
+        if (b->reserved2[i] != 0) return CS_STATUS_INVALID_VALUE;
+
+    const CsTypeDesc *td = &s_caps.types[b->type];
+    const CsNounDesc *nd = &cs_noun_table[b->noun];
+
+    if (b->type == CS_TYPE_IR) {
+        // Container slot: no noun/action/value semantics of its own; only
+        // the shared pin checks below apply.
+        uint8_t st = cs_validate_ir_container(b, slot);
+        if (st != PIN_CONFIG_SUCCESS) return st;
+    } else {
+        uint16_t bit = CS_ACT_BIT(b->action);
+        if (!(td->actions & bit) || !(nd->actions & bit))
+            return CS_STATUS_INVALID_ACTION;
+
+        // Events are a button concept; everything else must carry 0.
+        if (b->type == CS_TYPE_BUTTON) {
+            if (b->event >= CS_EVT_COUNT) return CS_STATUS_INVALID_EVENT;
+            // Hold-to-repeat and hold-to-engage both own the hold; they only
+            // make sense on the short-press event.
+            if ((b->action == CS_ACT_MOMENTARY || (b->flags & CS_FLAG_REPEAT)) &&
+                b->event != CS_EVT_PRESS)
+                return CS_STATUS_INVALID_EVENT;
+        } else if (b->event != 0) {
+            return CS_STATUS_INVALID_EVENT;
+        }
+        if ((b->flags & CS_FLAG_REPEAT) &&
+            (b->type != CS_TYPE_BUTTON ||
+             (b->action != CS_ACT_INC && b->action != CS_ACT_DEC)))
+            return CS_STATUS_INVALID_VALUE;
+        if ((b->flags & CS_FLAG_ACCEL) && b->type != CS_TYPE_ENCODER)
+            return CS_STATUS_INVALID_VALUE;
+
+        uint8_t tst = cs_noun_validate_target(b);
+        if (tst != PIN_CONFIG_SUCCESS) return tst;
+
+        uint8_t vst = cs_validate_values(b, nd);
+        if (vst != PIN_CONFIG_SUCCESS) return vst;
     }
 
     // Pins: distinct, valid, unclaimed anywhere; the one sanctioned overlap
@@ -938,6 +1028,152 @@ static uint8_t cs_validate(const CsBinding *b, uint8_t slot) {
         }
     }
     return PIN_CONFIG_SUCCESS;
+}
+
+// ---------------------------------------------------------------------------
+// IR commands.  Each is a button-shaped binding fired by a learned code; a
+// stack view re-uses the shared step / press / momentary / validation
+// helpers without a second code path.
+// ---------------------------------------------------------------------------
+
+static CsBinding cs_ir_view(const IrCommand *c) {
+    CsBinding b;
+    memset(&b, 0, sizeof(b));
+    b.type   = CS_TYPE_IR;    // ignored by the op helpers
+    b.noun   = c->noun;
+    b.action = c->action;
+    b.flags  = c->flags;
+    b.target = c->target;
+    b.index  = c->index;
+    b.value  = c->value;
+    b.step   = c->step;
+    return b;
+}
+
+// A command fires only while the receiver is up and the record validated.
+static bool cs_ir_cmd_live(uint8_t sub) {
+    return s_ir_slot != 0xFF &&
+           s_ir.cmds[sub].protocol != CS_IR_PROTO_NONE &&
+           s_ir_cmd_status[sub] == PIN_CONFIG_SUCCESS;
+}
+
+static uint8_t cs_validate_ir_cmd(const IrCommand *c) {
+    if (c->noun >= CS_NOUN_COUNT) return CS_STATUS_INVALID_NOUN;
+    if (c->action >= CS_ACT_COUNT) return CS_STATUS_INVALID_ACTION;
+    if (c->protocol >= CS_IR_PROTO_COUNT) return CS_STATUS_INVALID_VALUE;
+    if (c->code == 0) return CS_STATUS_INVALID_VALUE;   // 0 = never learned
+    if (c->reserved[0] != 0 || c->reserved[1] != 0) return CS_STATUS_INVALID_VALUE;
+    if (c->flags & (uint8_t)~(CS_FLAG_WRAP | CS_FLAG_REPEAT))
+        return CS_STATUS_INVALID_VALUE;
+    if ((c->flags & CS_FLAG_REPEAT) &&
+        c->action != CS_ACT_INC && c->action != CS_ACT_DEC)
+        return CS_STATUS_INVALID_VALUE;
+
+    const CsNounDesc *nd = &cs_noun_table[c->noun];
+    uint16_t bit = CS_ACT_BIT(c->action);
+    if (!(s_caps.types[CS_TYPE_IR].actions & bit) || !(nd->actions & bit))
+        return CS_STATUS_INVALID_ACTION;
+
+    CsBinding v = cs_ir_view(c);
+    uint8_t tst = cs_noun_validate_target(&v);
+    if (tst != PIN_CONFIG_SUCCESS) return tst;
+    return cs_validate_values(&v, nd);
+}
+
+// Best-effort momentary restore before a command's op state is discarded
+// (receiver teardown or command overwrite).  A BUSY dispatch is dropped
+// with the state; acceptable on a teardown path.
+static void cs_ir_release_momentary(uint8_t sub) {
+    CsOpState *op = &s_ir_op[sub];
+    if (!op->mom_engaged) return;
+    CsBinding v = cs_ir_view(&s_ir.cmds[sub]);
+    cs_momentary_release(&v, op);
+}
+
+uint8_t control_surfaces_apply_ir_cmd(uint8_t sub, const IrCommand *c) {
+    if (sub >= CS_MAX_IR_COMMANDS || !c) return CS_STATUS_INVALID_SLOT;
+    if (c->protocol == CS_IR_PROTO_NONE) {
+        // Clearing a sub-slot: the record must be all-zero (strict, like
+        // the binding reserved fields).
+        const uint8_t *p = (const uint8_t *)c;
+        for (size_t i = 0; i < sizeof(*c); i++)
+            if (p[i] != 0) return CS_STATUS_INVALID_VALUE;
+    } else {
+        uint8_t st = cs_validate_ir_cmd(c);
+        if (st != PIN_CONFIG_SUCCESS) return st;   // old command kept intact
+    }
+    cs_ir_release_momentary(sub);   // editing a held command restores first
+    s_ir.cmds[sub] = *c;
+    memset(&s_ir_op[sub], 0, sizeof(s_ir_op[sub]));
+    s_ir_cmd_status[sub] = PIN_CONFIG_SUCCESS;
+    return PIN_CONFIG_SUCCESS;
+}
+
+// Fire every live command learned to {protocol, code}.  Multiple commands
+// may share one remote button (one press, several actions).
+static void cs_ir_fire(uint8_t protocol, uint32_t code, uint8_t evkind) {
+    for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
+        const IrCommand *c = &s_ir.cmds[sub];
+        if (!cs_ir_cmd_live(sub) || c->protocol != protocol || c->code != code)
+            continue;
+        CsBinding v = cs_ir_view(c);
+        CsOpState *op = &s_ir_op[sub];
+        switch (evkind) {
+            case CS_IR_EVT_PRESS:
+                if (c->action == CS_ACT_MOMENTARY) cs_momentary_engage(&v, op);
+                else                               cs_button_press(&v, op);
+                break;
+            case CS_IR_EVT_REPEAT:
+                if (c->flags & CS_FLAG_REPEAT) cs_button_press(&v, op);
+                break;
+            case CS_IR_EVT_RELEASE:
+                if (c->action == CS_ACT_MOMENTARY) cs_momentary_release(&v, op);
+                break;
+            default: break;
+        }
+    }
+}
+
+// Per-tick IR processing: decoded events and the button-compatible repeat
+// gate (400 ms delay, then 12.5 Hz max).
+static void cs_tick_ir(void) {
+    if (s_ir_hold) {
+        if (s_ir_hold_ticks < 0xFFFF) s_ir_hold_ticks++;
+        if (s_ir_fire_gap  < 0xFFFF) s_ir_fire_gap++;
+    }
+
+    CsIrEvent ev;
+    while (cs_ir_poll(&ev)) {
+        switch (ev.kind) {
+            case CS_IR_EVT_PRESS:
+                s_ir_hold = true;
+                s_ir_hold_ticks = 0;
+                s_ir_fire_gap = 0;
+                cs_ir_fire(ev.protocol, ev.code, CS_IR_EVT_PRESS);
+                break;
+            case CS_IR_EVT_REPEAT:
+                if (s_ir_hold_ticks >= CS_REPEAT_DELAY_TICKS &&
+                    s_ir_fire_gap >= CS_REPEAT_RATE_TICKS) {
+                    s_ir_fire_gap = 0;
+                    cs_ir_fire(ev.protocol, ev.code, CS_IR_EVT_REPEAT);
+                }
+                break;
+            case CS_IR_EVT_RELEASE:
+                s_ir_hold = false;
+                cs_ir_fire(ev.protocol, ev.code, CS_IR_EVT_RELEASE);
+                break;
+            default: break;
+        }
+    }
+
+    // One notify per learn completion (capture or timeout).
+    if (cs_ir_learn_take_change()) {
+        uint8_t proto = 0;
+        uint32_t code = 0;
+        uint8_t st = cs_ir_learn_state();
+        if (st == CS_IR_LEARN_DONE) (void)cs_ir_learn_result(&proto, &code);
+        notify_push_cs_ir_learn(st, proto, code);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -992,27 +1228,68 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
     return PIN_CONFIG_SUCCESS;
 }
 
-void control_surfaces_init(void) {
+// Bring up every stored binding and IR command from the directory cache.
+// Shared by boot init and REQ_CS_REVERT; the caller has already cleared or
+// released the live state.  A stored entry that no longer validates is kept
+// visible (inactive) so the config survives round-trips; the failure is
+// reported in slot_status / ir_cmd_status.
+static void cs_load_stored(void) {
     CsFlashConfig stored;
     preset_get_cs_config(&stored);
+    if (stored.version <= CS_CONFIG_VERSION) {   // future format stays idle
+        for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++) {
+            const CsBinding *b = &stored.bindings[slot];
+            if (b->type == CS_TYPE_NONE) continue;
+            uint8_t st = control_surfaces_apply_binding(slot, b);
+            if (st != PIN_CONFIG_SUCCESS) {
+                s_cfg.bindings[slot] = *b;
+                s_slot_status[slot] = st;
+            }
+        }
+    }
+
+    CsIrConfig ir;
+    preset_get_cs_ir_config(&ir);
+    if (ir.version <= CS_IR_CONFIG_VERSION) {
+        for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
+            const IrCommand *c = &ir.cmds[sub];
+            if (c->protocol == CS_IR_PROTO_NONE) continue;
+            uint8_t st = cs_validate_ir_cmd(c);
+            s_ir.cmds[sub] = *c;
+            s_ir_cmd_status[sub] = st;
+        }
+    }
+}
+
+void control_surfaces_init(void) {
     memset(&s_cfg, 0, sizeof(s_cfg));
     memset(s_rt, 0, sizeof(s_rt));
     memset(s_slot_status, 0, sizeof(s_slot_status));
     for (int i = 0; i < CS_MAX_BINDINGS; i++) s_btn[i].pin = CS_GPIO_UNUSED;
     s_cfg.version = CS_CONFIG_VERSION;
-    if (stored.version > CS_CONFIG_VERSION) return;   // future format; stay idle
+    memset(&s_ir, 0, sizeof(s_ir));
+    s_ir.version = CS_IR_CONFIG_VERSION;
+    memset(s_ir_op, 0, sizeof(s_ir_op));
+    memset(s_ir_cmd_status, 0, sizeof(s_ir_cmd_status));
+    s_ir_slot = 0xFF;
+    s_ir_hold = false;
+    cs_load_stored();
+}
 
+void control_surfaces_revert(void) {
+    // Tear down every live binding through the normal path so pins, the PWM
+    // slices and the IR receiver release cleanly, then reload from flash.
+    CsBinding none;
+    memset(&none, 0, sizeof(none));
     for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++) {
-        const CsBinding *b = &stored.bindings[slot];
-        if (b->type == CS_TYPE_NONE) continue;
-        uint8_t st = control_surfaces_apply_binding(slot, b);
-        if (st != PIN_CONFIG_SUCCESS) {
-            // Keep the stored binding visible (inactive) so the config
-            // survives round-trips; the failure is reported in slot_status.
-            s_cfg.bindings[slot] = *b;
-            s_slot_status[slot] = st;
-        }
+        (void)control_surfaces_apply_binding(slot, &none);
+        s_slot_status[slot] = PIN_CONFIG_SUCCESS;
     }
+    memset(&s_ir, 0, sizeof(s_ir));
+    s_ir.version = CS_IR_CONFIG_VERSION;
+    memset(s_ir_op, 0, sizeof(s_ir_op));
+    memset(s_ir_cmd_status, 0, sizeof(s_ir_cmd_status));
+    cs_load_stored();
 }
 
 void control_surfaces_tick(void) {
@@ -1029,22 +1306,46 @@ void control_surfaces_tick(void) {
         CsRuntime *rt = &s_rt[s];
         if (!rt->active) continue;
         const CsBinding *b = &s_cfg.bindings[s];
-        if (rt->op_pending &&
-            cs_noun_dispatch(b->noun, b->target, b->index, rt->op_value))
-            rt->op_pending = false;
+        CsOpState *op = &rt->op;
+        if (op->pending &&
+            cs_noun_dispatch(b->noun, b->target, b->index, op->value))
+            op->pending = false;
         // Confirm checks are slot-staggered to every 4th tick: the live read
         // plus quantize is the engine's costliest recurring float work on the
         // RP2040, and retiring a shadow a few ms late is harmless.
-        if (rt->shadow_active) {
-            if (++rt->shadow_age >= CS_SHADOW_TIMEOUT_TICKS)
-                rt->shadow_active = false;
+        if (op->shadow_active) {
+            if (++op->shadow_age >= CS_SHADOW_TIMEOUT_TICKS)
+                op->shadow_active = false;
             else if (((s_tick_ct + s) & 3u) == 0 &&
                      cs_shadow_confirmed(&cs_noun_table[b->noun],
                                          cs_noun_get(b->noun, b->target, b->index),
-                                         rt))
-                rt->shadow_active = false;
+                                         op))
+                op->shadow_active = false;
         }
     }
+
+    // Same retry / shadow maintenance for the IR commands' op states.
+    for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
+        CsOpState *op = &s_ir_op[sub];
+        if (!op->pending && !op->shadow_active) continue;
+        if (!cs_ir_cmd_live(sub)) { op->pending = false; op->shadow_active = false; continue; }
+        const IrCommand *c = &s_ir.cmds[sub];
+        if (op->pending &&
+            cs_noun_dispatch(c->noun, c->target, c->index, op->value))
+            op->pending = false;
+        if (op->shadow_active) {
+            if (++op->shadow_age >= CS_SHADOW_TIMEOUT_TICKS)
+                op->shadow_active = false;
+            else if (((s_tick_ct + sub) & 3u) == 0 &&
+                     cs_shadow_confirmed(&cs_noun_table[c->noun],
+                                         cs_noun_get(c->noun, c->target, c->index),
+                                         op))
+                op->shadow_active = false;
+        }
+    }
+
+    if (s_ir_slot != 0xFF)
+        cs_tick_ir();
 
     // Buttons decode once per pin group, not per binding.
     for (uint8_t i = 0; i < CS_MAX_BINDINGS; i++)
@@ -1073,8 +1374,14 @@ void control_surfaces_tick(void) {
 
 const CsFlashConfig *control_surfaces_config(void) { return &s_cfg; }
 
+const CsIrConfig *control_surfaces_ir_config(void) { return &s_ir; }
+
 const CsBinding *control_surfaces_get_binding(uint8_t slot) {
     return (slot < CS_MAX_BINDINGS) ? &s_cfg.bindings[slot] : NULL;
+}
+
+const IrCommand *control_surfaces_get_ir_cmd(uint8_t sub) {
+    return (sub < CS_MAX_IR_COMMANDS) ? &s_ir.cmds[sub] : NULL;
 }
 
 void control_surfaces_get_status(CsStatusPacket *out) {
@@ -1082,12 +1389,45 @@ void control_surfaces_get_status(CsStatusPacket *out) {
     out->last_status = cs_last_status;
     out->last_slot = cs_last_slot;
     out->max_bindings = CS_MAX_BINDINGS;
-    out->reserved = 0;
+    out->dirty = s_dirty ? 1 : 0;
     out->active_mask = 0;
     for (int s = 0; s < CS_MAX_BINDINGS; s++) {
         if (s_rt[s].active) out->active_mask |= (uint16_t)(1u << s);
         out->slot_status[s] = s_slot_status[s];
     }
+    out->ir_active_mask = 0;
+    out->ir_learn_state = cs_ir_learn_state();
+    for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
+        if (cs_ir_cmd_live(sub)) out->ir_active_mask |= (uint8_t)(1u << sub);
+        out->ir_cmd_status[sub] = s_ir_cmd_status[sub];
+    }
+}
+
+bool control_surfaces_dirty(void) { return s_dirty; }
+void control_surfaces_set_dirty(bool dirty) { s_dirty = dirty; }
+
+uint8_t control_surfaces_ir_learn_control(uint8_t op) {
+    if (op == 1) {
+        if (s_ir_slot == 0xFF) return CS_STATUS_NO_IR;
+        cs_ir_learn_arm();
+    } else {
+        cs_ir_learn_cancel();
+    }
+    return PIN_CONFIG_SUCCESS;
+}
+
+void control_surfaces_get_ir_learn(uint8_t out[8]) {
+    uint8_t proto = 0;
+    uint32_t code = 0;
+    (void)cs_ir_learn_result(&proto, &code);
+    out[0] = cs_ir_learn_state();
+    out[1] = proto;
+    out[2] = 0;
+    out[3] = 0;
+    out[4] = (uint8_t)(code & 0xFF);
+    out[5] = (uint8_t)((code >> 8) & 0xFF);
+    out[6] = (uint8_t)((code >> 16) & 0xFF);
+    out[7] = (uint8_t)((code >> 24) & 0xFF);
 }
 
 const CsCapsHeader *control_surfaces_caps_header(void) { return &s_caps; }
