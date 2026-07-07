@@ -57,6 +57,7 @@
 #include "hardware/pio.h"
 #include "pico/stdlib.h"
 #include "pico/audio_spdif.h"
+#include "pico/audio_i2s_multi.h"
 #include "adat_output.h"
 
 #include "i2s_input.pio.h"
@@ -166,14 +167,23 @@ static int i2s_slave_offset = -1;
 // clock pins on the input PIO function.  (Data pins are captured per pair.)
 static uint8_t i2s_active_bck_pin;
 
-// RAM copy of the slave program with the BCK/LRCLK GPIO numbers patched into
-// the wait instructions (i2s_bck_pin is runtime-configurable).
-static uint16_t i2s_slave_prog_ram[7];
+// RAM copy of the loaded slave program variant with the BCK/LRCLK GPIO
+// numbers patched into the wait instructions (i2s_bck_pin is runtime
+// configurable).  Sized for the larger (checked) variant; .length is set
+// at load time to the variant actually loaded so stop()'s
+// pio_remove_program frees exactly what was added.
+#define I2S_RX_SLAVE_CHECKED_LEN \
+    (sizeof(audio_i2s_rx_slave_checked_program_instructions) / sizeof(uint16_t))
+static uint16_t i2s_slave_prog_ram[I2S_RX_SLAVE_CHECKED_LEN];
 static struct pio_program i2s_slave_prog = {
     .instructions = i2s_slave_prog_ram,
-    .length = 7,
+    .length = 0,
     .origin = -1,
 };
+
+// PIO irq flag raised by the checked slave program on a framing slip.
+// Block-local: nothing else on the SPDIF/I2S RX PIO raises PIO irq flags.
+#define I2S_RX_SLIP_IRQ 7u
 
 // ============================================================================
 // HELPERS
@@ -206,16 +216,30 @@ static void drain_rx_fifo(uint8_t sm) {
     }
 }
 
-// Patch and load the shared slave program (BCK/LRCLK pins are runtime config).
-// Patch map per i2s_input.pio: instr 0,1 = LRCLK; 2..5 = BCK.
-static void load_slave_program(void) {
-    memcpy(i2s_slave_prog_ram, audio_i2s_rx_slave_program_instructions,
-           sizeof(i2s_slave_prog_ram));
-    i2s_slave_prog_ram[0] = patch_wait_gpio(i2s_slave_prog_ram[0], i2s_active_bck_pin + 1);
-    i2s_slave_prog_ram[1] = patch_wait_gpio(i2s_slave_prog_ram[1], i2s_active_bck_pin + 1);
-    for (int i = 2; i <= 5; i++) {
-        i2s_slave_prog_ram[i] = patch_wait_gpio(i2s_slave_prog_ram[i], i2s_active_bck_pin);
+// Patch and load one of the two wait-driven slave program variants (BCK and
+// LRCLK pins are runtime config).  checked = the external-clock variant with
+// per-frame LRCLK framing verification; plain = the minimal free-running
+// variant for on-chip clocks (master role pairs 1..), which must stay small
+// enough to share program memory with the clkmaster program.
+//
+// Both variants are authored with placeholder GPIO indices in their `wait
+// gpio` instructions (0 = BCK, 1 = LRCLK); every WAIT-source-GPIO opcode
+// gets its 5-bit index rewritten here.
+static void load_slave_program(bool checked) {
+    const uint16_t *src = checked ? audio_i2s_rx_slave_checked_program_instructions
+                                  : audio_i2s_rx_slave_program_instructions;
+    uint8_t len = checked ? audio_i2s_rx_slave_checked_program.length
+                          : audio_i2s_rx_slave_program.length;
+    memcpy(i2s_slave_prog_ram, src, (size_t)len * sizeof(uint16_t));
+    for (uint8_t i = 0; i < len; i++) {
+        uint16_t instr = i2s_slave_prog_ram[i];
+        if ((instr >> 13) != 0x1u) continue;          // not a WAIT
+        if (((instr >> 5) & 0x3u) != 0u) continue;    // WAIT source not GPIO
+        uint8_t pin = (instr & 0x1Fu) ? (uint8_t)(i2s_active_bck_pin + 1)
+                                      : i2s_active_bck_pin;
+        i2s_slave_prog_ram[i] = patch_wait_gpio(instr, pin);
     }
+    i2s_slave_prog.length = len;
     i2s_slave_offset = pio_add_program(i2s_rx_pio, &i2s_slave_prog);
 }
 
@@ -373,9 +397,12 @@ void i2s_input_start(bool clock_master) {
         pio_sm_set_clkdiv_int_frac(i2s_rx_pio, i2s_pairs[0].sm,
                                    (uint16_t)(div >> 8u), (uint8_t)(div & 0xFFu));
 
-        // Pairs 1..: wait-driven slave program against the driven BCK/LRCLK pads.
+        // Pairs 1..: wait-driven slave program against the driven BCK/LRCLK
+        // pads.  Plain (unchecked) variant: on-chip clocks are glitch-free,
+        // and the checked variant would not fit alongside the clkmaster
+        // program in the block's instruction memory.
         if (pairs > 1) {
-            load_slave_program();
+            load_slave_program(false);
             for (uint8_t p = 1; p < pairs; p++) {
                 audio_i2s_rx_slave_program_init(i2s_rx_pio, i2s_pairs[p].sm,
                                                 (uint)i2s_slave_offset,
@@ -395,14 +422,28 @@ void i2s_input_start(bool clock_master) {
         }
         // Make sure the BCK/LRCLK input buffers are on (belt and braces in
         // the on-chip slave role), then run the slave program on every pair.
+        //
+        // Variant selection: the external-clock role runs the CHECKED
+        // program (per-frame LRCLK framing verification + slip flag) because
+        // real-world external masters glitch and re-frame their clocks; the
+        // on-chip slave role keeps the plain free-running program (our own
+        // TX master never glitches, and explicit i2s_input_resync() calls
+        // already re-phase it around output restarts).
         gpio_set_input_enabled(i2s_active_bck_pin, true);
         gpio_set_input_enabled(i2s_active_bck_pin + 1, true);
 
-        load_slave_program();
+        load_slave_program(i2s_role_extclk);
         for (uint8_t p = 0; p < pairs; p++) {
-            audio_i2s_rx_slave_program_init(i2s_rx_pio, i2s_pairs[p].sm,
-                                            (uint)i2s_slave_offset,
-                                            i2s_pairs[p].data_pin);
+            if (i2s_role_extclk) {
+                audio_i2s_rx_slave_checked_program_init(i2s_rx_pio, i2s_pairs[p].sm,
+                                                        (uint)i2s_slave_offset,
+                                                        i2s_pairs[p].data_pin,
+                                                        (uint)(i2s_active_bck_pin + 1));
+            } else {
+                audio_i2s_rx_slave_program_init(i2s_rx_pio, i2s_pairs[p].sm,
+                                                (uint)i2s_slave_offset,
+                                                i2s_pairs[p].data_pin);
+            }
             pio_sm_set_clkdiv_int_frac(i2s_rx_pio, i2s_pairs[p].sm, 1, 0);
         }
     }
@@ -425,6 +466,11 @@ void i2s_input_start(bool clock_master) {
                                    audio_i2s_rx_clkmaster_wrap_target));
     }
     // Slave SMs: pio_sm_init left the PC at the program entry point.
+
+    // A stale framing-slip flag from a previous session would trip the slip
+    // watchdog immediately after the next lock; this (re)start IS the slip
+    // handling, so consume it.
+    if (i2s_role_extclk) pio_interrupt_clear(i2s_rx_pio, I2S_RX_SLIP_IRQ);
 
     // Enable every pair on the SAME cycle so the rings advance in lockstep on
     // the one shared BCK/LRCLK.  (Mirrors audio_*_enable_sync() on the TX path.)
@@ -680,6 +726,7 @@ void i2s_input_prefill_silence(uint32_t frames) {
 static volatile I2sSlaveState i2s_slave_state = I2S_SLAVE_INACTIVE;
 static uint8_t  i2s_slave_lock_count = 0;      // cumulative since boot
 static uint8_t  i2s_slave_loss_count = 0;
+static uint8_t  i2s_slave_slip_count = 0;      // framing slips, cumulative
 static uint32_t i2s_slave_detected_rate = 0;   // snapped Hz, valid when LOCKED
 
 // Word accumulation (pair 0)
@@ -768,10 +815,42 @@ static void i2s_slave_drop_lock(void) {
     notify_push_i2s_slave_state(I2S_SLAVE_RELOCKING, 0);
 }
 
+// Read and clear the framing-slip flags from both PIO blocks: the RX SMs
+// (checked slave program) and the external-clock I2S output SMs.
+DSP_TIME_CRITICAL
+static bool i2s_slave_slip_check(void) {
+    bool slip = false;
+    if (pio_interrupt_get(i2s_rx_pio, I2S_RX_SLIP_IRQ)) {
+        pio_interrupt_clear(i2s_rx_pio, I2S_RX_SLIP_IRQ);
+        slip = true;
+    }
+    if (audio_i2s_extclk_framing_slipped()) slip = true;
+    return slip;
+}
+
 DSP_TIME_CRITICAL
 void i2s_slave_poll(void) {
     if (i2s_slave_state == I2S_SLAVE_INACTIVE || i2s_state != I2S_INPUT_RUNNING)
         return;
+
+    // Framing-slip watchdog.  The checked RX/TX programs verify LRCLK phase
+    // at every frame boundary; a BCK glitch or LRCLK phase jump from the
+    // external master (Amanero-style re-clocking around stream stop/start
+    // or rate switches) sets a PIO irq flag and the program re-frames
+    // itself.  A slip leaves the word RATE unchanged, so the rate watchdog
+    // below can never see one; and a slipped pair/slot is no longer
+    // sample-aligned with its peers, which only a full restart can fix.
+    // Treat the flag exactly like a clock loss: drop the lock and let the
+    // main loop's RELOCKING path restart the receiver and re-frame every
+    // output via the prefill's gated synchronized start.
+    if (i2s_slave_slip_check()) {
+        if (i2s_slave_slip_count < 255) i2s_slave_slip_count++;
+        if (i2s_slave_state != I2S_SLAVE_RELOCKING) {
+            i2s_slave_drop_lock();
+            meas_measured_hz = 0;
+        }
+        return;
+    }
 
     uint64_t now = time_us_64();
     uint32_t w = pair_write_word(&i2s_pairs[0]);
@@ -960,6 +1039,7 @@ void i2s_slave_get_status(I2sSlaveStatusPacket *out) {
     out->loss_count = i2s_slave_loss_count;
     out->detected_rate = i2s_slave_detected_rate;
     out->measured_hz = meas_measured_hz;
+    out->slip_count = i2s_slave_slip_count;
 }
 
 // ============================================================================

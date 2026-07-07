@@ -1,6 +1,6 @@
 # I2S Clock-Slave Input Mode Specification
 
-*Last updated: 2026-07-06*
+*Last updated: 2026-07-07 (framing-slip watchdog: per-frame LRCLK verification in both external-clock PIO programs, slip_count in the status packet)*
 
 This document specifies the I2S clock-slave input mode: behavior, wiring, the
 complete host-facing control surface (vendor commands, notifications, bulk
@@ -134,6 +134,34 @@ Mechanics:
 - A long-window (8-16 s) measurement refines the servo rate reference to
   ~0.1 ppm, which keeps ADAT rate-locked even with no SPDIF slot to observe.
 
+### Framing-slip watchdog
+
+Real-world external masters (USB-I2S bridges such as the Amanero Combo384)
+glitch or re-frame BCK/LRCLK around stream stop/start, pause/seek, and
+44.1/48-family rate switches. A short glitch (under the 5 ms clock-loss
+timeout) does not change the word RATE, so the lock state machine alone
+cannot see it; with naive free-running capture it would shift the bit
+alignment for the rest of the session (the sign bit lands mid-word and
+meters/audio show full-scale wrapped garbage).
+
+Both external-clock PIO programs (RX capture and edge-slaved I2S TX)
+therefore verify the LRCLK level at the two adjacent bit cells straddling
+every frame boundary, which catches every sub-frame misalignment within one
+frame. On a mismatch the program:
+
+1. re-frames itself at the next LRCLK falling edge (bounding wrong data to
+   ~2 frames, with L/R word order preserved so channels can never swap), and
+2. raises a PIO irq flag that `i2s_slave_poll()` treats exactly like a
+   clock loss: outputs mute, the receiver restarts, the device re-locks and
+   re-prefills, and every output re-frames through the gated synchronized
+   start (restoring inter-slot sample alignment, which a slip breaks at the
+   wire level).
+
+Each detected slip increments `slip_count` in the status packet (and
+`loss_count`, via the relock it forces). A steadily climbing `slip_count`
+with a stable master indicates signal-integrity problems on the BCK/LRCLK
+wiring rather than source behavior.
+
 ### Rate reporting
 
 - `REQ_GET_INPUT_RATE` (0xEE) still returns `{current pipeline Hz, selected
@@ -188,7 +216,8 @@ Returns the 16-byte `I2sSlaveStatusPacket` (little-endian):
 | 3 | 1 | loss_count | Losses since boot (saturates at 255) |
 | 4 | 4 | detected_rate | Snapped Hz (44100/48000/96000); 0 unless LOCKED |
 | 8 | 4 | measured_hz | Raw measured external rate, rounded Hz; 0 when no clocks |
-| 12 | 4 | reserved | Zero |
+| 12 | 1 | slip_count | Framing slips since boot (saturates at 255); each also increments loss_count via the relock it forces |
+| 13 | 3 | reserved | Zero |
 
 Poll this for diagnostics UI (e.g. 2-10 Hz while an I2S settings page is
 open). For state transitions prefer NOTIFY event 0x09.
@@ -326,14 +355,20 @@ positive confirmation, wait for the PARAM_CHANGED on
   88.2/176.4/192 kHz master never locks; outputs stay muted.
 - **BCK must be 64 x Fs and LRCLK polarity standard.** No runtime detection
   of other framings.
-- **Extreme DMA-interrupt outages can slip edge-slaved I2S output framing.**
-  The edge-slaved TX program free-runs between synchronized starts; a DMA
-  service outage longer than the joined TX FIFO (roughly 80 microseconds at
-  48 kHz) would slip its framing against the external clock until the next
-  synchronized restart (any prefill/reset re-frames it). This mirrors the
-  pre-existing exposure of the internal data-only I2S slave program and has
-  the same practical headroom; flash operations already suspend and restart
-  the pipeline around their blackout.
+- **Whole-frame slips are undetectable.** The framing-slip watchdog catches
+  every sub-frame misalignment, but a glitch burst that adds or drops
+  exactly 64 BCK edges (one whole frame) with every intermediate per-frame
+  check passing leaves a validly framed stream shifted one frame in time,
+  which no LRCLK-level check can distinguish. In practice a burst that
+  large trips a check (or the 5 ms clock-loss timeout) mid-way.
+- **Extreme DMA-interrupt outages slip edge-slaved I2S output framing, but
+  it now self-heals.** A DMA service outage longer than the joined TX FIFO
+  (roughly 80 microseconds at 48 kHz) stalls the TX program against the
+  external clock; the per-frame LRCLK check catches the resulting
+  misalignment at the next frame boundary and forces the standard
+  relock/re-frame instead of leaving it garbled until the next reset.
+  Flash operations already suspend and restart the pipeline around their
+  blackout.
 - **Mute-and-wait on clock loss** means downstream SPDIF/ADAT DACs lose lock
   while external clocks are absent (the deliberate design choice; there is
   no internal-clock fallback).
@@ -352,7 +387,9 @@ positive confirmation, wait for the PARAM_CHANGED on
 |---|---|
 | Mode globals, pending flags, `i2s_slave_mode_active()` | `firmware/DSPi/audio_input.h/.c` |
 | RX external role, rate measurement, lock FSM, servo, status | `firmware/DSPi/i2s_input.c` (`i2s_slave_*`), `i2s_input.h` |
-| Edge-slaved TX PIO program | `firmware/pico-extras/src/rp2_common/pico_audio_i2s_multi/audio_i2s_dataout_extclk.pio` |
+| Checked RX PIO program (per-frame LRCLK verification) | `firmware/DSPi/i2s_input.pio` (`audio_i2s_rx_slave_checked`) |
+| Framing-slip watchdog (flag read/clear, relock trigger) | `i2s_input.c` (`i2s_slave_slip_check`), `audio_i2s_multi.c` (`audio_i2s_extclk_framing_slipped`) |
+| Edge-slaved TX PIO program (with the same per-frame verification) | `firmware/pico-extras/src/rp2_common/pico_audio_i2s_multi/audio_i2s_dataout_extclk.pio` |
 | Library external-clock plumbing, program patch/reload, two-phase `enable_sync_prepare` | `audio_i2s_multi.c/.h` (and `audio_spdif.c/.h` for the SPDIF prepare half) |
 | LRCLK-gated combined output start, main-loop slave block, deferred mode-change handler, type-switch clocking rebuild | `firmware/DSPi/main.c` |
 | ADAT servo handoff | `firmware/DSPi/adat_output.c` (`adat_output_servo_divider`, resync divider pull) |

@@ -262,6 +262,26 @@ void audio_i2s_update_all_frequencies(uint32_t sample_freq);
 int8_t audio_i2s_get_clock_master_index(void);
 
 // ---------------------------------------------------------------------------
+// External-clock framing-slip flag
+// ---------------------------------------------------------------------------
+
+// PIO irq flag raised by audio_i2s_dataout_extclk.pio when its per-frame
+// LRCLK verification fails (external BCK glitch or LRCLK phase jump).  The
+// program re-frames itself; software must treat the flag like a clock loss
+// (the slipped slot is no longer sample-aligned with internally clocked
+// slots until the next synchronized output start).
+#define AUDIO_I2S_EXTCLK_SLIP_IRQ 7u
+
+/** \brief Read and clear the external-clock framing-slip flag
+ * \ingroup pico_audio_i2s_multi
+ *
+ * True if any external-clock I2S output SM flagged a framing slip since the
+ * last call.  Also cleared by audio_i2s_enable_sync_prepare() for extclk
+ * instances (a restart IS the slip handling).
+ */
+bool audio_i2s_extclk_framing_slipped(void);
+
+// ---------------------------------------------------------------------------
 // MCK (Master Clock) generator API
 // ---------------------------------------------------------------------------
 //

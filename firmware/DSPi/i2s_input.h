@@ -93,7 +93,10 @@ typedef struct __attribute__((packed)) {
     uint8_t  loss_count;      // losses since boot (saturates at 255)
     uint32_t detected_rate;   // snapped Hz (44100/48000/96000), 0 unless LOCKED
     uint32_t measured_hz;     // raw measured external rate, 0 when no clocks
-    uint8_t  reserved[4];
+    uint8_t  slip_count;      // framing slips since boot (saturates at 255);
+                              // each one also increments loss_count via the
+                              // relock it forces
+    uint8_t  reserved[3];
 } I2sSlaveStatusPacket;
 
 // Main-loop poll while the input runs in the slave role: accumulates the
