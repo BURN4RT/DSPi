@@ -168,6 +168,14 @@ typedef enum {
 #define CS_MAX_BINDINGS  16
 #define CS_GPIO_UNUSED   0xFF
 
+// Per-slot user label ("Sub Level", "Mute All", ...), NUL-terminated, set by
+// the host app and persisted device-global in the preset directory (V10+)
+// so external MCUs and apps on other hosts can read what each control is
+// for.  Same 32-byte convention as preset and channel names.  Names are
+// slot metadata, independent of the binding: they survive binding changes
+// and slot clears, and may be set before a binding exists.
+#define CS_NAME_LEN      32
+
 // ---------------------------------------------------------------------------
 // Wire / flash structures
 // ---------------------------------------------------------------------------
@@ -257,6 +265,7 @@ typedef struct __attribute__((packed)) {
                                         // this GPIO+event pair
 #define CS_STATUS_BUSY            0x1B  // a previous binding SET is still
                                         // queued for apply; retry shortly
+#define CS_STATUS_FLASH_ERROR     0x1C  // directory persist failed (name SET)
 
 // ---------------------------------------------------------------------------
 // Public API (all main-loop context)
@@ -295,12 +304,18 @@ const CsNounDesc *control_surfaces_noun_desc(uint8_t noun);   // NULL if bad nou
 
 // Deferred SET (written by the vendor handler, consumed by the main loop;
 // same shape as ctrl_set_uart_pending).  cs_last_status / cs_last_slot feed
-// REQ_GET_CS_STATUS.
+// REQ_GET_CS_STATUS and report both binding and name SETs.
 extern volatile bool    cs_set_binding_pending;
 extern uint8_t          cs_set_binding_slot;
 extern CsBinding        cs_set_binding_val;
 extern volatile uint8_t cs_last_status;
 extern volatile uint8_t cs_last_slot;
+
+// Deferred slot-name SET (REQ_SET_CS_NAME); the persist is a directory
+// flash write, so it is consumed in the main loop like the binding SET.
+extern volatile bool    cs_set_name_pending;
+extern uint8_t          cs_set_name_slot;
+extern char             cs_set_name_val[CS_NAME_LEN];
 
 // ---------------------------------------------------------------------------
 // Internal interface between the engine (control_surfaces.c) and the noun

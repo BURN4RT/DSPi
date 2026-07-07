@@ -1181,10 +1181,10 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 9)
-*Last updated: 2026-07-06 (V9 grows the Control Surfaces config to format v2)*
+### Preset Directory Fields (Version 10)
+*Last updated: 2026-07-07 (V10 appends per-slot Control Surfaces names)*
 
-`DIR_VERSION_CURRENT` = 9. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 10. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
 device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
 I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
@@ -1210,8 +1210,15 @@ v1 layout is frozen as `CsFlashConfig_v1` and translated field-by-field via
 `cs_config_from_v1()`. Both older versions fan in to V9: the V8->V9 step copies
 every field forward and upgrades `cs_config`, while V7->V9 additionally widens
 the 23-byte v7 `output_config` into the 25-byte field (new ADAT bytes zeroed).
-`dir_sanitize_cs_config()` now also range-checks each binding's `event`. This
-growth makes `sizeof(PresetDirectory)` 789 bytes (was ~533), still within the
+`dir_sanitize_cs_config()` now also range-checks each binding's `event`. V10
+appends the per-slot Control Surfaces names (`cs_names[16][32]`, 512 bytes):
+user labels set via `REQ_SET_CS_NAME` (0x8B) and read via `REQ_GET_CS_NAME`
+(0x8C), slot metadata independent of the binding table (survive binding
+changes; may be set before a binding exists). The V9->V10 step validates the
+V9 CRC (frozen `PresetDirectory_v9` snapshot), copies every field forward, and
+leaves the new block zeroed (all slots unnamed); `dir_sanitize_cs_config()`
+additionally forces NUL termination on every name at load. This growth makes
+`sizeof(PresetDirectory)` 1301 bytes (789 at V9), still within the
 single 4 KB directory sector. See
 `Documentation/Features/output_config_independent_load.md`,
 `Documentation/Features/control_interfaces_spec.md`, and
@@ -1233,6 +1240,7 @@ single 4 KB directory sector. See
 | uart_ctrl | UART control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
 | i2c_ctrl | I2C target control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
 | cs_config | Control Surfaces bindings (V7 format v1 = 132 B / 8x 16-byte; V9 format v2 = 388-byte `CsFlashConfig`: version + 16x 24-byte `CsBinding`; all-zero = idle; board-level, survives factory reset) |
+| cs_names[16][32] | Per-slot Control Surfaces names (V10+): 32-byte NUL-terminated user labels, independent of the bindings; all-zero = unnamed; board-level, survives factory reset |
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-04-09*
@@ -1688,9 +1696,11 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 > per-GPIO button gesture groups, and small cursors. Its code+rodata (now split
 > across `control_surfaces.c` and `control_surfaces_nouns.c`) is cold and runs
 > from flash XIP (above) so it does not consume RAM `.data`. In flash, the
-> preset directory grows by the 388-byte `CsFlashConfig` (V9); `sizeof
-> (PresetDirectory)` is now 789 bytes (was ~533), still well within its 4 KB
-> sector, so the flash layout is unchanged.
+> preset directory grows by the 388-byte `CsFlashConfig` (V9) plus the
+> 512-byte per-slot name block `cs_names[16][32]` (V10, 2026-07-07);
+> `sizeof(PresetDirectory)` is now 1301 bytes (789 at V9, ~533 before), still
+> well within its 4 KB sector, so the flash layout is unchanged. The name
+> block also grows the BSS `dir_cache` mirror by 512 bytes on both platforms.
 
 ### RP2040 (264 KB SRAM)
 
@@ -1973,11 +1983,12 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-07-06 (format v2: gestures, PWM LEDs, targeted nouns, 16 slots)*
+*Last updated: 2026-07-07 (per-slot persistent names, cmds 0x8B/0x8C, dir V10)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, and PWM-dimmed LEDs on spare GPIOs, configured
-over vendor commands `0x84`-`0x87`. A binding attaches one component (`CsType`)
+over vendor commands `0x84`-`0x87` plus `0x8B`/`0x8C` (per-slot names). A
+binding attaches one component (`CsType`)
 to one firmware parameter (`CsNoun`) through one operation (`CsAction`), on one
 or two GPIOs. The full integrator spec is
 `Documentation/Features/control_surfaces_spec.md`.
@@ -2021,12 +2032,13 @@ offers it and no binding to it validates there.
   through `REQ_SET_EQ_PARAM` behind an `eq_update_pending` BUSY guard;
   `CS_NOUN_FILTER_BYPASS` uses `REQ_SET_BAND_BYPASS`. Like `control_surfaces.c`,
   this file executes from flash XIP on RP2040 (not in the RAM pull list).
-- `vendor_commands.c`: the `0x84`-`0x87` handlers; `REQ_SET_CS_BINDING` latches a
-  deferred SET, the three GETs return live accessor data.
+- `vendor_commands.c`: the `0x84`-`0x87` and `0x8B`/`0x8C` handlers;
+  `REQ_SET_CS_BINDING` and `REQ_SET_CS_NAME` latch deferred SETs, the GETs
+  return live accessor data.
   `control_surfaces_owns_pin()` is wired into `pin_used_by_fixed_peripheral()`.
-- `flash_storage.c`: directory V9 persistence (`preset_set/get_cs_config`,
-  `dir_sanitize_cs_config`, the fan-in V7->V9 and V8->V9 migrations via
-  `cs_config_from_v1()`).
+- `flash_storage.c`: directory V10 persistence (`preset_set/get_cs_config`,
+  `preset_set/get_cs_name`, `dir_sanitize_cs_config`, the fan-in V7->V10 and
+  V8->V10 migrations via `cs_config_from_v1()`, and the V9->V10 name append).
 
 ### Dispatcher reuse via `CTRL_SOURCE_GPIO`
 
@@ -2081,12 +2093,30 @@ GPIO+event pair already claimed by another button binding), and
 `CS_STATUS_BUSY` (0x1B, a SET arrived while a previous SET was still queued
 for the main-loop apply; the new SET is dropped and the host retries).
 
+### Per-slot names (0x8B/0x8C, V10)
+
+Each of the 16 slots carries a device-persistent 32-byte NUL-terminated user
+label (`CS_NAME_LEN`, same convention as preset and channel names), set by the
+host app via `REQ_SET_CS_NAME` (0x8B) and read via `REQ_GET_CS_NAME` (0x8C),
+so external MCUs on UART/I2C and apps on other hosts can display what each
+control is for. Names are slot metadata independent of the binding: they
+survive binding changes and slot clears, and may be set before a binding
+exists. The SET is deferred like the binding SET (the persist is a
+directory-sector flash write, consumed in the main loop via
+`cs_set_name_pending`) and reports through the shared `cs_last_status` /
+`cs_last_slot` channel: `CS_STATUS_PENDING` then `PIN_CONFIG_SUCCESS`, or
+`CS_STATUS_FLASH_ERROR` (0x1C) if the directory write fails; `CS_STATUS_BUSY`
+if a previous name SET is still queued. The GET reads the directory RAM cache
+(no flash access). A payload of one NUL byte clears the name; names are not
+part of `WireBulkParams` and emit no notification.
+
 ### Persistence and platform placement
 
-The binding table is device-global in the preset directory (V9, 388-byte
+The binding table is device-global in the preset directory (388-byte
 `CsFlashConfig`: version + 16x 24-byte `CsBinding`), board-level like
 `dac_hw_mute` and the control-interface config; it survives preset changes and
-factory reset and is not part of `WireBulkParams`. On RP2040
+factory reset and is not part of `WireBulkParams`. The per-slot names live
+next to it (V10, `cs_names[16][32]`) with the same lifetime. On RP2040
 `control_surfaces.c.o` and `control_surfaces_nouns.c.o` execute from flash XIP
 (see Memory Layout). Behavior is identical on both platforms (same 16 bindings,
 same ADC pins 26-28) except that `CS_NOUN_ADAT_ACTIVE` is RP2350-only (empty
@@ -2095,7 +2125,7 @@ action mask on RP2040).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-06 (Control Surfaces v2: 0x84-0x87 payloads grow, no new codes)*
+*Last updated: 2026-07-07 (Control Surfaces slot names: 0x8B/0x8C)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2164,6 +2194,8 @@ action mask on RP2040).
 | REQ_GET_CS_BINDING | 0x85 | IN | Get the live 24-byte CsBinding for a slot (wValue=slot) |
 | REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 32-byte header+type table; wValue=noun: 12-byte CsNounDesc) |
 | REQ_GET_CS_STATUS | 0x87 | IN | Get 22-byte CsStatusPacket (last SET result + 16-bit active_mask + per-slot apply status) |
+| REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); deferred persist, poll 0x87 for result |
+| REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated) |
 | REQ_PRESET_SAVE | 0x90 | IN | Save live state to preset slot (wValue=slot) |
 | REQ_PRESET_LOAD | 0x91 | IN | Load preset slot to live state (wValue=slot) |
 | REQ_PRESET_DELETE | 0x92 | IN | Delete preset slot (wValue=slot) |

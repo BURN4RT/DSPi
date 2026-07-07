@@ -116,6 +116,16 @@ void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out);
 void preset_set_cs_config(const CsFlashConfig *cfg);
 void preset_get_cs_config(CsFlashConfig *out);
 
+// Control Surfaces slot names (board-level, directory-stored, V10+).  User
+// labels for what each control slot is for; independent of the bindings
+// (survive binding changes and slot clears).  Setter is synchronous and
+// main-loop only (one directory-sector write); `name` is copied with
+// guaranteed NUL termination (up to CS_NAME_LEN-1 chars).  Getter copies
+// CS_NAME_LEN bytes from the RAM cache into `name_out`.
+// Both return PRESET_OK or PRESET_ERR_*.
+uint8_t preset_set_cs_name(uint8_t slot, const char *name);
+uint8_t preset_get_cs_name(uint8_t slot, char *name_out);
+
 // Get the currently active preset slot (always 0-9).
 uint8_t preset_get_active(void);
 

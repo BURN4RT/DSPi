@@ -1088,6 +1088,37 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             break;
         }
 
+        case REQ_SET_CS_NAME: {
+            // wValue = slot, payload = 1-32 bytes of name (a single NUL
+            // byte clears it).  Deferred to main loop: the persist is a
+            // directory flash write.  Result lands in cs_last_status,
+            // readable via REQ_GET_CS_STATUS, like the binding SET.
+            uint8_t slot = vendor_last_wValue & 0xFF;
+            if (slot >= CS_MAX_BINDINGS) {
+                cs_last_status = CS_STATUS_INVALID_SLOT;
+                cs_last_slot = slot;
+            } else if (cs_set_name_pending) {
+                // Single-deep handoff still holds an unapplied name;
+                // overwriting it would silently drop that write.
+                cs_last_status = CS_STATUS_BUSY;
+                cs_last_slot = slot;
+            } else if (buffer->data_len > 0) {
+                memset(cs_set_name_val, 0, CS_NAME_LEN);
+                size_t copy_len = buffer->data_len < (CS_NAME_LEN - 1)
+                                ? buffer->data_len : (CS_NAME_LEN - 1);
+                memcpy(cs_set_name_val, vendor_rx_buf, copy_len);
+                cs_set_name_slot = slot;
+                cs_last_status = CS_STATUS_PENDING;
+                cs_last_slot = slot;
+                __dmb();
+                cs_set_name_pending = true;
+            } else {
+                cs_last_status = CS_STATUS_INVALID_VALUE;
+                cs_last_slot = slot;
+            }
+            break;
+        }
+
         case REQ_SET_CHANNEL_NAME: {
             // wValue = channel index, payload = 1-32 bytes of name
             uint8_t ch = vendor_last_wValue & 0xFF;
@@ -1970,6 +2001,19 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 CsStatusPacket pkt;
                 control_surfaces_get_status(&pkt);
                 vendor_send_response(&pkt, sizeof(pkt));
+                return true;
+            }
+
+            case REQ_GET_CS_NAME: {
+                // wValue = slot; returns the persisted 32-byte name (from
+                // the directory RAM cache; no flash access).
+                if (setup->wValue >= CS_MAX_BINDINGS) return false;
+                char name[CS_NAME_LEN];
+                if (preset_get_cs_name((uint8_t)setup->wValue, name) != PRESET_OK) {
+                    return false;
+                }
+                memcpy(resp_buf, name, CS_NAME_LEN);
+                vendor_send_response(resp_buf, CS_NAME_LEN);
                 return true;
             }
 

@@ -201,10 +201,14 @@ extern volatile uint32_t nominal_feedback_10_14;
 
 // Control Surfaces Commands (physical controls/indicators on user GPIOs).
 // See control_surfaces.h and Documentation/Features/control_surfaces_spec.md.
-#define REQ_SET_CS_BINDING          0x84  // wValue = slot (0-7), payload = 16-byte CsBinding
-#define REQ_GET_CS_BINDING          0x85  // wValue = slot, returns 16-byte CsBinding
-#define REQ_GET_CS_CAPS             0x86  // wValue = 0xFFFF: header + type table; wValue = noun: 8-byte noun descriptor
-#define REQ_GET_CS_STATUS           0x87  // returns 12-byte CsStatusPacket
+#define REQ_SET_CS_BINDING          0x84  // wValue = slot (0-15), payload = 24-byte CsBinding
+#define REQ_GET_CS_BINDING          0x85  // wValue = slot, returns 24-byte CsBinding
+#define REQ_GET_CS_CAPS             0x86  // wValue = 0xFFFF: header + type table; wValue = noun: 12-byte noun descriptor
+#define REQ_GET_CS_STATUS           0x87  // returns 22-byte CsStatusPacket
+// 0x88-0x8A reserved (claimed by the I2S slave-mode branch)
+#define REQ_SET_CS_NAME             0x8B  // wValue = slot (0-15), payload = 1-32 byte name (a single
+                                          // NUL byte clears it); deferred, result via REQ_GET_CS_STATUS
+#define REQ_GET_CS_NAME             0x8C  // wValue = slot, returns 32-byte NUL-terminated name
 
 // Preset System Commands
 #define REQ_PRESET_SAVE             0x90

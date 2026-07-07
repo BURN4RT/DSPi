@@ -320,6 +320,12 @@ typedef struct __attribute__((packed)) {
 // fields) and the slot count grows from 8 to 16, so cs_config grows from 132 to
 // 388 bytes.  The V8→V9 migration copies each of the 8 old bindings' shared
 // fields forward and zeroes the new ones; slots 8..15 start empty.
+//
+// V10 appends per-slot Control Surfaces names (16 x 32 bytes): user labels for
+// what each physical control is for, set by the host app and readable by
+// external MCUs / other hosts via REQ_GET_CS_NAME.  Slot metadata independent
+// of the bindings (a name may exist before its binding and survives binding
+// changes), hence a directory field rather than a cs_config format bump.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -355,6 +361,10 @@ typedef struct __attribute__((packed)) {
     // every slot CS_TYPE_NONE = feature idle.  V9 grew this from 132 to 388
     // bytes (config format v2: 24-byte bindings, 16 slots).
     CsFlashConfig cs_config;                 // 388 bytes
+
+    // V10 addition: per-slot Control Surfaces names (user labels, NUL-
+    // terminated).  All-zero = unnamed; a fresh directory needs no seeding.
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -473,7 +483,32 @@ typedef struct __attribute__((packed)) {
     CsFlashConfig_v1 cs_config;              // 132 bytes (frozen format v1)
 } PresetDirectory_v8;
 
-#define DIR_VERSION_CURRENT  9
+// Historical directory layout at V9, before the per-slot Control Surfaces
+// names were appended.  Read only by the V9→V10 migration in load_directory();
+// identical to the current PresetDirectory except it lacks the trailing
+// cs_names block.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 25 bytes
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+} PresetDirectory_v9;
+
+#define DIR_VERSION_CURRENT  10
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -822,6 +857,39 @@ static bool dir_load_cache(void) {
         return true;
     }
 
+    if (flash_dir->version == 9) {
+        // V9 → V10 migration.  V10 appends the per-slot Control Surfaces
+        // names (16 x 32 bytes).  Validate the v9 CRC, copy every field
+        // forward, and leave the new block zeroed (all slots unnamed).
+        const PresetDirectory_v9 *v9 = (const PresetDirectory_v9 *)flash_dir;
+        const uint8_t *v9_data_start = (const uint8_t *)&v9->startup_mode;
+        size_t v9_data_len = sizeof(PresetDirectory_v9) - offsetof(PresetDirectory_v9, startup_mode);
+        if (crc32(v9_data_start, v9_data_len) != v9->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v9->startup_mode;
+        dir_cache.default_slot       = v9->default_slot;
+        dir_cache.last_active_slot   = v9->last_active_slot;
+        dir_cache.output_config_mode = v9->output_config_mode;
+        dir_cache.slot_occupied      = v9->slot_occupied;
+        dir_cache.master_volume_mode = v9->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v9->spdif_rx_pin;
+        dir_cache.master_volume_db   = v9->master_volume_db;
+        memcpy(dir_cache.slot_names, v9->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v9->dac_hw_mute;
+        dir_cache.output_config      = v9->output_config;
+        dir_cache.uart_ctrl          = v9->uart_ctrl;
+        dir_cache.i2c_ctrl           = v9->i2c_ctrl;
+        dir_cache.cs_config          = v9->cs_config;   // already format v2
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
+        return true;
+    }
+
     if (flash_dir->version == 8) {
         // V8 → V9 migration.  V9 upgrades the embedded Control Surfaces config
         // from format v1 (132 bytes: 8 x 16-byte bindings) to v2 (388 bytes:
@@ -851,7 +919,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v8->i2c_ctrl;
         cs_config_from_v1(&dir_cache.cs_config, &v8->cs_config);
         dir_cache_valid = true;
-        (void)dir_flush();   // persist as V9
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -892,7 +960,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v7->i2c_ctrl;
         cs_config_from_v1(&dir_cache.cs_config, &v7->cs_config);
         dir_cache_valid = true;
-        (void)dir_flush();   // persist as V9
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -1210,6 +1278,11 @@ static void dir_sanitize_cs_config(void) {
     // Normalize the version byte; pre-V7 migration paths leave it 0 (same
     // layout, all slots NONE).
     c->version = CS_CONFIG_VERSION;
+    // Names (V10): guarantee NUL termination so hand-edited flash can never
+    // leak an unterminated string to REQ_GET_CS_NAME readers.
+    for (int s = 0; s < CS_MAX_BINDINGS; s++) {
+        dir_cache.cs_names[s][CS_NAME_LEN - 1] = '\0';
+    }
 }
 
 // Write the RAM-cached directory back to flash.
@@ -2290,6 +2363,30 @@ void preset_get_cs_config(CsFlashConfig *out) {
     if (!out) return;
     dir_ensure();
     memcpy(out, &dir_cache.cs_config, sizeof(*out));
+}
+
+// Control Surfaces slot names (V10).  Setter mirrors preset_set_name:
+// synchronous, main-loop only, one directory-sector write.  Getter reads the
+// RAM cache, so it is cheap enough for the vendor GET path.
+uint8_t preset_set_cs_name(uint8_t slot, const char *name) {
+    if (slot >= CS_MAX_BINDINGS) return PRESET_ERR_INVALID_SLOT;
+    dir_ensure();
+
+    // Copy name with guaranteed NUL termination
+    memset(dir_cache.cs_names[slot], 0, CS_NAME_LEN);
+    strncpy(dir_cache.cs_names[slot], name, CS_NAME_LEN - 1);
+
+    if (dir_flush() != 0) {
+        return PRESET_ERR_FLASH_WRITE;
+    }
+    return PRESET_OK;
+}
+
+uint8_t preset_get_cs_name(uint8_t slot, char *name_out) {
+    if (slot >= CS_MAX_BINDINGS) return PRESET_ERR_INVALID_SLOT;
+    dir_ensure();
+    memcpy(name_out, dir_cache.cs_names[slot], CS_NAME_LEN);
+    return PRESET_OK;
 }
 
 // Copy the live master volume into the directory's independent field and

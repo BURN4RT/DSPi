@@ -1817,6 +1817,25 @@ int main(void) {
                 }
             }
 
+            // Control Surfaces slot-name SET (deferred).  Pure slot
+            // metadata: no engine state to apply, just the directory
+            // persist.  Slot range was validated at the vendor handler.
+            if (cs_set_name_pending) {
+                char name[CS_NAME_LEN];
+                uint8_t slot;
+                uint32_t f = save_and_disable_interrupts();
+                memcpy(name, cs_set_name_val, sizeof(name));
+                slot = cs_set_name_slot;
+                cs_set_name_pending = false;
+                restore_interrupts(f);
+                prepare_flash_write_operation();
+                uint8_t rc = preset_set_cs_name(slot, name);
+                complete_flash_write_operation_light();
+                cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
+                                                   : CS_STATUS_FLASH_ERROR;
+                cs_last_slot = slot;
+            }
+
             // DAC hardware mute config update (deferred from USB ISR).
             // dac_hw_mute_set_config does validation, applies live pin
             // claims, writes the directory (~45 ms flash), and emits the

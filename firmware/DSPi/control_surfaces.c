@@ -91,6 +91,11 @@ CsBinding        cs_set_binding_val;
 volatile uint8_t cs_last_status = PIN_CONFIG_SUCCESS;
 volatile uint8_t cs_last_slot = 0;
 
+// Deferred slot-name SET handoff (persist is a directory flash write)
+volatile bool    cs_set_name_pending = false;
+uint8_t          cs_set_name_slot = 0;
+char             cs_set_name_val[CS_NAME_LEN];
+
 // ---------------------------------------------------------------------------
 // Type capability table; the per-noun half lives in control_surfaces_nouns.c.
 // REQ_GET_CS_CAPS serves these verbatim, so host UIs and the firmware can

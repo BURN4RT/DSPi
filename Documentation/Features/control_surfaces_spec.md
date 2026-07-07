@@ -2,12 +2,13 @@
 
 *Firmware capability format version: 2*
 *Config (flash) version: 2*
-*Directory version: 9*
+*Directory version: 10*
 
 This document is the complete, self-contained specification for the DSPi
 Control Surfaces feature: user-wired push buttons, toggle switches,
 potentiometers, quadrature rotary encoders, indicator LEDs, and PWM-dimmed
-LEDs on spare GPIOs, configured over vendor commands `0x84`-`0x87`. It is
+LEDs on spare GPIOs, configured over vendor commands `0x84`-`0x87` plus
+`0x8B`/`0x8C` (per-slot names). It is
 written for a host-app developer (e.g. DSPi Console) or an LLM adding Control
 Surfaces support to an app, or extending the firmware feature itself. No DSPi
 source is required to implement a host client.
@@ -99,6 +100,11 @@ Consequently the config:
 
 An all-zero blob (every slot `CS_TYPE_NONE`) is the idle state; a fresh or
 factory-reset device needs no special seeding.
+
+The per-slot **names** (section 3.4) follow the same reasoning and live in the
+same directory (V10), as slot metadata alongside the binding table rather than
+inside it: a name describes the physical control ("Sub Level"), so it survives
+binding edits and slot clears, and may be set before a binding exists.
 
 ---
 
@@ -230,7 +236,7 @@ Returned by `REQ_GET_CS_STATUS`.
 
 ---
 
-## 3. Command reference (`0x84`-`0x87`)
+## 3. Command reference (`0x84`-`0x87`, `0x8B`-`0x8C`)
 
 | Command | Code | Dir | wValue | wLength / payload | Response |
 |---------|------|-----|--------|-------------------|----------|
@@ -238,13 +244,17 @@ Returned by `REQ_GET_CS_STATUS`.
 | `REQ_GET_CS_BINDING` | `0x85` | IN | slot (0-15) | - | 24-byte `CsBinding` (live) |
 | `REQ_GET_CS_CAPS` | `0x86` | IN | `0xFFFF` = header+types; else noun index | - | 32-byte `CsCapsHeader` or 12-byte `CsNounDesc` |
 | `REQ_GET_CS_STATUS` | `0x87` | IN | - | - | 22-byte `CsStatusPacket` |
+| `REQ_SET_CS_NAME` | `0x8B` | OUT | slot (0-15) | 1-32 byte name | none (deferred; poll `0x87`) |
+| `REQ_GET_CS_NAME` | `0x8C` | IN | slot (0-15) | - | 32-byte NUL-terminated name |
+
+(`0x88`-`0x8A` are reserved for another feature branch.)
 
 ### 3.1 Transport note (UART / I2C)
 
 Every one of these commands works identically over USB, UART, and I2C (the
 transport-neutral dispatcher). On the external transports, the direction bit
-matters: `0x85`, `0x86`, `0x87` are IN (GET-type) frames; `0x84` is an OUT
-(SET-type) frame carrying the 24-byte payload.
+matters: `0x85`, `0x86`, `0x87`, `0x8C` are IN (GET-type) frames; `0x84` and
+`0x8B` are OUT (SET-type) frames carrying their payload.
 
 ### 3.2 Deferred-apply model (`REQ_SET_CS_BINDING`)
 
@@ -298,6 +308,39 @@ Surfaces extends it from `0x10`.
 | `0x19` | `CS_STATUS_PWM_CONFLICT` | PWM LED collides with another PWM LED on the same PWM slice+channel |
 | `0x1A` | `CS_STATUS_EVENT_IN_USE` | another button binding already has this GPIO+event pair |
 | `0x1B` | `CS_STATUS_BUSY` | SET dropped; a previous binding SET is still queued for apply (retry after polling) |
+| `0x1C` | `CS_STATUS_FLASH_ERROR` | name SET accepted but the directory persist failed |
+
+### 3.4 Per-slot names (`REQ_SET_CS_NAME` / `REQ_GET_CS_NAME`)
+
+Each of the 16 slots carries a device-persistent user label (`CS_NAME_LEN` =
+32 bytes, NUL-terminated; same convention as preset and channel names), so an
+app on any host, or an external MCU on UART/I2C, can show what a given control
+is for ("Sub Level", "Mute All") without out-of-band knowledge.
+
+Semantics:
+
+- **Names are slot metadata, independent of the binding.** Setting or clearing
+  a binding leaves the slot's name untouched, and a name may be set for a slot
+  that has no binding yet. Clear a name explicitly by sending a payload of one
+  NUL byte.
+- **Persistence** is device-global in the preset directory (V10), next to the
+  binding table; names survive preset changes and factory reset. All-zero =
+  unnamed, so a fresh directory needs no seeding.
+- `REQ_SET_CS_NAME` uses the **same deferred model** as the binding SET
+  (section 3.2) because the persist is a directory-sector flash write: the
+  handler validates the slot, latches the name, records `CS_STATUS_PENDING`
+  in `last_status`/`last_slot`, and the main loop persists and overwrites the
+  status with `PIN_CONFIG_SUCCESS` (or `CS_STATUS_FLASH_ERROR`). Binding and
+  name SETs share the single status channel; poll `REQ_GET_CS_STATUS` until
+  the PENDING result resolves before sending the next SET of either kind.
+  A name SET arriving while a previous name SET is still queued records
+  `CS_STATUS_BUSY`; an empty payload records `CS_STATUS_INVALID_VALUE`.
+  Payloads longer than 31 characters are truncated.
+- `REQ_GET_CS_NAME` is synchronous and reads the directory's RAM cache (no
+  flash access); it always returns 32 bytes with guaranteed NUL termination.
+- Names are **not** part of `WireBulkParams` and emit **no notification**;
+  a host that cares about cross-host renames re-reads the 16 names on
+  connect (16 GETs, one round trip each).
 
 ---
 
@@ -872,9 +915,11 @@ does not break existing hosts.
 ## 11. v1 -> v2 compatibility
 
 - **Stored configs migrate automatically.** A device with a V8 directory (v1
-  16-byte bindings, 8 slots) migrates to V9 on first boot: the 8 bindings carry
+  16-byte bindings, 8 slots) migrates on first boot: the 8 bindings carry
   over with `event = PRESS`, `target = index = 0`; slots 8-15 are empty. All
   v1 nouns, actions, flags, and status codes kept their numeric values.
+  A V9 directory migrates to V10 by appending the (empty) name block; the
+  bindings are untouched.
 - **The control wire format is NOT backward compatible.** `REQ_SET_CS_BINDING`
   requires 24 bytes (a 16-byte payload gets `CS_STATUS_INVALID_VALUE`);
   `REQ_GET_CS_BINDING`, `REQ_GET_CS_CAPS`, and `REQ_GET_CS_STATUS` responses
