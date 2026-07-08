@@ -247,7 +247,9 @@ volatile LevellerConfig leveller_config = {
     .speed = LEVELLER_DEFAULT_SPEED,
     .max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB,
     .lookahead = LEVELLER_DEFAULT_LOOKAHEAD,
-    .gate_threshold_db = LEVELLER_DEFAULT_GATE_DB
+    .gate_threshold_db = LEVELLER_DEFAULT_GATE_DB,
+    .detector_mask = LEVELLER_DEFAULT_DETECTOR_MASK,
+    .apply_mask = LEVELLER_DEFAULT_APPLY_MASK
 };
 volatile bool leveller_update_pending = false;
 volatile bool leveller_reset_pending = false;

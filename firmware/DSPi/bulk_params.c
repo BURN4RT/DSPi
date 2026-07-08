@@ -193,6 +193,8 @@ void bulk_params_collect(WireBulkParams *out) {
     out->leveller.amount = leveller_config.amount;
     out->leveller.max_gain_db = leveller_config.max_gain_db;
     out->leveller.gate_threshold_db = leveller_config.gate_threshold_db;
+    out->leveller.detector_mask = leveller_config.detector_mask;
+    out->leveller.apply_mask = leveller_config.apply_mask;
 
     // Per-channel preamp (V6+)
     for (int i = 0; i < NUM_INPUT_CHANNELS && i < WIRE_MAX_INPUT_CHANNELS; i++)
@@ -591,6 +593,8 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         leveller_config.amount = in->leveller.amount;
         leveller_config.max_gain_db = in->leveller.max_gain_db;
         leveller_config.gate_threshold_db = in->leveller.gate_threshold_db;
+        leveller_config.detector_mask = in->leveller.detector_mask;
+        leveller_config.apply_mask = in->leveller.apply_mask;
     }
     leveller_update_pending = true;
     leveller_reset_pending = true;

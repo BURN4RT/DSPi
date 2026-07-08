@@ -127,7 +127,10 @@
 //        spdif_rx_pin_ext[2]; struct grows by 3 bytes).  Backward-compatible
 //        tail-append like V22/V23: older slots load with both extra inputs
 //        disabled and their pins unset.
-#define SLOT_DATA_VERSION       24
+//   V25: Leveller channel masks appended (leveller_detector_mask +
+//        leveller_apply_mask; struct grows by 2 bytes).  Backward-compatible
+//        tail-append like V24: older slots load the all-channels default (0xFF).
+#define SLOT_DATA_VERSION       25
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -741,6 +744,12 @@ typedef struct __attribute__((packed)) {
     // io_config_from_slot() so older slots load with both inputs disabled.
     uint8_t spdif_rx_enabled_ext;    // Enable mask: bit 0 = SPDIF2, bit 1 = SPDIF3
     uint8_t spdif_rx_pin_ext[2];     // SPDIF RX 2/3 GPIOs (0 = unset; defaults 20/21)
+
+    // Leveller channel masks (V25+, struct grows by 2 bytes).  Gated on
+    // version >= 25 in apply_slot_to_live(); older slots load the
+    // all-channels default (0xFF).
+    uint8_t leveller_detector_mask;
+    uint8_t leveller_apply_mask;
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -2012,6 +2021,8 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->leveller_amount = leveller_config.amount;
     slot->leveller_max_gain_db = leveller_config.max_gain_db;
     slot->leveller_gate_threshold_db = leveller_config.gate_threshold_db;
+    slot->leveller_detector_mask = leveller_config.detector_mask;
+    slot->leveller_apply_mask = leveller_config.apply_mask;
 
     // Per-channel preamp + Master volume — all inputs, direct.
     for (int i = 0; i < NUM_INPUT_CHANNELS; i++)
@@ -2218,6 +2229,14 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         leveller_config.amount = slot->leveller_amount;
         leveller_config.max_gain_db = slot->leveller_max_gain_db;
         leveller_config.gate_threshold_db = slot->leveller_gate_threshold_db;
+        // Channel masks are V25+; older slots load the all-channels default.
+        if (slot->version >= 25) {
+            leveller_config.detector_mask = slot->leveller_detector_mask;
+            leveller_config.apply_mask = slot->leveller_apply_mask;
+        } else {
+            leveller_config.detector_mask = LEVELLER_DEFAULT_DETECTOR_MASK;
+            leveller_config.apply_mask = LEVELLER_DEFAULT_APPLY_MASK;
+        }
     } else {
         leveller_config.enabled = LEVELLER_DEFAULT_ENABLED;
         leveller_config.amount = LEVELLER_DEFAULT_AMOUNT;
@@ -2225,6 +2244,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         leveller_config.max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB;
         leveller_config.lookahead = LEVELLER_DEFAULT_LOOKAHEAD;
         leveller_config.gate_threshold_db = LEVELLER_DEFAULT_GATE_DB;
+        leveller_config.detector_mask = LEVELLER_DEFAULT_DETECTOR_MASK;
+        leveller_config.apply_mask = LEVELLER_DEFAULT_APPLY_MASK;
     }
     leveller_update_pending = true;
     leveller_reset_pending = true;
@@ -2322,8 +2343,10 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // CRC byte range = the slot data section (filter_recipes .. end of the version's
 // fields).  V21 ended at i2s_input_rate; V22 appended the I2S multichannel
 // fields, so V21's range stops where those begin.  V23 appended the ADAT
-// fields, so V22's range stops where those begin (a stored slot's CRC was
-// computed without the fields its version predates).
+// fields, so V22's range stops where those begin.  V24 appended the optional
+// SPDIF inputs 2/3; V25 appended the leveller channel masks, so V24's range
+// stops where they begin (a stored slot's CRC was computed without the fields
+// its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -2331,16 +2354,20 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V23 \
     (offsetof(PresetSlot, spdif_rx_enabled_ext) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V24 \
+    (offsetof(PresetSlot, leveller_detector_mask) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V25 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
-// V21 broke compatibility (unified channel model); V22 (I2S multichannel input)
-// and V23 (ADAT bulk output) are backward-compatible tail-appends.  V21, V22 and
-// V23 slots are all accepted (an older slot loads with the newer fields
-// defaulted to unset) while older/unknown versions are invalidated and the slot
-// loads factory defaults.
+// V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
+// V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3) and V25 (leveller
+// channel masks) are backward-compatible tail-appends.  V21..V25 slots are all
+// accepted (an older slot loads with the newer fields defaulted to unset) while
+// older/unknown versions are invalidated and the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 24
+        case SLOT_DATA_VERSION:   // 25
+            return SLOT_DATA_SIZE_V25;
+        case 24:
             return SLOT_DATA_SIZE_V24;
         case 23:
             return SLOT_DATA_SIZE_V23;
@@ -2920,6 +2947,8 @@ static void apply_factory_defaults(void) {
     leveller_config.max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB;
     leveller_config.lookahead = LEVELLER_DEFAULT_LOOKAHEAD;
     leveller_config.gate_threshold_db = LEVELLER_DEFAULT_GATE_DB;
+    leveller_config.detector_mask = LEVELLER_DEFAULT_DETECTOR_MASK;
+    leveller_config.apply_mask = LEVELLER_DEFAULT_APPLY_MASK;
     leveller_update_pending = true;
     leveller_reset_pending = true;
 

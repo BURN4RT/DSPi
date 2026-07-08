@@ -305,6 +305,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_LEVELLER_LOOKAHEAD  0xBD
 #define REQ_SET_LEVELLER_GATE       0xBE
 #define REQ_GET_LEVELLER_GATE       0xBF
+#define REQ_SET_LEVELLER_MASKS      0xDE  // 2 bytes: [detector_mask, apply_mask]
+#define REQ_GET_LEVELLER_MASKS      0xDF
 
 // Per-Channel Preamp Commands
 #define REQ_SET_PREAMP_CH           0xD0  // wValue = channel index (0=L, 1=R), payload = float dB

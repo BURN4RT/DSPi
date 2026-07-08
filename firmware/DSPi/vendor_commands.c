@@ -850,6 +850,19 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
 
+        case REQ_SET_LEVELLER_MASKS:
+            if (buffer->data_len >= 2) {
+                leveller_config.detector_mask = vendor_rx_buf[0];
+                leveller_config.apply_mask = vendor_rx_buf[1];
+                leveller_update_pending = true;
+                // No reset; masks switch glitch-free, rings keep running.
+                uint8_t dm = leveller_config.detector_mask;
+                uint8_t am = leveller_config.apply_mask;
+                notify_param_write(offsetof(WireBulkParams, leveller.detector_mask), 1, &dm);
+                notify_param_write(offsetof(WireBulkParams, leveller.apply_mask), 1, &am);
+            }
+            break;
+
         // Matrix Mixer Commands
         case REQ_SET_MATRIX_ROUTE:
             if (buffer->data_len >= sizeof(MatrixRoutePacket)) {
@@ -1494,6 +1507,13 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 float val = leveller_config.gate_threshold_db;
                 memcpy(resp_buf, &val, 4);
                 vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_LEVELLER_MASKS: {
+                resp_buf[0] = leveller_config.detector_mask;
+                resp_buf[1] = leveller_config.apply_mask;
+                vendor_send_response(resp_buf, 2);
                 return true;
             }
 

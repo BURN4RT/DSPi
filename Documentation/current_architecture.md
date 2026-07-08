@@ -248,13 +248,13 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 **`perform_rate_change()` (main.c):** bracketed with `prepare_pipeline_reset(PRESET_MUTE_SAMPLES)` / `complete_pipeline_reset()`. Without the bracket, the SPDIF `wrap_consumer_take` callback updates the PIO divider lazily on the next buffer-take, so old-rate audio already queued in each consumer pool plays out at the new bit-clock — audible pitch wobble for ~16 ms. `complete_pipeline_reset()` aborts DMA on every enabled slot, drains the consumer pool back to the free list, and restarts all outputs in sync at the new divider. The I2S `audio_i2s_update_all_frequencies()` call inside `perform_rate_change()` still runs for its own divider+clkdiv_restart pass; the subsequent `complete_pipeline_reset()` re-aborts/re-enables idempotently and costs only microseconds.
 
 ### Multichannel USB Input + Per-Input EQ/Metering (RP2350)
-*Last updated: 2026-06-25*
+*Last updated: 2026-07-08 (volume leveller now runs multichannel; no longer bypassed above 2 inputs)*
 
 **Unified channel model (no "master").** Channels are now `[inputs 0..NUM_INPUT_CHANNELS-1][outputs NUM_INPUT_CHANNELS..]`; `NUM_CHANNELS = NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS` (17 on RP2350, 7 on RP2040). The former "master EQ" was always the EQ on the 2 stereo inputs — it is generalized so **every input channel is a first-class channel with its own 10-band PEQ + peak/clip metering** (no crossover). Output channels keep PEQ + crossover + gain/delay/mute. `CH_OUT_1 = NUM_INPUT_CHANNELS`; the output-slot→channel-index mapping (`CH_OUT_1 + slot`) shifts automatically, so the slot-aligned output path is structurally unchanged. **Input EQ and metering reuse the existing `REQ_SET/GET_EQ_PARAM` (channel = input index) and `REQ_GET_STATUS` (`peaks[]`/`clip_flags`) commands — no new commands.** `clip_flags` is `uint32_t` (17 channels > 16 bits).
 
 **USB formats.** RP2350 advertises AudioStreaming alts **1 = 2ch/16, 2 = 2ch/24** (44.1/48/96 kHz), and **3 = 4ch, 4 = 6ch, 5 = 8ch** (all 48 kHz/16-bit fixed). The host picks the format; the firmware sets the active input count (`usb_input_channels` = 2/4/6/8) in `uac1_apply_alt()`, which forces 48 kHz for multichannel alts (SET_CUR rejects non-48k), flushes the ring, and resyncs. RP2040 is stereo-only (2 SPDIF = 4 output channels). The multichannel alt blocks are emitted by a parameterized `AS_MULTICH_ALT(alt,nch)` macro; descriptor offsets/`CONFIG_TOTAL_LEN` (369 on RP2350) are arithmetic + `_Static_assert`-verified. The single Input Terminal/Feature Unit declare the 8-channel superset (`wChannelConfig=0x063F`); iso OUT max-packet `AUDIO_EP_MAX_PKT=788`.
 
-**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2; `multichannel = n_active>2` **bypasses the stereo-only chain** (loudness, leveller, crossfeed). The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit. Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
+**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2; `multichannel = n_active>2` **bypasses the inherently-stereo stages** (loudness, crossfeed). The **volume leveller now runs channel-count-agnostic over the active inputs** (mask-driven; see "Volume Leveller"), so it is no longer bypassed in multichannel. The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit (the leveller delays every active input identically through its per-channel lookahead ring). Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
 
 **Live active-input-count for the host.** The app reads the active count (2/4/6/8) from the `REQ_GET_STATUS` combined packet (a 1-byte `active_input_channels` field, polled with the meters) or the scalar `wValue==23`; the bulk header `num_input_channels` stays the device max (8). Both report sites are **source-aware** via `active_input_channel_count()` (`audio_pipeline.c`), the single source of truth shared with the DSP pipeline's input dimension: USB → `usb_input_channels`, I2S → `i2s_input_channels`, S/PDIF → 2. A `NOTIFY_EVT_INPUT_FORMAT` (0x05) push event fires whenever the active count can change — USB alt change, input-source switch, and live I2S channel-count change (`REQ_SET_I2S_INPUT_CHANNELS` while I2S is active) — so the app relayouts immediately regardless of source.
 
@@ -392,7 +392,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-05-19*
+*Last updated: 2026-07-08 (leveller multichannel + 5 ms lookahead)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -401,9 +401,9 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Input conversion | USB int16/24-bit or SPDIF RX 24-bit → float full-scale, per-channel preamp gain (`global_preamp_linear[ch]`) |
 | Loudness | 2 SVF shelf filters (low shelf + high shelf), volume-dependent (stereo only) |
 | Per-Input EQ + metering | Per active input: block-based `dsp_process_channel_block()`, 10 bands, hybrid SVF/biquad; then peak/clip into `peaks[k]`/`clip_flags` |
-| Volume Leveller | Upward RMS compressor on master L/R with gain-reduction limiter (float throughout) |
-| Crossfeed | BS2B lowpass + allpass (ILD + ITD) |
-| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase; stereo master chain bypassed in 8-channel mode |
+| Volume Leveller | Upward RMS compressor over active inputs (2 to 8), mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (float throughout) |
+| Crossfeed | BS2B lowpass + allpass (ILD + ITD) (stereo only) |
+| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase; loudness/crossfeed bypassed in multichannel mode (leveller still runs) |
 | Output EQ | Block-based, 10 bands per output (Core 0: outputs 0-1, Core 1: outputs 2-7) |
 | Output gain | Per-output gain × host volume × master volume |
 | Delay | Float circular buffers, 2048 samples max (42ms at 48kHz) |
@@ -411,7 +411,7 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | PDM output | Float → Q28 for sigma-delta modulation |
 
 ### RP2040 Fixed-Point Pipeline
-*Last updated: 2026-05-19*
+*Last updated: 2026-07-08 (leveller mask-driven link + 5 ms lookahead)*
 
 Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixed-point (28 fractional bits). 2 S/PDIF stereo pairs + 1 PDM sub (5 output channels).
 
@@ -422,7 +422,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 | Input conversion | USB int16 → Q28 (`<< 14`), USB/SPDIF RX 24-bit → Q28 (`sample << 6`), per-channel preamp via `fast_mul_q28()` (`global_preamp_mul[ch]`) — block loop to `buf_l[192]`, `buf_r[192]` |
 | Loudness | 2 biquads per-sample via `fast_mul_q28()` (Q28 coefficients, state coupling) (stereo only) |
 | Per-Input EQ + metering | Per active input: **block-based** `dsp_process_channel_block()`, 10 bands; then peak/clip into `peaks[k]`/`clip_flags` |
-| Volume Leveller | Upward RMS compressor on master L/R with gain-reduction limiter (Q28 envelope + float gain) |
+| Volume Leveller | Upward RMS compressor on the 2 inputs, mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (Q28 envelope + float gain) |
 | Crossfeed | BS2B per-sample via `fast_mul_q28()` (Q28 coefficients, stereo coupling) |
 | Matrix mixing | Q15 gains via `fast_mul_q15()` (16-bit partial products), 2 inputs × 5 outputs → `buf_out[5][192]` |
 
@@ -1021,21 +1021,23 @@ output  = direct + ap_opposite     // Mix with opposite channel's crossfeed
 ---
 
 ## Volume Leveller
-*Last updated: 2026-04-04*
+*Last updated: 2026-07-08 (multichannel; channel masks; 5 ms lookahead)*
 
 ### Purpose
 
-Automatic volume levelling via a feedforward, stereo-linked, single-band RMS compressor applied to the stereo input L/R (stereo mode only; bypassed in multichannel). Sits in the signal chain after the per-input EQ and before Crossfeed (PASS 2.5 in the pipeline).
+Automatic volume levelling via a feedforward, channel-linked, single-band RMS compressor applied to the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ (PASS 2.5 in the pipeline). Runs at all input counts; no longer bypassed in multichannel (the earlier stereo-only restriction is gone). Loudness and crossfeed remain stereo-only.
 
 ### Algorithm
 
 - **Topology:** Feedforward upward compressor with soft knee — boosts content below the threshold, leaves content above the threshold completely untouched (no makeup gain needed)
-- **Stereo linking:** Stereo-linked — RMS envelope is computed from the louder of L/R channels, and the same gain is applied to both channels to preserve the stereo image
-- **Envelope:** Asymmetric attack/release smoothing on the RMS envelope
-- **Lookahead:** Optional 10ms lookahead delay buffer (less critical with upward compression since loud content receives 0 dB gain, reducing overshoot risk)
+- **Channel linking:** A single shared gain drives every selected channel. The link is the loudest selected detector envelope (max over `detector_mask` channels), preserving the mix balance; for stereo this is exactly the old "louder of L/R" behavior
+- **Channel masks:** `detector_mask` (which inputs feed the RMS detector) and `apply_mask` (which inputs receive the shared gain), each a `uint8_t` bit-per-input, default 0xFF (all channels). Both are ANDed with the active-input set at runtime; CPU is only spent on selected channels. Example uses: dialog boost = both masks on the center channel; night mode = all channels
+- **Envelope:** Asymmetric attack/release smoothing on the per-channel RMS envelopes
+- **Lookahead:** Optional 5 ms (240-sample) lookahead, one ring per input channel. When enabled, EVERY active input is delayed through its ring (applied channels through the gain stage, others as a plain delay), so inter-channel and inter-output-slot alignment is preserved exactly and mask changes cause zero time shift. Rings of newly activated inputs are cleared via the `active_prev` field
 - **Gain computation:** Upward compression curve: content below threshold is boosted by `(threshold - x_db) * (1 - 1/ratio)`, content above threshold + knee/2 passes at unity (0 dB gain), with soft knee transition between
 - **Limiter:** Gain-reduction style at -6 dBFS ceiling (instant attack, 100ms release) — computes gain reduction rather than hard clipping, rarely engages since loud content is untouched
 - **Gate:** User-configurable silence gate prevents noise amplification when input is below the gate threshold
+- **Glitch-free masks:** Writing masks (0xDE) recomputes coefficients but does NOT reset state; the rings keep running so a mask change is glitch-free
 
 ### Parameters
 
@@ -1044,32 +1046,34 @@ Automatic volume levelling via a feedforward, stereo-linked, single-band RMS com
 | enabled | bool | 0/1 | false | Enable/disable the leveller |
 | amount | float | 0.0–100.0 | 50.0 | Compression strength % (ratio = 1 + amount/100 * 19) |
 | speed | uint8_t | 0/1/2 | 0 (Slow) | Envelope speed: 0 = Slow, 1 = Medium, 2 = Fast |
-| max_gain_db | float | 0.0–35.0 | 15.0 | Maximum boost gain in dB |
-| lookahead | bool | 0/1 | true | Enable 10ms lookahead delay buffer |
+| max_gain_db | float | 0.0–35.0 | 15.0 | Maximum boost gain in dB (RP2040: effective cap 18 dB; Q28 gain range) |
+| lookahead | bool | 0/1 | true | Enable 5 ms (240-sample) lookahead delay |
 | gate_threshold_db | float | -96.0–0.0 | -96.0 | Silence gate level in dBFS (below = no boost) |
+| detector_mask | uint8_t | 0x00–0xFF | 0xFF | Bit k: input channel k feeds the detector |
+| apply_mask | uint8_t | 0x00–0xFF | 0xFF | Bit k: shared gain applied to input channel k |
 
 ### Signal Chain Position
 
 ```
-USB Input → Per-Ch Preamp → [stereo only: Loudness] → Per-Input EQ + Metering → [stereo only: Volume Leveller → Crossfeed] → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → Delay → Output
+USB Input → Per-Ch Preamp → [stereo only: Loudness] → Per-Input EQ + Metering → Volume Leveller (active inputs, mask-driven) → [stereo only: Crossfeed] → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → Delay → Output
 
-(In multichannel mode the stereo-only stages — loudness, leveller, crossfeed — are bypassed; each active input gets its own PEQ + metering before the matrix.)
+(In multichannel mode the stereo-only stages — loudness, crossfeed — are bypassed; the leveller runs over all active inputs; each active input gets its own PEQ + metering before the matrix.)
                                                      (PASS 2.5)
 ```
 
 ### Platform Implementation
 
-- **RP2350:** Float throughout — RMS envelope, gain computation, and gain application all in single-precision float
-- **RP2040:** Q28 fixed-point for the RMS envelope accumulator, float for gain computation and smoothing. Gain applied to Q28 audio samples
+- **RP2350:** Float throughout — RMS envelope, gain computation, and gain application all in single-precision float. `NUM_INPUT_CHANNELS = 8`; per-channel `env_sq[8]` and eight lookahead rings
+- **RP2040:** Q28 fixed-point for the RMS envelope accumulator, float for gain computation and smoothing. Gain applied to Q28 audio samples. `NUM_INPUT_CHANNELS = 2`; two lookahead rings. Max boost clamped to 18 dB at coefficient time (Q28 linear gain tops out below 8.0); the limiter cap conversion is likewise overflow-guarded
 
 ### Files
 
 | File | Purpose |
 |------|---------|
-| `leveller.c` | RMS envelope tracking, gain computation, soft-knee curve, lookahead buffer |
-| `leveller.h` | Public API, state struct, configuration struct |
+| `leveller.c` | RMS envelope tracking, gain computation, soft-knee curve, mask-driven link, per-channel lookahead rings |
+| `leveller.h` | Public API, state struct, configuration struct (incl. detector_mask/apply_mask) |
 
-### Vendor Commands (0xB4–0xBF)
+### Vendor Commands (0xB4–0xBF, 0xDE/0xDF)
 
 | Code | Command | Direction | Description |
 |------|---------|-----------|-------------|
@@ -1081,10 +1085,12 @@ USB Input → Per-Ch Preamp → [stereo only: Loudness] → Per-Input EQ + Meter
 | 0xB9 | REQ_GET_LEVELLER_SPEED | IN | Get envelope speed |
 | 0xBA | REQ_SET_LEVELLER_MAX_GAIN | OUT | Set max boost gain in dB (0.0–35.0, float) |
 | 0xBB | REQ_GET_LEVELLER_MAX_GAIN | IN | Get max boost gain |
-| 0xBC | REQ_SET_LEVELLER_LOOKAHEAD | OUT | Enable/disable 10ms lookahead |
+| 0xBC | REQ_SET_LEVELLER_LOOKAHEAD | OUT | Enable/disable 5 ms lookahead |
 | 0xBD | REQ_GET_LEVELLER_LOOKAHEAD | IN | Get lookahead state |
 | 0xBE | REQ_SET_LEVELLER_GATE | OUT | Set silence gate threshold (-96.0–0.0 dBFS, float) |
 | 0xBF | REQ_GET_LEVELLER_GATE | IN | Get silence gate threshold |
+| 0xDE | REQ_SET_LEVELLER_MASKS | OUT | Set channel masks (2 bytes: [detector_mask, apply_mask]); no state reset |
+| 0xDF | REQ_GET_LEVELLER_MASKS | IN | Get channel masks (2 bytes: [detector_mask, apply_mask]) |
 
 ---
 
@@ -1476,7 +1482,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-06*
+*Last updated: 2026-07-08 (leveller multichannel; wire V18 / slot V25)*
 
 ### Hardware
 
@@ -1519,11 +1525,11 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V17 / V23 | V17 / V23 |
+| Wire / slot version | V18 / V25 | V18 / V25 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
-| Volume leveller | Q28 envelope + float gain | Float throughout |
+| Volume leveller | Q28 envelope + float gain; 2 channels, 2 lookahead rings; max boost clamped to 18 dB (Q28 gain range) | Float throughout; 2 to 8 active channels, mask-driven, 8 lookahead rings; full 35 dB max boost |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
 ### Delay Lines
@@ -1593,7 +1599,15 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-06 (ADAT bulk output BSS note added)*
+*Last updated: 2026-07-08 (multichannel leveller ring pool BSS)*
+
+> **Multichannel volume leveller (2026-07-08).** The leveller now holds one
+> lookahead ring per input channel (`LevellerState.lookahead_buf[NUM_INPUT_CHANNELS][240]`)
+> and shortened the ring from 480 to 240 samples (5 ms at 48 kHz). On RP2350
+> `LevellerState` is 7,732 bytes (eight rings); the change grew total BSS by
+> ~3,880 bytes to 330,704 bytes. On RP2040 the two rings halved, shrinking BSS
+> by ~1,904 bytes to 139,668 bytes. `leveller_process_block` stays
+> `DSP_TIME_CRITICAL` and RAM-resident.
 
 > **ADAT bulk output (2026-07-06, RP2350 only).** The ADAT engine adds a fixed
 > 28 KB BSS frame ring (896 frames x 32 bytes, `adat_ring` in adat_output.c)
@@ -1726,7 +1740,7 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | `notify_rebaseline` static scratch (V15 WireBulkParams) | ~4.1 KB |
 | USB audio ring buffer (4 × 578) | ~2.3 KB |
 | Channel names (7 × 32) | ~224 B |
-| Leveller state + lookahead | ~2 KB |
+| Leveller state + lookahead (2 rings × 240 × 4) | ~1.9 KB |
 | Per-channel preamp + master volume | ~48 B |
 | Consumer pools + silence (static, 2 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~27 KB |
 | I2S RX DMA ring (1024 × 4, 4 KB aligned) | 4 KB |
@@ -1752,7 +1766,7 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | `notify_rebaseline` static scratch (V15 WireBulkParams) | ~4.1 KB |
 | USB audio ring buffer (4 × 794, 8-channel packets) | ~3.2 KB |
 | Channel names (11 × 32) | ~352 B |
-| Leveller state + lookahead | ~2 KB |
+| Leveller state + lookahead (8 rings × 240 × 4) | ~7.7 KB |
 | Per-channel preamp (8 ch) + master volume | ~120 B |
 | Matrix mixer (8 × 9 crosspoints + outputs) | ~1.3 KB |
 | Consumer pools + silence (static, 4 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~55 KB |
@@ -2203,7 +2217,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-08 (multi-SPDIF input: 0xE4/0xE5 gain an input index; new 0xE9 enable, 0xEF config query)*
+*Last updated: 2026-07-08 (leveller channel masks 0xDE/0xDF; multi-SPDIF input: 0xE4/0xE5 gain an input index; new 0xE9 enable, 0xEF config query)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2311,7 +2325,7 @@ op state ~400 B).
 | REQ_GET_LEVELLER_SPEED | 0xB9 | IN | Get leveller envelope speed |
 | REQ_SET_LEVELLER_MAX_GAIN | 0xBA | OUT | Set leveller max boost gain (0.0–35.0 dB, float) |
 | REQ_GET_LEVELLER_MAX_GAIN | 0xBB | IN | Get leveller max boost gain |
-| REQ_SET_LEVELLER_LOOKAHEAD | 0xBC | OUT | Enable/disable leveller 10ms lookahead |
+| REQ_SET_LEVELLER_LOOKAHEAD | 0xBC | OUT | Enable/disable leveller 5 ms lookahead |
 | REQ_GET_LEVELLER_LOOKAHEAD | 0xBD | IN | Get leveller lookahead state |
 | REQ_SET_LEVELLER_GATE | 0xBE | OUT | Set leveller silence gate threshold (-96.0–0.0 dBFS, float) |
 | REQ_GET_LEVELLER_GATE | 0xBF | IN | Get leveller silence gate threshold |
@@ -2342,6 +2356,8 @@ op state ~400 B).
 | REQ_GET_USER_VOLUME | 0xDB | IN | Get user-perceived volume (float dB) |
 | REQ_SET_USER_MUTE | 0xDC | OUT | Set vendor-channel `user_mute` flag (1 byte 0/1); always honored regardless of input source. Distinct from `audio_state.mute` (UAC1) which is USB-gated; pipeline ORs them. |
 | REQ_GET_USER_MUTE | 0xDD | IN | Get vendor-channel `user_mute` (UAC1 mute is read via UAC1 GET_CUR) |
+| REQ_SET_LEVELLER_MASKS | 0xDE | OUT | Set leveller channel masks (2 bytes: [detector_mask, apply_mask], bit k = input channel k); sets update-pending, no state reset (glitch-free) |
+| REQ_GET_LEVELLER_MASKS | 0xDF | IN | Get leveller channel masks (2 bytes: [detector_mask, apply_mask]) |
 | REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF, 2=I2S, 4=SPDIF2, 5=SPDIF3; 3 reserved for future ADAT). SPDIF2/3 rejected unless enabled |
 | REQ_GET_INPUT_SOURCE | 0xE1 | IN | Get active input source |
 | REQ_GET_SPDIF_RX_STATUS | 0xE2 | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |

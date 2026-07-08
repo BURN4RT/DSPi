@@ -289,10 +289,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // Active input count for this packet (see active_input_channel_count()):
     // the USB alt's channel count, the I2S input channel count, or the stereo
     // pair for S/PDIF.  In multichannel mode (>2 inputs) the inherently-stereo
-    // chain — loudness, leveller, crossfeed — is bypassed; each input gets only
-    // its own PEQ, then the matrix.  The matrix iterates n_active_inputs, so
-    // buf_in_ext (inputs 2..7) is read ONLY when those inputs are actually
-    // active; stale samples can never leak into stereo / S/PDIF output.
+    // chain — loudness, crossfeed — is bypassed; each input gets its own PEQ,
+    // then the leveller (channel-count agnostic, mask-driven), then the
+    // matrix.  The matrix iterates n_active_inputs, so buf_in_ext (inputs
+    // 2..7) is read ONLY when those inputs are actually active; stale samples
+    // can never leak into stereo / S/PDIF output.
     int n_active_inputs = active_input_channel_count();
     bool multichannel = (n_active_inputs > NUM_STEREO_INPUTS);
 
@@ -355,11 +356,16 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     for (int k = n_active_inputs; k < NUM_INPUT_CHANNELS; k++)
         global_status.peaks[k] = 0;
 
-    // ========== PASS 2.5: Volume Leveller ========== (stereo-only)
-    if (!multichannel && !leveller_bypassed) {
+    // ========== PASS 2.5: Volume Leveller ==========
+    // Channel-count agnostic: detector/apply masks select input channels,
+    // one linked gain preserves the mix balance.  With lookahead on, ALL
+    // active inputs are delayed identically inside the leveller, so
+    // inter-channel (and therefore inter-output-slot) alignment holds.
+    if (!leveller_bypassed) {
         leveller_process_block(&leveller_state, &leveller_coeffs,
                                (const LevellerConfig *)&leveller_config,
-                               buf_l, buf_r, sample_count);
+                               input_bufs, (uint32_t)n_active_inputs,
+                               sample_count);
     }
 
     // ========== PASS 3: Crossfeed ========== (stereo-only)
@@ -724,11 +730,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         if (pk > CLIP_THRESH_Q28) global_status.clip_flags |= (1u << k);
     }
 
-    // ========== PASS 2.5: Volume Leveller ==========
+    // ========== PASS 2.5: Volume Leveller ========== (masks select L/R)
     if (!leveller_bypassed) {
         leveller_process_block(&leveller_state, &leveller_coeffs,
                                (const LevellerConfig *)&leveller_config,
-                               buf_l, buf_r, sample_count);
+                               input_bufs, NUM_INPUT_CHANNELS, sample_count);
     }
 
     // ========== PASS 3: Crossfeed ==========
