@@ -59,13 +59,14 @@
 #include <stddef.h>
 #include <string.h>
 
+#include "audio_input.h"       /* spdif_rx_pin(_ext), spdif_input_enabled */
+
 /* External pin-conflict state lives in vendor_commands.c / usb_audio.c.
  * Imported here only for validation; we never write these. */
 extern uint8_t output_pins[];
 extern uint8_t i2s_bck_pin;
 extern uint8_t i2s_mck_pin;
 extern bool    i2s_mck_enabled;
-extern uint8_t spdif_rx_pin;
 
 /* ----------------------------------------------------------------- */
 /* File-scope state                                                   */
@@ -165,8 +166,10 @@ static bool collides_with_other_subsystem(uint8_t pin) {
     }
     /* MCK pin (only when MCK enabled) */
     if (i2s_mck_enabled && pin == i2s_mck_pin) return true;
-    /* SPDIF RX */
+    /* SPDIF RX (input 1 always; inputs 2/3 only while enabled) */
     if (pin == spdif_rx_pin) return true;
+    for (uint8_t i = 1; i < SPDIF_RX_NUM_INPUTS; i++)
+        if (spdif_input_enabled(i) && pin == spdif_rx_pin_for_index(i)) return true;
     /* Live UART / I2C control interface pins */
     if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) return true;
     return false;

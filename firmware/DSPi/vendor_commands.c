@@ -335,7 +335,11 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
     // ADAT data pin: claimed only while ADAT is config-enabled (mirrors MCK).
     if (adat_output_config_enabled() && pin == adat_output_pin()) return true;
 #endif
-    if (pin == spdif_rx_pin) return true;                     // SPDIF RX input
+    if (pin == spdif_rx_pin) return true;                     // SPDIF RX input 1 (always claimed)
+    // Optional SPDIF inputs 2/3: a pin is claimed only while that input is
+    // enabled; a disabled input's stored pin is invisible to conflict checks.
+    for (uint8_t i = 1; i < SPDIF_RX_NUM_INPUTS; i++)
+        if (spdif_input_enabled(i) && pin == spdif_rx_pin_for_index(i)) return true;
     if (dac_hw_mute_owns_pin(pin)) return true;               // DAC hardware-mute
     if (uart_ctrl_owns_pin(pin)) return true;                 // UART control (if live)
     if (i2c_ctrl_owns_pin(pin)) return true;                  // I2C control (if live)
@@ -389,6 +393,17 @@ static uint8_t check_i2s_rx_pin(uint8_t pin, uint8_t pair) {
     if (pin_used_by_fixed_peripheral(pin, 0xFF))             return PIN_CONFIG_PIN_IN_USE;
     if (i2s_rx_pair_pin_taken(pin, pair))                    return PIN_CONFIG_PIN_IN_USE;
     return PIN_CONFIG_SUCCESS;
+}
+
+// True if optional SPDIF input `idx` (1..2) could be enabled right now: its
+// configured GPIO is valid and not claimed by any other function.  While idx is
+// disabled its own pin is not reserved by pin_used_by_fixed_peripheral(), so
+// there is no self-conflict.  The bulk/preset restore paths and the enable
+// command (REQ_SET_SPDIF_INPUT_ENABLE) share this single check.
+bool spdif_input_enable_acceptable(uint8_t idx) {
+    if (idx == 0 || idx >= SPDIF_RX_NUM_INPUTS) return false;
+    uint8_t pin = spdif_rx_pin_for_index(idx);
+    return is_valid_gpio_pin(pin) && !is_pin_in_use(pin, 0xFF);
 }
 
 // Validate a proposed I2S RX data-pin SET (the first `n_pairs` entries of
@@ -1172,7 +1187,8 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             // the shadow tracks *active* state, not requested state.
             if (buffer->data_len >= 1) {
                 uint8_t src = vendor_rx_buf[0];
-                if (input_source_valid(src) && src != active_input_source) {
+                // input_source_selectable() also rejects a disabled SPDIF 2/3.
+                if (input_source_selectable(src) && src != active_input_source) {
                     pending_input_source = src;
                     __dmb();
                     input_source_change_pending = true;
@@ -2569,38 +2585,50 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_SET_SPDIF_RX_PIN: {
-                // Hot-swappable: when SPDIF input is active, the main-loop
-                // handler stops the RX library, persists the new pin to the
-                // directory, and restarts on the new pin. While stopped,
-                // outputs play silence; on lock-acquisition the polling
-                // block's prefill handshake re-engages playback. Mirrors
-                // the preset_load_pending pattern at main.c:1242+ which
-                // also brackets a flash blackout with stop/start.
+                // Hot-swappable: when this SPDIF input is the active source, the
+                // main-loop handler stops the RX library, restarts on the new
+                // pin, and re-engages playback on lock-acquisition.  Mirrors the
+                // preset_load_pending pattern at main.c:1242+ (flash blackout
+                // bracketed by stop/start).
                 //
-                // wValue = new GPIO pin number.
-                uint8_t new_pin = (uint8_t)setup->wValue;
+                // wValue = (index << 8) | GPIO.  The high byte selects the SPDIF
+                // input (0..2); old hosts that send just the pin address index 0.
+                //
+                // RAM-only update; persistence is slot-scoped, so the user must
+                // REQ_PRESET_SAVE to capture the new pin, exactly like
+                // REQ_SET_OUTPUT_PIN.
+                uint8_t new_pin = (uint8_t)(setup->wValue & 0xFF);
+                uint8_t index   = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
-                if (!is_valid_gpio_pin(new_pin)) {
+                if (index >= SPDIF_RX_NUM_INPUTS) {
+                    status = PIN_CONFIG_INVALID_OUTPUT;   // no such SPDIF input
+                } else if (!is_valid_gpio_pin(new_pin)) {
                     status = PIN_CONFIG_INVALID_PIN;
-                } else if (new_pin == spdif_rx_pin) {
+                } else if (new_pin == spdif_rx_pin_for_index(index)) {
                     status = PIN_CONFIG_SUCCESS;  // No-op
-                } else if (is_pin_in_use(new_pin, 0xFF)) {
+                } else if (spdif_input_enabled(index) && is_pin_in_use(new_pin, 0xFF)) {
+                    // Enabled inputs reserve their pin like SPDIF input 1; a
+                    // disabled 2/3 stores the pin as a preference only and its
+                    // conflicts are validated at enable time.
                     status = PIN_CONFIG_PIN_IN_USE;
                 } else {
-                    // RAM-only update.  Persistence is now slot-scoped:
-                    // the user must REQ_PRESET_SAVE to capture the new
-                    // pin in a preset slot, exactly like REQ_SET_OUTPUT_PIN.
-                    spdif_rx_pin = new_pin;
-                    if (active_input_source == INPUT_SOURCE_SPDIF) {
-                        // Hot-swap: defer the stop/start to main loop
-                        // because spdif_rx library teardown is too heavy
-                        // for USB ISR context.
+                    if (index == 0) spdif_rx_pin = new_pin;
+                    else            spdif_rx_pin_ext[index - 1] = new_pin;
+                    if (input_source_is_spdif(active_input_source) &&
+                        spdif_index_for_source(active_input_source) == index) {
+                        // Hot-swap: defer the stop/start to main loop because
+                        // spdif_rx library teardown is too heavy for USB ISR.
                         extern volatile bool spdif_rx_pin_change_pending;
                         spdif_rx_pin_change_pending = true;
                     }
                     status = PIN_CONFIG_SUCCESS;
-                    notify_param_write(offsetof(WireBulkParams, input_config.spdif_rx_pin),
-                                       1, &spdif_rx_pin);
+                    // Index 0 maps to input_config.spdif_rx_pin; indices 1..2 to
+                    // input_config.spdif_rx_pin_ext[index-1].
+                    uint16_t off = (index == 0)
+                        ? (uint16_t)offsetof(WireBulkParams, input_config.spdif_rx_pin)
+                        : (uint16_t)(offsetof(WireBulkParams, input_config.spdif_rx_pin_ext) +
+                                     (index - 1));
+                    notify_param_write(off, 1, &new_pin);
                 }
                 resp_buf[0] = status;
                 vendor_send_response(resp_buf, 1);
@@ -2608,8 +2636,77 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_SPDIF_RX_PIN: {
-                resp_buf[0] = spdif_rx_pin;
+                // wValue low byte = index (0..2); old hosts send 0.
+                uint8_t index = (uint8_t)(setup->wValue & 0xFF);
+                resp_buf[0] = (index < SPDIF_RX_NUM_INPUTS)
+                            ? spdif_rx_pin_for_index(index) : 0;
                 vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_SPDIF_INPUT_ENABLE: {
+                // wValue = (index << 8) | enable.  index 1..2 selects an optional
+                // SPDIF input; enable is 0 or 1.  RAM-only; persisted on
+                // REQ_PRESET_SAVE like REQ_SET_SPDIF_RX_PIN.
+                uint8_t index  = (uint8_t)((setup->wValue >> 8) & 0xFF);
+                uint8_t enable = (uint8_t)(setup->wValue & 0xFF) ? 1 : 0;
+                uint8_t status;
+                bool mask_changed = false;
+                if (index == 0) {
+                    // Input 1 is always enabled: enabling is a no-op, disabling
+                    // is rejected.
+                    status = enable ? PIN_CONFIG_SUCCESS : PIN_CONFIG_INVALID_OUTPUT;
+                } else if (index >= SPDIF_RX_NUM_INPUTS) {
+                    status = PIN_CONFIG_INVALID_OUTPUT;   // no such SPDIF input
+                } else if (enable == (spdif_input_enabled(index) ? 1 : 0)) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op: already in this state
+                } else if (enable) {
+                    if (!spdif_input_enable_acceptable(index)) {
+                        status = PIN_CONFIG_PIN_IN_USE;   // pin invalid or taken
+                    } else {
+                        spdif_rx_enabled_ext |= (uint8_t)(1u << (index - 1));
+                        mask_changed = true;
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                } else {
+                    // Disabling: refuse while this input is the live source or a
+                    // pending switch targets it; the host must switch the source
+                    // away first.
+                    bool is_active = input_source_is_spdif(active_input_source) &&
+                                     spdif_index_for_source(active_input_source) == index;
+                    bool is_pending = input_source_change_pending &&
+                                      pending_input_source == spdif_source_for_index(index);
+                    if (is_active || is_pending) {
+                        status = PIN_CONFIG_PIN_IN_USE;
+                    } else {
+                        spdif_rx_enabled_ext &= (uint8_t)~(1u << (index - 1));
+                        mask_changed = true;
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                }
+                if (mask_changed) {
+                    // Wire sentinel is the mask PLUS ONE; 0 on the wire means the
+                    // field is absent.
+                    uint8_t enc = (uint8_t)(spdif_rx_enabled_ext + 1);
+                    notify_param_write(offsetof(WireBulkParams,
+                                                input_config.spdif_rx_enabled_ext_p1),
+                                       1, &enc);
+                }
+                resp_buf[0] = status;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_SPDIF_INPUT_CONFIG: {
+                // 5 bytes: input count, enable mask over ALL inputs (bit 0 =
+                // input 1, always set), then the GPIO for inputs 0..2.  Lets a
+                // host build its source list data-driven.
+                resp_buf[0] = SPDIF_RX_NUM_INPUTS;
+                resp_buf[1] = (uint8_t)((spdif_rx_enabled_ext << 1) | 1);
+                resp_buf[2] = spdif_rx_pin_for_index(0);
+                resp_buf[3] = spdif_rx_pin_for_index(1);
+                resp_buf[4] = spdif_rx_pin_for_index(2);
+                vendor_send_response(resp_buf, 5);
                 return true;
             }
 

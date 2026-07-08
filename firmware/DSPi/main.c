@@ -391,7 +391,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     // If a caller already stopped RX (e.g. preset_load_pending across the
     // flash blackout), state==INACTIVE and we leave it that way — caller
     // is responsible for restart.
-    bool rx_was_running = (active_input_source == INPUT_SOURCE_SPDIF &&
+    bool rx_was_running = (input_source_is_spdif(active_input_source) &&
                            spdif_input_get_state() != SPDIF_INPUT_INACTIVE);
     if (rx_was_running) {
         spdif_input_stop();
@@ -587,7 +587,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     // changed during the switch (rare — driven by deferred input_source
     // change), skip restart — the input-source handler will manage it.
     if (rx_was_running &&
-        active_input_source == INPUT_SOURCE_SPDIF &&
+        input_source_is_spdif(active_input_source) &&
         !input_source_change_pending) {
         spdif_input_start();
     }
@@ -630,7 +630,7 @@ static void process_pin_changes(uint8_t mask) {
     // Suspend SPDIF RX across the reconfiguration: its decode-timeout alarm can
     // fire mid-mutation and touch shared DMA/PIO state.  Restart at the end if
     // it was running.  Mirrors process_type_switches.
-    bool rx_was_running = (active_input_source == INPUT_SOURCE_SPDIF &&
+    bool rx_was_running = (input_source_is_spdif(active_input_source) &&
                            spdif_input_get_state() != SPDIF_INPUT_INACTIVE);
     if (rx_was_running) {
         spdif_input_stop();
@@ -665,7 +665,7 @@ static void process_pin_changes(uint8_t mask) {
 
     // Restart SPDIF RX if we suspended it (unless the source changed mid-op).
     if (rx_was_running &&
-        active_input_source == INPUT_SOURCE_SPDIF &&
+        input_source_is_spdif(active_input_source) &&
         !input_source_change_pending) {
         spdif_input_start();
     }
@@ -1051,7 +1051,7 @@ static void prepare_flash_write_operation(void) {
     // envelope starts from the freshest possible state.
     if (active_input_source == INPUT_SOURCE_USB) {
         usb_audio_drain_ring();
-    } else if (active_input_source == INPUT_SOURCE_SPDIF) {
+    } else if (input_source_is_spdif(active_input_source)) {
         spdif_input_poll();
     } else if (active_input_source == INPUT_SOURCE_I2S) {
         i2s_input_poll();
@@ -1078,7 +1078,7 @@ static void prepare_flash_write_operation(void) {
     // thump and no hold to honor.
     extern volatile bool sync_started;
     bool usb_streaming   = (active_input_source == INPUT_SOURCE_USB) && sync_started;
-    bool spdif_streaming = (active_input_source == INPUT_SOURCE_SPDIF) &&
+    bool spdif_streaming = (input_source_is_spdif(active_input_source)) &&
                            (spdif_input_get_state() == SPDIF_INPUT_LOCKED);
     bool i2s_streaming   = (active_input_source == INPUT_SOURCE_I2S) &&
                            (i2s_input_get_state() == I2S_INPUT_RUNNING);
@@ -1088,7 +1088,7 @@ static void prepare_flash_write_operation(void) {
                || !dac_hw_mute_hold_elapsed()) {
             if (active_input_source == INPUT_SOURCE_USB) {
                 usb_audio_drain_ring();
-            } else if (active_input_source == INPUT_SOURCE_SPDIF) {
+            } else if (input_source_is_spdif(active_input_source)) {
                 spdif_input_poll();
             } else {
                 i2s_input_poll();
@@ -1109,7 +1109,7 @@ static void prepare_flash_write_operation(void) {
     // blackout edge, tearing down DMA/PIO asynchronously while preset_save
     // is between its two flash writes.  That race crashes the core.  Stop
     // cleanly here; complete_flash_write_operation_*() restarts.
-    if (active_input_source == INPUT_SOURCE_SPDIF &&
+    if (input_source_is_spdif(active_input_source) &&
         spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
         spdif_input_stop();
         spdif_prefilling = false;
@@ -1137,7 +1137,7 @@ static void resume_spdif_after_flash(void) {
     // If the active source changed during the flash write (e.g. preset load
     // that carries USB as the input source), don't restart — the pending
     // input_source_change_pending handler would immediately stop it again.
-    if (active_input_source != INPUT_SOURCE_SPDIF) return;
+    if (!input_source_is_spdif(active_input_source)) return;
     if (input_source_change_pending) return;
 
     // preset_loading=true is still set from prepare_pipeline_reset(); the
@@ -1209,7 +1209,7 @@ static void complete_flash_write_operation_full(void) {
     // slave against the freshly restarted TX master.
     resume_i2s_after_flash();
 
-    if (active_input_source == INPUT_SOURCE_SPDIF) {
+    if (input_source_is_spdif(active_input_source)) {
         // For SPDIF input: the pre-flash settle loop pre-filled the output
         // consumer pools with muted samples.  The blackout stopped DMA
         // chaining after ~one buffer, leaving the remaining pool buffers
@@ -1456,7 +1456,7 @@ void core0_init() {
     // "feedback targeting lower fill" asymmetry between boot-with-SPDIF and
     // the runtime USB→SPDIF switch.  The runtime path already calls this;
     // boot was the odd one out.
-    if (active_input_source == INPUT_SOURCE_SPDIF) {
+    if (input_source_is_spdif(active_input_source)) {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
         spdif_input_start();
     } else if (active_input_source == INPUT_SOURCE_I2S) {
@@ -1576,7 +1576,7 @@ int main(void) {
         }
 
         // Poll SPDIF input when active
-        if (active_input_source == INPUT_SOURCE_SPDIF) {
+        if (input_source_is_spdif(active_input_source)) {
             SpdifInputState rx_state = spdif_input_get_state();
 
             // Handle lock acquisition: drain outputs, prefill, then start.
@@ -2115,7 +2115,7 @@ int main(void) {
                 // post-blackout edge, racing with the downstream pipeline.
                 // See prepare_flash_write_operation() for the same pattern.
                 bool suspended_spdif = false;
-                if (active_input_source == INPUT_SOURCE_SPDIF &&
+                if (input_source_is_spdif(active_input_source) &&
                     spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
                     spdif_input_stop();
                     spdif_prefilling = false;
@@ -2178,7 +2178,7 @@ int main(void) {
                     memcpy(new_types, output_types, NUM_SPDIF_INSTANCES);
                     memcpy(output_types, old_types, NUM_SPDIF_INSTANCES);
                     process_type_switches(change_mask, new_types);
-                } else if (active_input_source == INPUT_SOURCE_SPDIF) {
+                } else if (input_source_is_spdif(active_input_source)) {
                     // SPDIF input: don't drain/re-enable the output pipeline.
                     // The pool holds muted samples queued by the preset-mute
                     // window; draining them would force outputs to restart
@@ -2196,7 +2196,7 @@ int main(void) {
                 // source — input_source_change_pending will manage RX
                 // when its handler fires below.
                 if (suspended_spdif &&
-                    active_input_source == INPUT_SOURCE_SPDIF &&
+                    input_source_is_spdif(active_input_source) &&
                     !input_source_change_pending) {
                     spdif_input_start();
                 }
@@ -2331,7 +2331,7 @@ int main(void) {
                 // at the end (or by process_type_switches if types changed and
                 // RX is still down — it leaves caller-stopped RX alone).
                 bool suspended_spdif = false;
-                if (active_input_source == INPUT_SOURCE_SPDIF &&
+                if (input_source_is_spdif(active_input_source) &&
                     spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
                     spdif_input_stop();
                     spdif_prefilling = false;
@@ -2393,7 +2393,7 @@ int main(void) {
                 // Restart SPDIF RX if we suspended it above (skip if an input-
                 // source change is pending — that handler manages RX).
                 if (suspended_spdif &&
-                    active_input_source == INPUT_SOURCE_SPDIF &&
+                    input_source_is_spdif(active_input_source) &&
                     !input_source_change_pending) {
                     spdif_input_start();
                 }
@@ -2487,7 +2487,7 @@ int main(void) {
             // Restarted once at the end (or by the input-source handler if the
             // bulk payload changed the source).
             bool suspended_spdif = false;
-            if (active_input_source == INPUT_SOURCE_SPDIF &&
+            if (input_source_is_spdif(active_input_source) &&
                 spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
                 spdif_input_stop();
                 spdif_prefilling = false;
@@ -2553,7 +2553,7 @@ int main(void) {
                     memcpy(new_types, output_types, NUM_SPDIF_INSTANCES);
                     memcpy(output_types, old_types, NUM_SPDIF_INSTANCES);
                     process_type_switches(change_mask, new_types);
-                } else if (active_input_source == INPUT_SOURCE_SPDIF) {
+                } else if (input_source_is_spdif(active_input_source)) {
                     // SPDIF input: don't drain/re-enable the output pipeline.
                     // Same rationale as the preset_load_pending path — draining
                     // mid-prefill would force outputs to restart against empty
@@ -2571,7 +2571,7 @@ int main(void) {
             // bulk payload queued an input-source change — that handler owns
             // RX restart then.  Mirrors preset_load_pending.
             if (suspended_spdif &&
-                active_input_source == INPUT_SOURCE_SPDIF &&
+                input_source_is_spdif(active_input_source) &&
                 !input_source_change_pending) {
                 spdif_input_start();
             }
@@ -2599,7 +2599,10 @@ int main(void) {
         if (input_source_change_pending) {
             uint8_t new_source = pending_input_source;
             uint8_t old_source = active_input_source;
-            bool real_switch = (new_source != old_source) && input_source_valid(new_source);
+            // Selectable, not just valid: a switch into a disabled SPDIF 2/3
+            // (e.g. from a stored preset in INDEPENDENT mode) is consumed as
+            // a no-op instead of bringing up an unclaimed GPIO.
+            bool real_switch = (new_source != old_source) && input_source_selectable(new_source);
 
             if (!real_switch) {
                 // No-op request (same / invalid source): consume without
@@ -2617,8 +2620,11 @@ int main(void) {
                 // idempotent re-assert (hold not re-armed).
                 prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
 
-                // Stop old source hardware
-                if (old_source == INPUT_SOURCE_SPDIF) {
+                // Stop old source hardware.  A SPDIF-to-SPDIF input switch
+                // takes this stop branch and the is-spdif start branch below:
+                // full stop/reset/start on the new input's GPIO, outputs
+                // muted until the new source locks.
+                if (input_source_is_spdif(old_source)) {
                     spdif_input_stop();
                     spdif_prefilling = false;
 
@@ -2635,8 +2641,14 @@ int main(void) {
                     // Switching INTO I2S: defer the output restart + mute release
                     // to the I2S prefill block (active_input_source is still
                     // SPDIF here, so complete_pipeline_reset()'s I2S guard can't
-                    // fire).  Switching to USB: complete_pipeline_reset() runs.
-                    perform_rate_change(target_rate, new_source == INPUT_SOURCE_I2S);
+                    // fire).  Switching INTO another SPDIF input: defer likewise,
+                    // so the SPDIF lock/prefill block owns the restart and the
+                    // outputs stay muted until the new input locks (same flow as
+                    // USB to SPDIF).  Switching to USB: complete_pipeline_reset()
+                    // runs here.
+                    perform_rate_change(target_rate,
+                                        new_source == INPUT_SOURCE_I2S ||
+                                        input_source_is_spdif(new_source));
                     dsp_update_delay_samples((float)target_rate);
 
                     // Reset DSP state to prevent stale SPDIF data leaking
@@ -2688,7 +2700,7 @@ int main(void) {
                 lg_sound_sync_on_input_source_change(active_input_source);
 
                 // Start new source hardware
-                if (new_source == INPUT_SOURCE_SPDIF) {
+                if (input_source_is_spdif(new_source)) {
                     spdif_input_start();
                     // Don't complete_pipeline_reset yet — output stays muted
                     // until SPDIF lock is acquired (handled in polling block below)
@@ -2732,16 +2744,17 @@ int main(void) {
             }
         }
 
-        // Handle deferred SPDIF RX pin hot-swap. Set when spdif_rx_pin is
-        // updated (by vendor command, bulk params apply, or preset load)
-        // while INPUT_SOURCE_SPDIF is active. RX library teardown is too
+        // Handle deferred SPDIF RX pin hot-swap. Set when the ACTIVE SPDIF
+        // input's pin is updated (by vendor command, bulk params apply, or
+        // preset load) while that input is the live source; restart picks up
+        // the new GPIO via spdif_rx_active_pin(). RX library teardown is too
         // heavy for USB ISR context, so we run stop/start here.
         // Persistence is now slot-scoped (REQ_PRESET_SAVE) — no flash
         // write happens here.
         extern volatile bool spdif_rx_pin_change_pending;
         if (spdif_rx_pin_change_pending) {
             spdif_rx_pin_change_pending = false;
-            if (active_input_source == INPUT_SOURCE_SPDIF &&
+            if (input_source_is_spdif(active_input_source) &&
                 spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
                 spdif_input_stop();
                 spdif_prefilling = false;

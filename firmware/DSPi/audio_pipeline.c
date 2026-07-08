@@ -1187,7 +1187,7 @@ void siggen_pump(void) {
         return;
     bool streaming =
         (active_input_source == INPUT_SOURCE_USB && usb_audio_stream_active()) ||
-        (active_input_source == INPUT_SOURCE_SPDIF &&
+        (input_source_is_spdif(active_input_source) &&
          spdif_input_get_state() == SPDIF_INPUT_LOCKED) ||
         (active_input_source == INPUT_SOURCE_I2S &&
          i2s_input_get_state() == I2S_INPUT_RUNNING);

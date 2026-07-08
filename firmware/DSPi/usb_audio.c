@@ -272,8 +272,15 @@ void get_default_channel_name(int ch, uint8_t input_source,
         if (input_source == INPUT_SOURCE_I2S) {
             snprintf(buf, PRESET_NAME_LEN, "I2S %d %c",
                      ch / 2 + 1, (ch % 2 == 0) ? 'L' : 'R');
-        } else if (input_source == INPUT_SOURCE_SPDIF) {
-            snprintf(buf, PRESET_NAME_LEN, "SPDIF %c", (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source_is_spdif(input_source)) {
+            // Input 1 keeps the historical bare "SPDIF L/R"; the optional
+            // inputs are numbered so the host can tell them apart.
+            uint8_t idx = spdif_index_for_source(input_source);
+            if (idx == 0)
+                snprintf(buf, PRESET_NAME_LEN, "SPDIF %c", (ch % 2 == 0) ? 'L' : 'R');
+            else
+                snprintf(buf, PRESET_NAME_LEN, "SPDIF %u %c",
+                         (unsigned)(idx + 1), (ch % 2 == 0) ? 'L' : 'R');
         } else {  // USB (and any future per-channel source)
             snprintf(buf, PRESET_NAME_LEN, "USB %d", ch + 1);
         }

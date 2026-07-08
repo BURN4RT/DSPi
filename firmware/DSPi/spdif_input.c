@@ -50,6 +50,11 @@
 
 static volatile SpdifInputState spdif_state = SPDIF_INPUT_INACTIVE;
 
+// GPIO the RX library was started on.  Recorded at start so stop() releases
+// the right pad even if the live pin config changed while running (the RX
+// library's teardown does not reset the GPIO function itself).
+static uint8_t spdif_active_data_pin = 0xFF;
+
 // Flags set by DMA IRQ callbacks (minimal ISR work — main loop handles)
 static volatile bool spdif_rx_stable_flag = false;
 static volatile bool spdif_rx_lost_flag = false;
@@ -164,8 +169,11 @@ void spdif_input_start(void) {
     const uint rx_pio_sm = 2;
 #endif
 
+    // Run on the GPIO of whichever SPDIF input (1/2/3) is the active source
+    spdif_active_data_pin = spdif_rx_active_pin();
+
     spdif_rx_config_t cfg = {
-        .data_pin = spdif_rx_pin,
+        .data_pin = spdif_active_data_pin,
         .pio_sm = rx_pio_sm,
         .dma_channel0 = PICO_SPDIF_RX_DMA_CH0,
         .dma_channel1 = PICO_SPDIF_RX_DMA_CH1,
@@ -199,7 +207,7 @@ void spdif_input_start(void) {
     last_mck_div = 0;
     lock_debounce_polls = 0;
 
-    printf("SPDIF RX: started on GPIO %u\n", spdif_rx_pin);
+    printf("SPDIF RX: started on GPIO %u\n", spdif_active_data_pin);
 }
 
 void spdif_input_stop(void) {
@@ -207,6 +215,14 @@ void spdif_input_stop(void) {
         spdif_rx_end();
         // Release the DMA IRQ refcount hold we took in start()
         audio_spdif_irq_refcount_adjust(PICO_SPDIF_RX_DMA_IRQ, -1);
+        // The library's teardown leaves the pad muxed to PIO input; reset it
+        // so a pin/input switch actually frees the old GPIO (mirrors
+        // i2s_input_stop).
+        if (spdif_active_data_pin != 0xFF) {
+            gpio_set_function(spdif_active_data_pin, GPIO_FUNC_NULL);
+            gpio_set_dir(spdif_active_data_pin, GPIO_IN);
+            spdif_active_data_pin = 0xFF;
+        }
         spdif_state = SPDIF_INPUT_INACTIVE;
         spdif_rx_detected_rate = 0;
         printf("SPDIF RX: stopped\n");

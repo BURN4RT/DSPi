@@ -14,19 +14,32 @@
 
 // Input source identifiers (extensible — leave gaps for future types)
 typedef enum {
-    INPUT_SOURCE_USB   = 0,
-    INPUT_SOURCE_SPDIF = 1,
-    INPUT_SOURCE_I2S   = 2,
-    // Future: INPUT_SOURCE_ADAT = 3
+    INPUT_SOURCE_USB    = 0,
+    INPUT_SOURCE_SPDIF  = 1,   // SPDIF input 1 (always enabled)
+    INPUT_SOURCE_I2S    = 2,
+    // 3 reserved: future INPUT_SOURCE_ADAT
+    INPUT_SOURCE_SPDIF2 = 4,   // Optional SPDIF input 2 (disabled until enabled by host)
+    INPUT_SOURCE_SPDIF3 = 5,   // Optional SPDIF input 3 (disabled until enabled by host)
 } InputSource;
 
-#define INPUT_SOURCE_MAX    INPUT_SOURCE_I2S   // Highest valid value
+#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF3   // Highest valid value (3 is a gap)
+
+// Number of selectable SPDIF inputs. Input 0 (INPUT_SOURCE_SPDIF) is the
+// always-present one; inputs 1..2 (SPDIF2/SPDIF3) are optional and share the
+// single RX PIO state machine; only the active one ever claims its GPIO.
+#define SPDIF_RX_NUM_INPUTS 3
 
 // Default SPDIF RX GPIO pin.  GPIO 5 sits just below the output-pin
 // neighborhood (SPDIF outs on 6-9, PDM on 10) and is unused by any
 // default output, leaving GPIO 11 free for the DAC hardware-mute
 // default (see DAC_HW_MUTE_DEFAULT_PIN in dac_hw_mute.h).
 #define PICO_SPDIF_RX_PIN_DEFAULT  5
+
+// Default GPIOs for the optional SPDIF inputs 2 and 3.  Both are free of
+// every default assignment on RP2350; GPIO 21 is the RP2040 MCK default, so
+// enable-time validation rejects the clash if MCK is enabled there.
+#define PICO_SPDIF_RX_PIN2_DEFAULT 20
+#define PICO_SPDIF_RX_PIN3_DEFAULT 21
 
 // Default I2S RX data GPIO (stereo pair 0).  The four data-pin defaults are the
 // contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all unused by any default
@@ -57,6 +70,17 @@ extern volatile uint8_t active_input_source;
 // SPDIF RX pin (device-level setting, stored in PresetDirectory)
 extern uint8_t spdif_rx_pin;
 
+// GPIOs for the optional SPDIF inputs 2 and 3 ([0] = SPDIF2, [1] = SPDIF3).
+// Same persistence model as spdif_rx_pin.  A disabled input's pin is only a
+// stored preference: it is not reserved against other functions and is never
+// claimed in hardware until the input is enabled AND selected.
+extern uint8_t spdif_rx_pin_ext[SPDIF_RX_NUM_INPUTS - 1];
+
+// Enable mask for the optional SPDIF inputs: bit 0 = SPDIF2, bit 1 = SPDIF3.
+// 0 by default; both extra inputs absent from the source list and invisible
+// to pin-conflict validation.  SPDIF input 1 is always enabled.
+extern uint8_t spdif_rx_enabled_ext;
+
 // I2S RX serial-data pins, one per stereo pair, each independently
 // configurable (same per-pin persistence model as spdif_rx_pin).  [0] is the
 // always-present stereo pair (default PICO_I2S_RX_PIN_DEFAULT); [1..3] are used
@@ -83,9 +107,51 @@ extern volatile uint8_t pending_input_source;
 extern volatile bool i2s_rx_pin_change_pending;
 extern volatile bool i2s_input_restart_pending;
 
-// Validate an input source value
+// Structurally valid input source value (3 is the reserved ADAT gap)
 static inline bool input_source_valid(uint8_t src) {
-    return src <= INPUT_SOURCE_MAX;
+    return src <= INPUT_SOURCE_MAX && src != 3;
+}
+
+// True for any of the three SPDIF inputs
+static inline bool input_source_is_spdif(uint8_t src) {
+    return src == INPUT_SOURCE_SPDIF || src == INPUT_SOURCE_SPDIF2 ||
+           src == INPUT_SOURCE_SPDIF3;
+}
+
+// SPDIF input index (0..2) for a source; 0 for non-SPDIF sources
+static inline uint8_t spdif_index_for_source(uint8_t src) {
+    if (src == INPUT_SOURCE_SPDIF2) return 1;
+    if (src == INPUT_SOURCE_SPDIF3) return 2;
+    return 0;
+}
+
+// InputSource value for a SPDIF input index (0..2)
+static inline uint8_t spdif_source_for_index(uint8_t idx) {
+    if (idx == 1) return INPUT_SOURCE_SPDIF2;
+    if (idx == 2) return INPUT_SOURCE_SPDIF3;
+    return INPUT_SOURCE_SPDIF;
+}
+
+// Configured GPIO for a SPDIF input index (0..2)
+static inline uint8_t spdif_rx_pin_for_index(uint8_t idx) {
+    return (idx == 0) ? spdif_rx_pin : spdif_rx_pin_ext[idx - 1];
+}
+
+// True if SPDIF input `idx` is enabled (index 0 is always enabled)
+static inline bool spdif_input_enabled(uint8_t idx) {
+    return idx == 0 || ((spdif_rx_enabled_ext >> (idx - 1)) & 1u) != 0;
+}
+
+// Valid AND currently offered in the source list (disabled SPDIF 2/3 are not)
+static inline bool input_source_selectable(uint8_t src) {
+    if (!input_source_valid(src)) return false;
+    if (!input_source_is_spdif(src)) return true;
+    return spdif_input_enabled(spdif_index_for_source(src));
+}
+
+// GPIO the RX library should run on for the currently-active SPDIF source
+static inline uint8_t spdif_rx_active_pin(void) {
+    return spdif_rx_pin_for_index(spdif_index_for_source(active_input_source));
 }
 
 // Validate a proposed I2S RX data-pin set (the first `n_pairs` entries of
@@ -105,6 +171,12 @@ bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs, uint8_t bck
 // contention and an invalid GPIO can fault pio_gpio_init()).  Defined in
 // vendor_commands.c; declared here for the same reason as above.
 bool i2s_bck_pin_acceptable(uint8_t bck_pin);
+
+// True if SPDIF input `idx` (1..2) could be enabled right now: its configured
+// GPIO is valid and not claimed by any other function.  Defined in
+// vendor_commands.c (alongside the other pin helpers); declared here so the
+// bulk/preset restore paths can validate a stored enable before applying it.
+bool spdif_input_enable_acceptable(uint8_t idx);
 
 // I2S input rate wire/flash encoding (1 byte): 0 = 44100, 1 = 48000,
 // 2 = 96000. Unknown values decode to 48000.

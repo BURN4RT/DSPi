@@ -2203,7 +2203,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-08 (CS slot-name SET 0x8B now an apply-live-only preview)*
+*Last updated: 2026-07-08 (multi-SPDIF input: 0xE4/0xE5 gain an input index; new 0xE9 enable, 0xEF config query)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2342,17 +2342,19 @@ op state ~400 B).
 | REQ_GET_USER_VOLUME | 0xDB | IN | Get user-perceived volume (float dB) |
 | REQ_SET_USER_MUTE | 0xDC | OUT | Set vendor-channel `user_mute` flag (1 byte 0/1); always honored regardless of input source. Distinct from `audio_state.mute` (UAC1) which is USB-gated; pipeline ORs them. |
 | REQ_GET_USER_MUTE | 0xDD | IN | Get vendor-channel `user_mute` (UAC1 mute is read via UAC1 GET_CUR) |
-| REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF, 2=I2S) |
+| REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF, 2=I2S, 4=SPDIF2, 5=SPDIF3; 3 reserved for future ADAT). SPDIF2/3 rejected unless enabled |
 | REQ_GET_INPUT_SOURCE | 0xE1 | IN | Get active input source |
 | REQ_GET_SPDIF_RX_STATUS | 0xE2 | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | REQ_GET_SPDIF_RX_CH_STATUS | 0xE3 | IN | Get IEC 60958 channel status (24 bytes) |
-| REQ_SET_SPDIF_RX_PIN | 0xE4 | IN* | Set SPDIF RX GPIO pin (wValue=pin, returns status) |
-| REQ_GET_SPDIF_RX_PIN | 0xE5 | IN | Get SPDIF RX GPIO pin |
+| REQ_SET_SPDIF_RX_PIN | 0xE4 | IN* | Set a SPDIF input's RX GPIO (wValue = (index<<8)\|pin, index 0..2; old hosts sending just a pin target index 0). Enabled inputs conflict-check the new pin; a disabled 2/3 stores it as a preference. Returns status byte |
+| REQ_GET_SPDIF_RX_PIN | 0xE5 | IN | Get a SPDIF input's RX GPIO (wValue = index 0..2) |
 | REQ_SET_LG_SOUND_SYNC_ENABLE | 0xE6 | OUT | Set LG Sound Sync enable flag (per-preset; live until REQ_SAVE_PRESET) |
 | REQ_GET_LG_SOUND_SYNC_ENABLE | 0xE7 | IN | Get LG Sound Sync enable flag |
 | REQ_GET_LG_SOUND_SYNC_STATUS | 0xE8 | IN | Get 16-byte LgSoundSyncStatus (enabled/present/volume/muted + reserved) |
+| REQ_SET_SPDIF_INPUT_ENABLE | 0xE9 | IN* | Enable/disable optional SPDIF input 2 or 3 (wValue = (index<<8)\|enable, index 1..2). Enabling validates the configured pin (PIN_IN_USE on conflict); disabling the live/pending source is rejected. RAM-only; persist via REQ_PRESET_SAVE. Returns PIN_CONFIG_* status byte |
 | REQ_SET_INPUT_RATE | 0xED | OUT | Set I2S input sample rate (uint32_t Hz: 44100/48000/96000; applied live when I2S input active) |
 | REQ_GET_INPUT_RATE | 0xEE | IN | Returns 8 bytes: 2x uint32_t {current pipeline Hz, selected I2S input Hz} |
+| REQ_GET_SPDIF_INPUT_CONFIG | 0xEF | IN | Get 5 bytes: input count (3), enable mask over all inputs (bit 0 = input 1, always set), then GPIOs for inputs 1..3. Lets a host build its source list data-driven |
 | REQ_SET_I2S_RX_PIN | 0xF1 | IN* | Set I2S RX data GPIO pin (wValue=pin, returns status) |
 | REQ_GET_I2S_RX_PIN | 0xF2 | IN | Get I2S RX data GPIO pin |
 | REQ_SET_UART_CONFIG | 0xF5 | OUT | Configure UART control interface (8-byte `UartCtrlConfig`; **USB only**, refused with BLOCKED over UART/I2C; deferred apply, persist on success; returns `PIN_CONFIG_*`) |
@@ -2640,32 +2642,48 @@ Master volume is re-derived on every preset *context* change (preset load, activ
 ---
 
 ## Audio Input Source System
-*Last updated: 2026-06-11*
+*Last updated: 2026-07-08 (up to three selectable SPDIF inputs sharing one RX SM/DMA)*
 
-Abstraction layer enabling selection between multiple audio input sources. Currently supports USB (default), SPDIF and I2S. Designed for future extensibility to ADAT input without restructuring.
+Abstraction layer enabling selection between multiple audio input sources. Currently supports USB (default), up to three SPDIF inputs, and I2S. Designed for future extensibility to ADAT input without restructuring.
 
 ### Files
 
-- `audio_input.h`: `InputSource` enum, globals, constants, I2S rate enum helpers
+- `audio_input.h`: `InputSource` enum, globals, constants, I2S rate enum helpers, SPDIF-input index/enable helpers
 - `audio_input.c` — Global definitions
 
 ### Input Source Enum
 
 ```c
 typedef enum {
-    INPUT_SOURCE_USB   = 0,
-    INPUT_SOURCE_SPDIF = 1,
-    INPUT_SOURCE_I2S   = 2,
-    // Future: INPUT_SOURCE_ADAT = 3
+    INPUT_SOURCE_USB    = 0,
+    INPUT_SOURCE_SPDIF  = 1,   // SPDIF input 1 (always enabled)
+    INPUT_SOURCE_I2S    = 2,
+    // 3 reserved: future INPUT_SOURCE_ADAT
+    INPUT_SOURCE_SPDIF2 = 4,   // Optional SPDIF input 2 (disabled until enabled by host)
+    INPUT_SOURCE_SPDIF3 = 5,   // Optional SPDIF input 3 (disabled until enabled by host)
 } InputSource;
 ```
+
+`input_source_valid()` accepts every value except the reserved 3; `input_source_selectable()` additionally requires that a SPDIF 2/3 be enabled before it is offered. `input_source_is_spdif()`, `spdif_index_for_source()` (0..2), and `spdif_source_for_index()` map between the two SPDIF representations.
+
+### Multiple Selectable SPDIF Inputs
+*Last updated: 2026-07-08*
+
+Up to `SPDIF_RX_NUM_INPUTS` (3) SPDIF inputs share the single RX PIO state machine and DMA pair; only the active one ever claims its GPIO. SPDIF input 1 (`INPUT_SOURCE_SPDIF`, default GPIO 5) is always enabled and behaves exactly as before. The optional inputs 2 and 3 (`INPUT_SOURCE_SPDIF2` / `INPUT_SOURCE_SPDIF3`, default GPIOs 20 and 21) are **disabled by default**.
+
+- **Enable model.** `spdif_rx_enabled_ext` is a 2-bit mask (bit 0 = SPDIF2, bit 1 = SPDIF3). While an input is disabled it is not offered by `REQ_SET_INPUT_SOURCE`, and its configured pin is a stored preference only: invisible to pin-conflict validation, so other functions may use GPIO 20/21 freely. Enabling validates the configured pin via `spdif_input_enable_acceptable()` (valid GPIO, not claimed by any other function) and is rejected with `PIN_IN_USE` on a conflict. Disabling the input that is the active source (or the target of a pending source switch) is rejected; the host must switch away first.
+- **GPIO lifecycle.** `spdif_rx_pin_for_index()` resolves an input's pin (`spdif_rx_pin` for index 0, `spdif_rx_pin_ext[]` for 1..2) and `spdif_rx_active_pin()` gives the GPIO the RX library should run on for the current source. `spdif_input_stop()` now resets the RX GPIO to `GPIO_FUNC_NULL` (the vendored `pico_spdif_rx` library never did); it releases the pin it recorded at start time, not the current config, so a pin change or an input switch actually frees the previous pad.
+- **Switching between SPDIF inputs** reuses the existing deferred source-switch machinery (full stop, pipeline reset, restart on the new GPIO, outputs muted until lock). Inter-slot output alignment is preserved by the same complete-reset path as every other source switch.
+- **Vendor commands.** `REQ_SET_SPDIF_RX_PIN` (0xE4) and `REQ_GET_SPDIF_RX_PIN` (0xE5) carry the input index (`wValue = (index<<8)|GPIO` on SET, `wValue = index` on GET); a bare pin from an old host targets index 0. `REQ_SET_SPDIF_INPUT_ENABLE` (0xE9, `wValue = (index<<8)|enable`, index 1..2) toggles the mask; `REQ_GET_SPDIF_INPUT_CONFIG` (0xEF) returns the input count, the enable mask over all inputs (bit 0 always set), and all three GPIOs so a host can build its source list data-driven.
+- **Default channel names.** SPDIF input 1 keeps "SPDIF L/R"; inputs 2/3 produce "SPDIF 2 L/R" / "SPDIF 3 L/R" so the host can tell them apart.
+- **Platform-independent:** identical on RP2040 and RP2350.
 
 ### Switching Behavior
 
 - Source switching is deferred to the main loop via `input_source_change_pending` / `pending_input_source` flags (same pattern as output type switching)
 - On switch: drain USB ring, `prepare_pipeline_reset()`, update `active_input_source`, `complete_pipeline_reset()`
 - When input is not USB, `usb_audio_drain_ring()` is skipped — USB enumeration stays active but audio data is silently dropped
-- SPDIF RX hardware only runs when SPDIF is the selected input source; I2S RX hardware only runs when I2S is the selected input source. The two share the same PIO SM and DMA channels, which is safe because inputs are switched, never mixed
+- SPDIF RX hardware only runs when SPDIF is the selected input source; I2S RX hardware only runs when I2S is the selected input source. The two share the same PIO SM and DMA channels, which is safe because inputs are switched, never mixed. The three SPDIF inputs likewise share the single RX SM/DMA pair; switching between them runs the same full stop/restart so only the active input's GPIO is ever claimed
 - Switching to I2S applies the selected `i2s_input_rate` (via `perform_rate_change()` when it differs from the current rate), then runs the same drain/prefill-to-50%/enable-in-sync handshake as SPDIF (minus the lock wait, since the synchronous input runs as soon as it is started). See the I2S Input prefill note below
 
 ### USB Behavior While Non-USB Input is Active (2026-05-04)
@@ -2688,11 +2706,11 @@ The SPDIF→USB transition in the deferred input-source switch handler (`main.c:
 This matches the user's product-level decision; it differs from the industry-standard pattern (RME TotalMix / UA Apollo, where host volume continues to act as master output gain on external sources) on purpose.
 
 ### SPDIF RX Pin
-*Last updated: 2026-05-15*
+*Last updated: 2026-07-08 (per-input pins: `spdif_rx_pin` plus `spdif_rx_pin_ext[2]` for SPDIF 2/3)*
 
-- Default: GPIO 5 (`PICO_SPDIF_RX_PIN_DEFAULT`). Moved off GPIO 11 to avoid colliding with `DAC_HW_MUTE_DEFAULT_PIN`; GPIO 5 is unclaimed by any default output, the UART, or the I²S pins, so the SPDIF RX defaults stop blocking a fresh-install enable of the DAC hardware-mute feature.
-- **Persistence follows `output_config_mode` (matches `output_pins[]`).** `REQ_SET_SPDIF_RX_PIN` updates the live `spdif_rx_pin` global in RAM only; no implicit flash write. In with-preset mode the user `REQ_PRESET_SAVE`s to capture the pin in a slot (restored on load); in independent mode `REQ_SAVE_OUTPUT_CONFIG` persists it to the device-global block (applied at boot). The RX pin is part of the physical-IO config block, applied by `apply_output_config_from_mode()`.
-- Configurable via `REQ_SET_SPDIF_RX_PIN` (0xE4) / `REQ_GET_SPDIF_RX_PIN` (0xE5).
+- Default: GPIO 5 (`PICO_SPDIF_RX_PIN_DEFAULT`) for input 1; GPIO 20/21 (`PICO_SPDIF_RX_PIN2_DEFAULT` / `PICO_SPDIF_RX_PIN3_DEFAULT`) for the optional inputs 2/3. Input 1's GPIO 5 moved off GPIO 11 to avoid colliding with `DAC_HW_MUTE_DEFAULT_PIN`; it is unclaimed by any default output, the UART, or the I²S pins, so the SPDIF RX defaults stop blocking a fresh-install enable of the DAC hardware-mute feature. A disabled input's pin is not reserved, so GPIO 20/21 stay free for other functions until the input is enabled.
+- **Persistence follows `output_config_mode` (matches `output_pins[]`).** `REQ_SET_SPDIF_RX_PIN` updates the live `spdif_rx_pin` / `spdif_rx_pin_ext[]` global in RAM only; no implicit flash write. In with-preset mode the user `REQ_PRESET_SAVE`s to capture the pins in a slot (restored on load); in independent mode `REQ_SAVE_OUTPUT_CONFIG` persists them to the device-global block (applied at boot). The RX pins are part of the physical-IO config block, applied by `apply_output_config_from_mode()`.
+- Configurable via `REQ_SET_SPDIF_RX_PIN` (0xE4) / `REQ_GET_SPDIF_RX_PIN` (0xE5); both now carry the input index (0..2) in `wValue`. Enabled inputs conflict-check a new pin; a disabled 2/3's pin is a stored preference validated at enable time (`REQ_SET_SPDIF_INPUT_ENABLE`, 0xE9).
 - **On-flash layout:** `spdif_rx_pin` lives in one byte that V13 originally reserved as `input_source_padding[0]`. Reusing that byte keeps the `PresetSlot` size unchanged, so existing V13 presets remain CRC-valid (their padding bytes were zero-initialised, which fails GPIO validity and falls through to the live default — same observable behaviour as before this change).
 - **Boot-time bootstrap.** `preset_boot_load` still reads the directory's legacy `spdif_rx_pin` field as the initial live value. This means users upgrading from auto-flush firmware keep their previously-configured pin until they save a preset under the new firmware. After that, the slot's value drives behaviour and the directory field is no longer consulted on subsequent boots that load the same slot.
 - **Hot-swap supported.** Pin changes (from vendor command, bulk params apply, or preset load) while SPDIF input is active set `spdif_rx_pin_change_pending`; the main-loop deferred handler runs `spdif_input_stop()` → `prepare_pipeline_reset()` → `spdif_input_start()` so the running RX library picks up the new GPIO. Deferred to main loop because the `pico_spdif_rx` library's teardown (program removal, IRQ handler removal, DMA channel unclaim) is not safe to perform from USB ISR context.
@@ -2773,21 +2791,23 @@ How the pools get filled depends on the input's clock role, because the prefill 
 
 | Code | Command | Direction | Description |
 |------|---------|-----------|-------------|
-| 0xE0 | REQ_SET_INPUT_SOURCE | OUT | Set active input source (uint8_t payload; 2 = I2S) |
+| 0xE0 | REQ_SET_INPUT_SOURCE | OUT | Set active input source (uint8_t payload; 2 = I2S, 4 = SPDIF2, 5 = SPDIF3; SPDIF2/3 rejected unless enabled) |
 | 0xE1 | REQ_GET_INPUT_SOURCE | IN | Get active input source (returns uint8_t) |
 | 0xE2 | REQ_GET_SPDIF_RX_STATUS | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | 0xE3 | REQ_GET_SPDIF_RX_CH_STATUS | IN | Get IEC 60958 channel status (24 bytes) |
-| 0xE4 | REQ_SET_SPDIF_RX_PIN | IN* | Set SPDIF RX pin (wValue=pin, returns status byte) |
-| 0xE5 | REQ_GET_SPDIF_RX_PIN | IN | Get SPDIF RX pin (returns uint8_t) |
+| 0xE4 | REQ_SET_SPDIF_RX_PIN | IN* | Set a SPDIF input's RX pin (wValue = (index<<8)\|pin, index 0..2; old hosts sending a bare pin target index 0). Returns status byte |
+| 0xE5 | REQ_GET_SPDIF_RX_PIN | IN | Get a SPDIF input's RX pin (wValue = index 0..2, returns uint8_t) |
+| 0xE9 | REQ_SET_SPDIF_INPUT_ENABLE | IN* | Enable/disable optional SPDIF input 2/3 (wValue = (index<<8)\|enable, index 1..2). Returns PIN_CONFIG_* status byte |
 | 0xED | REQ_SET_INPUT_RATE | OUT | Set I2S input rate (uint32_t Hz: 44100/48000/96000) |
 | 0xEE | REQ_GET_INPUT_RATE | IN | Returns 2x uint32_t {current pipeline Hz, selected I2S Hz} |
+| 0xEF | REQ_GET_SPDIF_INPUT_CONFIG | IN | Returns 5 bytes: input count (3), enable mask (bit 0 = input 1, always set), GPIOs for inputs 1..3 |
 | 0xF1 | REQ_SET_I2S_RX_PIN | IN* | Set I2S RX data pin (wValue=pin, returns status byte) |
 | 0xF2 | REQ_GET_I2S_RX_PIN | IN | Get I2S RX data pin (returns uint8_t) |
 
-*0xE4/0xF1 use the immediate-response SET pattern (same as `REQ_SET_I2S_BCK_PIN`).
+*0xE4/0xE9/0xF1 use the immediate-response SET pattern (same as `REQ_SET_I2S_BCK_PIN`).
 
 ### Persistence
-*Last updated: 2026-06-11*
+*Last updated: 2026-07-08 (multi-SPDIF: slot V24, directory V12, FlashOutputConfig 28 bytes)*
 
 - `SLOT_DATA_VERSION` 13 adds `input_source` (uint8_t) to `PresetSlot`
 - Slots with version < 13 leave input source at its current value (USB by default)
@@ -2796,6 +2816,9 @@ How the pools get filled depends on the input's clock role, because the prefill 
 - SPDIF RX pin stored in `PresetDirectory` (consumed existing padding byte, no directory format change)
 - `SLOT_DATA_VERSION` 17 appends `i2s_rx_pin` (0 = unset, use default) and `i2s_input_rate` to `PresetSlot` (struct grows 2 bytes; per-version CRC ranges via `slot_data_size_for_version()`, same mechanism as V16)
 - `FlashOutputConfig` claims two reserved bytes for `i2s_rx_pin` (0 = unset) and `i2s_input_rate_p1` (+1 sentinel so old zeroed directories read as "unset" instead of 44.1 kHz), so both survive boot in independent IO mode via `REQ_SAVE_OUTPUT_CONFIG`
+- **Multi-SPDIF (SLOT_DATA_VERSION 23 → 24).** `PresetSlot` tail-appends `spdif_rx_enabled_ext` + `spdif_rx_pin_ext[2]` (struct grows 3 bytes). Backward-compatible: older slots load with the extra inputs disabled and their pins unset. Same `output_config_mode` (with-preset vs independent) routing as the existing SPDIF RX pin.
+- **Directory (V11 → V12).** `FlashOutputConfig` grows 25 → 28 bytes (adds `spdif_rx_enabled_ext` + `spdif_rx_pin_ext[2]`), so `DIR_VERSION_CURRENT` bumps to 12 with a frozen `FlashOutputConfig_v11` / `PresetDirectory_v11` used by the migration. All-zero new bytes read as disabled/unset.
+- **Wire format (WIRE_FORMAT_VERSION stays 17).** `WireInputConfig` claims three of its reserved bytes: `spdif_rx_pin_ext[2]` (0 = absent, keep the live pin) and `spdif_rx_enabled_ext_p1` (enable mask PLUS ONE; 0 = absent), per the reserved-byte claim convention that needs no version break. Bulk apply refuses to disable the live input and validates any newly enabled input's pin (`spdif_input_enable_acceptable()`).
 
 ---
 

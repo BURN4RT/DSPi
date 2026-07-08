@@ -199,7 +199,15 @@ typedef struct __attribute__((packed)) {
     // wire layout/size is unchanged and the format version need not bump.
     uint8_t  i2s_input_channels;     // Active I2S input channels: 2/4/6/8 (0 = absent)
     uint8_t  i2s_rx_pin_ext[3];      // I2S RX data GPIOs for stereo pairs 1..3 (0 = unset)
-    uint8_t  reserved[8];            // Future expansion (pad to 16 bytes)
+    // Optional SPDIF inputs 2/3, claimed from the reserved bytes with the same
+    // 0 = "absent, keep live value" convention as the I2S fields above (so the
+    // wire layout/size is unchanged and the format version need not bump).
+    // The enable mask is stored PLUS ONE for that reason: old hosts push zeros
+    // here, and plain encoding 0 would read as "disable both".
+    uint8_t  spdif_rx_pin_ext[2];    // SPDIF RX 2/3 GPIOs (0 = absent, keep live)
+    uint8_t  spdif_rx_enabled_ext_p1;// SPDIF 2/3 enable mask + 1 (0 = absent;
+                                     // 1 = both disabled, 2 = SPDIF2, 3 = both, ...)
+    uint8_t  reserved[5];            // Future expansion (pad to 16 bytes)
 } WireInputConfig;                   // 16 bytes
 
 // ============================================================================
