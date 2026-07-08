@@ -116,21 +116,19 @@ void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out);
 void preset_get_cs_config(CsFlashConfig *out);
 
 // Control Surfaces IR command table (board-level, directory-stored, V11+).
-// Getter copies out of the RAM cache.  preset_set_cs_all persists bindings
-// and IR commands together in one directory-sector write (the REQ_CS_SAVE
-// path); synchronous and main-loop only, caller has validated both.
-// Returns PRESET_OK or PRESET_ERR_*.
+// Getter copies out of the RAM cache.  preset_set_cs_all persists bindings,
+// IR commands and slot names together in one directory-sector write (the
+// REQ_CS_SAVE path); synchronous and main-loop only, caller has validated
+// all three.  Returns PRESET_OK or PRESET_ERR_*.
 void preset_get_cs_ir_config(CsIrConfig *out);
-uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir);
+uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
+                          const char (*names)[CS_NAME_LEN]);
 
 // Control Surfaces slot names (board-level, directory-stored, V10+).  User
 // labels for what each control slot is for; independent of the bindings
-// (survive binding changes and slot clears).  Setter is synchronous and
-// main-loop only (one directory-sector write); `name` is copied with
-// guaranteed NUL termination (up to CS_NAME_LEN-1 chars).  Getter copies
-// CS_NAME_LEN bytes from the RAM cache into `name_out`.
-// Both return PRESET_OK or PRESET_ERR_*.
-uint8_t preset_set_cs_name(uint8_t slot, const char *name);
+// (survive binding changes and slot clears).  Names persist only through
+// preset_set_cs_all above; the getter copies CS_NAME_LEN bytes from the RAM
+// cache into `name_out`.  Returns PRESET_OK or PRESET_ERR_*.
 uint8_t preset_get_cs_name(uint8_t slot, char *name_out);
 
 // Get the currently active preset slot (always 0-9).

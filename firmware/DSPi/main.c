@@ -1815,9 +1815,9 @@ int main(void) {
                 }
             }
 
-            // Control Surfaces slot-name SET (deferred).  Pure slot
-            // metadata: no engine state to apply, just the directory
-            // persist.  Slot range was validated at the vendor handler.
+            // Control Surfaces slot-name SET (deferred).  Live-only preview
+            // like the binding SET: update the live name table, mark dirty,
+            // no flash.  Slot range was validated at the vendor handler.
             if (cs_set_name_pending) {
                 char name[CS_NAME_LEN];
                 uint8_t slot;
@@ -1826,12 +1826,12 @@ int main(void) {
                 slot = cs_set_name_slot;
                 cs_set_name_pending = false;
                 restore_interrupts(f);
-                prepare_flash_write_operation();
-                uint8_t rc = preset_set_cs_name(slot, name);
-                complete_flash_write_operation_light();
-                cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
-                                                   : CS_STATUS_FLASH_ERROR;
+                uint8_t status = control_surfaces_apply_name(slot, name);
+                cs_last_status = status;
                 cs_last_slot = slot;
+                if (status == PIN_CONFIG_SUCCESS) {
+                    control_surfaces_set_dirty(true);
+                }
             }
 
             // Control Surfaces IR-command SET (deferred).  Live-only preview
@@ -1854,15 +1854,16 @@ int main(void) {
             }
 
             // Control Surfaces SAVE (deferred).  Persist the whole live
-            // config (bindings + IR commands) in one directory flash write,
-            // then clear the dirty preview flag on success.
+            // config (bindings + IR commands + slot names) in one directory
+            // flash write, then clear the dirty preview flag on success.
             if (cs_save_pending) {
                 uint32_t f = save_and_disable_interrupts();
                 cs_save_pending = false;
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 uint8_t rc = preset_set_cs_all(control_surfaces_config(),
-                                               control_surfaces_ir_config());
+                                               control_surfaces_ir_config(),
+                                               control_surfaces_names());
                 complete_flash_write_operation_light();
                 cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
                                                    : CS_STATUS_FLASH_ERROR;

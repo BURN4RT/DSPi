@@ -2470,36 +2470,25 @@ void preset_get_cs_ir_config(CsIrConfig *out) {
     memcpy(out, &dir_cache.cs_ir, sizeof(*out));
 }
 
-uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir) {
-    if (!cfg || !ir) return PRESET_ERR_INVALID_SLOT;
+uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
+                          const char (*names)[CS_NAME_LEN]) {
+    if (!cfg || !ir || !names) return PRESET_ERR_INVALID_SLOT;
     dir_ensure();
     memcpy(&dir_cache.cs_config, cfg, sizeof(dir_cache.cs_config));
     dir_cache.cs_config.version = CS_CONFIG_VERSION;
     memcpy(&dir_cache.cs_ir, ir, sizeof(dir_cache.cs_ir));
     dir_cache.cs_ir.version = CS_IR_CONFIG_VERSION;
+    memcpy(dir_cache.cs_names, names, sizeof(dir_cache.cs_names));
+    for (uint8_t s = 0; s < CS_MAX_BINDINGS; s++)
+        dir_cache.cs_names[s][CS_NAME_LEN - 1] = '\0';
     if (dir_flush() != 0) {
         return PRESET_ERR_FLASH_WRITE;
     }
     return PRESET_OK;
 }
 
-// Control Surfaces slot names (V10).  Setter mirrors preset_set_name:
-// synchronous, main-loop only, one directory-sector write.  Getter reads the
-// RAM cache, so it is cheap enough for the vendor GET path.
-uint8_t preset_set_cs_name(uint8_t slot, const char *name) {
-    if (slot >= CS_MAX_BINDINGS) return PRESET_ERR_INVALID_SLOT;
-    dir_ensure();
-
-    // Copy name with guaranteed NUL termination
-    memset(dir_cache.cs_names[slot], 0, CS_NAME_LEN);
-    strncpy(dir_cache.cs_names[slot], name, CS_NAME_LEN - 1);
-
-    if (dir_flush() != 0) {
-        return PRESET_ERR_FLASH_WRITE;
-    }
-    return PRESET_OK;
-}
-
+// Control Surfaces slot names (V10).  Reads the RAM cache; the engine loads
+// its live name table from here at boot and on REQ_CS_REVERT.
 uint8_t preset_get_cs_name(uint8_t slot, char *name_out) {
     if (slot >= CS_MAX_BINDINGS) return PRESET_ERR_INVALID_SLOT;
     dir_ensure();

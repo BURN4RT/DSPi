@@ -1118,9 +1118,10 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
 
         case REQ_SET_CS_NAME: {
             // wValue = slot, payload = 1-32 bytes of name (a single NUL
-            // byte clears it).  Deferred to main loop: the persist is a
-            // directory flash write.  Result lands in cs_last_status,
-            // readable via REQ_GET_CS_STATUS, like the binding SET.
+            // byte clears it).  Apply-live-only preview like the binding
+            // SET: deferred to the main loop, marks the config dirty, no
+            // flash; REQ_CS_SAVE persists.  Result lands in cs_last_status,
+            // readable via REQ_GET_CS_STATUS.
             uint8_t slot = vendor_last_wValue & 0xFF;
             if (slot >= CS_MAX_BINDINGS) {
                 cs_last_status = CS_STATUS_INVALID_SLOT;
@@ -2034,13 +2035,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_CS_NAME: {
-                // wValue = slot; returns the persisted 32-byte name (from
-                // the directory RAM cache; no flash access).
-                if (setup->wValue >= CS_MAX_BINDINGS) return false;
-                char name[CS_NAME_LEN];
-                if (preset_get_cs_name((uint8_t)setup->wValue, name) != PRESET_OK) {
-                    return false;
-                }
+                // wValue = slot; returns the live 32-byte name (the unsaved
+                // preview when dirty, else the persisted name).
+                const char *name = control_surfaces_get_name((uint8_t)setup->wValue);
+                if (name == NULL) return false;
                 memcpy(resp_buf, name, CS_NAME_LEN);
                 vendor_send_response(resp_buf, CS_NAME_LEN);
                 return true;

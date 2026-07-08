@@ -347,7 +347,7 @@ and is not part of `WireBulkParams`.
 | `REQ_GET_CS_CAPS` | `0x86` | IN | `0xFFFF` = header+types; else noun index | - | 40-byte `CsCapsHeader` or 12-byte `CsNounDesc` |
 | `REQ_GET_CS_STATUS` | `0x87` | IN | - | - | 32-byte `CsStatusPacket` |
 | `REQ_SET_CS_NAME` | `0x8B` | OUT | slot (0-15) | 1-32 byte name | none (deferred; poll `0x87`) |
-| `REQ_GET_CS_NAME` | `0x8C` | IN | slot (0-15) | - | 32-byte NUL-terminated name |
+| `REQ_GET_CS_NAME` | `0x8C` | IN | slot (0-15) | - | 32-byte NUL-terminated name (live) |
 | `REQ_SET_CS_IR_CMD` | `0x8D` | OUT | sub-slot (0-7) | 16-byte `IrCommand` | none (deferred; poll `0x87`) |
 | `REQ_GET_CS_IR_CMD` | `0x8E` | IN | sub-slot (0-7) | - | 16-byte `IrCommand` (live) |
 | `REQ_CS_IR_LEARN` | `0x8F` | IN | 1 = arm, 0 = cancel, 2 = read result | - | 1 ack byte (arm/cancel) or 8-byte result (3.6.1) |
@@ -431,7 +431,7 @@ Surfaces extends it from `0x10`.
 | `0x19` | `CS_STATUS_PWM_CONFLICT` | PWM LED collides with another PWM LED on the same PWM slice+channel |
 | `0x1A` | `CS_STATUS_EVENT_IN_USE` | another button binding already has this GPIO+event pair |
 | `0x1B` | `CS_STATUS_BUSY` | SET dropped; a previous SET of the same kind is still queued for apply (retry after polling); also a save/revert while one is already queued |
-| `0x1C` | `CS_STATUS_FLASH_ERROR` | the directory persist failed (name SET or `REQ_CS_SAVE`) |
+| `0x1C` | `CS_STATUS_FLASH_ERROR` | the directory persist failed (`REQ_CS_SAVE`) |
 | `0x1D` | `CS_STATUS_IR_IN_USE` | another slot already holds the IR component (one receiver per device) |
 | `0x1E` | `CS_STATUS_NO_IR` | learn was armed with no live `CS_TYPE_IR` binding |
 
@@ -449,38 +449,41 @@ Semantics:
   that has no binding yet. Clear a name explicitly by sending a payload of one
   NUL byte.
 - **Persistence** is device-global in the preset directory (V10), next to the
-  binding table; names survive preset changes and factory reset. All-zero =
-  unnamed, so a fresh directory needs no seeding.
+  binding table; saved names survive preset changes and factory reset (an
+  unsaved live name is preview state and is lost on reboot, section 3.5).
+  All-zero = unnamed, so a fresh directory needs no seeding.
 - `REQ_SET_CS_NAME` uses the **same deferred model** as the binding SET
-  (section 3.2) because the persist is a directory-sector flash write: the
-  handler validates the slot, latches the name, records `CS_STATUS_PENDING`
-  in `last_status`/`last_slot`, and the main loop persists and overwrites the
-  status with `PIN_CONFIG_SUCCESS` (or `CS_STATUS_FLASH_ERROR`). Binding and
-  name SETs share the single status channel; poll `REQ_GET_CS_STATUS` until
-  the PENDING result resolves before sending the next SET of either kind.
-  A name SET arriving while a previous name SET is still queued records
-  `CS_STATUS_BUSY`; an empty payload records `CS_STATUS_INVALID_VALUE`.
-  Payloads longer than 31 characters are truncated.
-- `REQ_GET_CS_NAME` is synchronous and reads the directory's RAM cache (no
-  flash access); it always returns 32 bytes with guaranteed NUL termination.
+  (section 3.2): the handler validates the slot, latches the name, records
+  `CS_STATUS_PENDING` in `last_status`/`last_slot`, and the main loop applies
+  it to the live name table and overwrites the status with
+  `PIN_CONFIG_SUCCESS`. Binding and name SETs share the single status
+  channel; poll `REQ_GET_CS_STATUS` until the PENDING result resolves before
+  sending the next SET of either kind. A name SET arriving while a previous
+  name SET is still queued records `CS_STATUS_BUSY`; an empty payload records
+  `CS_STATUS_INVALID_VALUE`. Payloads longer than 31 characters are
+  truncated.
+- `REQ_GET_CS_NAME` is synchronous and reads the live name table; it always
+  returns 32 bytes with guaranteed NUL termination. While `dirty` is set the
+  returned name may be an unsaved preview.
 - Names are **not** part of `WireBulkParams` and emit **no notification**;
   a host that cares about cross-host renames re-reads the 16 names on
   connect (16 GETs, one round trip each).
-- Names are **outside the Apply/Save/Revert preview** (section 3.5): a name
-  SET persists immediately, is never part of the dirty state, and is not
-  touched by `REQ_CS_REVERT`.
+- Names are **inside the Apply/Save/Revert preview** (section 3.5), exactly
+  like bindings and IR commands: a name SET is live-only and sets `dirty`,
+  `REQ_CS_SAVE` persists the names with the rest of the config, and
+  `REQ_CS_REVERT` restores the stored names.
 
 ### 3.5 Apply / Save / Revert (`REQ_CS_SAVE` / `REQ_CS_REVERT`)
 
-Binding and IR command SETs are **live-only previews**: they claim pins and
-start behaving immediately, but nothing is written to flash. This lets a host
-wire up a panel or a remote, try it, and only then commit:
+Binding, IR command, and slot-name SETs are **live-only previews**: they
+claim pins and start behaving immediately, but nothing is written to flash.
+This lets a host wire up a panel or a remote, try it, and only then commit:
 
-- **Apply** = `REQ_SET_CS_BINDING` / `REQ_SET_CS_IR_CMD`. Each successful
-  apply sets the `dirty` flag in the status packet.
+- **Apply** = `REQ_SET_CS_BINDING` / `REQ_SET_CS_IR_CMD` / `REQ_SET_CS_NAME`.
+  Each successful apply sets the `dirty` flag in the status packet.
 - **Save** = `REQ_CS_SAVE`: persists the **whole live config** (the 16
-  bindings and the 8 IR commands together) in one directory-sector flash
-  write, then clears `dirty`. Deferred like a SET: the handler acknowledges
+  bindings, the 8 IR commands, and the 16 slot names together) in one
+  directory-sector flash write, then clears `dirty`. Deferred like a SET: the handler acknowledges
   with one status byte, records `CS_STATUS_PENDING` with `last_slot = 0xFF`,
   and the main loop overwrites it with `PIN_CONFIG_SUCCESS` or
   `CS_STATUS_FLASH_ERROR`.
@@ -492,8 +495,6 @@ wire up a panel or a remote, try it, and only then commit:
   `CS_STATUS_BUSY` and does nothing.
 - **A reboot is an implicit revert**: unsaved changes do not survive power
   loss. That is the preview semantics, not a defect.
-- Per-slot **names are outside the preview** (section 3.4): they persist on
-  their own SET and revert does not touch them.
 
 Hosts should surface `dirty` ("unsaved changes") and offer Save / Revert
 whenever it is set. Serialize SETs against save/revert per section 3.2.

@@ -33,9 +33,9 @@
  * Caps v3 adds the IR remote component: one CS_TYPE_IR binding holds the
  * receiver GPIO and up to CS_MAX_IR_COMMANDS learned remote buttons live in
  * a separate command table (commands 0x8D-0x8F), each dispatching through
- * the same noun/action machinery as a physical button.  Binding and IR
- * command SETs are apply-live-only previews; REQ_CS_SAVE persists the whole
- * live config and REQ_CS_REVERT reloads the stored one.
+ * the same noun/action machinery as a physical button.  Binding, IR command
+ * and slot-name SETs are apply-live-only previews; REQ_CS_SAVE persists the
+ * whole live config and REQ_CS_REVERT reloads the stored one.
  *
  * See Documentation/Features/control_surfaces_spec.md.
  */
@@ -205,7 +205,9 @@ typedef enum {
 // so external MCUs and apps on other hosts can read what each control is
 // for.  Same 32-byte convention as preset and channel names.  Names are
 // slot metadata, independent of the binding: they survive binding changes
-// and slot clears, and may be set before a binding exists.
+// and slot clears, and may be set before a binding exists.  Like bindings
+// and IR commands, a name SET is an apply-live-only preview; REQ_CS_SAVE
+// persists and REQ_CS_REVERT restores the stored names.
 #define CS_NAME_LEN      32
 
 // ---------------------------------------------------------------------------
@@ -340,8 +342,7 @@ typedef struct __attribute__((packed)) {
                                         // this GPIO+event pair
 #define CS_STATUS_BUSY            0x1B  // a previous binding SET is still
                                         // queued for apply; retry shortly
-#define CS_STATUS_FLASH_ERROR     0x1C  // directory persist failed (name SET,
-                                        // REQ_CS_SAVE)
+#define CS_STATUS_FLASH_ERROR     0x1C  // directory persist failed (REQ_CS_SAVE)
 #define CS_STATUS_IR_IN_USE       0x1D  // another slot already holds the IR
                                         // component (one receiver per device)
 #define CS_STATUS_NO_IR           0x1E  // IR command/learn needs a live
@@ -378,8 +379,15 @@ bool control_surfaces_owns_pin(uint8_t pin);
 // accessors for the vendor GET handlers.
 const CsFlashConfig *control_surfaces_config(void);
 const CsIrConfig *control_surfaces_ir_config(void);
+const char (*control_surfaces_names(void))[CS_NAME_LEN];
 const CsBinding *control_surfaces_get_binding(uint8_t slot);  // NULL if bad slot
 const IrCommand *control_surfaces_get_ir_cmd(uint8_t sub);    // NULL if bad sub-slot
+const char *control_surfaces_get_name(uint8_t slot);          // NULL if bad slot
+
+// Update one live slot name (copied, NUL termination guaranteed).  Live-only,
+// like apply_binding; the caller marks the config dirty.  Returns
+// PIN_CONFIG_SUCCESS or CS_STATUS_INVALID_SLOT.
+uint8_t control_surfaces_apply_name(uint8_t slot, const char *name);
 void control_surfaces_get_status(CsStatusPacket *out);
 const CsCapsHeader *control_surfaces_caps_header(void);
 const CsNounDesc *control_surfaces_noun_desc(uint8_t noun);   // NULL if bad noun
@@ -390,9 +398,10 @@ const CsNounDesc *control_surfaces_noun_desc(uint8_t noun);   // NULL if bad nou
 // when it comes up.  Returns PIN_CONFIG_* / CS_STATUS_*.
 uint8_t control_surfaces_apply_ir_cmd(uint8_t sub, const IrCommand *c);
 
-// Re-apply the persisted config (bindings + IR commands) from the directory
-// cache, discarding the live preview.  Per-slot failures land in slot_status
-// exactly as at boot.  Main-loop only (releases and reclaims GPIOs).
+// Re-apply the persisted config (bindings + IR commands + slot names) from
+// the directory cache, discarding the live preview.  Per-slot failures land
+// in slot_status exactly as at boot.  Main-loop only (releases and reclaims
+// GPIOs).
 void control_surfaces_revert(void);
 
 // Preview dirty flag: set when a live apply diverges from flash, cleared by
@@ -413,8 +422,8 @@ extern CsBinding        cs_set_binding_val;
 extern volatile uint8_t cs_last_status;
 extern volatile uint8_t cs_last_slot;
 
-// Deferred slot-name SET (REQ_SET_CS_NAME); the persist is a directory
-// flash write, so it is consumed in the main loop like the binding SET.
+// Deferred slot-name SET (REQ_SET_CS_NAME); live-only preview like the
+// binding SET, consumed in the main loop for the shared status channel.
 extern volatile bool    cs_set_name_pending;
 extern uint8_t          cs_set_name_slot;
 extern char             cs_set_name_val[CS_NAME_LEN];
@@ -427,9 +436,9 @@ extern uint8_t          cs_set_ir_cmd_slot;
 extern IrCommand        cs_set_ir_cmd_val;
 
 // Deferred save / revert (REQ_CS_SAVE / REQ_CS_REVERT).  Save persists the
-// whole live CS config (bindings + IR commands) in one directory write;
-// revert re-applies the stored config.  Results land in cs_last_status
-// (cs_last_slot = 0xFF).
+// whole live CS config (bindings + IR commands + slot names) in one
+// directory write; revert re-applies the stored config.  Results land in
+// cs_last_status (cs_last_slot = 0xFF).
 extern volatile bool    cs_save_pending;
 extern volatile bool    cs_revert_pending;
 

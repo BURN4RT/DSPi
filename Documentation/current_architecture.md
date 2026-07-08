@@ -1993,7 +1993,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-07-07 (IR remote component + learn, cmds 0x8D-0x8F; Apply/Save/Revert preview model, cmds 0x9D/0x9E; caps v3, dir V11)*
+*Last updated: 2026-07-08 (slot names join the Apply/Save/Revert preview: 0x8B live-only, persist via 0x9D)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
@@ -2062,7 +2062,8 @@ offers it and no binding to it validates there.
   `control_surfaces_owns_pin()` is wired into `pin_used_by_fixed_peripheral()`.
 - `flash_storage.c`: directory V11 persistence (`preset_get_cs_config`,
   `preset_get_cs_ir_config`, the combined single-write setter
-  `preset_set_cs_all`, `preset_set/get_cs_name`, `dir_sanitize_cs_config`,
+  `preset_set_cs_all` (bindings + IR commands + names), `preset_get_cs_name`,
+  `dir_sanitize_cs_config`,
   `dir_sanitize_cs_ir`, the fan-in V7->current and V8->current migrations via
   `cs_config_from_v1()`, the V9->V10 name append, and the V10->V11 IR-table
   append).
@@ -2115,17 +2116,17 @@ index and latches the binding (`cs_set_binding_pending`), mirroring
 `REQ_SET_CS_IR_CMD` follows the identical single-deep deferred shape for a
 16-byte `IrCommand` sub-slot, reported as `cs_last_slot = 0x80 | sub`.
 
-**Apply-live-only preview (v3):** neither SET persists to flash. A successful
-apply marks the live config dirty (`CsStatusPacket.dirty`, the former reserved
-byte). `REQ_CS_SAVE` (0x9D, deferred via `cs_save_pending`) persists the
-bindings and the IR table together in one directory write
-(`preset_set_cs_all`) inside the usual `prepare_flash_write_operation`
-brackets and clears dirty; `REQ_CS_REVERT` (0x9E, `cs_revert_pending`)
-re-applies the stored config from the directory cache
-(`control_surfaces_revert`: clears every slot through the normal
-release/claim path, then re-runs the boot loader `cs_load_stored`) with no
-flash write. A reboot is an implicit revert. Per-slot names stay outside the
-preview and persist immediately as before.
+**Apply-live-only preview (v3):** no CS SET (binding, IR command, or slot
+name) persists to flash. A successful apply marks the live config dirty
+(`CsStatusPacket.dirty`, the former reserved byte). `REQ_CS_SAVE` (0x9D,
+deferred via `cs_save_pending`) persists the bindings, the IR table, and the
+slot names together in one directory write (`preset_set_cs_all`) inside the
+usual `prepare_flash_write_operation` brackets and clears dirty;
+`REQ_CS_REVERT` (0x9E, `cs_revert_pending`) re-applies the stored config from
+the directory cache (`control_surfaces_revert`: clears every slot through the
+normal release/claim path, then re-runs the boot loader `cs_load_stored`,
+which also reloads the stored names) with no flash write. A reboot is an
+implicit revert.
 
 `control_surfaces_init()` runs last in `core0_init()` (after
 all pin claims and `notify_init`); a stored binding whose pins now collide is
@@ -2168,14 +2169,17 @@ host app via `REQ_SET_CS_NAME` (0x8B) and read via `REQ_GET_CS_NAME` (0x8C),
 so external MCUs on UART/I2C and apps on other hosts can display what each
 control is for. Names are slot metadata independent of the binding: they
 survive binding changes and slot clears, and may be set before a binding
-exists. The SET is deferred like the binding SET (the persist is a
-directory-sector flash write, consumed in the main loop via
-`cs_set_name_pending`) and reports through the shared `cs_last_status` /
-`cs_last_slot` channel: `CS_STATUS_PENDING` then `PIN_CONFIG_SUCCESS`, or
-`CS_STATUS_FLASH_ERROR` (0x1C) if the directory write fails; `CS_STATUS_BUSY`
-if a previous name SET is still queued. The GET reads the directory RAM cache
-(no flash access). A payload of one NUL byte clears the name; names are not
-part of `WireBulkParams` and emit no notification.
+exists. Like bindings and IR commands, the SET is an apply-live-only
+preview: deferred to the main loop via `cs_set_name_pending`, it updates the
+engine's live name table (`control_surfaces_apply_name`) and marks the config
+dirty, with no flash write; `REQ_CS_SAVE` persists the names alongside the
+bindings and IR commands, and `REQ_CS_REVERT` (or a reboot) restores the
+stored names. The SET reports through the shared `cs_last_status` /
+`cs_last_slot` channel: `CS_STATUS_PENDING` then `PIN_CONFIG_SUCCESS`;
+`CS_STATUS_BUSY` if a previous name SET is still queued. The GET returns the
+live name (`control_surfaces_get_name`; the unsaved preview while dirty). A
+payload of one NUL byte clears the name; names are not part of
+`WireBulkParams` and emit no notification.
 
 ### Persistence and platform placement
 
@@ -2199,7 +2203,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-07 (Control Surfaces IR remote 0x8D-0x8F, save/revert 0x9D/0x9E; caps 40 B, status 32 B)*
+*Last updated: 2026-07-08 (CS slot-name SET 0x8B now an apply-live-only preview)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2268,8 +2272,8 @@ op state ~400 B).
 | REQ_GET_CS_BINDING | 0x85 | IN | Get the live 24-byte CsBinding for a slot (wValue=slot) |
 | REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v3; wValue=noun: 12-byte CsNounDesc) |
 | REQ_GET_CS_STATUS | 0x87 | IN | Get 32-byte CsStatusPacket (last SET result, dirty flag, active_mask, per-slot status, ir_active_mask, learn state, per-sub-slot IR status) |
-| REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); deferred persist, poll 0x87 for result |
-| REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated) |
+| REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); apply-live-only preview (persist via 0x9D), poll 0x87 for result |
+| REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated, live) |
 | REQ_SET_CS_IR_CMD | 0x8D | OUT | Set a Control Surfaces IR remote command (wValue=sub-slot 0-7, payload=16-byte IrCommand); apply-live-only, deferred; poll 0x87 (last_slot = 0x80\|sub) |
 | REQ_GET_CS_IR_CMD | 0x8E | IN | Get an IR remote command (wValue=sub-slot, returns 16-byte IrCommand) |
 | REQ_CS_IR_LEARN | 0x8F | IN | IR learn control: wValue 1=arm (10 s window), 0=cancel, 2=read result (8 bytes: state, protocol, 0, 0, code_LE32); completion also pushed as notify 0x0A |

@@ -207,6 +207,7 @@ typedef struct {
 } CsBtnGroup;
 
 static CsFlashConfig s_cfg;                      // live config (flash on save)
+static char          s_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // live slot names
 static CsRuntime     s_rt[CS_MAX_BINDINGS];
 static CsBtnGroup    s_btn[CS_MAX_BINDINGS];
 static uint8_t       s_slot_status[CS_MAX_BINDINGS];
@@ -1259,6 +1260,9 @@ static void cs_load_stored(void) {
             s_ir_cmd_status[sub] = st;
         }
     }
+
+    for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++)
+        preset_get_cs_name(slot, s_names[slot]);
 }
 
 void control_surfaces_init(void) {
@@ -1375,6 +1379,19 @@ void control_surfaces_tick(void) {
 const CsFlashConfig *control_surfaces_config(void) { return &s_cfg; }
 
 const CsIrConfig *control_surfaces_ir_config(void) { return &s_ir; }
+
+const char (*control_surfaces_names(void))[CS_NAME_LEN] { return s_names; }
+
+const char *control_surfaces_get_name(uint8_t slot) {
+    return (slot < CS_MAX_BINDINGS) ? s_names[slot] : NULL;
+}
+
+uint8_t control_surfaces_apply_name(uint8_t slot, const char *name) {
+    if (slot >= CS_MAX_BINDINGS) return CS_STATUS_INVALID_SLOT;
+    memset(s_names[slot], 0, CS_NAME_LEN);
+    strncpy(s_names[slot], name, CS_NAME_LEN - 1);
+    return PIN_CONFIG_SUCCESS;
+}
 
 const CsBinding *control_surfaces_get_binding(uint8_t slot) {
     return (slot < CS_MAX_BINDINGS) ? &s_cfg.bindings[slot] : NULL;

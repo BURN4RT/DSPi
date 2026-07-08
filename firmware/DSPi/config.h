@@ -207,8 +207,9 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_CS_STATUS           0x87  // returns 22-byte CsStatusPacket
 // 0x88-0x8A reserved (claimed by the I2S slave-mode branch)
 #define REQ_SET_CS_NAME             0x8B  // wValue = slot (0-15), payload = 1-32 byte name (a single
-                                          // NUL byte clears it); deferred, result via REQ_GET_CS_STATUS
-#define REQ_GET_CS_NAME             0x8C  // wValue = slot, returns 32-byte NUL-terminated name
+                                          // NUL byte clears it); apply-live-only preview, deferred,
+                                          // result via REQ_GET_CS_STATUS
+#define REQ_GET_CS_NAME             0x8C  // wValue = slot, returns 32-byte NUL-terminated live name
 #define REQ_SET_CS_IR_CMD           0x8D  // wValue = sub-slot (0-7), payload = 16-byte IrCommand;
                                           // apply-live-only preview, deferred to the main loop
 #define REQ_GET_CS_IR_CMD           0x8E  // wValue = sub-slot, returns 16-byte IrCommand
@@ -232,7 +233,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_PRESET_GET_ACTIVE       0x9A
 #define REQ_SET_CHANNEL_NAME        0x9B
 #define REQ_GET_CHANNEL_NAME        0x9C
-// Control Surfaces persistence (whole live config: bindings + IR commands).
+// Control Surfaces persistence (whole live config: bindings + IR commands +
+// slot names).
 #define REQ_CS_SAVE                 0x9D  // GET; persists the whole live CS config in one flash
                                           // write; deferred, result via REQ_GET_CS_STATUS
 #define REQ_CS_REVERT               0x9E  // GET; discards the live preview and re-applies the
