@@ -358,6 +358,15 @@ per-channel delay for `channel = output + 2`.
 | 0x5B | `GET_LOUDNESS_REF` | R | 0 | f32 | - |
 | 0x5C | `SET_LOUDNESS_INTENSITY` | W | 0 | f32 % | clamped 0..200 |
 | 0x5D | `GET_LOUDNESS_INTENSITY` | R | 0 | f32 | - |
+| 0xFA | `SET_LOUDNESS_MASK` | W | 0 | u16 LE output mask | bit k = output k |
+| 0xFB | `GET_LOUDNESS_MASK` | R | 0 | u16 LE | - |
+
+Loudness runs **per output channel** (post output-gain, pre delay), gated by the
+output mask (bit k = output channel k, PDM included; bits above the platform's
+output count are stored but ignored; default `0xFFFF` = all outputs). Mask writes
+apply from the next packet with no recompute or reset. The mask exists from wire
+format V19 / slot V26; on older firmware 0xFA/0xFB stall. Full behavioral spec:
+`Features/loudness_compensation_spec.md`.
 
 ### 7.2 Crossfeed (headphone)
 
@@ -559,7 +568,7 @@ header counts to know how many entries are valid).
 | Offset | Size | Section | Contents |
 |-------:|-----:|---------|----------|
 | 0 | 16 | `header` | see 13.4 |
-| 16 | 16 | `global` | f32 preamp_gain_db; u8 bypass; u8 loudness_enabled; u8[2] rsv; f32 loudness_ref_spl; f32 loudness_intensity_pct |
+| 16 | 16 | `global` | f32 preamp_gain_db; u8 bypass; u8 loudness_enabled; u16 loudness_output_mask (V19+; reserved before V19); f32 loudness_ref_spl; f32 loudness_intensity_pct |
 | 32 | 16 | `crossfeed` | u8 enabled; u8 preset; u8 itd_enabled; u8 rsv; f32 custom_fc; f32 custom_feed_db; u32 rsv |
 | 48 | 16 | `legacy` | f32 gain_db[3]; u8 mute[3]; u8 rsv |
 | 64 | 44 | `delays` | f32 delay_ms[11] (per channel, ms) |
@@ -867,6 +876,7 @@ Every settable parameter has a matching read. Use this to verify a write landed
 | 0x54 / 0x56 SET_CHANNEL_GAIN/MUTE | 0x55 / 0x57 GET_CHANNEL_GAIN/MUTE |
 | 0x48 SET_DELAY | 0x49 GET_DELAY |
 | 0x58/0x5A/0x5C loudness | 0x59/0x5B/0x5D |
+| 0xFA SET_LOUDNESS_MASK | 0xFB GET_LOUDNESS_MASK |
 | 0x5E..0x66 crossfeed | 0x5F..0x67 |
 | 0xB4..0xBE leveller | 0xB5..0xBF |
 | 0x70 SET_MATRIX_ROUTE | 0x71 GET_MATRIX_ROUTE |
@@ -1077,6 +1087,8 @@ with no OUT data, issued as an IN transfer (returns a status/echo byte).
 | 0xF7 | SET_I2C_CONFIG | W | **USB only** (BLOCKED over UART/I2C); `ctrl_set_i2c_pending` -> main loop `i2c_ctrl_apply()`, persist directory on success; returns `PIN_CONFIG_*` |
 | 0xF8 | GET_I2C_CONFIG | R | returns persisted 8-byte `I2cCtrlConfig` |
 | 0xF9 | GET_CTRL_IFACE_STATUS | R | returns 8-byte `CtrlIfaceStatus` (uart/i2c last_status + live flags, proto_version=1) |
+| 0xFA | SET_LOUDNESS_MASK | W | writes `loudness_output_mask` (u16 LE, bit k = output k); no recompute; applies next packet |
+| 0xFB | GET_LOUDNESS_MASK | R | returns `loudness_output_mask` (u16 LE) |
 
 > The Microsoft OS 2.0 vendor code (`0x01`) is intercepted earlier in
 > `tud_vendor_control_xfer_cb` for descriptor delivery and is not an application opcode.

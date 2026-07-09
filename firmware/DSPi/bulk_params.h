@@ -31,7 +31,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      18   // V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
+#define WIRE_FORMAT_VERSION      19   // V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -61,7 +61,7 @@ typedef struct __attribute__((packed)) {
     float    preamp_gain_db;         // Preamp gain
     uint8_t  bypass;                 // Master EQ bypass (0/1)
     uint8_t  loudness_enabled;       // Loudness compensation (0/1)
-    uint8_t  reserved[2];
+    uint16_t loudness_output_mask;   // Bit k: loudness processes output channel k (V19+)
     float    loudness_ref_spl;       // Reference SPL
     float    loudness_intensity_pct; // Intensity percentage
 } WireGlobalParams;                  // 16 bytes
@@ -336,19 +336,19 @@ typedef struct __attribute__((packed)) {
     WireDacHwMute       dac_hw_mute;     //   16
     WireCrossoverConfig crossovers;      // 1088 (17×4; input rows unused)
     WireAdatConfig      adat_config;     //    8
-} WireBulkParams;                        // Total: 5876 bytes (V18)
+} WireBulkParams;                        // Total: 5876 bytes (V19)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
 // Backward compatibility is intentionally broken at V16 (unified channel model).
-// Only the current full-size V18 layout is accepted; there are no legacy size
+// Only the current full-size V19 layout is accepted; there are no legacy size
 // anchors or per-section version gates; every section is always present.
-// bulk_params_apply() rejects any payload whose format_version != V18 or whose
+// bulk_params_apply() rejects any payload whose format_version != V19 or whose
 // length != sizeof(WireBulkParams).
 #define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
 // Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
-// V18 is 5876 bytes (17-channel EQ/names/crossover + ADAT + leveller masks); 8192 is the next power of 2.
+// V19 is 5876 bytes (17-channel EQ/names/crossover + ADAT + leveller masks); 8192 is the next power of 2.
 // Shared by both platforms (the wire format is platform-independent).
 #define WIRE_BULK_BUF_SIZE     8192
 

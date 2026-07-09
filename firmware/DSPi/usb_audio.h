@@ -62,6 +62,8 @@ extern volatile bool loudness_enabled;
 extern volatile float loudness_ref_spl;
 extern volatile float loudness_intensity_pct;
 extern volatile bool loudness_recompute_pending;
+// Output-channel mask: bit k = compensate output k (see loudness.h)
+extern volatile uint16_t loudness_output_mask;
 // Pointer-typed `volatile` (qualifier on the pointer itself, not the
 // pointee) — the audio pipeline reads this every packet, and any write
 // from apply_vol_index_to_audio() must not be hoisted/cached across

@@ -2,8 +2,7 @@
  * audio_pipeline.c — Input-agnostic DSP pipeline for DSPi
  *
  * Extracted from usb_audio.c: process_input_block() and associated
- * pipeline state (loudness filter state, preset mute envelope, CPU
- * metering, buffer watermarks).
+ * pipeline state (preset mute envelope, CPU metering, buffer watermarks).
  *
  * All output slot state DEFINITIONS remain in usb_audio.c; this file
  * accesses them via extern declarations in usb_audio.h.
@@ -40,12 +39,8 @@ extern volatile uint8_t spdif0_consumer_fill;
 // PIPELINE STATE (moved from usb_audio.c)
 // ----------------------------------------------------------------------------
 
-// Loudness compensation filter state
-#if PICO_RP2350
-static LoudnessSvfState loudness_state[2][LOUDNESS_BIQUAD_COUNT];  // [0]=Left, [1]=Right
-#else
-static Biquad loudness_biquads[2][LOUDNESS_BIQUAD_COUNT];  // [0]=Left, [1]=Right
-#endif
+// Loudness compensation filter state lives in loudness.c
+// (loudness_output_state[NUM_OUTPUT_CHANNELS], shared with the Core 1 worker).
 
 // Crossfeed state
 CrossfeedState crossfeed_state;
@@ -183,9 +178,9 @@ void pipeline_reset_cpu_metering(void) {
 }
 
 // ----------------------------------------------------------------------------
-// Input-agnostic DSP pipeline: loudness, EQ, leveller, crossfeed, matrix
-// mixer, per-output EQ/gain/delay, output encoding, buffer return, CPU
-// metering.  Reads from file-scope buf_l[]/buf_r[] (filled by caller).
+// Input-agnostic DSP pipeline: per-input EQ, leveller, crossfeed, matrix
+// mixer, per-output EQ/gain/loudness/delay, output encoding, buffer return,
+// CPU metering.  Reads from file-scope buf_l[]/buf_r[] (filled by caller).
 // ----------------------------------------------------------------------------
 
 // Single source of truth for the active input channel count (see header).
@@ -289,52 +284,23 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // Active input count for this packet (see active_input_channel_count()):
     // the USB alt's channel count, the I2S input channel count, or the stereo
     // pair for S/PDIF.  In multichannel mode (>2 inputs) the inherently-stereo
-    // chain — loudness, crossfeed — is bypassed; each input gets its own PEQ,
-    // then the leveller (channel-count agnostic, mask-driven), then the
-    // matrix.  The matrix iterates n_active_inputs, so buf_in_ext (inputs
-    // 2..7) is read ONLY when those inputs are actually active; stale samples
-    // can never leak into stereo / S/PDIF output.
+    // crossfeed is bypassed; each input gets its own PEQ, then the leveller
+    // (channel-count agnostic, mask-driven), then the matrix.  The matrix
+    // iterates n_active_inputs, so buf_in_ext (inputs 2..7) is read ONLY when
+    // those inputs are actually active; stale samples can never leak into
+    // stereo / S/PDIF output.
     int n_active_inputs = active_input_channel_count();
     bool multichannel = (n_active_inputs > NUM_STEREO_INPUTS);
 
-    // Snapshot loudness state for this packet
-    bool loud_on = loudness_enabled;
-    const LoudnessCoeffs *loud_coeffs = current_loudness_coeffs;
+    // Loudness snapshot for this packet: one coefficient pointer + output
+    // mask, shared with Core 1 via core1_eq_work so both cores apply the
+    // same view.  Compensation runs per output (post-gain) in PASS 5-7 on
+    // the outputs selected by loudness_output_mask; input-count agnostic.
+    const LoudnessCoeffs *loud_coeffs = loudness_enabled ? current_loudness_coeffs : NULL;
+    uint16_t loud_mask = loudness_output_mask;
 
     // Pre-compute PDM scale factor
     const float pdm_scale = (float)(1 << 28);
-
-    // Loudness compensation (SVF shelf filters); stereo-only, skip in multichannel
-    if (!multichannel && loud_on && loud_coeffs) {
-        for (uint32_t i = 0; i < sample_count; i++) {
-            float raw_left = buf_l[i];
-            float raw_right = buf_r[i];
-            for (int j = 0; j < LOUDNESS_BIQUAD_COUNT; j++) {
-                const LoudnessCoeffs *lc = &loud_coeffs[j];
-                if (lc->bypass) continue;
-                LoudnessSvfState *st = &loudness_state[0][j];
-                float v3 = raw_left - st->ic2eq;
-                float v1 = lc->sva1 * st->ic1eq + lc->sva2 * v3;
-                float v2 = st->ic2eq + lc->sva2 * st->ic1eq + lc->sva3 * v3;
-                st->ic1eq = 2.0f * v1 - st->ic1eq;
-                st->ic2eq = 2.0f * v2 - st->ic2eq;
-                raw_left = lc->svm0 * raw_left + lc->svm1 * v1 + lc->svm2 * v2;
-            }
-            for (int j = 0; j < LOUDNESS_BIQUAD_COUNT; j++) {
-                const LoudnessCoeffs *lc = &loud_coeffs[j];
-                if (lc->bypass) continue;
-                LoudnessSvfState *st = &loudness_state[1][j];
-                float v3 = raw_right - st->ic2eq;
-                float v1 = lc->sva1 * st->ic1eq + lc->sva2 * v3;
-                float v2 = st->ic2eq + lc->sva2 * st->ic1eq + lc->sva3 * v3;
-                st->ic1eq = 2.0f * v1 - st->ic1eq;
-                st->ic2eq = 2.0f * v2 - st->ic2eq;
-                raw_right = lc->svm0 * raw_right + lc->svm1 * v1 + lc->svm2 * v2;
-            }
-            buf_l[i] = raw_left;
-            buf_r[i] = raw_right;
-        }
-    }
 
     // ========== PASS 2: Per-Input EQ + Metering ==========
     // Each active input channel gets its own PEQ (the generalized "master EQ"),
@@ -440,6 +406,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.vol_mul_start = vol_mul_master_start;
         core1_eq_work.vol_mul_step  = vol_mul_master_step;
         core1_eq_work.delay_write_idx = delay_write_idx;
+        core1_eq_work.loud_coeffs = loud_coeffs;
+        core1_eq_work.loud_mask = loud_mask;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[1] = audio_buf[2] ? (int32_t *)audio_buf[2]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[2] = audio_buf[3] ? (int32_t *)audio_buf[3]->buffer->bytes : NULL;
@@ -450,7 +418,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
         // Core 0: EQ + gain for outputs 0-1
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
-            if (!matrix_mixer.outputs[out].enabled) continue;
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                continue;
+            }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
@@ -484,7 +455,26 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                     gain += gain_step;
                 }
             }
+
+            // Volume-keyed loudness on masked outputs, post-gain (loudness
+            // only boosts at low volume, so headroom is maximal here).
+            // Skipped-and-cleared when masked off, muted to zero this
+            // packet, or carrying a RAW test signal.
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0.0f && gain_step == 0.0f)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
+            }
         }
+
+        // PDM is inactive in EQ_WORKER mode and owned by neither core's
+        // output loop; keep its loudness state cleared so the first packet
+        // after a switch back to single-core starts clean.
+        loudness_reset_output_state(&loudness_output_state[NUM_OUTPUT_CHANNELS - 1]);
 
         // Core 0: Delay for outputs 0-1
         if (any_delay_active) {
@@ -547,7 +537,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // EQ + gain (per-sample vol ramp, see Core 0 dual-core branch above for
         // rationale; steady-state step==0 falls back to constant-gain path).
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
-            if (!matrix_mixer.outputs[out].enabled) continue;
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                continue;
+            }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
@@ -576,6 +569,18 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                     dst[i] *= gain;
                     gain += gain_step;
                 }
+            }
+
+            // Volume-keyed loudness on masked outputs, post-gain (see
+            // dual-core Core 0 branch above for rationale).
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0.0f && gain_step == 0.0f)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
             }
         }
 
@@ -680,41 +685,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
     bool is_bypassed = bypass_master_eq;
 
-    // Snapshot loudness state for this packet
-    bool loud_on = loudness_enabled;
-    const LoudnessCoeffs *loud_coeffs = current_loudness_coeffs;
-
-    // Loudness compensation (per-sample — biquad state coupling)
-    if (loud_on && loud_coeffs) {
-        for (uint32_t i = 0; i < sample_count; i++) {
-            int32_t raw_left_32 = buf_l[i];
-            int32_t raw_right_32 = buf_r[i];
-            for (int j = 0; j < LOUDNESS_BIQUAD_COUNT; j++) {
-                const LoudnessCoeffs *lc = &loud_coeffs[j];
-                if (lc->bypass) continue;
-                Biquad *bq = &loudness_biquads[0][j];
-                int32_t result = fast_mul_q28(lc->b0, raw_left_32) + bq->s1;
-                bq->s1 = fast_mul_q28(lc->b1, raw_left_32)
-                        - fast_mul_q28(lc->a1, result) + bq->s2;
-                bq->s2 = fast_mul_q28(lc->b2, raw_left_32)
-                        - fast_mul_q28(lc->a2, result);
-                raw_left_32 = result;
-            }
-            for (int j = 0; j < LOUDNESS_BIQUAD_COUNT; j++) {
-                const LoudnessCoeffs *lc = &loud_coeffs[j];
-                if (lc->bypass) continue;
-                Biquad *bq = &loudness_biquads[1][j];
-                int32_t result = fast_mul_q28(lc->b0, raw_right_32) + bq->s1;
-                bq->s1 = fast_mul_q28(lc->b1, raw_right_32)
-                        - fast_mul_q28(lc->a1, result) + bq->s2;
-                bq->s2 = fast_mul_q28(lc->b2, raw_right_32)
-                        - fast_mul_q28(lc->a2, result);
-                raw_right_32 = result;
-            }
-            buf_l[i] = raw_left_32;
-            buf_r[i] = raw_right_32;
-        }
-    }
+    // Loudness snapshot for this packet: one coefficient pointer + output
+    // mask, shared with Core 1 via core1_eq_work (see RP2350 branch above).
+    // Compensation runs per output (post-gain) in PASS 5-7.
+    const LoudnessCoeffs *loud_coeffs = loudness_enabled ? current_loudness_coeffs : NULL;
+    uint16_t loud_mask = loudness_output_mask;
 
     // ========== PASS 2: Per-Input EQ + Metering ========== (RP2040: 2 inputs)
     for (int k = 0; k < NUM_INPUT_CHANNELS; k++) {
@@ -792,6 +767,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.vol_mul_start = vol_mul_master_start_q15;
         core1_eq_work.vol_mul_step  = vol_mul_master_step_q15;
         core1_eq_work.delay_write_idx = delay_write_idx;
+        core1_eq_work.loud_coeffs = loud_coeffs;
+        core1_eq_work.loud_mask = loud_mask;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.work_done = false;
         __dmb();
@@ -800,7 +777,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
         // Core 0: EQ + gain for outputs 0-1 (SPDIF pair 1)
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
-            if (!matrix_mixer.outputs[out].enabled) continue;
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                continue;
+            }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
@@ -830,7 +810,26 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                     gain += gain_step;
                 }
             }
+
+            // Volume-keyed loudness on masked outputs, post-gain (loudness
+            // only boosts at low volume, so Q28 headroom is maximal here).
+            // Skipped-and-cleared when masked off, muted to zero this
+            // packet, or carrying a RAW test signal.
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0 && gain_step == 0)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
+            }
         }
+
+        // PDM is inactive in EQ_WORKER mode and owned by neither core's
+        // output loop; keep its loudness state cleared so the first packet
+        // after a switch back to single-core starts clean.
+        loudness_reset_output_state(&loudness_output_state[NUM_OUTPUT_CHANNELS - 1]);
 
         // Core 0: Delay for outputs 0-1
         if (any_delay_active) {
@@ -891,7 +890,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // EQ + gain (block-based, per-sample vol ramp; step==0 in steady state
         // → constant-gain path with no extra per-sample work).
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
-            if (!matrix_mixer.outputs[out].enabled) continue;
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                continue;
+            }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
                 if (!channel_xover_bypassed[eq_ch])
@@ -919,6 +921,18 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                     dst[i] = fast_mul_q15(dst[i], gain);
                     gain += gain_step;
                 }
+            }
+
+            // Volume-keyed loudness on masked outputs, post-gain (see
+            // dual-core Core 0 branch above for rationale).
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0 && gain_step == 0)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
             }
         }
 

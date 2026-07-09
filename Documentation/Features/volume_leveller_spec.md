@@ -4,7 +4,7 @@
 
 The Volume Leveller is a feedforward, channel-linked, single-band RMS dynamic range compressor. Its purpose is to maintain a consistent perceived volume across content with varying loudness levels -- for example, preventing quiet dialogue from being drowned out by loud action scenes, or normalizing volume differences between music tracks.
 
-It runs on the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ. On earlier firmware the leveller was stereo-only and was bypassed whenever more than two inputs were active; that restriction is gone. Two channel bitmasks (detector_mask, apply_mask) select which inputs feed the shared detector and which receive the shared gain, so the same feature covers stereo, dialog-only boost, and full multichannel levelling. Loudness and crossfeed remain stereo-only.
+It runs on the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ. On earlier firmware the leveller was stereo-only and was bypassed whenever more than two inputs were active; that restriction is gone. Two channel bitmasks (detector_mask, apply_mask) select which inputs feed the shared detector and which receive the shared gain, so the same feature covers stereo, dialog-only boost, and full multichannel levelling. Crossfeed remains stereo-only; loudness compensation is now per-output with its own output mask (see loudness_compensation_spec.md) and works in all input modes.
 
 ### Key characteristics
 

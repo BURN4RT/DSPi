@@ -422,6 +422,10 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_I2C_CONFIG          0xF8  // returns I2cCtrlConfig (live)
 #define REQ_GET_CTRL_IFACE_STATUS   0xF9  // returns CtrlIfaceStatus (8 bytes)
 
+// Loudness output-channel mask (bit k = compensate output k; see loudness.h)
+#define REQ_SET_LOUDNESS_MASK       0xFA  // payload = uint16 LE mask
+#define REQ_GET_LOUDNESS_MASK       0xFB  // returns uint16 LE mask
+
 // UART control interface configuration.  Fixed 8N1 framing (the wire CRC16
 // covers integrity, so parity adds nothing); only the baud rate is
 // configurable.  Persisted device-level in the preset directory (V6+).
@@ -678,6 +682,11 @@ typedef struct {
     uint32_t          delay_write_idx;
     int32_t          *spdif_out[1];    // SPDIF pair 2 output buffer (NULL = skip)
 #endif
+    // Loudness snapshot for THIS packet; Core 0 samples the coefficient
+    // pointer and output mask once and both cores use the same view, so a
+    // mid-packet vendor write can't split the outputs across two settings.
+    const void       *loud_coeffs;     // LoudnessCoeffs[2] or NULL = off
+    uint16_t          loud_mask;       // Bit k = compensate output k
 } Core1EqWork;
 
 // ----------------------------------------------------------------------------

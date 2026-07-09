@@ -6,6 +6,9 @@
 LoudnessCoeffs loudness_tables[2][LOUDNESS_VOL_STEPS][LOUDNESS_BIQUAD_COUNT];
 LoudnessCoeffs (*loudness_active_table)[LOUDNESS_BIQUAD_COUNT] = NULL;
 
+// Per-output filter state (BSS; each output touched by exactly one core)
+LoudnessOutputState loudness_output_state[NUM_OUTPUT_CHANNELS];
+
 // Track which buffer is active (0 or 1)
 static uint8_t active_buf = 0;
 

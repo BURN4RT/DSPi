@@ -39,6 +39,7 @@
 #include "pdm_generator.h"
 #include "usb_feedback_controller.h"
 #include "leveller.h"
+#include "loudness.h"     // LOUDNESS_DEFAULT_OUTPUT_MASK
 #include "lg_sound_sync.h"
 #include "adat_output.h"     // adat_output_config_enabled/_pin/_set_config (RP2350)
 #include "notify.h"
@@ -130,7 +131,10 @@
 //   V25: Leveller channel masks appended (leveller_detector_mask +
 //        leveller_apply_mask; struct grows by 2 bytes).  Backward-compatible
 //        tail-append like V24: older slots load the all-channels default (0xFF).
-#define SLOT_DATA_VERSION       25
+//   V26: Loudness output mask appended (loudness_output_mask; struct grows by
+//        2 bytes).  Backward-compatible tail-append like V25: older slots load
+//        the all-outputs default (0xFFFF).
+#define SLOT_DATA_VERSION       26
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -750,6 +754,11 @@ typedef struct __attribute__((packed)) {
     // all-channels default (0xFF).
     uint8_t leveller_detector_mask;
     uint8_t leveller_apply_mask;
+
+    // Loudness output mask (V26+, struct grows by 2 bytes).  Gated on
+    // version >= 26 in apply_slot_to_live(); older slots load the
+    // all-outputs default (0xFFFF).
+    uint16_t loudness_output_mask;
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -779,6 +788,7 @@ extern volatile bool loudness_enabled;
 extern volatile float loudness_ref_spl;
 extern volatile float loudness_intensity_pct;
 extern volatile bool loudness_recompute_pending;
+extern volatile uint16_t loudness_output_mask;
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool crossfeed_update_pending;
 extern volatile LevellerConfig leveller_config;
@@ -1941,6 +1951,7 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
 
     // Loudness
     slot->loudness_enabled = loudness_enabled ? 1 : 0;
+    slot->loudness_output_mask = loudness_output_mask;
     slot->loudness_ref_spl = loudness_ref_spl;
     slot->loudness_intensity_pct = loudness_intensity_pct;
 
@@ -2175,6 +2186,8 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 
     // Loudness
     loudness_enabled = (slot->loudness_enabled != 0);
+    if (slot->version >= 26) loudness_output_mask = slot->loudness_output_mask;
+    else loudness_output_mask = LOUDNESS_DEFAULT_OUTPUT_MASK;
     loudness_ref_spl = slot->loudness_ref_spl;
     loudness_intensity_pct = slot->loudness_intensity_pct;
     loudness_recompute_pending = true;
@@ -2344,9 +2357,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // fields).  V21 ended at i2s_input_rate; V22 appended the I2S multichannel
 // fields, so V21's range stops where those begin.  V23 appended the ADAT
 // fields, so V22's range stops where those begin.  V24 appended the optional
-// SPDIF inputs 2/3; V25 appended the leveller channel masks, so V24's range
-// stops where they begin (a stored slot's CRC was computed without the fields
-// its version predates).
+// SPDIF inputs 2/3; V25 appended the leveller channel masks; V26 appended the
+// loudness output mask, so V25's range stops where it begins (a stored slot's
+// CRC was computed without the fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -2356,16 +2369,21 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V24 \
     (offsetof(PresetSlot, leveller_detector_mask) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V25 \
+    (offsetof(PresetSlot, loudness_output_mask) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V26 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
-// V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3) and V25 (leveller
-// channel masks) are backward-compatible tail-appends.  V21..V25 slots are all
-// accepted (an older slot loads with the newer fields defaulted to unset) while
-// older/unknown versions are invalidated and the slot loads factory defaults.
+// V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
+// masks) and V26 (loudness output mask) are backward-compatible tail-appends.
+// V21..V26 slots are all accepted (an older slot loads with the newer fields
+// defaulted to unset) while older/unknown versions are invalidated and the slot
+// loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 25
+        case SLOT_DATA_VERSION:   // 26
+            return SLOT_DATA_SIZE_V26;
+        case 25:
             return SLOT_DATA_SIZE_V25;
         case 24:
             return SLOT_DATA_SIZE_V24;
@@ -2899,6 +2917,7 @@ static void apply_factory_defaults(void) {
 
     // Loudness
     loudness_enabled = false;
+    loudness_output_mask = LOUDNESS_DEFAULT_OUTPUT_MASK;
     loudness_ref_spl = 87.0f;
     loudness_intensity_pct = 100.0f;
     loudness_recompute_pending = true;

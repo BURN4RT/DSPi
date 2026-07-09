@@ -444,11 +444,17 @@ static void __not_in_flash_func(eq_worker_loop)() {
         uint32_t sample_count = core1_eq_work.sample_count;
         float vol_mul_start = core1_eq_work.vol_mul_start;
         float vol_mul_step  = core1_eq_work.vol_mul_step;
+        const LoudnessCoeffs *loud_coeffs =
+            (const LoudnessCoeffs *)core1_eq_work.loud_coeffs;
+        uint16_t loud_mask = core1_eq_work.loud_mask;
 
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
-            if (!matrix_mixer.outputs[out].enabled) continue;
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                continue;
+            }
 
             // Output crossover + EQ
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
@@ -482,6 +488,19 @@ static void __not_in_flash_func(eq_worker_loop)() {
                     dst[i] *= gain;
                     gain += gain_step;
                 }
+            }
+
+            // Volume-keyed loudness on masked outputs, post-gain (same
+            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
+            // core1_eq_work so both cores share one view per packet).
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0.0f && gain_step == 0.0f)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
             }
         }
 
@@ -579,11 +598,17 @@ static void __not_in_flash_func(eq_worker_loop)() {
         uint32_t sample_count = core1_eq_work.sample_count;
         int32_t vol_mul_start_q15 = core1_eq_work.vol_mul_start;
         int32_t vol_mul_step_q15  = core1_eq_work.vol_mul_step;
+        const LoudnessCoeffs *loud_coeffs =
+            (const LoudnessCoeffs *)core1_eq_work.loud_coeffs;
+        uint16_t loud_mask = core1_eq_work.loud_mask;
 
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
-            if (!matrix_mixer.outputs[out].enabled) continue;
+            if (!matrix_mixer.outputs[out].enabled) {
+                loudness_reset_output_state(&loudness_output_state[out]);
+                continue;
+            }
 
             // Output crossover + EQ (block-based)
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
@@ -617,6 +642,19 @@ static void __not_in_flash_func(eq_worker_loop)() {
                     dst[i] = fast_mul_q15(dst[i], gain);
                     gain += gain_step;
                 }
+            }
+
+            // Volume-keyed loudness on masked outputs, post-gain (same
+            // predicate as Core 0 in audio_pipeline.c; snapshot comes from
+            // core1_eq_work so both cores share one view per packet).
+            if (loud_coeffs && ((loud_mask >> out) & 1u)
+                && !(siggen_raw_mask & (1u << out))
+                && !(gain_start == 0 && gain_step == 0)) {
+                loudness_process_output_block(loud_coeffs,
+                                              &loudness_output_state[out],
+                                              buf_out[out], sample_count);
+            } else {
+                loudness_reset_output_state(&loudness_output_state[out]);
             }
         }
 

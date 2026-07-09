@@ -62,6 +62,7 @@ extern volatile bool loudness_enabled;
 extern volatile float loudness_ref_spl;
 extern volatile float loudness_intensity_pct;
 extern volatile bool loudness_recompute_pending;
+extern volatile uint16_t loudness_output_mask;
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool crossfeed_update_pending;
 extern volatile LevellerConfig leveller_config;
@@ -109,6 +110,7 @@ void bulk_params_collect(WireBulkParams *out) {
     out->global.preamp_gain_db = global_preamp_db[0];  // Legacy field: channel 0
     out->global.bypass = bypass_master_eq ? 1 : 0;
     out->global.loudness_enabled = loudness_enabled ? 1 : 0;
+    out->global.loudness_output_mask = loudness_output_mask;
     out->global.loudness_ref_spl = loudness_ref_spl;
     out->global.loudness_intensity_pct = loudness_intensity_pct;
 
@@ -323,6 +325,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     bypass_master_eq = (in->global.bypass != 0);
 
     loudness_enabled = (in->global.loudness_enabled != 0);
+    loudness_output_mask = in->global.loudness_output_mask;
     loudness_ref_spl = in->global.loudness_ref_spl;
     loudness_intensity_pct = in->global.loudness_intensity_pct;
     loudness_recompute_pending = true;

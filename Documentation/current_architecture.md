@@ -254,7 +254,7 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 
 **USB formats.** RP2350 advertises AudioStreaming alts **1 = 2ch/16, 2 = 2ch/24** (44.1/48/96 kHz), and **3 = 4ch, 4 = 6ch, 5 = 8ch** (all 48 kHz/16-bit fixed). The host picks the format; the firmware sets the active input count (`usb_input_channels` = 2/4/6/8) in `uac1_apply_alt()`, which forces 48 kHz for multichannel alts (SET_CUR rejects non-48k), flushes the ring, and resyncs. RP2040 is stereo-only (2 SPDIF = 4 output channels). The multichannel alt blocks are emitted by a parameterized `AS_MULTICH_ALT(alt,nch)` macro; descriptor offsets/`CONFIG_TOTAL_LEN` (369 on RP2350) are arithmetic + `_Static_assert`-verified. The single Input Terminal/Feature Unit declare the 8-channel superset (`wChannelConfig=0x063F`); iso OUT max-packet `AUDIO_EP_MAX_PKT=788`.
 
-**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2; `multichannel = n_active>2` **bypasses the inherently-stereo stages** (loudness, crossfeed). The **volume leveller now runs channel-count-agnostic over the active inputs** (mask-driven; see "Volume Leveller"), so it is no longer bypassed in multichannel. The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit (the leveller delays every active input identically through its per-channel lookahead ring). Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
+**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2; `multichannel = n_active>2` **bypasses the inherently-stereo crossfeed stage**. (Loudness no longer sits on the input bus; it runs per output post-gain, mask-selected, in both stereo and multichannel modes; see "Loudness Compensation".) The **volume leveller now runs channel-count-agnostic over the active inputs** (mask-driven; see "Volume Leveller"), so it is no longer bypassed in multichannel. The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit (the leveller delays every active input identically through its per-channel lookahead ring). Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
 
 **Live active-input-count for the host.** The app reads the active count (2/4/6/8) from the `REQ_GET_STATUS` combined packet (a 1-byte `active_input_channels` field, polled with the meters) or the scalar `wValue==23`; the bulk header `num_input_channels` stays the device max (8). Both report sites are **source-aware** via `active_input_channel_count()` (`audio_pipeline.c`), the single source of truth shared with the DSP pipeline's input dimension: USB → `usb_input_channels`, I2S → `i2s_input_channels`, S/PDIF → 2. A `NOTIFY_EVT_INPUT_FORMAT` (0x05) push event fires whenever the active count can change — USB alt change, input-source switch, and live I2S channel-count change (`REQ_SET_I2S_INPUT_CHANNELS` while I2S is active) — so the app relayouts immediately regardless of source.
 
@@ -386,7 +386,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 1. **Ring push (task context)** — Copy raw packet into SPSC ring, detect arrival gaps
 2. **Ring drain (main loop)** — Peek/process/consume loop, highest priority in main loop
 3. **USB decode (`process_audio_packet` in `usb_audio.c`)** — Gap detection, sync tracking, USB byte decode (16/24-bit) with per-channel preamp into `buf_l[]`/`buf_r[]`
-4. **DSP pipeline (`process_input_block` in `audio_pipeline.c`)** — Input-agnostic: buffer acquisition, preset mute envelope, loudness, EQ, leveller, crossfeed, matrix mixer, per-output EQ/gain/delay, output encoding, buffer return, CPU metering
+4. **DSP pipeline (`process_input_block` in `audio_pipeline.c`)** — Input-agnostic: buffer acquisition, preset mute envelope, EQ, leveller, crossfeed, matrix mixer, per-output EQ/gain/loudness/delay, output encoding, buffer return, CPU metering
 5. **Buffer return** — Give completed buffers to consumer pools for DMA
 
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
@@ -399,13 +399,13 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Stage | Description |
 |-------|-------------|
 | Input conversion | USB int16/24-bit or SPDIF RX 24-bit → float full-scale, per-channel preamp gain (`global_preamp_linear[ch]`) |
-| Loudness | 2 SVF shelf filters (low shelf + high shelf), volume-dependent (stereo only) |
 | Per-Input EQ + metering | Per active input: block-based `dsp_process_channel_block()`, 10 bands, hybrid SVF/biquad; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor over active inputs (2 to 8), mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (float throughout) |
 | Crossfeed | BS2B lowpass + allpass (ILD + ITD) (stereo only) |
-| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase; loudness/crossfeed bypassed in multichannel mode (leveller still runs) |
+| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase; crossfeed bypassed in multichannel mode (loudness now per-output post-gain; leveller still runs) |
 | Output EQ | Block-based, 10 bands per output (Core 0: outputs 0-1, Core 1: outputs 2-7) |
 | Output gain | Per-output gain × host volume × master volume |
+| Loudness | Per masked output, post-gain: 2 SVF shelf filters, volume-keyed; `loudness_output_mask` selects outputs; skipped-and-cleared when masked off / muted / RAW test signal |
 | Delay | Float circular buffers, 2048 samples max (42ms at 48kHz) |
 | SPDIF output | Float → int24 conversion, 4 stereo pairs |
 | PDM output | Float → Q28 for sigma-delta modulation |
@@ -420,7 +420,6 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 | Stage | Description |
 |-------|-------------|
 | Input conversion | USB int16 → Q28 (`<< 14`), USB/SPDIF RX 24-bit → Q28 (`sample << 6`), per-channel preamp via `fast_mul_q28()` (`global_preamp_mul[ch]`) — block loop to `buf_l[192]`, `buf_r[192]` |
-| Loudness | 2 biquads per-sample via `fast_mul_q28()` (Q28 coefficients, state coupling) (stereo only) |
 | Per-Input EQ + metering | Per active input: **block-based** `dsp_process_channel_block()`, 10 bands; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor on the 2 inputs, mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (Q28 envelope + float gain) |
 | Crossfeed | BS2B per-sample via `fast_mul_q28()` (Q28 coefficients, stereo coupling) |
@@ -432,6 +431,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 |-------|-------------|
 | Output EQ | **Block-based** `dsp_process_channel_block()`, 10 bands per output |
 | Output gain + volume | Combined Q15 multiply via `fast_mul_q15()` (output gain × host volume × master volume) |
+| Loudness | Per masked output, post-gain: 2 Q28 biquads via `fast_mul_q28()`, volume-keyed; `loudness_output_mask` selects outputs; skipped-and-cleared when masked off / muted / RAW test signal |
 | Delay | int32 circular buffers, 2048 samples max (42ms at 48kHz) |
 | SPDIF output | Q28 → int24 (`>> 6` with rounding), 2 stereo pairs |
 | PDM output | Q28 direct to sigma-delta modulator (single-core fallback only) |
@@ -638,7 +638,7 @@ Where `g = tan(pi * freq / Fs)` and `A = 10^(gain_dB/40)`.
 
 **FPU configuration (RP2350):** Both cores set FPSCR flush-to-zero (FZ) and default-NaN (DN) bits at startup. This prevents denormalized floats from causing performance penalties as SVF integrator and biquad states decay toward zero after silence.
 
-**Memory impact:** Biquad struct grows from ~48 to ~68 bytes on RP2350. With 114 total biquads (110 EQ + 4 loudness): ~3 KB additional BSS.
+**Memory impact:** Biquad struct grows from ~48 to ~68 bytes on RP2350. With 110 EQ biquads at the larger size: ~3 KB additional BSS. (Loudness no longer uses the full `Biquad` struct; since 2026-07-09 its per-output shelf state is a separate minimal array, `loudness_output_state`, 144 B on RP2350 / 80 B on RP2040.)
 
 **RP2040:** Completely unaffected. All SVF code is inside `#if PICO_RP2350` blocks.
 
@@ -1025,7 +1025,7 @@ output  = direct + ap_opposite     // Mix with opposite channel's crossfeed
 
 ### Purpose
 
-Automatic volume levelling via a feedforward, channel-linked, single-band RMS compressor applied to the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ (PASS 2.5 in the pipeline). Runs at all input counts; no longer bypassed in multichannel (the earlier stereo-only restriction is gone). Loudness and crossfeed remain stereo-only.
+Automatic volume levelling via a feedforward, channel-linked, single-band RMS compressor applied to the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ (PASS 2.5 in the pipeline). Runs at all input counts; no longer bypassed in multichannel (the earlier stereo-only restriction is gone). Crossfeed remains stereo-only; loudness now runs per output (post-gain, `loudness_output_mask`-selected), not on the stereo input bus, so it too is no longer stereo-only (see "Loudness Compensation").
 
 ### Algorithm
 
@@ -1055,9 +1055,9 @@ Automatic volume levelling via a feedforward, channel-linked, single-band RMS co
 ### Signal Chain Position
 
 ```
-USB Input → Per-Ch Preamp → [stereo only: Loudness] → Per-Input EQ + Metering → Volume Leveller (active inputs, mask-driven) → [stereo only: Crossfeed] → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → Delay → Output
+USB Input → Per-Ch Preamp → Per-Input EQ + Metering → Volume Leveller (active inputs, mask-driven) → [stereo only: Crossfeed] → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → [Loudness, per masked output] → Delay → Output
 
-(In multichannel mode the stereo-only stages — loudness, crossfeed — are bypassed; the leveller runs over all active inputs; each active input gets its own PEQ + metering before the matrix.)
+(In multichannel mode the stereo-only crossfeed stage is bypassed; loudness runs per output post-gain in every mode, gated by `loudness_output_mask`; the leveller runs over all active inputs; each active input gets its own PEQ + metering before the matrix.)
                                                      (PASS 2.5)
 ```
 
@@ -1095,7 +1095,7 @@ USB Input → Per-Ch Preamp → [stereo only: Loudness] → Per-Input EQ + Meter
 ---
 
 ## Loudness Compensation
-*Last updated: 2026-05-05*
+*Last updated: 2026-07-09 (per-output processing + output mask)*
 
 ### Purpose
 
@@ -1103,13 +1103,31 @@ ISO 226:2003 equal-loudness contour compensation to maintain perceived frequency
 
 ### Filter Architecture
 
-2 shelf filters per stereo channel:
-1. Low shelf (200 Hz, Q=0.707) — bass boost at low volume
-2. High shelf (6000 Hz, Q=0.707) — treble boost at low volume
+2 shelf filters per processed OUTPUT channel:
+1. Low shelf (200 Hz, Q=0.707); bass boost at low volume
+2. High shelf (6000 Hz, Q=0.707); treble boost at low volume
 
-**RP2350:** SVF shelf filters (Cytomic "SvfLinearTrapAllOutputs" with `k = 1/Q` for exact RBJ matching). Both loudness filters are always below the SVF crossover frequency at all supported sample rates, so SVF is used unconditionally. Coefficients are SVF integrator + mix coefficients (`sva1-3`, `svm0-2`); state is minimal `LoudnessSvfState` (`ic1eq`, `ic2eq`).
+**RP2350:** SVF shelf filters (Cytomic "SvfLinearTrapAllOutputs" with `k = 1/Q` for exact RBJ matching). Both loudness filters are always below the SVF crossover frequency at all supported sample rates, so SVF is used unconditionally. Coefficients (`LoudnessCoeffs`) are SVF integrator + mix coefficients (`sva1-3`, `svm0-2`) plus a `bypass` flag; per-output state is the minimal `LoudnessSvfState` (`ic1eq`, `ic2eq`).
 
-**RP2040:** Q28 fixed-point RBJ biquad coefficients with `fast_mul_q28()` processing.
+**RP2040:** Q28 fixed-point RBJ biquad coefficients with `fast_mul_q28()` processing; per-output state is a minimal DF2 pair (`s1`, `s2`) in `LoudnessBqState`.
+
+### Per-Output Processing (2026-07-09)
+
+Loudness now runs **per output channel**, inside the per-output chain (PASS 5-7), immediately after the output gain stage and before delay, peak metering, and encode. Post-gain placement maximizes headroom (compensation only boosts when user volume is low) and keeps clip meters truthful. This replaces the previous design, which ran two volume-keyed shelves on the stereo input bus (`buf_l`/`buf_r`) before per-input EQ and the matrix and was hard-skipped whenever a multichannel USB alt was active on RP2350. The old stereo state arrays in `audio_pipeline.c` are gone, as is the multichannel skip.
+
+**Output mask.** A global `volatile uint16_t loudness_output_mask` (default `0xFFFF` = all outputs; `LOUDNESS_DEFAULT_OUTPUT_MASK`) selects which output channels are compensated; bit k = output k. Only masked outputs cost CPU, and behavior is identical in stereo and multichannel input modes. Intended uses: compensate headphone outputs 0-1 but not speaker outputs 2-3, or all outputs for a 7.1 night mode. Outputs derived through crossovers or bass management should share the same mask setting to keep summed responses coherent; this is a user configuration choice.
+
+**Per-output state.** `LoudnessOutputState loudness_output_state[NUM_OUTPUT_CHANNELS]` lives in `loudness.c` (RP2350: 2 SVF states = 16 B/output, 144 B total; RP2040: 2 DF2 states = 16 B/output, 80 B total). The coefficient table generation (ISO 226 math, double-buffered tables, recompute triggers) is UNCHANGED; only the filter state moved out of the shelves and into this per-output array.
+
+**Block helper.** `loudness_process_output_block()` is a `static inline` in `loudness.h`, shared by Core 0 (`audio_pipeline.c`) and the Core 1 EQ worker (`pdm_generator.c`). It is filter-major (each shelf processes the whole block before the next, equivalent to the per-sample cascade for these LTI filters and cheaper); a bypassed shelf (0 dB at this volume step) clears its state and is skipped.
+
+**Two-core coherence.** Core 0 snapshots the coefficient pointer (`current_loudness_coeffs`, or NULL when loudness is disabled) and the mask once per packet and passes them to Core 1 through new `Core1EqWork` fields (`loud_coeffs`, `loud_mask`), so both cores apply one consistent view for the whole packet.
+
+**Skip-and-clear.** An output is skipped and its state cleared (`loudness_reset_output_state()`) when it is masked off, matrix-disabled, muted to zero gain for the whole packet, or carrying a siggen RAW test signal. Clearing prevents a stale-state transient when the output re-enters compensation.
+
+**Alignment.** The shelves are IIR with no sample delay, so inter-output slot alignment is untouched (the CLAUDE.md inviolable guarantee holds). ADAT bulk output mirrors the finalized `buf_out`, so it inherits per-output loudness automatically.
+
+**Persistence and control.** `loudness_output_mask` is set/read by vendor commands `REQ_SET_LOUDNESS_MASK` (0xFA, 2-byte little-endian mask) and `REQ_GET_LOUDNESS_MASK` (0xFB, returns 2 bytes). It persists via wire format **V19** (a `uint16 loudness_output_mask` in `WireGlobalParams`, replacing its `reserved[2]`) and preset slot **V26** (tail-append; older slots default to `0xFFFF` = all outputs).
 
 ### Parameters
 
@@ -1482,7 +1500,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-08 (leveller multichannel; wire V18 / slot V25)*
+*Last updated: 2026-07-09 (per-output loudness + output mask; wire V19 / slot V26)*
 
 ### Hardware
 
@@ -1525,11 +1543,12 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V18 / V25 | V18 / V25 |
+| Wire / slot version | V19 / V26 | V19 / V26 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
 | Volume leveller | Q28 envelope + float gain; 2 channels, 2 lookahead rings; max boost clamped to 18 dB (Q28 gain range) | Float throughout; 2 to 8 active channels, mask-driven, 8 lookahead rings; full 35 dB max boost |
+| Loudness | Per output, post-gain: 2 Q28 shelf biquads; `loudness_output_mask` (5 outputs) | Per output, post-gain: 2 SVF shelves; `loudness_output_mask` (9 outputs). Both platforms: volume-keyed, works in stereo and multichannel input modes |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
 ### Delay Lines
@@ -1735,6 +1754,7 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | Filters + recipes (7 channels) | ~8 KB |
 | Crossover filters + recipes (7 × 4 × Biquad + recipes) | ~4.1 KB |
 | Loudness tables (2 × 61 × 2 × ~13B) | ~3 KB |
+| Loudness per-output state (5 × 16 B) | 80 B |
 | Preset system (dir_cache + slot_buf + write_buf) | ~6 KB |
 | Bulk param buffer (8 KB aligned, holds V15 = 4128 B) | ~8 KB |
 | `notify_rebaseline` static scratch (V15 WireBulkParams) | ~4.1 KB |
@@ -1769,6 +1789,7 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | Leveller state + lookahead (8 rings × 240 × 4) | ~7.7 KB |
 | Per-channel preamp (8 ch) + master volume | ~120 B |
 | Matrix mixer (8 × 9 crosspoints + outputs) | ~1.3 KB |
+| Loudness tables + per-output state (2 × 61 × 2 coeffs + 9 × 16 B) | ~3 KB |
 | Consumer pools + silence (static, 4 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~55 KB |
 | I2S RX DMA ring (2048 × 4, 8 KB aligned) | 8 KB |
 | Other BSS | ~24 KB |
@@ -2378,6 +2399,8 @@ op state ~400 B).
 | REQ_SET_I2C_CONFIG | 0xF7 | OUT | Configure I2C target control interface (8-byte `I2cCtrlConfig`; **USB only**, refused with BLOCKED over UART/I2C; deferred apply, persist on success; returns `PIN_CONFIG_*`) |
 | REQ_GET_I2C_CONFIG | 0xF8 | IN | Get persisted `I2cCtrlConfig` (8 bytes) |
 | REQ_GET_CTRL_IFACE_STATUS | 0xF9 | IN | Get `CtrlIfaceStatus` (8 bytes: uart/i2c last_status + live flags, proto_version=1) |
+| REQ_SET_LOUDNESS_MASK | 0xFA | OUT | Set `loudness_output_mask` (2-byte little-endian; bit k = compensate output k, default 0xFFFF). Selects which output channels get per-output loudness |
+| REQ_GET_LOUDNESS_MASK | 0xFB | IN | Get `loudness_output_mask` (returns 2 bytes) |
 
 ### Bulk Parameter Transfer
 *Last updated: 2026-06-11*

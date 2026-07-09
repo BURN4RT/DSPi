@@ -863,6 +863,16 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
 
+        case REQ_SET_LOUDNESS_MASK:
+            if (buffer->data_len >= 2) {
+                loudness_output_mask = vendor_rx_buf[0] | ((uint16_t)vendor_rx_buf[1] << 8);
+                // No recompute; the mask does not affect the coefficient table.
+                uint16_t m = loudness_output_mask;
+                notify_param_write(offsetof(WireBulkParams, global.loudness_output_mask),
+                                   2, (const uint8_t *)&m);
+            }
+            break;
+
         // Matrix Mixer Commands
         case REQ_SET_MATRIX_ROUTE:
             if (buffer->data_len >= sizeof(MatrixRoutePacket)) {
@@ -1513,6 +1523,14 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_LEVELLER_MASKS: {
                 resp_buf[0] = leveller_config.detector_mask;
                 resp_buf[1] = leveller_config.apply_mask;
+                vendor_send_response(resp_buf, 2);
+                return true;
+            }
+
+            case REQ_GET_LOUDNESS_MASK: {
+                uint16_t m = loudness_output_mask;
+                resp_buf[0] = (uint8_t)(m & 0xFF);
+                resp_buf[1] = (uint8_t)((m >> 8) & 0xFF);
                 vendor_send_response(resp_buf, 2);
                 return true;
             }
