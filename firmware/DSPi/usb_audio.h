@@ -84,8 +84,6 @@ extern volatile uint8_t effective_vol_index;
 #include "crossfeed.h"
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool crossfeed_update_pending;
-extern volatile bool crossfeed_bypassed;
-extern CrossfeedState crossfeed_state;
 
 // Volume Leveller
 extern volatile LevellerConfig leveller_config;

@@ -779,6 +779,16 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
 
+        case REQ_SET_CROSSFEED_OUTPUTS:
+            if (buffer->data_len >= 1) {
+                uint8_t v = vendor_rx_buf[0] & ((1u << NUM_SPDIF_INSTANCES) - 1);
+                crossfeed_config.output_pair_mask = v;
+                // No crossfeed_update_pending; the pipeline reads the mask live
+                // each packet and resets skipped pairs, so no recompute is needed.
+                notify_param_write(offsetof(WireBulkParams, crossfeed.output_pair_mask), 1, &v);
+            }
+            break;
+
         // Volume Leveller Commands
         case REQ_SET_LEVELLER_ENABLE:
             if (buffer->data_len >= 1) {
@@ -1476,6 +1486,12 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 
             case REQ_GET_CROSSFEED_ITD: {
                 resp_buf[0] = crossfeed_config.itd_enabled ? 1 : 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_CROSSFEED_OUTPUTS: {
+                resp_buf[0] = crossfeed_config.output_pair_mask;
                 vendor_send_response(resp_buf, 1);
                 return true;
             }

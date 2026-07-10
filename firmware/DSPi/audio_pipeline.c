@@ -42,8 +42,8 @@ extern volatile uint8_t spdif0_consumer_fill;
 // Loudness compensation filter state lives in loudness.c
 // (loudness_output_state[NUM_OUTPUT_CHANNELS], shared with the Core 1 worker).
 
-// Crossfeed state
-CrossfeedState crossfeed_state;
+// Crossfeed per-pair state and published coefficients live in crossfeed.c
+// (crossfeed_pair_state[NUM_SPDIF_INSTANCES], current_crossfeed_coeffs).
 
 // Volume Leveller state
 LevellerCoeffs leveller_coeffs;
@@ -178,8 +178,8 @@ void pipeline_reset_cpu_metering(void) {
 }
 
 // ----------------------------------------------------------------------------
-// Input-agnostic DSP pipeline: per-input EQ, leveller, crossfeed, matrix
-// mixer, per-output EQ/gain/loudness/delay, output encoding, buffer return,
+// Input-agnostic DSP pipeline: per-input EQ, leveller, matrix mixer,
+// per-pair crossfeed, per-output EQ/gain/loudness/delay, output encoding, buffer return,
 // CPU metering.  Reads from file-scope buf_l[]/buf_r[] (filled by caller).
 // ----------------------------------------------------------------------------
 
@@ -283,14 +283,13 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
 
     // Active input count for this packet (see active_input_channel_count()):
     // the USB alt's channel count, the I2S input channel count, or the stereo
-    // pair for S/PDIF.  In multichannel mode (>2 inputs) the inherently-stereo
-    // crossfeed is bypassed; each input gets its own PEQ, then the leveller
+    // pair for S/PDIF.  Each active input gets its own PEQ, then the leveller
     // (channel-count agnostic, mask-driven), then the matrix.  The matrix
     // iterates n_active_inputs, so buf_in_ext (inputs 2..7) is read ONLY when
     // those inputs are actually active; stale samples can never leak into
-    // stereo / S/PDIF output.
+    // stereo / S/PDIF output.  (Crossfeed runs per output pair post-matrix,
+    // so it is input-count agnostic and no longer bypassed in multichannel.)
     int n_active_inputs = active_input_channel_count();
-    bool multichannel = (n_active_inputs > NUM_STEREO_INPUTS);
 
     // Loudness snapshot for this packet: one coefficient pointer + output
     // mask, shared with Core 1 via core1_eq_work so both cores apply the
@@ -298,6 +297,12 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     // the outputs selected by loudness_output_mask; input-count agnostic.
     const LoudnessCoeffs *loud_coeffs = loudness_enabled ? current_loudness_coeffs : NULL;
     uint16_t loud_mask = loudness_output_mask;
+
+    // Crossfeed snapshot for this packet: published coefficient pointer
+    // (NULL = disabled) + output pair mask, shared with Core 1 via
+    // core1_eq_work.  Runs per output pair post-matrix (PASS 4.5).
+    const CrossfeedCoeffs *xf_coeffs = (const CrossfeedCoeffs *)current_crossfeed_coeffs;
+    uint8_t xf_mask = crossfeed_config.output_pair_mask;
 
     // Pre-compute PDM scale factor
     const float pdm_scale = (float)(1 << 28);
@@ -332,15 +337,6 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                                (const LevellerConfig *)&leveller_config,
                                input_bufs, (uint32_t)n_active_inputs,
                                sample_count);
-    }
-
-    // ========== PASS 3: Crossfeed ========== (stereo-only)
-    if (!multichannel && !crossfeed_bypassed) {
-        for (uint32_t i = 0; i < sample_count; i++) {
-            float ml = buf_l[i], mr = buf_r[i];
-            crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
-            buf_l[i] = ml; buf_r[i] = mr;
-        }
     }
 
     // ========== PASS 4: Matrix Mixing (block-based, output-major) ==========
@@ -408,6 +404,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.delay_write_idx = delay_write_idx;
         core1_eq_work.loud_coeffs = loud_coeffs;
         core1_eq_work.loud_mask = loud_mask;
+        core1_eq_work.xfeed_coeffs = xf_coeffs;
+        core1_eq_work.xfeed_mask = xf_mask;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[1] = audio_buf[2] ? (int32_t *)audio_buf[2]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[2] = audio_buf[3] ? (int32_t *)audio_buf[3]->buffer->bytes : NULL;
@@ -415,6 +413,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         __dmb();
         core1_eq_work.work_ready = true;
         __sev();
+
+        // ========== PASS 4.5: Crossfeed (per output pair, pre-EQ) ==========
+        // Core 0 owns pair 0; Core 1 runs pairs 1-3 inside eq_worker_loop.
+        // Pre-EQ so per-output (headphone) EQ shapes the post-crossfeed signal.
+        crossfeed_process_pairs(xf_coeffs, xf_mask, 0, 0, buf_out, sample_count);
 
         // Core 0: EQ + gain for outputs 0-1
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
@@ -533,6 +536,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     } else {
         // --- Single-core path: all outputs on Core 0 ---
+
+        // ========== PASS 4.5: Crossfeed (per output pair, pre-EQ) ==========
+        crossfeed_process_pairs(xf_coeffs, xf_mask, 0, NUM_SPDIF_INSTANCES - 1,
+                                buf_out, sample_count);
 
         // EQ + gain (per-sample vol ramp, see Core 0 dual-core branch above for
         // rationale; steady-state step==0 falls back to constant-gain path).
@@ -691,6 +698,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     const LoudnessCoeffs *loud_coeffs = loudness_enabled ? current_loudness_coeffs : NULL;
     uint16_t loud_mask = loudness_output_mask;
 
+    // Crossfeed snapshot for this packet (see RP2350 branch above): runs per
+    // output pair post-matrix, shared with Core 1 via core1_eq_work.
+    const CrossfeedCoeffs *xf_coeffs = (const CrossfeedCoeffs *)current_crossfeed_coeffs;
+    uint8_t xf_mask = crossfeed_config.output_pair_mask;
+
     // ========== PASS 2: Per-Input EQ + Metering ========== (RP2040: 2 inputs)
     for (int k = 0; k < NUM_INPUT_CHANNELS; k++) {
         int32_t *ibuf = input_bufs[k];
@@ -710,15 +722,6 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         leveller_process_block(&leveller_state, &leveller_coeffs,
                                (const LevellerConfig *)&leveller_config,
                                input_bufs, NUM_INPUT_CHANNELS, sample_count);
-    }
-
-    // ========== PASS 3: Crossfeed ==========
-    if (!crossfeed_bypassed) {
-        for (uint32_t i = 0; i < sample_count; i++) {
-            int32_t ml = buf_l[i], mr = buf_r[i];
-            crossfeed_process_stereo(&crossfeed_state, &ml, &mr);
-            buf_l[i] = ml; buf_r[i] = mr;
-        }
     }
 
     // ========== PASS 4: Matrix Mixing (block-based, output-major) ==========
@@ -769,11 +772,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.delay_write_idx = delay_write_idx;
         core1_eq_work.loud_coeffs = loud_coeffs;
         core1_eq_work.loud_mask = loud_mask;
+        core1_eq_work.xfeed_coeffs = xf_coeffs;
+        core1_eq_work.xfeed_mask = xf_mask;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.work_done = false;
         __dmb();
         core1_eq_work.work_ready = true;
         __sev();
+
+        // ========== PASS 4.5: Crossfeed (per output pair, pre-EQ) ==========
+        // Core 0 owns pair 0; Core 1 runs pair 1 inside eq_worker_loop.
+        crossfeed_process_pairs(xf_coeffs, xf_mask, 0, 0, buf_out, sample_count);
 
         // Core 0: EQ + gain for outputs 0-1 (SPDIF pair 1)
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
@@ -886,6 +895,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     } else {
         // --- Single-core path: all outputs on Core 0 ---
         uint32_t saved_delay_write_idx = delay_write_idx;
+
+        // ========== PASS 4.5: Crossfeed (per output pair, pre-EQ) ==========
+        crossfeed_process_pairs(xf_coeffs, xf_mask, 0, NUM_SPDIF_INSTANCES - 1,
+                                buf_out, sample_count);
 
         // EQ + gain (block-based, per-sample vol ramp; step==0 in steady state
         // → constant-gain path with no extra per-sample work).

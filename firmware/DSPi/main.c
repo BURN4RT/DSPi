@@ -2035,12 +2035,12 @@ int main(void) {
             }
         }
 
-        // Handle crossfeed coefficient updates
+        // Handle crossfeed coefficient updates: compute into the inactive
+        // buffer and publish (NULL = disabled); pair states are reset by
+        // the pipeline whenever a pair is skipped.
         if (crossfeed_update_pending) {
             crossfeed_update_pending = false;
-            crossfeed_compute_coefficients(&crossfeed_state, (const CrossfeedConfig *)&crossfeed_config, (float)audio_state.freq);
-            // Update bypass flag atomically
-            crossfeed_bypassed = !crossfeed_config.enabled;
+            crossfeed_apply_config((const CrossfeedConfig *)&crossfeed_config, (float)audio_state.freq);
         }
 
         // Handle volume leveller coefficient updates

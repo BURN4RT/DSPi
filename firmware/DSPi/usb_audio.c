@@ -236,10 +236,10 @@ volatile CrossfeedConfig crossfeed_config = {
     .itd_enabled = true,
     .preset = CROSSFEED_PRESET_DEFAULT,
     .custom_fc = 700.0f,
-    .custom_feed_db = 4.5f
+    .custom_feed_db = 4.5f,
+    .output_pair_mask = 0x01  // Default: pair 1 only (outputs 0/1)
 };
 volatile bool crossfeed_update_pending = false;
-volatile bool crossfeed_bypassed = true;  // Fast bypass flag for audio callback
 
 // Volume Leveller state
 volatile LevellerConfig leveller_config = {

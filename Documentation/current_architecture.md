@@ -44,7 +44,7 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 - Parametric EQ: 11 channels on RP2350 (2 master + 9 outputs), 7 channels on RP2040 (2 master + 5 outputs)
 - Matrix mixer with per-output gain, mute, phase invert, and delay
 - Master volume: device-side attenuation-only ceiling on all outputs (post-output-gain)
-- BS2B crossfeed for headphone listening
+- BS2B crossfeed for headphone listening (per output pair, selectable output-pair mask)
 - ISO 226:2003 loudness compensation
 - Per-output configurable delay lines
 - Runtime pin reconfiguration
@@ -66,7 +66,7 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 | `usb_audio.c` | USB audio input decode (`process_audio_packet`), custom UAC1 TinyUSB class driver (`uac1_driver_*`), output slots, volume, init |
 | `usb_audio.h` | USB audio interface API, AudioState struct, extern declarations for shared state |
 | `tusb_config.h` | TinyUSB configuration (disables built-in classes; UAC1 handled by custom driver) |
-| `audio_pipeline.c` | Input-agnostic DSP pipeline (`process_input_block`): loudness, EQ, leveller, crossfeed, matrix mixer, per-output EQ/gain/delay, output encoding, buffer stats |
+| `audio_pipeline.c` | Input-agnostic DSP pipeline (`process_input_block`): loudness, EQ, leveller, matrix mixer, per-output-pair crossfeed, per-output EQ/gain/delay, output encoding, buffer stats |
 | `audio_pipeline.h` | Pipeline entry point, shared buffer declarations (`buf_l`/`buf_r`/`buf_out`), buffer stats API |
 | `vendor_commands.c` | Vendor USB control request handlers (GET/SET dispatch, pin/MCK helpers, diagnostics). Public entry `vendor_control_xfer_cb(rhport, stage, req)` is invoked from `usb_audio.c`'s UAC1 class driver. |
 | `vendor_commands.h` | Vendor handler declarations, system stats and pin helper prototypes. |
@@ -75,8 +75,8 @@ DSPi is a USB Audio Class 1 (UAC1) digital signal processor built on the Raspber
 | `dsp_process_rp2040.S` | RP2040-only: hand-optimized ARM assembly biquad (per-sample + block-based) |
 | `pdm_generator.c` | 2nd-order sigma-delta PDM modulator, Core 1 PDM mode |
 | `pdm_generator.h` | PDM API, ring buffer communication |
-| `crossfeed.c` | BS2B crossfeed filter (lowpass + allpass for ILD/ITD) |
-| `crossfeed.h` | Crossfeed API, presets, state structs |
+| `crossfeed.c` | BS2B crossfeed filter (lowpass + allpass for ILD/ITD), per-output-pair dispatch + shared double-buffered coeffs |
+| `crossfeed.h` | Crossfeed API, presets, `CrossfeedConfig`/`CrossfeedCoeffs`/`CrossfeedPairState` structs |
 | `loudness.c` | ISO 226:2003 loudness curve computation, double-buffered tables |
 | `loudness.h` | Loudness API, coefficient structs |
 | `leveller.c` | Volume leveller (feedforward RMS compressor) |
@@ -248,13 +248,13 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 **`perform_rate_change()` (main.c):** bracketed with `prepare_pipeline_reset(PRESET_MUTE_SAMPLES)` / `complete_pipeline_reset()`. Without the bracket, the SPDIF `wrap_consumer_take` callback updates the PIO divider lazily on the next buffer-take, so old-rate audio already queued in each consumer pool plays out at the new bit-clock — audible pitch wobble for ~16 ms. `complete_pipeline_reset()` aborts DMA on every enabled slot, drains the consumer pool back to the free list, and restarts all outputs in sync at the new divider. The I2S `audio_i2s_update_all_frequencies()` call inside `perform_rate_change()` still runs for its own divider+clkdiv_restart pass; the subsequent `complete_pipeline_reset()` re-aborts/re-enables idempotently and costs only microseconds.
 
 ### Multichannel USB Input + Per-Input EQ/Metering (RP2350)
-*Last updated: 2026-07-08 (volume leveller now runs multichannel; no longer bypassed above 2 inputs)*
+*Last updated: 2026-07-10 (crossfeed moved to per-output-pair stage; no longer bypassed in multichannel)*
 
 **Unified channel model (no "master").** Channels are now `[inputs 0..NUM_INPUT_CHANNELS-1][outputs NUM_INPUT_CHANNELS..]`; `NUM_CHANNELS = NUM_INPUT_CHANNELS + NUM_OUTPUT_CHANNELS` (17 on RP2350, 7 on RP2040). The former "master EQ" was always the EQ on the 2 stereo inputs — it is generalized so **every input channel is a first-class channel with its own 10-band PEQ + peak/clip metering** (no crossover). Output channels keep PEQ + crossover + gain/delay/mute. `CH_OUT_1 = NUM_INPUT_CHANNELS`; the output-slot→channel-index mapping (`CH_OUT_1 + slot`) shifts automatically, so the slot-aligned output path is structurally unchanged. **Input EQ and metering reuse the existing `REQ_SET/GET_EQ_PARAM` (channel = input index) and `REQ_GET_STATUS` (`peaks[]`/`clip_flags`) commands — no new commands.** `clip_flags` is `uint32_t` (17 channels > 16 bits).
 
 **USB formats.** RP2350 advertises AudioStreaming alts **1 = 2ch/16, 2 = 2ch/24** (44.1/48/96 kHz), and **3 = 4ch, 4 = 6ch, 5 = 8ch** (all 48 kHz/16-bit fixed). The host picks the format; the firmware sets the active input count (`usb_input_channels` = 2/4/6/8) in `uac1_apply_alt()`, which forces 48 kHz for multichannel alts (SET_CUR rejects non-48k), flushes the ring, and resyncs. RP2040 is stereo-only (2 SPDIF = 4 output channels). The multichannel alt blocks are emitted by a parameterized `AS_MULTICH_ALT(alt,nch)` macro; descriptor offsets/`CONFIG_TOTAL_LEN` (369 on RP2350) are arithmetic + `_Static_assert`-verified. The single Input Terminal/Feature Unit declare the 8-channel superset (`wChannelConfig=0x063F`); iso OUT max-packet `AUDIO_EP_MAX_PKT=788`.
 
-**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2; `multichannel = n_active>2` **bypasses the inherently-stereo crossfeed stage**. (Loudness no longer sits on the input bus; it runs per output post-gain, mask-selected, in both stereo and multichannel modes; see "Loudness Compensation".) The **volume leveller now runs channel-count-agnostic over the active inputs** (mask-driven; see "Volume Leveller"), so it is no longer bypassed in multichannel. The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit (the leveller delays every active input identically through its per-channel lookahead ring). Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
+**Decode + pipeline.** `process_audio_packet()` deinterleaves N channels (stride = `channels`) into `input_bufs[c]`. The 24-bit stereo path casts the packet buffer to `uint32_t*` and the compiler may emit `ldrd` (which faults on a non-word-aligned address), so the USB ring slot's `data[]` is `__attribute__((aligned(4)))` (`usb_audio_ring.h`); macOS opens a stereo device at 24-bit, so this path runs even in "2-channel" mode. (inputs 0/1 → buf_l/buf_r, 2-7 → buf_in_ext) with per-input preamp. In `process_input_block()` the **input-EQ pass** runs `dsp_process_channel_block(filters[k], input_bufs[k], …)` for each active input `k`, then meters its post-EQ peak/clip into `global_status.peaks[k]`/`clip_flags`. `n_active_inputs` = `usb_input_channels` for USB else 2. **Crossfeed no longer sits on the input bus; it runs per output pair post-matrix (PASS 4.5), so it is input-count agnostic and never bypassed in multichannel** (see "Crossfeed"). (Loudness no longer sits on the input bus; it runs per output post-gain, mask-selected, in both stereo and multichannel modes; see "Loudness Compensation".) The **volume leveller now runs channel-count-agnostic over the active inputs** (mask-driven; see "Volume Leveller"), so it is no longer bypassed in multichannel. The matrix iterates `n_active_inputs`, so `buf_in_ext` is read only when those inputs are active; inactive input peaks are zeroed. Inter-output sample alignment is preserved bit-for-bit (the leveller delays every active input identically through its per-channel lookahead ring). Default factory routing is stereo pass-through; multichannel routing is configured by the host app.
 
 **Live active-input-count for the host.** The app reads the active count (2/4/6/8) from the `REQ_GET_STATUS` combined packet (a 1-byte `active_input_channels` field, polled with the meters) or the scalar `wValue==23`; the bulk header `num_input_channels` stays the device max (8). Both report sites are **source-aware** via `active_input_channel_count()` (`audio_pipeline.c`), the single source of truth shared with the DSP pipeline's input dimension: USB → `usb_input_channels`, I2S → `i2s_input_channels`, S/PDIF → 2. A `NOTIFY_EVT_INPUT_FORMAT` (0x05) push event fires whenever the active count can change — USB alt change, input-source switch, and live I2S channel-count change (`REQ_SET_I2S_INPUT_CHANNELS` while I2S is active) — so the app relayouts immediately regardless of source.
 
@@ -386,13 +386,13 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 1. **Ring push (task context)** — Copy raw packet into SPSC ring, detect arrival gaps
 2. **Ring drain (main loop)** — Peek/process/consume loop, highest priority in main loop
 3. **USB decode (`process_audio_packet` in `usb_audio.c`)** — Gap detection, sync tracking, USB byte decode (16/24-bit) with per-channel preamp into `buf_l[]`/`buf_r[]`
-4. **DSP pipeline (`process_input_block` in `audio_pipeline.c`)** — Input-agnostic: buffer acquisition, preset mute envelope, EQ, leveller, crossfeed, matrix mixer, per-output EQ/gain/loudness/delay, output encoding, buffer return, CPU metering
+4. **DSP pipeline (`process_input_block` in `audio_pipeline.c`)**; input-agnostic: buffer acquisition, preset mute envelope, EQ, leveller, matrix mixer, per-output-pair crossfeed (PASS 4.5), per-output EQ/gain/loudness/delay, output encoding, buffer return, CPU metering
 5. **Buffer return** — Give completed buffers to consumer pools for DMA
 
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-07-08 (leveller multichannel + 5 ms lookahead)*
+*Last updated: 2026-07-10 (crossfeed now per-output-pair, post-matrix)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -401,8 +401,8 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Input conversion | USB int16/24-bit or SPDIF RX 24-bit → float full-scale, per-channel preamp gain (`global_preamp_linear[ch]`) |
 | Per-Input EQ + metering | Per active input: block-based `dsp_process_channel_block()`, 10 bands, hybrid SVF/biquad; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor over active inputs (2 to 8), mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (float throughout) |
-| Crossfeed | BS2B lowpass + allpass (ILD + ITD) (stereo only) |
-| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase; crossfeed bypassed in multichannel mode (loudness now per-output post-gain; leveller still runs) |
+| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase (loudness now per-output post-gain; leveller still runs) |
+| Crossfeed | BS2B lowpass + allpass (ILD + ITD) per output pair, post-matrix (PASS 4.5), pre-output-EQ; `output_pair_mask`-selected (up to 4 pairs); works in every input mode |
 | Output EQ | Block-based, 10 bands per output (Core 0: outputs 0-1, Core 1: outputs 2-7) |
 | Output gain | Per-output gain × host volume × master volume |
 | Loudness | Per masked output, post-gain: 2 SVF shelf filters, volume-keyed; `loudness_output_mask` selects outputs; skipped-and-cleared when masked off / muted / RAW test signal |
@@ -411,7 +411,7 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | PDM output | Float → Q28 for sigma-delta modulation |
 
 ### RP2040 Fixed-Point Pipeline
-*Last updated: 2026-07-08 (leveller mask-driven link + 5 ms lookahead)*
+*Last updated: 2026-07-10 (crossfeed now per-output-pair, post-matrix)*
 
 Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixed-point (28 fractional bits). 2 S/PDIF stereo pairs + 1 PDM sub (5 output channels).
 
@@ -422,8 +422,8 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 | Input conversion | USB int16 → Q28 (`<< 14`), USB/SPDIF RX 24-bit → Q28 (`sample << 6`), per-channel preamp via `fast_mul_q28()` (`global_preamp_mul[ch]`) — block loop to `buf_l[192]`, `buf_r[192]` |
 | Per-Input EQ + metering | Per active input: **block-based** `dsp_process_channel_block()`, 10 bands; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor on the 2 inputs, mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (Q28 envelope + float gain) |
-| Crossfeed | BS2B per-sample via `fast_mul_q28()` (Q28 coefficients, stereo coupling) |
 | Matrix mixing | Q15 gains via `fast_mul_q15()` (16-bit partial products), 2 inputs × 5 outputs → `buf_out[5][192]` |
+| Crossfeed | BS2B block via `fast_mul_q28()` (Q28 coefficients) per output pair, post-matrix (PASS 4.5), pre-output-EQ; `output_pair_mask`-selected (up to 2 pairs) |
 
 **Phase 2 (per-output block, dual-core or single-core):**
 
@@ -989,7 +989,7 @@ Linear fade-in/fade-out ramp applied to `pcm_val` after hard limiting, before th
 ---
 
 ## Crossfeed
-*Last updated: 2026-02-14*
+*Last updated: 2026-07-10 (per-output-pair stage; output-pair mask; dual-core split)*
 
 ### Purpose
 
@@ -1018,14 +1018,38 @@ output  = direct + ap_opposite     // Mix with opposite channel's crossfeed
 
 **ITD target:** 220 us (60 degree stereo speakers, 15 cm head width), implemented as 1st-order allpass.
 
+### Per-Output-Pair Stage
+
+Crossfeed runs as a **per-output-pair** stage (PASS 4.5) rather than a stereo-only input-bus stage. It sits **post-matrix and post test-signal injection**, immediately before the per-output crossover/EQ/gain/loudness/delay chain. This keeps its position relative to output EQ identical to before (a headphone EQ still shapes the post-crossfeed signal), while making it work in **every input mode** (2/4/6/8-channel USB, S/PDIF, I2S): it processes whatever stereo program the matrix routed to each pair, so the old multichannel bypass is gone.
+
+- **Pairs are stereo output slots:** outputs `2p`/`2p+1`, `NUM_SPDIF_INSTANCES` pairs (4 on RP2350, 2 on RP2040). The mono PDM sub is not a pair and is excluded.
+- **Output-pair mask:** `CrossfeedConfig.output_pair_mask` (bit `p` = run crossfeed on pair `p`). Default `0x01` (pair 1 only) at factory reset and when loading pre-V27 presets. The filter settings (preset / fc / feed / ITD) stay **global** and are shared by every selected pair; only the mask picks which pairs run.
+- **Per-pair state, shared coefficients:** `crossfeed.c` publishes one shared `CrossfeedCoeffs` (lp_a0, lp_b1, ap_a) via `volatile const CrossfeedCoeffs *current_crossfeed_coeffs` (NULL = disabled; this replaces the old `crossfeed_bypassed` flag). Coefficients are double-buffered: `crossfeed_apply_config()` computes into the inactive buffer, then atomically publishes the pointer, so it never mutates the buffer the pipeline is reading (the `main.c` `crossfeed_update_pending` handler calls it). Each pair owns an independent `CrossfeedPairState crossfeed_pair_state[NUM_SPDIF_INSTANCES]` (4 filter states each: lp L/R, ap L/R) so pairs run in isolation.
+- **Skip / reset predicate:** a pair runs when coeffs are published AND its mask bit is set AND neither channel of the pair carries a RAW test signal (`siggen_raw_mask`) AND both channels are matrix-enabled (crossfeed writes both buffers; a half-enabled pair would leak bleed into the disabled channel's zeroed, never re-zeroed buffer). Skipped pairs have their filter state reset each packet (`crossfeed_reset_pair_state`) so re-enabling starts clean; selected-off pairs cost zero DSP cycles.
+- **Dispatch:** `crossfeed_process_pairs(coeffs, mask, first_pair, last_pair, buf_out, n)` iterates the assigned pairs, running `crossfeed_process_pair_block()` on selected pairs in place and resetting the rest.
+
+### Dual-Core Split
+
+Each packet snapshots the coefficient pointer + mask once and hands them to Core 1 via new `Core1EqWork` fields `xfeed_coeffs`/`xfeed_mask` (same single-view rationale as the loudness fields, so both cores apply the same view). **Core 0 owns pair 0**; **Core 1 crossfeeds its own pairs** (RP2350: pairs 1-3; RP2040: pair 1) at the top of `eq_worker_loop`, before its per-output EQ loop. The single-core path runs all pairs on Core 0. Crossfeed is pure IIR (no buffer delay), with identical `sample_count` on every output, so **inter-slot sample alignment is untouched**.
+
+### RAM Cost
+
+Double-buffered coeffs plus 4 (RP2350) / 2 (RP2040) pair states; net a few dozen bytes.
+
+### Persistence & Control
+
+- **Wire format V20:** `WireCrossfeedParams` reserved byte (offset 3) is now `output_pair_mask`; struct sizes unchanged.
+- **Preset slot V27:** `uint8 crossfeed_output_pair_mask` tail-appended (struct grows 1 byte), gated on `version >= 27` at apply; older slots load `0x01`; factory default `0x01`; V26 CRC sizes still validate.
+- **Vendor commands:** `REQ_SET_CROSSFEED_OUTPUTS` (0xFC, OUT, 1 byte pair mask, clamped to valid pair bits, notify on write) and `REQ_GET_CROSSFEED_OUTPUTS` (0xFD, IN, 1 byte). The existing 0x5E-0x67 crossfeed commands are unchanged. The mask is read live each packet, so 0xFC needs no coefficient recompute.
+
 ---
 
 ## Volume Leveller
-*Last updated: 2026-07-08 (multichannel; channel masks; 5 ms lookahead)*
+*Last updated: 2026-07-10 (crossfeed no longer stereo-only; runs per output pair)*
 
 ### Purpose
 
-Automatic volume levelling via a feedforward, channel-linked, single-band RMS compressor applied to the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ (PASS 2.5 in the pipeline). Runs at all input counts; no longer bypassed in multichannel (the earlier stereo-only restriction is gone). Crossfeed remains stereo-only; loudness now runs per output (post-gain, `loudness_output_mask`-selected), not on the stereo input bus, so it too is no longer stereo-only (see "Loudness Compensation").
+Automatic volume levelling via a feedforward, channel-linked, single-band RMS compressor applied to the active input channels (2 to 8 on RP2350; always 2 on RP2040), pre-matrix, after per-input EQ (PASS 2.5 in the pipeline). Runs at all input counts; no longer bypassed in multichannel (the earlier stereo-only restriction is gone). Crossfeed now runs per output pair post-matrix (`output_pair_mask`-selected), not on the stereo input bus, so it too works in every input mode (see "Crossfeed"); loudness likewise runs per output (post-gain, `loudness_output_mask`-selected), so it is no longer stereo-only (see "Loudness Compensation").
 
 ### Algorithm
 
@@ -1055,9 +1079,9 @@ Automatic volume levelling via a feedforward, channel-linked, single-band RMS co
 ### Signal Chain Position
 
 ```
-USB Input → Per-Ch Preamp → Per-Input EQ + Metering → Volume Leveller (active inputs, mask-driven) → [stereo only: Crossfeed] → Matrix Mix → Output EQ → Output Gain × Host Vol × Master Vol → [Loudness, per masked output] → Delay → Output
+USB Input → Per-Ch Preamp → Per-Input EQ + Metering → Volume Leveller (active inputs, mask-driven) → Matrix Mix → [Crossfeed, per masked output pair] → Output EQ → Output Gain × Host Vol × Master Vol → [Loudness, per masked output] → Delay → Output
 
-(In multichannel mode the stereo-only crossfeed stage is bypassed; loudness runs per output post-gain in every mode, gated by `loudness_output_mask`; the leveller runs over all active inputs; each active input gets its own PEQ + metering before the matrix.)
+(Crossfeed now runs per output pair post-matrix, gated by `output_pair_mask`, so it works in every input mode instead of being bypassed in multichannel; loudness runs per output post-gain in every mode, gated by `loudness_output_mask`; the leveller runs over all active inputs; each active input gets its own PEQ + metering before the matrix.)
                                                      (PASS 2.5)
 ```
 
@@ -1277,7 +1301,7 @@ the single 4 KB directory sector. See
 | cs_ir | Control Surfaces IR command table (V11+, 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
-*Last updated: 2026-04-09*
+*Last updated: 2026-07-10 (crossfeed output_pair_mask, slot V27)*
 
 | Field | Description |
 |-------|-------------|
@@ -1292,7 +1316,7 @@ the single 4 KB directory sector. See
 | Delays | NUM_CHANNELS delay values |
 | Legacy gain/mute | 3 channels (backward compatibility) |
 | Loudness | enabled, reference SPL, intensity |
-| Crossfeed | enabled, preset, ITD, custom fc/feed |
+| Crossfeed | enabled, preset, ITD, custom fc/feed, output_pair_mask (V27+, tail-appended; older slots default 0x01) |
 | Matrix mixer | crosspoints + output channels |
 | Pin config | NUM_PIN_OUTPUTS pin assignments (always stored, conditionally loaded) |
 | Channel names | NUM_CHANNELS × 32-byte NUL-terminated names (V8, default names for V<8) |
@@ -1500,7 +1524,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-09 (per-output loudness + output mask; wire V19 / slot V26)*
+*Last updated: 2026-07-10 (per-output-pair crossfeed + output-pair mask; wire V20 / slot V27)*
 
 ### Hardware
 
@@ -1543,12 +1567,13 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V19 / V26 | V19 / V26 |
+| Wire / slot version | V20 / V27 | V20 / V27 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
 | Volume leveller | Q28 envelope + float gain; 2 channels, 2 lookahead rings; max boost clamped to 18 dB (Q28 gain range) | Float throughout; 2 to 8 active channels, mask-driven, 8 lookahead rings; full 35 dB max boost |
 | Loudness | Per output, post-gain: 2 Q28 shelf biquads; `loudness_output_mask` (5 outputs) | Per output, post-gain: 2 SVF shelves; `loudness_output_mask` (9 outputs). Both platforms: volume-keyed, works in stereo and multichannel input modes |
+| Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
 ### Delay Lines
@@ -2238,7 +2263,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-08 (leveller channel masks 0xDE/0xDF; multi-SPDIF input: 0xE4/0xE5 gain an input index; new 0xE9 enable, 0xEF config query)*
+*Last updated: 2026-07-10 (crossfeed output-pair mask 0xFC/0xFD)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2401,13 +2426,15 @@ op state ~400 B).
 | REQ_GET_CTRL_IFACE_STATUS | 0xF9 | IN | Get `CtrlIfaceStatus` (8 bytes: uart/i2c last_status + live flags, proto_version=1) |
 | REQ_SET_LOUDNESS_MASK | 0xFA | OUT | Set `loudness_output_mask` (2-byte little-endian; bit k = compensate output k, default 0xFFFF). Selects which output channels get per-output loudness |
 | REQ_GET_LOUDNESS_MASK | 0xFB | IN | Get `loudness_output_mask` (returns 2 bytes) |
+| REQ_SET_CROSSFEED_OUTPUTS | 0xFC | OUT | Set `output_pair_mask` (1 byte; bit p = crossfeed on output pair p, default 0x01 = pair 1 only). Clamped to valid pair bits; read live each packet (no recompute) |
+| REQ_GET_CROSSFEED_OUTPUTS | 0xFD | IN | Get `output_pair_mask` (returns 1 byte) |
 
 ### Bulk Parameter Transfer
-*Last updated: 2026-06-11*
+*Last updated: 2026-07-10 (wire V20: crossfeed output_pair_mask)*
 
 Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 12) — packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 12); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged.
 
 **Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 
@@ -2790,11 +2817,11 @@ This matches the user's product-level decision; it differs from the industry-sta
 **Files**: `spdif_input.h` (API + status struct), `spdif_input.c` (lifecycle, audio extraction, clock servo, status queries)
 
 ### I2S Input
-*Last updated: 2026-06-30 (multichannel: up to 4 stereo pairs / 8 channels on RP2350; data-pin defaults moved to GPIO 1/2/3/4)*
+*Last updated: 2026-07-10 (crossfeed no longer bypassed in multichannel; runs per output pair)*
 
 I2S input keeps the device as the clock authority (master architecture): the external source slaves to our BCK/LRCLK, the same shared clock pair the I2S outputs use (`i2s_bck_pin` / +1). Because the input is synchronous to the device clock domain, there is **no clock servo, no rate detection and no lock state machine**; the subsystem is structurally a much simpler sibling of SPDIF RX. State is just INACTIVE / RUNNING.
 
-**Multichannel input (RP2350).** The receiver fans out to up to `I2S_RX_MAX_PAIRS` (4) stereo pairs — **2/4/6/8 channels**, selected by `i2s_input_channels` — each one PIO state machine + one IRQ-less DMA ring + one independently-configurable data pin (`i2s_rx_pin[0..3]`), all sharing the single BCK/LRCLK. In `i2s_input.c` each pair is an `I2sRxPair` descriptor and every lifecycle step loops over `i2s_n_pairs` (= channels/2), so the single-pair path is just `n_pairs == 1` with no special-casing. In the clock-master role pair 0's SM runs `clkmaster` (drives BCK/LRCLK + reads pair 0) and pairs 1.. run the `slave` program waiting on the *same* pads pair 0 drives; in the slave role every pair runs `slave` against the external clock. All pairs are enabled on one cycle via `pio_enable_sm_mask_in_sync()` and advance in lockstep on the one shared clock. In the **slave role** every pair runs the same wait preamble, so all latch the same first frame. In the **master role** there is a deterministic one-frame asymmetry: pair 0 (`clkmaster`) starts sampling immediately and captures from frame 0, while the slave-program pairs cannot detect the start of frame 0 (LRCLK is already low at enable) and lock on the next LRCLK fall, capturing from frame 1. `i2s_input_start()` corrects this by advancing pair 0's read pointer one stereo frame (2 words) when `clock_master && pairs > 1`, so every pair's read pointer lands on the same physical frame (cycle-exact per the clkmaster/slave PIO start timing, independent of ADC settling). Either way the 2/4/6/8 channels are sample-aligned (the inviolable inter-channel guarantee), exactly as the TX path's `audio_*_enable_sync()` aligns the outputs. The poll consumes the per-pair minimum available and reads the same frame index from every ring, deinterleaving pair `p` into input channels `2p`/`2p+1`; the pipeline's `n_active_inputs` for the I2S source is `i2s_input_channels`, so the 8×9 matrix and the multichannel bypass of the stereo-only loudness/leveller/crossfeed chain apply automatically (identical to 8-ch USB input). A live channel-count *raise* is applied to `i2s_input_channels` immediately but the extra pairs are not allocated until the deferred restart fires, so for the intervening poll cycles the poll zeroes the not-yet-filled `buf_in_ext` rows up to `active_input_channel_count()` — the matrix sees silence on the new channels, never stale samples (preserving the no-leak invariant). A count *drop* needs nothing (the matrix just stops reading the surplus rows). RP2040 is stereo-only (`I2S_RX_MAX_PAIRS` = 1). **Config:** vendor `REQ_SET/GET_I2S_INPUT_CHANNELS` (0xF3/0xF4) and `REQ_SET/GET_I2S_RX_PIN` (0xF1/0xF2, now `wValue = (pair<<8)|gpio`); a channel-count or higher-pair pin change restarts the input (`i2s_input_restart_pending`) so every pair re-syncs (pair-0 stereo keeps its lighter hot-swap). The four pair pins are kept mutually distinct AND clear of the I2S clocks: `check_i2s_rx_pin()` rejects a pin that is invalid, a clock pin (BCK/LRCLK), used by a fixed peripheral, or already on another pair. The clock check is **unconditional** — an I2S RX data pin coexists with BCK/LRCLK whenever the input runs, so it must avoid them even while I2S is inactive (closing the gap where `is_pin_in_use()` only reserves the clocks while they run; the inactive placeholders still never block their default GPIO 2/3/4 in stereo). The four data-pin defaults are the contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all clear of the default peripheral assignments so enabling 4/6/8-channel input out of the box never self-collides. `REQ_SET_I2S_RX_PIN` and the count-*increase* path use it per-pin. The bulk and preset/flash **restore paths** validate the proposed pin set as a unit (`i2s_rx_pin_set_acceptable()`, against the effective BCK that transfer installs) and reject an inconsistent pushed/stored I2S config rather than apply it — so two state machines can never come up on one GPIO or on a clock pin regardless of how the config arrived. The restore paths also validate the incoming **BCK** itself before installing it (`i2s_bck_pin_acceptable()`: BCK + LRCLK valid GPIOs, no fixed-peripheral collision), keeping the live pin on failure — BCK/LRCLK are push-pull clock outputs, so an invalid GPIO could fault `pio_gpio_init()` and a collision with an output pin would be driver contention. (The vendor `REQ_SET_I2S_BCK_PIN` path keeps its additional "reject while an I2S output is active" guard; a restore omits it since it installs the output config and clock pair together.) **Persistence:** `WireInputConfig` carries the count + 3 ext pins in reserved bytes (`0 = absent`, no `WIRE_FORMAT_VERSION` break); per-preset `PresetSlot` V22 tail-append; device-global `FlashOutputConfig` via a directory V4→V5 migration.
+**Multichannel input (RP2350).** The receiver fans out to up to `I2S_RX_MAX_PAIRS` (4) stereo pairs — **2/4/6/8 channels**, selected by `i2s_input_channels` — each one PIO state machine + one IRQ-less DMA ring + one independently-configurable data pin (`i2s_rx_pin[0..3]`), all sharing the single BCK/LRCLK. In `i2s_input.c` each pair is an `I2sRxPair` descriptor and every lifecycle step loops over `i2s_n_pairs` (= channels/2), so the single-pair path is just `n_pairs == 1` with no special-casing. In the clock-master role pair 0's SM runs `clkmaster` (drives BCK/LRCLK + reads pair 0) and pairs 1.. run the `slave` program waiting on the *same* pads pair 0 drives; in the slave role every pair runs `slave` against the external clock. All pairs are enabled on one cycle via `pio_enable_sm_mask_in_sync()` and advance in lockstep on the one shared clock. In the **slave role** every pair runs the same wait preamble, so all latch the same first frame. In the **master role** there is a deterministic one-frame asymmetry: pair 0 (`clkmaster`) starts sampling immediately and captures from frame 0, while the slave-program pairs cannot detect the start of frame 0 (LRCLK is already low at enable) and lock on the next LRCLK fall, capturing from frame 1. `i2s_input_start()` corrects this by advancing pair 0's read pointer one stereo frame (2 words) when `clock_master && pairs > 1`, so every pair's read pointer lands on the same physical frame (cycle-exact per the clkmaster/slave PIO start timing, independent of ADC settling). Either way the 2/4/6/8 channels are sample-aligned (the inviolable inter-channel guarantee), exactly as the TX path's `audio_*_enable_sync()` aligns the outputs. The poll consumes the per-pair minimum available and reads the same frame index from every ring, deinterleaving pair `p` into input channels `2p`/`2p+1`; the pipeline's `n_active_inputs` for the I2S source is `i2s_input_channels`, so the 8×9 matrix applies automatically (identical to 8-ch USB input); the leveller runs over all active inputs, and loudness and crossfeed run per output (loudness post-gain, crossfeed per output pair post-matrix) rather than being bypassed. A live channel-count *raise* is applied to `i2s_input_channels` immediately but the extra pairs are not allocated until the deferred restart fires, so for the intervening poll cycles the poll zeroes the not-yet-filled `buf_in_ext` rows up to `active_input_channel_count()` — the matrix sees silence on the new channels, never stale samples (preserving the no-leak invariant). A count *drop* needs nothing (the matrix just stops reading the surplus rows). RP2040 is stereo-only (`I2S_RX_MAX_PAIRS` = 1). **Config:** vendor `REQ_SET/GET_I2S_INPUT_CHANNELS` (0xF3/0xF4) and `REQ_SET/GET_I2S_RX_PIN` (0xF1/0xF2, now `wValue = (pair<<8)|gpio`); a channel-count or higher-pair pin change restarts the input (`i2s_input_restart_pending`) so every pair re-syncs (pair-0 stereo keeps its lighter hot-swap). The four pair pins are kept mutually distinct AND clear of the I2S clocks: `check_i2s_rx_pin()` rejects a pin that is invalid, a clock pin (BCK/LRCLK), used by a fixed peripheral, or already on another pair. The clock check is **unconditional** — an I2S RX data pin coexists with BCK/LRCLK whenever the input runs, so it must avoid them even while I2S is inactive (closing the gap where `is_pin_in_use()` only reserves the clocks while they run; the inactive placeholders still never block their default GPIO 2/3/4 in stereo). The four data-pin defaults are the contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all clear of the default peripheral assignments so enabling 4/6/8-channel input out of the box never self-collides. `REQ_SET_I2S_RX_PIN` and the count-*increase* path use it per-pin. The bulk and preset/flash **restore paths** validate the proposed pin set as a unit (`i2s_rx_pin_set_acceptable()`, against the effective BCK that transfer installs) and reject an inconsistent pushed/stored I2S config rather than apply it — so two state machines can never come up on one GPIO or on a clock pin regardless of how the config arrived. The restore paths also validate the incoming **BCK** itself before installing it (`i2s_bck_pin_acceptable()`: BCK + LRCLK valid GPIOs, no fixed-peripheral collision), keeping the live pin on failure — BCK/LRCLK are push-pull clock outputs, so an invalid GPIO could fault `pio_gpio_init()` and a collision with an output pin would be driver contention. (The vendor `REQ_SET_I2S_BCK_PIN` path keeps its additional "reject while an I2S output is active" guard; a restore omits it since it installs the output config and clock pair together.) **Persistence:** `WireInputConfig` carries the count + 3 ext pins in reserved bytes (`0 = absent`, no `WIRE_FORMAT_VERSION` break); per-preset `PresetSlot` V22 tail-append; device-global `FlashOutputConfig` via a directory V4→V5 migration.
 
 **Files**: `i2s_input.h` (API), `i2s_input.c` (lifecycle, DMA ring, poll), `i2s_input.pio` (both RX PIO programs).
 

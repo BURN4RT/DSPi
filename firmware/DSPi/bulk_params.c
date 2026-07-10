@@ -118,6 +118,7 @@ void bulk_params_collect(WireBulkParams *out) {
     out->crossfeed.enabled = crossfeed_config.enabled ? 1 : 0;
     out->crossfeed.preset = crossfeed_config.preset;
     out->crossfeed.itd_enabled = crossfeed_config.itd_enabled ? 1 : 0;
+    out->crossfeed.output_pair_mask = crossfeed_config.output_pair_mask;
     out->crossfeed.custom_fc = crossfeed_config.custom_fc;
     out->crossfeed.custom_feed_db = crossfeed_config.custom_feed_db;
 
@@ -334,6 +335,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     crossfeed_config.enabled = (in->crossfeed.enabled != 0);
     crossfeed_config.preset = in->crossfeed.preset;
     crossfeed_config.itd_enabled = (in->crossfeed.itd_enabled != 0);
+    crossfeed_config.output_pair_mask = in->crossfeed.output_pair_mask & ((1u << NUM_SPDIF_INSTANCES) - 1);
     crossfeed_config.custom_fc = in->crossfeed.custom_fc;
     crossfeed_config.custom_feed_db = in->crossfeed.custom_feed_db;
     crossfeed_update_pending = true;

@@ -448,6 +448,13 @@ static void __not_in_flash_func(eq_worker_loop)() {
             (const LoudnessCoeffs *)core1_eq_work.loud_coeffs;
         uint16_t loud_mask = core1_eq_work.loud_mask;
 
+        // Crossfeed for Core 1's pairs, pre-EQ (Core 0 owns pair 0; snapshot
+        // comes from core1_eq_work so both cores apply the same view).
+        crossfeed_process_pairs((const CrossfeedCoeffs *)core1_eq_work.xfeed_coeffs,
+                                core1_eq_work.xfeed_mask,
+                                CORE1_EQ_FIRST_OUTPUT / 2, CORE1_EQ_LAST_OUTPUT / 2,
+                                buf_out, sample_count);
+
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;
         for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++) {
@@ -601,6 +608,13 @@ static void __not_in_flash_func(eq_worker_loop)() {
         const LoudnessCoeffs *loud_coeffs =
             (const LoudnessCoeffs *)core1_eq_work.loud_coeffs;
         uint16_t loud_mask = core1_eq_work.loud_mask;
+
+        // Crossfeed for Core 1's pair, pre-EQ (Core 0 owns pair 0; snapshot
+        // comes from core1_eq_work so both cores apply the same view).
+        crossfeed_process_pairs((const CrossfeedCoeffs *)core1_eq_work.xfeed_coeffs,
+                                core1_eq_work.xfeed_mask,
+                                CORE1_EQ_FIRST_OUTPUT / 2, CORE1_EQ_LAST_OUTPUT / 2,
+                                buf_out, sample_count);
 
         // Process EQ + gain for outputs assigned to Core 1
         extern MatrixMixer matrix_mixer;

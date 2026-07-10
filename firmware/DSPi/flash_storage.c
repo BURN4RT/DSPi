@@ -134,7 +134,10 @@
 //   V26: Loudness output mask appended (loudness_output_mask; struct grows by
 //        2 bytes).  Backward-compatible tail-append like V25: older slots load
 //        the all-outputs default (0xFFFF).
-#define SLOT_DATA_VERSION       26
+//   V27: Crossfeed output pair mask appended (crossfeed_output_pair_mask; struct
+//        grows by 1 byte).  Backward-compatible tail-append like V26: older slots
+//        load the pair-1-only default (0x01).
+#define SLOT_DATA_VERSION       27
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -759,6 +762,11 @@ typedef struct __attribute__((packed)) {
     // version >= 26 in apply_slot_to_live(); older slots load the
     // all-outputs default (0xFFFF).
     uint16_t loudness_output_mask;
+
+    // Crossfeed output pair mask (V27+, struct grows by 1 byte).  Gated on
+    // version >= 27 in apply_slot_to_live(); older slots load the
+    // pair-1-only default (0x01).
+    uint8_t crossfeed_output_pair_mask;
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -1959,6 +1967,7 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->crossfeed_enabled = crossfeed_config.enabled ? 1 : 0;
     slot->crossfeed_preset = crossfeed_config.preset;
     slot->crossfeed_itd_enabled = crossfeed_config.itd_enabled ? 1 : 0;
+    slot->crossfeed_output_pair_mask = crossfeed_config.output_pair_mask;
     slot->crossfeed_custom_fc = crossfeed_config.custom_fc;
     slot->crossfeed_custom_feed_db = crossfeed_config.custom_feed_db;
 
@@ -2196,6 +2205,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     crossfeed_config.enabled = (slot->crossfeed_enabled != 0);
     crossfeed_config.preset = slot->crossfeed_preset;
     crossfeed_config.itd_enabled = (slot->crossfeed_itd_enabled != 0);
+    crossfeed_config.output_pair_mask = (slot->version >= 27)
+        ? (slot->crossfeed_output_pair_mask & ((1u << NUM_SPDIF_INSTANCES) - 1))
+        : 0x01;
     crossfeed_config.custom_fc = slot->crossfeed_custom_fc;
     crossfeed_config.custom_feed_db = slot->crossfeed_custom_feed_db;
     crossfeed_update_pending = true;
@@ -2358,8 +2370,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // fields, so V21's range stops where those begin.  V23 appended the ADAT
 // fields, so V22's range stops where those begin.  V24 appended the optional
 // SPDIF inputs 2/3; V25 appended the leveller channel masks; V26 appended the
-// loudness output mask, so V25's range stops where it begins (a stored slot's
-// CRC was computed without the fields its version predates).
+// loudness output mask; V27 appended the crossfeed output pair mask, so V26's
+// range stops where it begins (a stored slot's CRC was computed without the
+// fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -2371,17 +2384,21 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V25 \
     (offsetof(PresetSlot, loudness_output_mask) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V26 \
+    (offsetof(PresetSlot, crossfeed_output_pair_mask) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V27 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
-// masks) and V26 (loudness output mask) are backward-compatible tail-appends.
-// V21..V26 slots are all accepted (an older slot loads with the newer fields
-// defaulted to unset) while older/unknown versions are invalidated and the slot
-// loads factory defaults.
+// masks), V26 (loudness output mask) and V27 (crossfeed output pair mask) are
+// backward-compatible tail-appends.  V21..V27 slots are all accepted (an older
+// slot loads with the newer fields defaulted to unset) while older/unknown
+// versions are invalidated and the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 26
+        case SLOT_DATA_VERSION:   // 27
+            return SLOT_DATA_SIZE_V27;
+        case 26:
             return SLOT_DATA_SIZE_V26;
         case 25:
             return SLOT_DATA_SIZE_V25;
@@ -2926,6 +2943,7 @@ static void apply_factory_defaults(void) {
     crossfeed_config.enabled = false;
     crossfeed_config.itd_enabled = true;
     crossfeed_config.preset = CROSSFEED_PRESET_DEFAULT;
+    crossfeed_config.output_pair_mask = 0x01;
     crossfeed_config.custom_fc = 700.0f;
     crossfeed_config.custom_feed_db = 4.5f;
     crossfeed_update_pending = true;

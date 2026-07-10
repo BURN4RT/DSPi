@@ -426,6 +426,10 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_LOUDNESS_MASK       0xFA  // payload = uint16 LE mask
 #define REQ_GET_LOUDNESS_MASK       0xFB  // returns uint16 LE mask
 
+// Crossfeed output-pair mask (bit p = crossfeed on output pair p; see crossfeed.h)
+#define REQ_SET_CROSSFEED_OUTPUTS   0xFC  // payload = uint8 pair mask
+#define REQ_GET_CROSSFEED_OUTPUTS   0xFD  // returns uint8 pair mask
+
 // UART control interface configuration.  Fixed 8N1 framing (the wire CRC16
 // covers integrity, so parity adds nothing); only the baud rate is
 // configurable.  Persisted device-level in the preset directory (V6+).
@@ -687,6 +691,9 @@ typedef struct {
     // mid-packet vendor write can't split the outputs across two settings.
     const void       *loud_coeffs;     // LoudnessCoeffs[2] or NULL = off
     uint16_t          loud_mask;       // Bit k = compensate output k
+    // Crossfeed snapshot for THIS packet; same single-view rationale.
+    const void       *xfeed_coeffs;    // CrossfeedCoeffs or NULL = off
+    uint8_t           xfeed_mask;      // Bit p = crossfeed output pair p
 } Core1EqWork;
 
 // ----------------------------------------------------------------------------
