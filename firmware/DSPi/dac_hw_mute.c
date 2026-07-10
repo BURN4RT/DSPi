@@ -56,6 +56,8 @@
 #include "hardware/gpio.h"
 #include "pico/time.h"         /* time_us_64 */
 
+#include "audio_input.h"       /* i2s_clock_pin_claimed() */
+
 #include <stddef.h>
 #include <string.h>
 
@@ -156,11 +158,11 @@ static bool collides_with_other_subsystem(uint8_t pin) {
     for (int i = 0; i < NUM_PIN_OUTPUTS; i++) {
         if (output_pins[i] == pin) return true;
     }
-    /* I2S BCK + LRCLK partner if any slot is I2S */
+    /* I2S clock pair(s) if any slot is I2S; both pairs in SPLIT pin mode */
     extern uint8_t output_types[];
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
         if (output_types[i] == OUTPUT_TYPE_I2S) {
-            if (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1)) return true;
+            if (i2s_clock_pin_claimed(pin)) return true;
             break;
         }
     }

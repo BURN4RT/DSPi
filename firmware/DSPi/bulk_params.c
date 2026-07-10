@@ -184,6 +184,9 @@ void bulk_params_collect(WireBulkParams *out) {
         memset(&out->i2s_config, 0, sizeof(out->i2s_config));
         memcpy(out->i2s_config.output_types, output_types, NUM_SPDIF_INSTANCES);
         out->i2s_config.bck_pin = i2s_bck_pin;
+        // Clock-pin mode + slave BCK: +1 encoding so 0 stays "absent/keep-live".
+        out->i2s_config.clock_pin_mode_p1 = (uint8_t)(i2s_clock_pin_mode + 1);
+        out->i2s_config.bck_pin_slave = i2s_bck_pin_slave;
         out->i2s_config.mck_pin = i2s_mck_pin;
         out->i2s_config.mck_enabled = i2s_mck_enabled ? 1 : 0;
         out->i2s_config.mck_multiplier = (i2s_mck_multiplier == 256) ? 1 : 0;  // 0=128x, 1=256x
@@ -512,7 +515,23 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             // applied, so this matches the install-time check.
             uint8_t eff_bck = i2s_bck_pin_acceptable(in->i2s_config.bck_pin)
                                   ? in->i2s_config.bck_pin : i2s_bck_pin;
-            if (i2s_rx_pin_set_acceptable(proposed, count / 2, eff_bck)) {
+            // Same reasoning for the clock-pin mode and slave BCK: the payload
+            // may change them below, so validate the RX set against the values
+            // that will actually be installed, not the live ones.
+            uint8_t eff_pin_mode =
+                (in->i2s_config.clock_pin_mode_p1 != 0 &&
+                 (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1) <= 1)
+                    ? (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1)
+                    : i2s_clock_pin_mode;
+            uint8_t inc_slave = in->i2s_config.bck_pin_slave;
+            uint8_t eff_slave =
+                (inc_slave != 0 && i2s_bck_pin_acceptable(inc_slave) &&
+                 inc_slave != eff_bck && inc_slave != (uint8_t)(eff_bck + 1) &&
+                 (uint8_t)(inc_slave + 1) != eff_bck)
+                    ? inc_slave : i2s_bck_pin_slave;
+            if (i2s_rx_pin_set_acceptable(proposed, count / 2, eff_bck,
+                                          (eff_pin_mode == I2S_CLOCK_PIN_MODE_SPLIT)
+                                              ? eff_slave : 0xFF)) {
                 bool changed = false;
                 for (int p = 0; p < I2S_RX_MAX_PAIRS; p++)
                     if (proposed[p] != i2s_rx_pin[p]) {
@@ -560,6 +579,9 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         extern bool    i2s_mck_enabled;
         extern uint16_t i2s_mck_multiplier;
         memcpy(output_types, in->i2s_config.output_types, NUM_SPDIF_INSTANCES);
+        // Snapshot the effective input BCK before any pin install so we can tell
+        // whether the active pair actually moved and arm a restart below.
+        uint8_t old_eff_bck = i2s_effective_bck_pin();
         // Validate the pushed BCK before installing it raw: BCK/LRCLK are clock
         // OUTPUTS, so an invalid GPIO can fault pio_gpio_init() and a collision
         // with an output pin is driver contention.  Reject (keep the live, known-
@@ -572,6 +594,35 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             printf("Bulk apply: I2S BCK pin %u rejected (invalid/conflict); kept %u\n",
                    (unsigned)in->i2s_config.bck_pin, (unsigned)i2s_bck_pin);
         }
+
+        // Clock-pin mode: +1 encoded, 0 = absent (keep live); only 0/1 valid.
+        if (in->i2s_config.clock_pin_mode_p1 != 0 &&
+            (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1) <= 1) {
+            i2s_clock_pin_mode = (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1);
+        }
+
+        // Slave-mode BCK pin (SPLIT): 0 = absent (keep live).  Install only if
+        // acceptable and non-overlapping with the master pair just installed
+        // (equal, +1, or its +1 equals master); otherwise keep the live pin.
+        if (in->i2s_config.bck_pin_slave != 0) {
+            uint8_t sp = in->i2s_config.bck_pin_slave;
+            bool overlap = (sp == i2s_bck_pin) ||
+                           (sp == (uint8_t)(i2s_bck_pin + 1)) ||
+                           ((uint8_t)(sp + 1) == i2s_bck_pin);
+            if (i2s_bck_pin_acceptable(sp) && !overlap) {
+                i2s_bck_pin_slave = sp;
+            } else {
+                printf("Bulk apply: I2S slave BCK pin %u rejected (invalid/conflict); kept %u\n",
+                       (unsigned)sp, (unsigned)i2s_bck_pin_slave);
+            }
+        }
+
+        // If the effective input pair moved, arm a deferred restart.  Bracketed
+        // bulk-apply paths in main.c restart anyway and clear this flag; this
+        // covers unbracketed callers so the input re-syncs on the new pins.
+        if (i2s_effective_bck_pin() != old_eff_bck &&
+            active_input_source == INPUT_SOURCE_I2S)
+            i2s_input_restart_pending = true;
 
         // MCK pin migration mirrors flash_storage.c apply_slot_to_live():
         // CLK_GPOUTn requires the pin to map to clk_gpout0..3 on this

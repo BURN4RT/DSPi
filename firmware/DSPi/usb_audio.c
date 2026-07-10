@@ -1600,6 +1600,11 @@ _Static_assert(PICO_AUDIO_I2S_CONSUMER_FRAME_BYTES <= PICO_AUDIO_SPDIF_CONSUMER_
 
 // I2S clock configuration
 uint8_t i2s_bck_pin = PICO_I2S_BCK_PIN;     // BCK GPIO; LRCLK = BCK + 1
+// Clock-pin mode + slave-mode pair (see audio_input.h / clock_pins_spec.md).
+// The slave pair is dormant unless SPLIT mode AND slave clock mode are both
+// selected; i2s_effective_bck_pin() resolves the pair the hardware uses.
+uint8_t i2s_clock_pin_mode = I2S_CLOCK_PIN_MODE_UNIFIED;
+uint8_t i2s_bck_pin_slave = PICO_I2S_BCK_PIN_SLAVE;
 uint8_t i2s_mck_pin = PICO_I2S_MCK_PIN;     // MCK GPIO
 bool    i2s_mck_enabled = false;             // MCK enabled state
 // MCK multiplier: actual value (128 or 256).

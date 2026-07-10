@@ -351,8 +351,9 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
 bool is_pin_in_use(uint8_t pin, uint8_t exclude) {
     if (pin_used_by_fixed_peripheral(pin, exclude)) return true;
     // I2S BCK/LRCLK: reserved only while the clocks actually run (any I2S output,
-    // or I2S is the active input — both its master and slave roles drive/read the
-    // same clock pair).  A general caller (e.g. assigning a pin output) may
+    // or I2S is the active input).  In SPLIT clock-pin mode this claims both the
+    // master and the slave pair; the dormant pair is one deferred mode flip away
+    // from being driven/read.  A general caller (e.g. assigning a pin output) may
     // legitimately use these GPIOs when no I2S path is live.
     bool i2s_clocks_in_use = (active_input_source == INPUT_SOURCE_I2S);
     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
@@ -361,8 +362,7 @@ bool is_pin_in_use(uint8_t pin, uint8_t exclude) {
             break;  // All I2S slots share the same BCK/LRCLK
         }
     }
-    if (i2s_clocks_in_use &&
-        (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1))) return true;
+    if (i2s_clocks_in_use && i2s_clock_pin_claimed(pin)) return true;
     // I2S RX data pins for every active (by count) stereo pair.
     for (int p = 0; p < i2s_input_channels / 2 && p < I2S_RX_MAX_PAIRS; p++)
         if (pin == i2s_rx_pin[p]) return true;
@@ -389,8 +389,7 @@ static bool i2s_rx_pair_pin_taken(uint8_t pin, uint8_t exclude_pair) {
 // surface on the switch INTO I2S).  Also rejects a pin already on another pair.
 static uint8_t check_i2s_rx_pin(uint8_t pin, uint8_t pair) {
     if (!is_valid_gpio_pin(pin))                              return PIN_CONFIG_INVALID_PIN;
-    if (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1))
-                                                              return PIN_CONFIG_PIN_IN_USE;
+    if (i2s_clock_pin_claimed(pin))                           return PIN_CONFIG_PIN_IN_USE;
     if (pin_used_by_fixed_peripheral(pin, 0xFF))             return PIN_CONFIG_PIN_IN_USE;
     if (i2s_rx_pair_pin_taken(pin, pair))                    return PIN_CONFIG_PIN_IN_USE;
     return PIN_CONFIG_SUCCESS;
@@ -414,13 +413,18 @@ bool spdif_input_enable_acceptable(uint8_t idx) {
 // restore paths use this to reject an inconsistent pushed/stored I2S config as a
 // unit before it can reach i2s_input_start().  `bck_pin` is passed explicitly
 // because a restore may set BCK in the same transaction, so the live value is
-// not yet updated when this runs.
-bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs, uint8_t bck_pin) {
+// not yet updated when this runs.  `bck2_pin` is the secondary (slave-pair)
+// clock base when SPLIT clock-pin mode is in force, or 0xFF for none; data
+// pins must avoid both pairs.
+bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs,
+                               uint8_t bck_pin, uint8_t bck2_pin) {
     if (n_pairs > I2S_RX_MAX_PAIRS) return false;
     for (uint8_t p = 0; p < n_pairs; p++) {
         uint8_t pin = pins[p];
         if (!is_valid_gpio_pin(pin)) return false;
         if (pin == bck_pin || pin == (uint8_t)(bck_pin + 1)) return false;
+        if (bck2_pin != 0xFF &&
+            (pin == bck2_pin || pin == (uint8_t)(bck2_pin + 1))) return false;
         if (pin_used_by_fixed_peripheral(pin, 0xFF)) return false;
         for (uint8_t q = 0; q < p; q++)
             if (pins[q] == pin) return false;   // mutual distinctness
@@ -467,8 +471,7 @@ bool adat_pin_acceptable(uint8_t pin) {
 // clocks stomp the live control link).
 uint8_t ctrl_iface_check_pin(uint8_t pin) {
     if (!is_valid_gpio_pin(pin))                              return PIN_CONFIG_INVALID_PIN;
-    if (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1))
-                                                              return PIN_CONFIG_PIN_IN_USE;
+    if (i2s_clock_pin_claimed(pin))                           return PIN_CONFIG_PIN_IN_USE;
     if (is_pin_in_use(pin, 0xFF))                             return PIN_CONFIG_PIN_IN_USE;
     return PIN_CONFIG_SUCCESS;
 }
@@ -2412,29 +2415,65 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_SET_I2S_BCK_PIN: {
-                uint8_t new_pin = (uint8_t)setup->wValue;
+                // wValue = (role << 8) | GPIO.  Role 0 = master/unified pair
+                // (legacy hosts send role 0 implicitly), role 1 = slave pair
+                // (meaningful in SPLIT clock-pin mode; storable any time).
+                uint8_t new_pin = (uint8_t)(setup->wValue & 0xFF);
+                uint8_t role    = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
 
-                if (!is_valid_gpio_pin(new_pin) || !is_valid_gpio_pin(new_pin + 1)) {
+                if (role > 1) {
+                    status = PIN_CONFIG_INVALID_OUTPUT;
+                } else if (!is_valid_gpio_pin(new_pin) || !is_valid_gpio_pin(new_pin + 1)) {
                     status = PIN_CONFIG_INVALID_PIN;
-                } else if (new_pin == i2s_bck_pin) {
+                } else if (new_pin == (role ? i2s_bck_pin_slave : i2s_bck_pin)) {
                     status = PIN_CONFIG_SUCCESS;  // No-op
                 } else {
-                    // Reject if any slot is currently I2S
                     bool any_i2s = false;
                     for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
                         if (output_types[i] == OUTPUT_TYPE_I2S) { any_i2s = true; break; }
                     }
-                    if (any_i2s) {
+                    // Pair distinctness (adjacent bases overlap via the shared
+                    // LRCLK).  Setting the slave pair always checks against the
+                    // master pair; the master pair checks against the slave pair
+                    // only in SPLIT mode, so the dormant slave default never
+                    // constrains legacy role-0 hosts in UNIFIED mode (the SPLIT
+                    // enable in 0xFE re-validates distinctness).
+                    uint8_t other = role ? i2s_bck_pin : i2s_bck_pin_slave;
+                    bool overlaps = (new_pin == other) ||
+                                    (new_pin == (uint8_t)(other + 1)) ||
+                                    ((uint8_t)(new_pin + 1) == other);
+                    if (role == 0 && i2s_clock_pin_mode != I2S_CLOCK_PIN_MODE_SPLIT)
+                        overlaps = false;
+                    // Reject while I2S output slots run on the pair being moved:
+                    // role 0 drives them except in SPLIT+slave clocking, where
+                    // the extclk programs wait on the slave pair (role 1) instead.
+                    uint8_t eff_mode = i2s_clock_mode_change_pending
+                                           ? pending_i2s_clock_mode
+                                           : i2s_clock_mode;
+                    bool split_slave = (i2s_clock_pin_mode == I2S_CLOCK_PIN_MODE_SPLIT &&
+                                        eff_mode == I2S_CLOCK_MODE_SLAVE);
+                    if (any_i2s && (role == 1) == split_slave) {
                         status = PIN_CONFIG_OUTPUT_ACTIVE;
-                    } else if (is_pin_in_use(new_pin, 0xFF) || is_pin_in_use(new_pin + 1, 0xFF)) {
+                    } else if (overlaps ||
+                               is_pin_in_use(new_pin, 0xFF) || is_pin_in_use(new_pin + 1, 0xFF)) {
                         status = PIN_CONFIG_PIN_IN_USE;
+                    } else if (role == 1) {
+                        i2s_bck_pin_slave = new_pin;
+                        // Restart only if the input currently listens on this
+                        // pair (SPLIT + slave clocking; no I2S outputs here).
+                        // Deferred: PIO teardown is too heavy for ISR context.
+                        if (active_input_source == INPUT_SOURCE_I2S && split_slave) {
+                            i2s_input_restart_pending = true;
+                        }
+                        status = PIN_CONFIG_SUCCESS;
+                        notify_param_write(offsetof(WireBulkParams, i2s_config.bck_pin_slave),
+                                           1, &i2s_bck_pin_slave);
                     } else {
                         i2s_bck_pin = new_pin;
-                        if (active_input_source == INPUT_SOURCE_I2S) {
-                            // Input SM is the clock master here (any-I2S-output
-                            // was rejected above); restart it on the new pins.
-                            // Deferred: PIO teardown is too heavy for ISR context.
+                        // Restart only if the input currently uses this pair
+                        // (every role except SPLIT + slave clocking).
+                        if (active_input_source == INPUT_SOURCE_I2S && !split_slave) {
                             i2s_input_restart_pending = true;
                         }
                         status = PIN_CONFIG_SUCCESS;
@@ -2448,7 +2487,77 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_I2S_BCK_PIN: {
-                resp_buf[0] = i2s_bck_pin;
+                // wValue = role: 0 = master/unified pair (legacy calls send 0),
+                // 1 = slave pair.  Invalid role returns 0.
+                uint8_t role = (uint8_t)(setup->wValue & 0xFF);
+                resp_buf[0] = (role == 0) ? i2s_bck_pin
+                            : (role == 1) ? i2s_bck_pin_slave : 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_I2S_CLOCK_PIN_MODE: {
+                // wValue = 0 (unified) / 1 (split).  Only a live pair swap needs
+                // hardware work: the effective pair changes only when the clock
+                // mode is (or is pending) SLAVE.  Master-mode and non-I2S-input
+                // sets are pure dormant stores.
+                uint8_t new_mode = (uint8_t)(setup->wValue & 0xFF);
+                uint8_t status;
+
+                if (new_mode > I2S_CLOCK_PIN_MODE_SPLIT) {
+                    status = PIN_CONFIG_INVALID_PARAM;
+                } else if (new_mode == i2s_clock_pin_mode) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op
+                } else {
+                    bool any_i2s = false;
+                    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+                        if (output_types[i] == OUTPUT_TYPE_I2S) { any_i2s = true; break; }
+                    }
+                    uint8_t eff_mode = i2s_clock_mode_change_pending
+                                           ? pending_i2s_clock_mode
+                                           : i2s_clock_mode;
+                    // live_swap: slave clocking is (or is pending) in force, so
+                    // this change moves the effective pair right now.
+                    bool live_swap = (eff_mode == I2S_CLOCK_MODE_SLAVE);
+                    bool to_split  = (new_mode == I2S_CLOCK_PIN_MODE_SPLIT);
+                    // Entering SPLIT: the slave pair must be distinct from the
+                    // master pair and free of other owners even while dormant;
+                    // a later clock-mode flip adopts it without rechecking.
+                    // Leaving SPLIT needs no pin checks: the master pair is
+                    // clock-claimed in every mode, so nothing else can sit on it.
+                    bool slave_pair_bad = to_split &&
+                        ((i2s_bck_pin_slave == i2s_bck_pin) ||
+                         (i2s_bck_pin_slave == (uint8_t)(i2s_bck_pin + 1)) ||
+                         ((uint8_t)(i2s_bck_pin_slave + 1) == i2s_bck_pin) ||
+                         is_pin_in_use(i2s_bck_pin_slave, 0xFF) ||
+                         is_pin_in_use((uint8_t)(i2s_bck_pin_slave + 1), 0xFF));
+                    if (live_swap && any_i2s) {
+                        // The extclk programs wait on the effective pair; same
+                        // restriction as moving the BCK pin under running outputs.
+                        status = PIN_CONFIG_OUTPUT_ACTIVE;
+                    } else if (slave_pair_bad) {
+                        status = PIN_CONFIG_PIN_IN_USE;
+                    } else {
+                        i2s_clock_pin_mode = new_mode;
+                        if (live_swap && active_input_source == INPUT_SOURCE_I2S) {
+                            // Deferred restart re-snapshots the effective pair.
+                            i2s_input_restart_pending = true;
+                        }
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                    if (status == PIN_CONFIG_SUCCESS) {
+                        uint8_t wire_mode_p1 = (uint8_t)(i2s_clock_pin_mode + 1);
+                        notify_param_write(offsetof(WireBulkParams, i2s_config.clock_pin_mode_p1),
+                                           1, &wire_mode_p1);
+                    }
+                }
+                resp_buf[0] = status;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_I2S_CLOCK_PIN_MODE: {
+                resp_buf[0] = i2s_clock_pin_mode;
                 vendor_send_response(resp_buf, 1);
                 return true;
             }

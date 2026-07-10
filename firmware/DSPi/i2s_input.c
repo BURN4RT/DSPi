@@ -353,7 +353,9 @@ void i2s_input_start(bool clock_master) {
     if (pairs > I2S_RX_MAX_PAIRS) pairs = I2S_RX_MAX_PAIRS;
     i2s_n_pairs = pairs;
     i2s_role_master = clock_master;
-    i2s_active_bck_pin = i2s_bck_pin;
+    // Effective pair: SPLIT pin mode routes the external-clock role onto its
+    // own BCK/LRCLK pair; every other role uses the master/unified pair.
+    i2s_active_bck_pin = i2s_effective_bck_pin();
 
     // Assign and claim per-pair resources.
     for (uint8_t p = 0; p < pairs; p++) {
@@ -1056,6 +1058,7 @@ bool i2s_input_is_clock_master(void) {
 
 uint8_t i2s_input_active_bck_pin(void) {
     // The pin the running session was actually configured with; falls back
-    // to the live global when the input is stopped (next start will use it).
-    return (i2s_state == I2S_INPUT_RUNNING) ? i2s_active_bck_pin : i2s_bck_pin;
+    // to the effective pin when the input is stopped (next start will use it).
+    return (i2s_state == I2S_INPUT_RUNNING) ? i2s_active_bck_pin
+                                            : i2s_effective_bck_pin();
 }

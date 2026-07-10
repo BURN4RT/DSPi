@@ -44,8 +44,9 @@ typedef enum {
 // Default I2S RX data GPIO (stereo pair 0).  The four data-pin defaults are the
 // contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all unused by any default
 // assignment (SPDIF RX 5, outputs 6-9, PDM 10, DAC mute 11, BCK 14, LRCLK 15,
-// MCK 21 on RP2040 / 13 on RP2350), so enabling 4/6/8-channel input
-// out of the box never self-collides.  Real boards override these per wiring.
+// MCK 21 on RP2040 / 13 on RP2350, slave clock pair 12/13 on RP2040 / 26/27 on
+// RP2350), so enabling 4/6/8-channel input out of the box never self-collides.
+// Real boards override these per wiring.
 #define PICO_I2S_RX_PIN_DEFAULT    1
 
 // Maximum I2S RX stereo pairs.  Each pair is one PIO state machine + one DMA
@@ -130,6 +131,45 @@ extern uint8_t i2s_clock_mode;
 extern volatile bool i2s_clock_mode_change_pending;
 extern volatile uint8_t pending_i2s_clock_mode;
 
+// I2S clock-pin mode: whether both clock modes share one BCK/LRCLK pair
+// (UNIFIED, legacy behavior) or each mode has its own (SPLIT: master mode
+// drives i2s_bck_pin, slave mode listens on i2s_bck_pin_slave).  LRCLK =
+// BCK + 1 in both modes (PIO side-set constraint).  The slave pair is fully
+// dormant in UNIFIED mode.  See Documentation/Features/clock_pins_spec.md.
+typedef enum {
+    I2S_CLOCK_PIN_MODE_UNIFIED = 0,
+    I2S_CLOCK_PIN_MODE_SPLIT   = 1,
+} I2sClockPinMode;
+
+extern uint8_t i2s_clock_pin_mode;   // defined in usb_audio.c
+extern uint8_t i2s_bck_pin_slave;    // slave-mode BCK (SPLIT only); LRCLK = +1
+
+// The BCK pin the current clock mode actually uses (LRCLK = return + 1).
+// Every hardware consumer (TX clock_pin_base, RX start snapshot, rebuild
+// change-detection) reads this instead of i2s_bck_pin so SPLIT mode routes
+// the slave role onto its own pair.  Callers that rebuild after a deferred
+// clock-mode flip read it AFTER the handler updates i2s_clock_mode, so the
+// result tracks the mode the rebuild is for.
+static inline uint8_t i2s_effective_bck_pin(void) {
+    extern uint8_t i2s_bck_pin;
+    return (i2s_clock_pin_mode == I2S_CLOCK_PIN_MODE_SPLIT &&
+            i2s_clock_mode == I2S_CLOCK_MODE_SLAVE) ? i2s_bck_pin_slave
+                                                    : i2s_bck_pin;
+}
+
+// True if `pin` is one of the configured I2S clock GPIOs: the master/unified
+// BCK/LRCLK pair, plus the slave pair when SPLIT mode is configured.  Used by
+// the "clock pins are always claimed" validation sites so nothing else can be
+// assigned onto a pair the next mode switch will drive or listen on.
+static inline bool i2s_clock_pin_claimed(uint8_t pin) {
+    extern uint8_t i2s_bck_pin;
+    if (pin == i2s_bck_pin || pin == (uint8_t)(i2s_bck_pin + 1)) return true;
+    if (i2s_clock_pin_mode == I2S_CLOCK_PIN_MODE_SPLIT &&
+        (pin == i2s_bck_pin_slave || pin == (uint8_t)(i2s_bck_pin_slave + 1)))
+        return true;
+    return false;
+}
+
 // True when I2S slave clocking is in force (SLAVE selected AND I2S is the
 // active input source)
 static inline bool i2s_slave_mode_active(void) {
@@ -192,7 +232,10 @@ static inline uint8_t spdif_rx_active_pin(void) {
 // can reach i2s_input_start().  Defined in vendor_commands.c (alongside the
 // other pin helpers); declared here so the restore paths can call it without
 // pulling in the TinyUSB-heavy vendor_commands.h.
-bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs, uint8_t bck_pin);
+// bck2_pin: secondary (slave-pair) clock base when SPLIT clock-pin mode is in
+// force, or 0xFF for none.
+bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs,
+                               uint8_t bck_pin, uint8_t bck2_pin);
 
 // True if `bck_pin` (LRCLK = bck_pin + 1) is acceptable as the I2S clock pair:
 // both valid GPIOs and neither colliding with a fixed peripheral.  The

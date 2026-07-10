@@ -342,7 +342,6 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     extern audio_spdif_instance_t *spdif_instance_ptrs[];
     extern audio_i2s_instance_t *i2s_instance_ptrs[];
     extern uint8_t output_pins[];
-    extern uint8_t i2s_bck_pin;
     extern struct audio_buffer_pool *producer_pools[];
     extern struct audio_buffer_pool *slot_consumer_pools[];  // shared per-slot static pools
     extern bool i2s_mck_enabled;
@@ -388,8 +387,10 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
     // Same-type I2S slots still count as a change when their live clocking
     // (master election / external-clock mode / BCK pin) no longer matches
     // the target; clock-mode and input-source transitions, and bulk/preset
-    // restores that install a new i2s_bck_pin without a type change, call in
-    // with an unchanged type map precisely to trigger this rebuild.
+    // restores that install a new clock pin/pin mode without a type change,
+    // call in with an unchanged type map precisely to trigger this rebuild.
+    // The effective BCK tracks the clock-pin mode: SPLIT + slave clocking
+    // waits on the slave pair instead of the master pair.
     if (!any_change) {
         for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
             if (target_types[i] != OUTPUT_TYPE_I2S) continue;
@@ -397,7 +398,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
             if (!inst || !inst->consumer_pool) continue;
             if (inst->external_clock != want_extclk ||
                 inst->clock_master != (i == target_master_slot) ||
-                inst->clock_pin_base != i2s_bck_pin) {
+                inst->clock_pin_base != i2s_effective_bck_pin()) {
                 any_change = true;
                 break;
             }
@@ -518,7 +519,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
                 audio_i2s_instance_t *inst = i2s_instance_ptrs[i];
                 if (!inst->consumer_pool || inst->clock_master != want_master ||
                     inst->external_clock != want_extclk ||
-                    inst->clock_pin_base != i2s_bck_pin) {
+                    inst->clock_pin_base != i2s_effective_bck_pin()) {
                     if (inst->enabled) {
                         audio_i2s_set_enabled(inst, false);
                     }
@@ -530,7 +531,7 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
             if (need_rebuild) {
                 audio_i2s_config_t i2s_cfg = {
                     .data_pin = output_pins[i],
-                    .clock_pin_base = i2s_bck_pin,
+                    .clock_pin_base = i2s_effective_bck_pin(),
                     // Shared with this slot's S/PDIF instance: one DMA channel
                     // per output slot (channel index == slot index).  The
                     // outgoing S/PDIF instance released channel i in Pass 1.

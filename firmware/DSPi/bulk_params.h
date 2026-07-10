@@ -155,7 +155,13 @@ typedef struct __attribute__((packed)) {
     uint8_t  mck_pin;                // MCK GPIO
     uint8_t  mck_enabled;            // 0 = off, 1 = on
     uint8_t  mck_multiplier;         // 128 or 256
-    uint8_t  reserved[8];            // Future expansion (must be 0)
+    // I2S clock-pin mode + slave pair.  Claimed from the reserved bytes with
+    // "0 = absent, keep live" conventions so the wire layout/size and format
+    // version are unchanged (old hosts send zeros here).  The mode needs a +1
+    // sentinel because 0 (unified) is a meaningful value.
+    uint8_t  clock_pin_mode_p1;      // 0 = absent; 1 = unified, 2 = split
+    uint8_t  bck_pin_slave;          // Slave-mode BCK GPIO, LRCLK = +1 (0 = absent)
+    uint8_t  reserved[6];            // Future expansion (must be 0)
 } WireI2SConfig;                     // 16 bytes
 
 // ============================================================================
