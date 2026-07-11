@@ -272,6 +272,14 @@ static void update_pio_frequency(audio_spdif_instance_t *inst, uint32_t sample_f
     }
 }
 
+// Public eager variant: the input clock servos (SPDIF input, I2S slave) trim
+// the SM divider directly without touching inst->freq, so the lazy
+// wrap_consumer_take update below never fires when the pipeline rate is
+// unchanged; this lets the application restore nominal explicitly.
+void audio_spdif_apply_pio_frequency(audio_spdif_instance_t *inst, uint32_t sample_freq) {
+    update_pio_frequency(inst, sample_freq);
+}
+
 // ---------------------------------------------------------------------------
 // Connection callbacks
 // ---------------------------------------------------------------------------

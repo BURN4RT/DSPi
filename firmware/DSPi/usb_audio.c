@@ -69,6 +69,25 @@ volatile bool rate_change_pending = false;
 volatile uint32_t pending_rate = 48000;
 volatile bool bulk_params_pending = false;
 
+// UAC1 endpoint state is retained while USB is a decorative, inactive source;
+// audio_state.freq remains the rate actually applied to the live pipeline.
+static volatile uint32_t usb_selected_rate = 44100u;
+
+uint32_t usb_audio_get_selected_rate(void) {
+    return usb_selected_rate;
+}
+
+// Record the host's endpoint rate unconditionally, but only retune the live
+// pipeline when USB currently owns it.  The main loop performs the retune.
+static void usb_audio_set_selected_rate(uint32_t rate) {
+    usb_selected_rate = rate;
+    if (active_input_source != INPUT_SOURCE_USB || rate == audio_state.freq) return;
+
+    pending_rate = rate;
+    __dmb();
+    rate_change_pending = true;
+}
+
 // Output type switching — deferred to main loop (needs heap allocation).
 // Per-slot bitmask supports back-to-back requests without dropping any.
 volatile uint8_t output_type_change_mask = 0;                   // Bit N = slot N has pending change
@@ -1166,14 +1185,10 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
     }
 
 #if PICO_RP2350
-    // The multichannel alts (4/6/8) advertise 48 kHz only.  Force it so the main
-    // loop re-derives filters/delays (via the existing rate-change machinery,
-    // which preserves output-slot alignment) if the host had been at 44.1/96.
-    if (new_channels > NUM_STEREO_INPUTS && audio_state.freq != 48000u) {
-        audio_state.freq = 48000u;
-        pending_rate = 48000u;
-        rate_change_pending = true;
-    }
+    // Multichannel alts advertise 48 kHz only.  Retain that USB endpoint state
+    // while USB is inactive without disturbing the rate owned by another input.
+    if (new_channels > NUM_STEREO_INPUTS)
+        usb_audio_set_selected_rate(48000u);
 #endif
 
     bool active = (alt > 0);
@@ -1277,7 +1292,7 @@ static bool uac1_handle_ep_get(uint8_t rhport, tusb_control_request_t const *req
     uint8_t cs = TU_U16_HIGH(req->wValue);
     if (req->bRequest == UAC1_REQ_GET_CUR && cs == UAC1_EP_CTRL_SAMPLING_FREQ) {
         static uint8_t freq_bytes[3];
-        uint32_t f = audio_state.freq;
+        uint32_t f = usb_audio_get_selected_rate();
         freq_bytes[0] = (uint8_t)(f & 0xFF);
         freq_bytes[1] = (uint8_t)((f >> 8) & 0xFF);
         freq_bytes[2] = (uint8_t)((f >> 16) & 0xFF);
@@ -1431,11 +1446,7 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                     uac1.pending_recipient = 0;
                     return false;
                 }
-                if (new_freq != audio_state.freq) {
-                    audio_state.freq = new_freq;
-                    rate_change_pending = true;
-                    pending_rate = new_freq;
-                }
+                usb_audio_set_selected_rate(new_freq);
             }
         }
         uac1.pending_recipient = 0;

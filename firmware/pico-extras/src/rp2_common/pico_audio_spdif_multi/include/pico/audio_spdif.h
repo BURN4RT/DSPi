@@ -216,6 +216,18 @@ void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count);
  */
 uint32_t audio_spdif_enable_sync_prepare(audio_spdif_instance_t *instances[], uint count);
 
+/*! \brief Eagerly program the instance's PIO clock divider for a sample rate
+ * \ingroup pico_audio_spdif_multi
+ *
+ * Recomputes and writes the nominal divider for \p sample_freq and updates
+ * the instance's rate bookkeeping (inst->freq) and the IEC 60958-3 channel
+ * status rate byte.  The normal divider update is lazy (wrap_consumer_take,
+ * gated on a rate mismatch against inst->freq); callers that trim the SM
+ * divider behind the library's back (input clock servos) use this to restore
+ * nominal even when the rate value is unchanged.
+ */
+void audio_spdif_apply_pio_frequency(audio_spdif_instance_t *inst, uint32_t sample_freq);
+
 /** \brief Enable/disable DMA-starvation monitoring
  * \ingroup audio_spdif
  *

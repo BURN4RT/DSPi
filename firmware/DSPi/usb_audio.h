@@ -42,6 +42,10 @@ extern volatile float global_preamp_linear[NUM_INPUT_CHANNELS];
 // the stereo master chain.  Always 2 on RP2040.
 extern volatile uint8_t usb_input_channels;
 
+// Host-selected rate for the USB playback endpoint.  This remains distinct
+// from audio_state.freq while another input source owns the live pipeline.
+uint32_t usb_audio_get_selected_rate(void);
+
 // Master volume — device-side ceiling on all output (does not affect DSP stages)
 extern volatile float master_volume_db;
 extern volatile float master_volume_linear;

@@ -121,6 +121,29 @@ static bool i2s_input_should_be_master(void) {
     return true;
 }
 
+// Rewrite every SPDIF-type slot's PIO divider to nominal for the given rate.
+// The input clock servos (SPDIF input, I2S slave) trim these SMs directly and
+// never update the library's inst->freq bookkeeping, so the library's lazy
+// wrap_consumer_take update is blind to the trim and won't fire when the
+// pipeline rate value is unchanged; without an explicit restore the trim
+// outlives its servo.  That matters beyond an off-nominal carrier: ADAT
+// resyncs to nominal inside complete_pipeline_reset()/enable_outputs_in_sync()
+// (the input servo dividers read 0 once the input is stopped), and a
+// nominal-ADAT vs trimmed-SPDIF split makes ADAT drift against the slots it
+// mirrors, eroding its alignment cushion until the slip machinery forces a
+// resync.  All SPDIF slots get the same value, so inter-slot alignment is
+// unaffected.  I2S-type slots are excluded: their SMs run other programs
+// (extclk slots at divider 1.0) and are rebuilt by their own paths.
+static void restore_nominal_spdif_dividers(uint32_t sample_freq) {
+    extern uint8_t output_types[];
+    extern audio_spdif_instance_t *spdif_instance_ptrs[];
+    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
+        if (output_types[i] == OUTPUT_TYPE_SPDIF && spdif_instance_ptrs[i]) {
+            audio_spdif_apply_pio_frequency(spdif_instance_ptrs[i], sample_freq);
+        }
+    }
+}
+
 // defer_output_to_input_prefill: when true, the caller's input prefill handshake
 // (the main-loop I2S block) will drain, re-enable outputs in sync, and own the
 // DAC-mute release after this returns, so perform_rate_change() must NOT run
@@ -188,6 +211,15 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
     // Atomically update all I2S instances and restart in sync (avoids brief
     // master/slave divider mismatch from lazy per-instance callbacks)
     audio_i2s_update_all_frequencies(new_freq);
+
+    // SPDIF TX dividers: restore nominal eagerly, even when new_freq equals
+    // the old rate.  The library's lazy update is gated on a rate mismatch
+    // against inst->freq, which an input clock servo's trim never creates,
+    // so an equal-rate call through here (e.g. a source switch away from a
+    // servoed input) would otherwise leave the trim in place.  The mute
+    // bracket above covers the write, and complete_pipeline_reset() (or the
+    // caller's prefill block) drains and restarts in sync afterwards.
+    restore_nominal_spdif_dividers(new_freq);
 
     // Update MCK frequency for new sample rate (if enabled).  No per-rate
     // multiplier sanitization — CLK_GPOUTn handles every Fs × multiplier
@@ -2906,11 +2938,15 @@ int main(void) {
                     // machinery re-detects and re-arms the external rate.
                     rate_change_pending = false;
                 } else {
-                    // Back to master mode: return to the selected rate (the
-                    // external rate may differ; slave-servo divider trim is
-                    // ppm-level and normalizes like the SPDIF-input path).
+                    // Back to master mode: return to the selected rate.  When
+                    // the rates differ, perform_rate_change restores nominal
+                    // dividers itself; when they match it is skipped, so
+                    // restore the slave servo's divider trim explicitly (see
+                    // restore_nominal_spdif_dividers).
                     if (i2s_input_rate != audio_state.freq) {
                         perform_rate_change(i2s_input_rate, true);
+                    } else {
+                        restore_nominal_spdif_dividers(audio_state.freq);
                     }
                     if (i2s_mck_enabled && i2s_input_should_be_master()) {
                         audio_i2s_mck_update_frequency(i2s_input_rate,
@@ -2973,10 +3009,13 @@ int main(void) {
                     // rate so the switch costs a single reset instead of two.
                     // In slave clock mode the stored I2S rate is dormant
                     // (auto-detected after lock), so stay at the current rate.
-                    uint32_t target_rate = (new_source == INPUT_SOURCE_I2S &&
-                                            i2s_clock_mode != I2S_CLOCK_MODE_SLAVE)
-                                               ? i2s_input_rate
-                                               : audio_state.freq;
+                    uint32_t target_rate = audio_state.freq;
+                    if (new_source == INPUT_SOURCE_USB) {
+                        target_rate = usb_audio_get_selected_rate();
+                    } else if (new_source == INPUT_SOURCE_I2S &&
+                               i2s_clock_mode != I2S_CLOCK_MODE_SLAVE) {
+                        target_rate = i2s_input_rate;
+                    }
                     // Switching INTO I2S: defer the output restart + mute release
                     // to the I2S prefill block (active_input_source is still
                     // SPDIF here, so complete_pipeline_reset()'s I2S guard can't
@@ -2996,9 +3035,28 @@ int main(void) {
                 } else if (old_source == INPUT_SOURCE_I2S) {
                     i2s_input_stop();
 
+                    // Slave-mode clock servo may have trimmed the SPDIF TX
+                    // dividers to the departed external master's rate; the
+                    // conditional perform_rate_change below skips equal-rate
+                    // switches, so restore nominal explicitly (see
+                    // restore_nominal_spdif_dividers; ADAT resyncs to nominal
+                    // in the reset below and would drift against trimmed
+                    // slots).  No-op cost in master mode, and harmless before
+                    // a SPDIF target (its servo re-trims after lock).
+                    restore_nominal_spdif_dividers(audio_state.freq);
+
+                    // USB endpoint rate is retained while another source is
+                    // active; apply it now without letting USB retune I2S live.
+                    if (new_source == INPUT_SOURCE_USB) {
+                        uint32_t target_rate = usb_audio_get_selected_rate();
+                        if (target_rate != audio_state.freq) {
+                            perform_rate_change(target_rate, false);
+                            dsp_update_delay_samples((float)target_rate);
+                        }
+                    }
+
                     // MCK was running for the external source; stop it when
-                    // no I2S output still needs it.  (No divider restore:
-                    // I2S input never servos the output clocks.)
+                    // no I2S output still needs it.
                     if (i2s_mck_enabled && i2s_input_should_be_master()) {
                         audio_i2s_mck_set_enabled(false);
                     }
@@ -3030,6 +3088,21 @@ int main(void) {
                 }
 
                 active_input_source = new_source;
+
+                // Drop any pending rate change armed for the OLD source (e.g.
+                // a USB SET_CUR that landed after this iteration's rate-change
+                // handler already ran, or a detector arm that raced the
+                // switch).  Left set, it would fire next iteration and retune
+                // the pipeline under the NEW source; the original decorative-
+                // USB bug through a side door.  Every path below re-derives
+                // the rate itself: the SPDIF-source branch already called
+                // perform_rate_change, SPDIF/I2S targets re-arm via their
+                // lock/prefill machinery, and the USB target re-checks the
+                // retained endpoint selection after its reset.  Mirrors the
+                // clock-mode flip handler's clear.  Placed after the source
+                // flip so an IRQ arm during the teardown above is also caught;
+                // from here on, only the new source can legitimately arm.
+                rate_change_pending = false;
 
                 // Notify the LG Sound Sync module of the source change.
                 // On a switch away from SPDIF it demotes to absent without
@@ -3076,6 +3149,20 @@ int main(void) {
                     // loudness coefficient pointer.  Re-applying here brings
                     // the live gain path in line with what Windows last sent.
                     audio_set_volume(audio_state.volume);
+
+                    // Close the switch-window race: a host SET_CUR that
+                    // landed after the old-source branch read the retained
+                    // selection but before active_input_source flipped above
+                    // was recorded without arming (USB was not the active
+                    // source yet), and the switch applied the older value.
+                    // Re-check now that USB owns the pipeline; the deferred
+                    // handler performs the retune.
+                    uint32_t usb_rate = usb_audio_get_selected_rate();
+                    if (usb_rate != audio_state.freq) {
+                        pending_rate = usb_rate;
+                        __dmb();
+                        rate_change_pending = true;
+                    }
                 }
 
                 printf("Input source: %u -> %u\n",
