@@ -3,13 +3,21 @@
 //
 // One 256-bit ADAT frame per sample carries all 8 post-gain output channels:
 //   [1][10x0][1][u3..u0]  then 8 x ( 6 x [1][nibble] ), nibbles MSB-first,
-// NRZI on the wire (1 = level transition).  NRZI is encoded on the CPU
-// (prefix-XOR per word) so the PIO is a single out-pins instruction at
-// 1 cycle/bit: PIO clock = 256*Fs, making the ADAT clkdiv IDENTICAL to the
-// S/PDIF TX divider.  The SPDIF-input clock servo therefore rate-locks ADAT
-// by writing it the same divider it writes the slots (see spdif_input.c);
-// in USB/I2S modes both run the same nominal divider.  Either way ADAT can
-// never drift against the output slots.
+// NRZI on the wire (1 = level transition).  NRZI is encoded on the CPU so
+// the PIO is a single out-pins instruction at 1 cycle/bit: PIO clock =
+// 256*Fs, making the ADAT clkdiv IDENTICAL to the S/PDIF TX divider.  The
+// SPDIF-input clock servo therefore rate-locks ADAT by writing it the same
+// divider it writes the slots (see spdif_input.c); in USB/I2S modes both run
+// the same nominal divider.  Either way ADAT can never drift against the
+// output slots.
+//
+// Encoding is LUT-driven: each PCM byte stuffs to a fixed 10-bit token
+// [1][hi nibble][1][lo nibble], and NRZI is linear (the entry-level-1 line
+// pattern is the complement of the entry-level-0 pattern), so a 256 x 16-bit
+// table of pre-NRZI'd tokens plus one XOR mask per byte replaces the old
+// separate stuff + prefix-XOR passes.  Samples arrive already converted to
+// S24 in place in buf_out (see output_s24.h); the pipeline's single
+// float->S24 pass feeds both the S/PDIF slots and this encoder.
 //
 // Buffering: a single 896-frame ring (28 KB BSS) drained by a free-running
 // DMA data channel; a chained control channel rewrites the read address at
@@ -31,7 +39,6 @@
 #if PICO_RP2350
 
 #include <string.h>
-#include <math.h>
 #include "config.h"
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
@@ -98,19 +105,38 @@ extern uint8_t output_types[];  // usb_audio.c; slot 0 type selects starvation s
 // Frame construction
 // ---------------------------------------------------------------------------
 
-// Expand a 24-bit sample into its 30-bit channel chunk: a '1' before each of
-// the six nibbles, MSB nibble first.  0x21084210 = the six '1' bits.
-static inline uint32_t adat_stuff30(int32_t s24) {
-    uint32_t s = (uint32_t)s24 & 0xFFFFFFu;
-    return 0x21084210u
-         | ((s & 0xF00000u) << 5) | ((s & 0x0F0000u) << 4) | ((s & 0x00F000u) << 3)
-         | ((s & 0x000F00u) << 2) | ((s & 0x0000F0u) << 1) |  (s & 0x00000Fu);
-}
+// Pre-NRZI'd 10-bit line tokens for every PCM byte, entry level 0: the wire
+// levels of the stuffed pattern [1][b7..b4][1][b3..b0], MSB transmitted
+// first.  Entry level 1 is the complement (XOR 0x3FF).  Built at init; BSS
+// so the hot path never touches flash.
+static uint16_t adat_token_lut[256];
 
-// Pack header + eight 30-bit chunks into 8 words, transmit order = w[0] MSB
-// first (the SM shifts left).  Bit budget: 16 + 8*30 = 256.
-static inline void adat_pack_frame(uint32_t *w, const uint32_t c[8]) {
-    w[0] = (ADAT_SYNC_HEADER << 16) | (c[0] >> 14);
+// NRZI'd 16-bit frame header [1][10x0][1][u3..u0] per entry level, with the
+// exit level each variant leaves the line at.
+static uint16_t adat_hdr_nrzi[2];
+static uint32_t adat_hdr_exit[2];
+
+// Encode one frame (header + 8 x S24) into 8 pre-NRZI'd transmit words,
+// w[0] MSB first (the SM shifts left; bit budget 16 + 8*30 = 256).  entry is
+// the line level (0/1) at the frame start; returns the exit level.  The
+// level chains through the tokens as an XOR mask m (0 or 0x3FF): each
+// token's LSB is the line level during its last bit.
+static inline uint32_t adat_encode_frame(uint32_t *w, const int32_t s24[8],
+                                         uint32_t entry) {
+    uint32_t hdr = adat_hdr_nrzi[entry];
+    uint32_t m = (0u - adat_hdr_exit[entry]) & 0x3FFu;
+    uint32_t c[8];
+    for (int ch = 0; ch < 8; ch++) {
+        uint32_t s = (uint32_t)s24[ch];
+        uint32_t t2 = adat_token_lut[(s >> 16) & 0xFFu] ^ m;
+        m = (0u - (t2 & 1u)) & 0x3FFu;
+        uint32_t t1 = adat_token_lut[(s >> 8) & 0xFFu] ^ m;
+        m = (0u - (t1 & 1u)) & 0x3FFu;
+        uint32_t t0 = adat_token_lut[s & 0xFFu] ^ m;
+        m = (0u - (t0 & 1u)) & 0x3FFu;
+        c[ch] = (t2 << 20) | (t1 << 10) | t0;
+    }
+    w[0] = (hdr << 16)  | (c[0] >> 14);
     w[1] = (c[0] << 18) | (c[1] >> 12);
     w[2] = (c[1] << 20) | (c[2] >> 10);
     w[3] = (c[2] << 22) | (c[3] >> 8);
@@ -118,18 +144,7 @@ static inline void adat_pack_frame(uint32_t *w, const uint32_t c[8]) {
     w[5] = (c[4] << 26) | (c[5] >> 4);
     w[6] = (c[5] << 28) | (c[6] >> 2);
     w[7] = (c[6] << 30) |  c[7];
-}
-
-// NRZI-encode one transmit word (MSB first): each output bit is the line
-// level during that bit; a 1 in the input toggles the level.  The shift-right
-// cascade makes bit j the XOR of input bits 31..j (cumulative from the MSB);
-// XOR with the broadcast entry level yields the level stream.  *level (0/1)
-// is updated to the level after the word's last bit.
-static inline uint32_t adat_nrzi_word(uint32_t x, uint32_t *level) {
-    x ^= x >> 1; x ^= x >> 2; x ^= x >> 4; x ^= x >> 8; x ^= x >> 16;
-    x ^= (uint32_t)0 - *level;
-    *level = x & 1u;
-    return x;
+    return m & 1u;
 }
 
 // ---------------------------------------------------------------------------
@@ -279,15 +294,32 @@ static void adat_notify_if_changed(void) {
 // ---------------------------------------------------------------------------
 
 void adat_output_init(void) {
-    uint32_t c[8], raw[ADAT_FRAME_WORDS];
-    for (int i = 0; i < 8; i++) c[i] = adat_stuff30(0);
-    adat_pack_frame(raw, c);
-    for (uint32_t lvl = 0; lvl < 2; lvl++) {
-        uint32_t l = lvl;
-        for (int w = 0; w < ADAT_FRAME_WORDS; w++)
-            adat_silence_nrzi[lvl][w] = adat_nrzi_word(raw[w], &l);
-        adat_silence_exit[lvl] = l;
+    // Token LUT: NRZI wire levels (entry level 0) of the stuffed byte
+    // [1][b7..b4][1][b3..b0].  0x210 = the two forced '1' bits.
+    for (uint32_t b = 0; b < 256; b++) {
+        uint32_t stuffed = 0x210u | ((b & 0xF0u) << 1) | (b & 0x0Fu);
+        uint32_t t = 0, l = 0;
+        for (int k = 9; k >= 0; k--) {
+            l ^= (stuffed >> k) & 1u;
+            t = (t << 1) | l;
+        }
+        adat_token_lut[b] = (uint16_t)t;
     }
+    // Header variants per entry level.
+    for (uint32_t lvl = 0; lvl < 2; lvl++) {
+        uint32_t t = 0, l = lvl;
+        for (int k = 15; k >= 0; k--) {
+            l ^= (ADAT_SYNC_HEADER >> k) & 1u;
+            t = (t << 1) | l;
+        }
+        adat_hdr_nrzi[lvl] = (uint16_t)t;
+        adat_hdr_exit[lvl] = l;
+    }
+    // Silence frames per entry level, via the same encoder as live audio.
+    const int32_t zero[8] = {0};
+    for (uint32_t lvl = 0; lvl < 2; lvl++)
+        adat_silence_exit[lvl] =
+            adat_encode_frame(adat_silence_nrzi[lvl], zero, lvl);
 }
 
 void adat_output_set_config(bool enabled, uint8_t pin) {
@@ -423,7 +455,7 @@ void adat_output_task(void) {
 }
 
 DSP_TIME_CRITICAL
-void adat_output_push_block(const float (*bufs)[192], uint32_t sample_count) {
+void adat_output_push_block(const out_s24_t (*bufs)[192], uint32_t sample_count) {
     if (!adat_running) return;
 
     // Structurally unreachable while the blocking give caps the slot fill;
@@ -437,16 +469,9 @@ void adat_output_push_block(const float (*bufs)[192], uint32_t sample_count) {
     uint32_t wf = adat_wr_frame;
     uint32_t lvl = adat_line_level;
     for (uint32_t i = 0; i < sample_count; i++) {
-        uint32_t c[8], raw[ADAT_FRAME_WORDS];
-        for (int ch = 0; ch < 8; ch++) {
-            float x = bufs[ch][i];
-            x = fmaxf(-1.0f, fminf(1.0f, x));
-            c[ch] = adat_stuff30((int32_t)(x * 8388607.0f));
-        }
-        adat_pack_frame(raw, c);
-        uint32_t *dst = &adat_ring[wf * ADAT_FRAME_WORDS];
-        for (int w = 0; w < ADAT_FRAME_WORDS; w++)
-            dst[w] = adat_nrzi_word(raw[w], &lvl);
+        int32_t s[8];
+        for (int ch = 0; ch < 8; ch++) s[ch] = bufs[ch][i];
+        lvl = adat_encode_frame(&adat_ring[wf * ADAT_FRAME_WORDS], s, lvl);
         if (++wf == ADAT_RING_FRAMES) wf = 0;
     }
     adat_line_level = lvl;

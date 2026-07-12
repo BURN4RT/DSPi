@@ -396,7 +396,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-07-10 (crossfeed now per-output-pair, post-matrix)*
+*Last updated: 2026-07-13 (single in-place float->S24 finalization; slot interleave is now an integer copy)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -411,7 +411,9 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Output gain | Per-output gain × host volume × master volume |
 | Loudness | Per masked output, post-gain: 2 SVF shelf filters, volume-keyed; `loudness_output_mask` selects outputs; skipped-and-cleared when masked off / muted / RAW test signal |
 | Delay | Float circular buffers, 2048 samples max (42ms at 48kHz) |
-| SPDIF output | Float → int24 conversion, 4 stereo pairs |
+| S24 finalization | After the last float consumer, each output row of `buf_out` (rows 0-7) is converted to a clamped 24-bit sample **in place** via `output_block_to_s24_inplace()` (`output_s24.h`, `out_s24_t` = `may_alias` int32). This runs once per sample per channel; it runs even when a slot pool is starved so ADAT always sees converted data. Row 8 (PDM sub) stays float. |
+| SPDIF output | Pure integer copy of the finalized S24 rows into the 4 stereo slot pairs (no per-sample clamp/scale) |
+| ADAT output | Encodes the same finalized S24 rows 0-7 directly (see "ADAT Bulk Output") |
 | PDM output | Float → Q28 for sigma-delta modulation |
 
 ### RP2040 Fixed-Point Pipeline
@@ -1482,9 +1484,16 @@ Determined at boot and runtime based on output enables:
 **Mutual exclusion:** PDM sub and EQ worker outputs cannot coexist on either platform, enforced in `REQ_SET_OUTPUT_ENABLE`. RP2040: outputs 2-3 conflict with PDM. RP2350: outputs 2-7 conflict with PDM.
 
 ### EQ Worker (Both Platforms)
+*Last updated: 2026-07-13 (RP2350 Core 1 now finalizes buf_out rows 2-7 to S24 in place before the integer pair interleave)*
 
 Core 0 processes input pipeline + matrix mix, then dispatches per-output work to Core 1.
 Core 1 processes assigned SPDIF outputs in parallel: EQ, gain, delay, and S/PDIF conversion.
+On RP2350, `eq_worker_loop` (`pdm_generator.c`) now converts its `buf_out` rows
+2-7 to S24 in place via `output_block_to_s24_inplace()` (the single conversion
+point shared with ADAT; runs even when a slot pool is starved) and then
+interleaves pairs 1-3 as a pure integer copy. Core 0 symmetrically converts rows
+0-1 and interleaves pair 0; the single-core fallback converts rows 0-7 and
+interleaves pairs 0-3.
 
 | Platform | Core 0 outputs | Core 1 outputs | spdif_out[] size |
 |----------|----------------|----------------|------------------|
@@ -1656,7 +1665,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-12 (Linkwitz Transform qp sidecar BSS)*
+*Last updated: 2026-07-13 (ADAT encoder LUT tables; in-place S24 finalization adds no RAM)*
 
 > **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
 > fourth parameter (`Qp`) is stored out-of-band in a new BSS array
@@ -1674,13 +1683,19 @@ masked, and PDM claims its channel once at init.
 > by ~1,904 bytes to 139,668 bytes. `leveller_process_block` stays
 > `DSP_TIME_CRITICAL` and RAM-resident.
 
-> **ADAT bulk output (2026-07-06, RP2350 only).** The ADAT engine adds a fixed
-> 28 KB BSS frame ring (896 frames x 32 bytes, `adat_ring` in adat_output.c)
-> plus small state; the ring is sized to cover the alignment cushion (96
-> frames) plus the blocking-give fill cap (16 x 48 samples) so overwrite of
-> unplayed frames is structurally impossible. Only `adat_output_push_block()`
-> is RAM-resident (`DSP_TIME_CRITICAL`); all control paths stay cold in flash.
-> RP2040 compiles the engine out entirely (zero cost). See "ADAT Bulk Output".
+> **ADAT bulk output (2026-07-06, RP2350 only; encoder LUT added 2026-07-13).**
+> The ADAT engine adds a fixed 28 KB BSS frame ring (896 frames x 32 bytes,
+> `adat_ring` in adat_output.c) plus small state; the ring is sized to cover
+> the alignment cushion (96 frames) plus the blocking-give fill cap (16 x 48
+> samples) so overwrite of unplayed frames is structurally impossible. The
+> LUT-driven encoder adds 528 bytes of BSS (`adat_token_lut[256]` uint16 = 512 B,
+> plus the per-entry-level header variants `adat_hdr_nrzi`/`adat_hdr_exit`),
+> built once in `adat_output_init()`. The new single float->S24 conversion point
+> costs zero extra RAM: it reuses `buf_out` rows 0-7 in place (the rows stay
+> declared `float` but are read as `out_s24_t` = `may_alias` int32 after
+> finalization). Only `adat_output_push_block()` is RAM-resident
+> (`DSP_TIME_CRITICAL`); all control paths stay cold in flash. RP2040 compiles
+> the engine out entirely (zero cost). See "ADAT Bulk Output".
 
 > **Test signal generator (2026-07-05).** The siggen subsystem adds a small amount
 > of BSS (well under 1 KB: applied + staged `SiggenConfig`, three 44.1/48/96 kHz
@@ -2591,7 +2606,7 @@ Full specification: `Documentation/Features/i2s_output_spec.md`
 ---
 
 ## ADAT Bulk Output
-*Last updated: 2026-07-06*
+*Last updated: 2026-07-13 (LUT-driven NRZI encoder; single float->S24 conversion point shared with the slots)*
 
 RP2350 only. Streams all 8 main output channels (post-matrix, post per-output
 EQ/gain/delay/mute, the same finalized samples the SPDIF/I2S slots receive) as
@@ -2600,19 +2615,40 @@ the four output slots and PDM. 44.1/48 kHz only; the stream auto-suspends at
 higher rates and auto-resumes when the rate returns. RP2040 compiles the
 feature out (2 output channel pairs only).
 
-**Engine** (`adat_output.c/h`): NRZI is encoded on the CPU (prefix-XOR per
-word, line-level state carried across frames; per-entry-level silence
-templates), so the PIO program is a single `out pins, 1` at 256 x Fs and the
-clkdiv is the IDENTICAL value the S/PDIF TX SMs run. In USB/I2S modes both use
-the nominal `ceil(sys / Fs)`; in SPDIF-input mode the clock servo
-(`spdif_input_update_clock_servo`) writes ADAT the same servoed divider it
-writes the SPDIF slots (`adat_output_servo_divider`, sanity-bounded against
-nominal; resync pulls `spdif_input_current_tx_divider()`), so ADAT is
-rate-locked to the slots with zero long-term drift in every input mode.
-Frames (256 bits: `[1][10x0][1][u3..u0]` then 8 x 6 x `[1][nibble]`, user bits
-0) are stuffed on Core 0 in `process_input_block()` after the slot gives and
-written into a 896-frame (28 KB BSS) ring drained by DMA CH13, with CH14 as an
-IRQ-less control channel that rewrites the read address at the ring end.
+**Engine** (`adat_output.c/h`): NRZI is encoded on the CPU, so the PIO program
+is a single `out pins, 1` at 256 x Fs and the clkdiv is the IDENTICAL value the
+S/PDIF TX SMs run. In USB/I2S modes both use the nominal `ceil(sys / Fs)`; in
+SPDIF-input mode the clock servo (`spdif_input_update_clock_servo`) writes ADAT
+the same servoed divider it writes the SPDIF slots (`adat_output_servo_divider`,
+sanity-bounded against nominal; resync pulls `spdif_input_current_tx_divider()`),
+so ADAT is rate-locked to the slots with zero long-term drift in every input
+mode. Frames (256 bits: `[1][10x0][1][u3..u0]` then 8 x 6 x `[1][nibble]`, user
+bits 0) are encoded on Core 0 in `process_input_block()` after the slot gives
+and written into a 896-frame (28 KB BSS) ring drained by DMA CH13, with CH14 as
+an IRQ-less control channel that rewrites the read address at the ring end.
+
+Encoding is LUT-driven. Each PCM byte stuffs to a fixed 10-bit token
+`[1][hi nibble][1][lo nibble]`, and NRZI is linear (the entry-level-1 line
+pattern is the bitwise complement of the entry-level-0 pattern), so a 256-entry
+`uint16` table `adat_token_lut[256]` of pre-NRZI'd tokens (built in
+`adat_output_init()`, level-0 wire pattern) plus one XOR mask per byte replaces
+the old separate stuff, pack, and prefix-XOR-per-word passes. `adat_encode_frame()`
+chains the line level through the three tokens of each channel as an XOR mask
+(each token's LSB is the line level during its last bit), prepends the
+per-entry-level NRZI'd 16-bit sync header (`adat_hdr_nrzi[2]` / `adat_hdr_exit[2]`),
+and packs header + eight 30-bit chunks with the same fixed shifts as before;
+silence templates are built at init through the same encoder. Bit-exactness
+against the old encoder was proven by a 4-million-frame host differential test
+(chained levels, silence templates, all 256 tokens x 3 positions x 2 levels,
+float edge cases); codegen on Cortex-M33 -O3 dropped from 311 to 231
+instructions per frame. Samples arrive already converted to S24 in place in
+`buf_out` (see `output_s24.h`): the pipeline's single float->S24 pass feeds both
+the S/PDIF slots and this encoder, and `adat_output_push_block()` now takes
+`const out_s24_t (*)[192]` and encodes the integers directly. PIO-side NRZI was
+rejected (the servo dithers between adjacent possibly-odd dividers, and a
+two-mode encoder would need mid-stream resync); the encode LUT is intentionally
+not shared with the planned ADAT input, whose NRZI decode is `x ^ (x >> 1)` and
+whose destuffing is two masks, needing no LUT.
 
 **Alignment:** pushing after the blocking gives makes the ring lead track the
 slot-0 consumer fill plus a constant 96-frame cushion; the blocking-give cap

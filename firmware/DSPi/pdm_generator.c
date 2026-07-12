@@ -6,6 +6,7 @@
 #include "crossover.h"
 #include "usb_audio.h"
 #include "siggen.h"     // siggen_raw_mask: per-output EQ bypass in RAW mode
+#include "output_s24.h" // RP2350 EQ worker: in-place S24 finalization
 #include "pico/stdlib.h"
 #include "hardware/pio.h"
 #include "hardware/dma.h"
@@ -538,7 +539,11 @@ static void __not_in_flash_func(eq_worker_loop)() {
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
         }
 
-        // S/PDIF conversion for pairs 1-3
+        // Finalize Core 1's outputs to S24 in place (single conversion
+        // point, shared with ADAT; runs even with no slot buffer so ADAT
+        // always sees converted samples), then interleave pairs 1-3.
+        for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++)
+            output_block_to_s24_inplace(buf_out[out], sample_count);
         for (int p = 0; p < 3; p++) {
             int32_t *out_ptr = core1_eq_work.spdif_out[p];
             if (!out_ptr) continue;
@@ -549,11 +554,11 @@ static void __not_in_flash_func(eq_worker_loop)() {
                 memset(out_ptr, 0, sample_count * 8);
                 continue;
             }
+            const out_s24_t *sl = (const out_s24_t *)buf_out[left_out];
+            const out_s24_t *sr = (const out_s24_t *)buf_out[right_out];
             for (uint32_t i = 0; i < sample_count; i++) {
-                float dl = fmaxf(-1.0f, fminf(1.0f, buf_out[left_out][i]));
-                float dr = fmaxf(-1.0f, fminf(1.0f, buf_out[right_out][i]));
-                out_ptr[i*2]   = (int32_t)(dl * 8388607.0f);
-                out_ptr[i*2+1] = (int32_t)(dr * 8388607.0f);
+                out_ptr[i*2]   = sl[i];
+                out_ptr[i*2+1] = sr[i];
             }
         }
 

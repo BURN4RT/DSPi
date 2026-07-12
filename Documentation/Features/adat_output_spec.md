@@ -1,6 +1,6 @@
 # ADAT Bulk Output
 
-*Last updated: 2026-07-06*
+*Last updated: 2026-07-13*
 
 ## Overview
 
@@ -184,19 +184,73 @@ Samples are MSB-first, two's complement 24-bit. The 10-zero run is the only
 place the stream is transition-free for more than 4 bits, which is what
 receivers lock onto. The encoder was verified by exhaustive host-side
 decode/NRZI/zero-run analysis (4096-frame corpus including both full-scale
-extremes); no hardware ADAT receiver has confirmed interop yet.
+extremes); no hardware ADAT receiver has confirmed interop yet. The 2026-07-13
+LUT rewrite (below) was proven bit-identical to that original encoder by a
+host-side differential test: 4 million streamed frames (random plus edge-case
+samples, chained NRZI line level across frames), both silence-template entry
+levels, all 256 byte tokens in all 3 byte positions at both entry levels, and
+the float clamp/convert path including +/-1.0, denormals and infinities.
 
 ## Firmware internals (summary)
 
-- Engine: `firmware/DSPi/adat_output.c`; NRZI is encoded on the CPU (prefix-XOR
-  per word with line-level state carried across frames), so the PIO program is
-  a single `out pins, 1` at 256 x Fs and the clkdiv is identical to the SPDIF
-  TX divider (servo-tracked in SPDIF-input mode). DMA channels 13 (data) + 14
-  (control) run a free-running 896-frame (28 KB) ring with an IRQ-less chained
-  wrap.
-- The DSP pushes stuffed frames from `process_input_block()` after the slot
+- Engine: `firmware/DSPi/adat_output.c`; NRZI is encoded on the CPU (line-level
+  state carried across frames), so the PIO program is a single `out pins, 1`
+  at 256 x Fs and the clkdiv is identical to the SPDIF TX divider
+  (servo-tracked in SPDIF-input mode). DMA channels 13 (data) + 14 (control)
+  run a free-running 896-frame (28 KB) ring with an IRQ-less chained wrap.
+- Encoder (2026-07-13, LUT-driven; bit-identical to the original stuff +
+  prefix-XOR implementation): each PCM byte maps to a fixed 10-bit stuffed
+  token `[1][hi nibble][1][lo nibble]`, and NRZI is linear, so the
+  entry-level-1 line pattern is the bitwise complement of the entry-level-0
+  pattern. `adat_token_lut[256]` (uint16, BSS, built in `adat_output_init()`)
+  holds the pre-NRZI'd entry-level-0 token per byte; `adat_encode_frame()`
+  XORs each token with a level mask (0 or 0x3FF) chained through the token
+  LSB (the line level during the token's last bit), then packs the header +
+  eight 30-bit chunks with the same fixed shifts as before. The 16-bit sync
+  header is precomputed per entry level (`adat_hdr_nrzi[2]`/`adat_hdr_exit[2]`).
+  Table cost: 528 bytes BSS. Encoder codegen (Cortex-M33, -O3): 311 -> 231
+  instructions per frame, and the per-frame float clamp/convert is gone
+  entirely (see next bullet). Silence templates are built at init through the
+  same encoder.
+- Single S24 conversion point: the pipeline converts `buf_out[0..7]` float ->
+  clamped S24 **in place** once per block (`output_s24.h`,
+  `output_block_to_s24_inplace()`), after the last float consumer (EQ, gain,
+  loudness, delay, peak metering) and before the S/PDIF slot interleave. Both
+  the slot interleave and the ADAT encoder read the integer form
+  (`out_s24_t`, a may_alias int32), eliminating the previous duplicate
+  conversion (8 channels x Fs = 384,000 extra clamp/scale/convert per second
+  at 48 kHz) with zero additional RAM. In dual-core mode Core 0 converts
+  rows 0-1 and Core 1 converts rows 2-7; ADAT reads them only after the
+  `work_done` handshake. Conversion runs even when a slot pool is starved
+  (no buffer taken), so ADAT always sees converted samples.
+- The DSP pushes encoded frames from `process_input_block()` after the slot
   buffer gives; the blocking give bounds the ring lead, so overwrite of
   unplayed frames is structurally impossible while the DMA runs.
 - Rate policy hooks in `perform_rate_change()`; stream restarts in
   `complete_pipeline_reset()` Phase 6 and `enable_outputs_in_sync()`.
 - RP2040 compiles the engine out entirely (zero RAM/flash cost).
+
+## Planned ADAT input: what this engine shares (design notes, 2026-07-13)
+
+Decisions made while optimizing the output encoder, recorded so the future
+input implementation does not re-derive them:
+
+- The encode token LUT is deliberately **not** shared with decode, because
+  decode does not need a LUT at all: NRZI decode of a captured word is
+  `x ^ (x >> 1)` (plus the carried entry bit), and destuffing a decoded
+  10-bit token back to a byte is two masks and a shift
+  (`((t >> 1) & 0xF0) | (t & 0x0F)`). A 1024-entry reverse table would cost
+  RAM to save nothing.
+- What the input should reuse directly: the frame geometry and sync header
+  (`ADAT_SYNC_HEADER`, 16 + 8x30 = 256 bits per frame, token layout above),
+  the 256 x Fs bit-clock relationship, and the divider plumbing patterns.
+  In slave mode, follow the SPDIF-input model (RX SM + DMA, rate detect,
+  output clock servo trimming the TX dividers, which already rate-locks this
+  ADAT output via `adat_output_servo_divider()`). In master mode the device
+  clock is nominal and the existing nominal-divider path already applies.
+- Hybrid PIO NRZI (encoding NRZI in the PIO program for nominal-clock modes)
+  was evaluated and rejected: the servo dithers between adjacent, possibly
+  odd, divider values, PIO NRZI at 2 cycles/bit would halve divider
+  resolution, and switching encode modes mid-stream would need a resync or a
+  ring re-encode. With NRZI baked into the token LUT the CPU cost of NRZI is
+  already zero, so a two-mode encoder has no remaining upside.

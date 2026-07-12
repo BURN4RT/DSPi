@@ -23,6 +23,7 @@
 #include "pdm_generator.h"
 #include "siggen.h"
 #include "adat_output.h"
+#include "output_s24.h"
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
 #include "pico/audio.h"
 #include "pico/audio_spdif.h"
@@ -508,18 +509,22 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // PDM is inactive in EQ_WORKER mode
         global_status.peaks[CH_OUT_SUB] = 0;
 
-        // Core 0: S/PDIF for pair 0
+        // Core 0: finalize outputs 0-1 to S24 in place (single conversion
+        // point, shared with ADAT), then interleave S/PDIF pair 0.  Runs
+        // even with no slot buffer so ADAT always sees converted samples.
+        output_block_to_s24_inplace(buf_out[0], sample_count);
+        output_block_to_s24_inplace(buf_out[1], sample_count);
         if (audio_buf[0]) {
             int left_ch = 0, right_ch = 1;
             if (!matrix_mixer.outputs[left_ch].enabled && !matrix_mixer.outputs[right_ch].enabled) {
                 memset(audio_buf[0]->buffer->bytes, 0, sample_count * 8);
             } else {
                 int32_t *out_ptr = (int32_t *)audio_buf[0]->buffer->bytes;
+                const out_s24_t *sl = (const out_s24_t *)buf_out[0];
+                const out_s24_t *sr = (const out_s24_t *)buf_out[1];
                 for (uint32_t i = 0; i < sample_count; i++) {
-                    float dl = fmaxf(-1.0f, fminf(1.0f, buf_out[0][i]));
-                    float dr = fmaxf(-1.0f, fminf(1.0f, buf_out[1][i]));
-                    out_ptr[i*2]   = (int32_t)(dl * 8388607.0f);
-                    out_ptr[i*2+1] = (int32_t)(dr * 8388607.0f);
+                    out_ptr[i*2]   = sl[i];
+                    out_ptr[i*2+1] = sr[i];
                 }
             }
         }
@@ -619,7 +624,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
         }
 
-        // S/PDIF conversion
+        // Finalize outputs 0-7 to S24 in place (single conversion point,
+        // shared with ADAT; runs even with no slot buffer so ADAT always
+        // sees converted samples), then interleave the S/PDIF slots.
+        for (int out = 0; out < NUM_SPDIF_INSTANCES * 2; out++)
+            output_block_to_s24_inplace(buf_out[out], sample_count);
         for (int pair = 0; pair < 4; pair++) {
             if (!audio_buf[pair]) continue;
             int left_ch = pair * 2;
@@ -629,11 +638,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                 continue;
             }
             int32_t *out_ptr = (int32_t *)audio_buf[pair]->buffer->bytes;
+            const out_s24_t *sl = (const out_s24_t *)buf_out[left_ch];
+            const out_s24_t *sr = (const out_s24_t *)buf_out[right_ch];
             for (uint32_t i = 0; i < sample_count; i++) {
-                float dl = fmaxf(-1.0f, fminf(1.0f, buf_out[left_ch][i]));
-                float dr = fmaxf(-1.0f, fminf(1.0f, buf_out[right_ch][i]));
-                out_ptr[i*2]     = (int32_t)(dl * 8388607.0f);
-                out_ptr[i*2+1]   = (int32_t)(dr * 8388607.0f);
+                out_ptr[i*2]   = sl[i];
+                out_ptr[i*2+1] = sr[i];
             }
         }
 
@@ -1037,10 +1046,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     }
 
-    // ADAT bulk output tap: buf_out[0..7] are finalized post-gain for every
-    // pipeline variant here, and pushing AFTER the (blocking) gives keeps the
-    // ADAT ring lead bounded by the slot-0 consumer fill; see adat_output.c.
-    adat_output_push_block((const float (*)[192])buf_out, sample_count);
+    // ADAT bulk output tap: buf_out[0..7] hold finalized in-place S24 for
+    // every pipeline variant here (see output_s24.h), and pushing AFTER the
+    // (blocking) gives keeps the ADAT ring lead bounded by the slot-0
+    // consumer fill; see adat_output.c.
+    adat_output_push_block((const out_s24_t (*)[192])buf_out, sample_count);
 #else
     if (audio_buf[0]) give_audio_buffer(producer_pool_1, audio_buf[0]);
     if (audio_buf[1]) give_audio_buffer(producer_pool_2, audio_buf[1]);

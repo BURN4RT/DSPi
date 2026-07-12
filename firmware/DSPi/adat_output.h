@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "output_s24.h"
 
 // ----------------------------------------------------------------------------
 // ADAT bulk output (RP2350 only)
@@ -71,9 +72,10 @@ void adat_output_servo_divider(uint32_t div_16_8);
 // Main-loop service: slaved/idle silence top-up and deferred local resync.
 void adat_output_task(void);
 
-// DSP push: stuff and enqueue sample_count frames from the 8 finalized
-// post-gain channels.  Called from process_input_block() after the slot
-// gives; no-op while the stream is down.
-void adat_output_push_block(const float (*bufs)[192], uint32_t sample_count);
+// DSP push: encode and enqueue sample_count frames from the 8 finalized
+// output channels, already converted to S24 in place in buf_out (see
+// output_s24.h).  Called from process_input_block() after the slot gives;
+// no-op while the stream is down.
+void adat_output_push_block(const out_s24_t (*bufs)[192], uint32_t sample_count);
 
 #endif // PICO_RP2350
