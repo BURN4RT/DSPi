@@ -146,7 +146,12 @@
 //        tail-append like V22..V28: V21..V28 slots still load via
 //        slot_data_size_for_version; the missing bytes read as 0 (= unified +
 //        unset), the correct defaults for older presets.
-#define SLOT_DATA_VERSION       29
+//   V30: Linkwitz Transform per-band target Q appended (peq_qp_x512, Q*512;
+//        struct grows by NUM_CHANNELS*MAX_BANDS*2 bytes).  Backward-compatible
+//        tail-append like V22..V29: V21..V29 slots still load via
+//        slot_data_size_for_version; the missing bytes read as 0 (= 0.707
+//        default), the correct default for older presets.
+#define SLOT_DATA_VERSION       30
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -915,6 +920,12 @@ typedef struct __attribute__((packed)) {
     // live clock-pin mode untouched.
     uint8_t i2s_clock_pin_mode;      // 0=unified, 1=split
     uint8_t i2s_bck_pin_slave;       // slave-mode BCK GPIO (0 = unset → default)
+
+    // Linkwitz Transform per-band target Q (V30+, struct grows by
+    // NUM_CHANNELS*MAX_BANDS*2 bytes).  Stored as Q*512; 0 selects the 0.707
+    // default.  Gated on version >= 30 in apply_slot_to_live(); older slots
+    // have no qp data and load all-zero (= 0.707 default) for every band.
+    uint16_t peq_qp_x512[NUM_CHANNELS][MAX_BANDS];
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -2351,6 +2362,9 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->i2s_clock_pin_mode = i2s_clock_pin_mode;
     slot->i2s_bck_pin_slave  = i2s_bck_pin_slave;
 
+    // Linkwitz Transform per-band target Q (V30): Q*512, 0 = 0.707 default.
+    memcpy(slot->peq_qp_x512, peq_qp_x512, sizeof(slot->peq_qp_x512));
+
     // Channel names
     memcpy(slot->channel_names, channel_names, sizeof(slot->channel_names));
 
@@ -2501,6 +2515,13 @@ static void apply_slot_to_live(const PresetSlot *slot) {
                 filter_recipes[ch][b].type = remap_filter_type_pre_v18(filter_recipes[ch][b].type);
         }
     }
+
+    // Linkwitz Transform per-band target Q (V30): older slots have no qp data,
+    // so restore all-zero (0 selects the 0.707 default) for them.
+    if (slot->version >= 30)
+        memcpy(peq_qp_x512, slot->peq_qp_x512, sizeof(peq_qp_x512));
+    else
+        memset(peq_qp_x512, 0, sizeof(peq_qp_x512));
 
     // Per-channel preamp — all inputs, direct.
     for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
@@ -2705,9 +2726,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // fields, so V22's range stops where those begin.  V24 appended the optional
 // SPDIF inputs 2/3; V25 appended the leveller channel masks; V26 appended the
 // loudness output mask; V27 appended the crossfeed output pair mask; V28
-// appended i2s_clock_mode; V29 appended i2s_clock_pin_mode + i2s_bck_pin_slave,
-// so V28's range stops where those begin (a stored slot's CRC was computed
-// without the fields its version predates).
+// appended i2s_clock_mode; V29 appended i2s_clock_pin_mode + i2s_bck_pin_slave;
+// V30 appended peq_qp_x512, so V29's range stops where that begins (a stored
+// slot's CRC was computed without the fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -2725,18 +2746,23 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V28 \
     (offsetof(PresetSlot, i2s_clock_pin_mode) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V29 \
+    (offsetof(PresetSlot, peq_qp_x512) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V30 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
-// (I2S clock master/slave mode) and V29 (I2S clock-pin mode) are backward-
-// compatible tail-appends.  V21..V29 slots are all accepted (an older slot
-// loads with the newer fields defaulted to unset) while older/unknown versions
-// are invalidated and the slot loads factory defaults.
+// (I2S clock master/slave mode), V29 (I2S clock-pin mode) and V30 (Linkwitz
+// Transform per-band target Q) are backward-compatible tail-appends.  V21..V30
+// slots are all accepted (an older slot loads with the newer fields defaulted
+// to unset) while older/unknown versions are invalidated and the slot loads
+// factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 29
+        case SLOT_DATA_VERSION:   // 30
+            return SLOT_DATA_SIZE_V30;
+        case 29:
             return SLOT_DATA_SIZE_V29;
         case 28:
             return SLOT_DATA_SIZE_V28;

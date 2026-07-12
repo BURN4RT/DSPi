@@ -65,6 +65,8 @@ volatile SystemStatusPacket global_status = {0};
 
 volatile bool eq_update_pending = false;
 volatile EqParamPacket pending_packet;
+// Linkwitz Transform target Qp (Q*512); latched with pending_packet, consumed by the eq_update_pending handler.
+volatile uint16_t pending_eq_qp_x512 = 0;
 volatile bool rate_change_pending = false;
 volatile uint32_t pending_rate = 48000;
 volatile bool bulk_params_pending = false;

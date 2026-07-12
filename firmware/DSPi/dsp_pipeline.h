@@ -6,6 +6,9 @@
 // Filter storage
 extern Biquad filters[NUM_CHANNELS][MAX_BANDS];
 extern EqParamPacket filter_recipes[NUM_CHANNELS][MAX_BANDS];
+// Linkwitz Transform target Q per PEQ band (Q*512, 0 = 0.707 default);
+// parallel to filter_recipes, read only for FILTER_LINKWITZ_TRANSFORM bands.
+extern uint16_t peq_qp_x512[NUM_CHANNELS][MAX_BANDS];
 extern float channel_delays_ms[NUM_CHANNELS];
 extern bool channel_bypassed[NUM_CHANNELS];  // true if all bands in channel are flat
 

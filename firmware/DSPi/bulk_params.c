@@ -161,8 +161,15 @@ void bulk_params_collect(WireBulkParams *out) {
         for (int b = 0; b < MAX_BANDS; b++) {
             out->eq[ch][b].type = filter_recipes[ch][b].type;
             out->eq[ch][b].bypass = (filter_recipes[ch][b].bypass == 1) ? 1 : 0;
-            out->eq[ch][b].reserved[0] = 0;
-            out->eq[ch][b].reserved[1] = 0;
+            // LT bands carry the target Q (Q*512) in reserved[2] LE; zero otherwise.
+            if (filter_recipes[ch][b].type == FILTER_LINKWITZ_TRANSFORM) {
+                uint16_t qp = peq_qp_x512[ch][b];
+                out->eq[ch][b].reserved[0] = (uint8_t)(qp & 0xFF);
+                out->eq[ch][b].reserved[1] = (uint8_t)(qp >> 8);
+            } else {
+                out->eq[ch][b].reserved[0] = 0;
+                out->eq[ch][b].reserved[1] = 0;
+            }
             out->eq[ch][b].freq = filter_recipes[ch][b].freq;
             out->eq[ch][b].q = filter_recipes[ch][b].Q;
             out->eq[ch][b].gain_db = filter_recipes[ch][b].gain_db;
@@ -562,6 +569,14 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             filter_recipes[ch][b].freq = in->eq[ch][b].freq;
             filter_recipes[ch][b].Q = in->eq[ch][b].q;
             filter_recipes[ch][b].gain_db = in->eq[ch][b].gain_db;
+            // LT target Q rides in reserved[2] (Q*512 LE); zero for non-LT types.
+            // Caller recomputes all filters after apply returns.
+            if (in->eq[ch][b].type == FILTER_LINKWITZ_TRANSFORM) {
+                peq_qp_x512[ch][b] = (uint16_t)(in->eq[ch][b].reserved[0] |
+                                                (in->eq[ch][b].reserved[1] << 8));
+            } else {
+                peq_qp_x512[ch][b] = 0;
+            }
         }
     }
 

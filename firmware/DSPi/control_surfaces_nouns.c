@@ -36,6 +36,9 @@ extern volatile bool sync_started;
 
 // PEQ filter types run 0..FILTER_HIGHSHELF1 contiguously (crossover types
 // start at FILTER_XOVER_FIRST = 32 and are not front-panel material).
+// FILTER_LINKWITZ_TRANSFORM (11) is deliberately excluded from cycling: its
+// gain_db field carries a frequency and it needs a 4th parameter no CS noun
+// edits; it is host-configurable only.
 #define CS_PEQ_TYPE_COUNT  (FILTER_HIGHSHELF1 + 1)
 
 // ---------------------------------------------------------------------------
@@ -180,7 +183,11 @@ static bool cs_filter_rmw(uint8_t noun, uint8_t ch, uint8_t band, float value) {
     p.bypass = (p.bypass == 1) ? 1 : 0;
     switch (noun) {
         case CS_NOUN_FILTER_FREQ:   p.freq = value;            break;
-        case CS_NOUN_FILTER_GAIN:   p.gain_db = value;         break;
+        // gain_db holds fp in Hz for LT; a dB clamp would corrupt it, so
+        // report the adjust handled without touching the recipe.
+        case CS_NOUN_FILTER_GAIN:
+            if (p.type == FILTER_LINKWITZ_TRANSFORM) return true;
+            p.gain_db = value;         break;
         case CS_NOUN_FILTER_Q:      p.Q = value;               break;
         case CS_NOUN_FILTER_TYPE:   p.type = (uint8_t)value;   break;
         case CS_NOUN_FILTER_BYPASS: p.bypass = (value >= 0.5f) ? 1 : 0; break;
@@ -225,6 +232,7 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
         case CS_NOUN_OUTPUT_MUTE:   return matrix_mixer.outputs[target].mute ? 1.0f : 0.0f;
         case CS_NOUN_OUTPUT_ENABLE: return matrix_mixer.outputs[target].enabled ? 1.0f : 0.0f;
         case CS_NOUN_FILTER_FREQ:   return cs_filter_recipe(target, index)->freq;
+        // LT bands report fp (Hz) here since gain_db is repurposed; writes are blocked.
         case CS_NOUN_FILTER_GAIN:   return cs_filter_recipe(target, index)->gain_db;
         case CS_NOUN_FILTER_Q:      return cs_filter_recipe(target, index)->Q;
         case CS_NOUN_FILTER_TYPE:   return (float)cs_filter_recipe(target, index)->type;

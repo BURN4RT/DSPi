@@ -582,14 +582,17 @@ every source; inputs ≥2 carry audio only in a multichannel USB alt.
 | CH_OUT_5_PDM | 6 | PDM Subwoofer |
 
 ### Biquad Filter
+*Last updated: 2026-07-12*
 
-**Types:** Flat (bypass), Peaking, Low Shelf, High Shelf, Low Pass, High Pass, Notch, All-Pass (2nd-order RBJ), First-Order All-Pass (`FILTER_ALLPASS1`), First-Order Low Shelf (`FILTER_LOWSHELF1`), First-Order High Shelf (`FILTER_HIGHSHELF1`)
+**Types:** Flat (bypass), Peaking, Low Shelf, High Shelf, Low Pass, High Pass, Notch, All-Pass (2nd-order RBJ), First-Order All-Pass (`FILTER_ALLPASS1`), First-Order Low Shelf (`FILTER_LOWSHELF1`), First-Order High Shelf (`FILTER_HIGHSHELF1`), Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM`)
 
 **Coefficient computation:** RBJ Audio-EQ-Cookbook formulas for biquad path, Cytomic SVF equations for SVF path (RP2350 only), both in `dsp_compute_coefficients()`
 
 **First-order types (`FILTER_ALLPASS1`, added 2026-06-17; `FILTER_LOWSHELF1` / `FILTER_HIGHSHELF1`, added 2026-06-20):** Genuine 1st-order sections. The all-pass has flat magnitude with phase 0° → -180° (-90° at the corner), single parameter `freq` (`Q`/`gain_db` unused). The shelves are gentle 6 dB/oct shelves (monotonic, no `Q`); the first-order shelf prewarps `g` by `A` (not `sqrt(A)` like the 2nd-order shelves). On RP2350 these follow the **same hybrid rule as every other type** (changed 2026-06-20): a one-pole TPT SVF below `Fs/7.5` (`bq->svf_first_order`), a degenerate TDF2 biquad (`b2 = a2 = 0`) above. The one-pole SVF folds the `1/(1+g)` reciprocal into a coefficient so its inner loop is multiply-only. On RP2040 (no SVF) they always run as a Q28 degenerate biquad through the existing assembly kernel. Both realizations produce the identical RBJ-cookbook response, verified across the `Fs/7.5` boundary by `tools/filter_tester`.
 
-**Filter type value space (`enum FilterType`):** PEQ types occupy 0–7 plus the first-order all-pass at 8 and the first-order low/high shelves at 9–10 (added 2026-06-20), with 11–31 reserved for future PEQ types; crossover types occupy 32–63 (see [Crossover Filters](#crossover-filters)). `filter_is_peq_type()` (config.h) is the single classifier (any value below `FILTER_XOVER_FIRST`); `is_filter_flat()` uses it to flatten a crossover type that lands in a PEQ band slot. The crossover types were renumbered from the old 8–39 range on 2026-06-17 to open the contiguous PEQ block, which bumped `SLOT_DATA_VERSION` to 18 (pre-V18 presets migrated on load via `remap_filter_type_pre_v18()`) and `WIRE_FORMAT_VERSION` to 13. Adding the first-order shelves (new enum values only — no renumber, no on-disk layout change, no migration) bumped `SLOT_DATA_VERSION` to 19 and `WIRE_FORMAT_VERSION` to 14.
+**Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM` = 11, added 2026-07-12):** A pole/zero bass-extension biquad that replaces a driver's measured 2nd-order rolloff (`f0`, `Q0`) with a target alignment (`fp`, `Qp`): `H(s) = (s^2 + s*w0/Q0 + w0^2) / (s^2 + s*wp/Qp + wp^2)`. Unlike every other PEQ type it needs **four** parameters, so it borrows the wire packet unconventionally: `EqParamPacket.freq` = `f0`, `.Q` = `Q0`, `.gain_db` carries `fp` in Hz (`gain_db` is otherwise unused, and the front-panel gain noun is a no-op on LT bands), and the fourth parameter `Qp` rides a parallel array `peq_qp_x512[NUM_CHANNELS][MAX_BANDS]` (`dsp_pipeline.c`) as a `uint16` LE `Q*512` (`0` = the 0.707 default). Clamps: `f0` and `fp` to `[10, 0.15*Fs]` (tighter than the generic 0.45*Fs PEQ clamp; bounds every normalized coefficient inside the RP2040 Q28 range), `Q0` and `Qp` to `[0.1, 20]`; `fp <= 0` (or `freq <= 0`) is treated as flat. On RP2350 it runs on the hybrid path (see below); on RP2040 it is the same exact-bilinear TDF2 biquad in Q28 with both corners independently prewarped. The sidecar `Qp` is carried through the wire (`WireBandParams.reserved[2]`), flash (`PresetSlot.peq_qp_x512` tail-append), the `REQ_SET_EQ_PARAM` optional 18-byte payload, and `REQ_GET_EQ_PARAM` param code 5; these bumped `WIRE_FORMAT_VERSION` to 22 and `SLOT_DATA_VERSION` to 30 (V21..V29 slots still load, `qp` defaulting to 0 = 0.707). Full host-facing spec: [`Documentation/Features/peq_filters.md`](Features/peq_filters.md).
+
+**Filter type value space (`enum FilterType`):** PEQ types occupy 0–7 plus the first-order all-pass at 8, the first-order low/high shelves at 9–10 (added 2026-06-20), and the Linkwitz Transform at 11 (added 2026-07-12), with 12–31 reserved for future PEQ types; crossover types occupy 32–63 (see [Crossover Filters](#crossover-filters)). `filter_is_peq_type()` (config.h) is the single classifier (any value below `FILTER_XOVER_FIRST`); `is_filter_flat()` uses it to flatten a crossover type that lands in a PEQ band slot. The crossover types were renumbered from the old 8–39 range on 2026-06-17 to open the contiguous PEQ block, which bumped `SLOT_DATA_VERSION` to 18 (pre-V18 presets migrated on load via `remap_filter_type_pre_v18()`) and `WIRE_FORMAT_VERSION` to 13. Adding the first-order shelves (new enum values only; no renumber, no on-disk layout change, no migration) bumped `SLOT_DATA_VERSION` to 19 and `WIRE_FORMAT_VERSION` to 14. The Linkwitz Transform adds a per-band target-`Q` sidecar (`peq_qp_x512`), tail-appended to `PresetSlot` and carried in the `WireBandParams.reserved[2]` bytes, which bumped `SLOT_DATA_VERSION` to 30 and `WIRE_FORMAT_VERSION` to 22 (V21..V29 slots still load with `qp` defaulting to 0 = 0.707).
 
 **RP2350 biquad (hybrid SVF/biquad):**
 ```c
@@ -607,7 +610,7 @@ Single-precision throughout. Per-band SVF or TDF2 biquad path selected at coeffi
 Q28 fixed-point. Both per-sample and block-based biquad processing implemented in hand-optimized ARM assembly (`dsp_process_rp2040.S`). Block-based `dsp_process_channel_block()` keeps s1/s2 state in high registers across the entire sample loop, shares operand decompositions across multiply groups, and uses r12 for intermediate saves — eliminating per-sample struct access, function call overhead, and redundant decompositions vs the C `fast_mul_q28()` version.
 
 ### Hybrid SVF/Biquad Filtering (RP2350)
-*Last updated: 2026-06-20*
+*Last updated: 2026-07-12*
 
 The RP2350 uses a hybrid filter architecture that selects between a State Variable Filter (SVF) and a Transposed Direct Form II (TDF2) biquad on a per-band basis. This provides better numerical stability at low frequencies (where single-precision biquad pole quantization is worst) while retaining the efficiency of biquads at higher frequencies.
 
@@ -635,6 +638,8 @@ Where `g = tan(pi * freq / Fs)` and `A = 10^(gain_dB/40)`.
 - **Shelf (default):** output = m0*in + m1*v1 + m2*v2 (general form)
 
 **First-order (one-pole) SVF (added 2026-06-20):** First-order types (`FILTER_ALLPASS1`, `FILTER_LOWSHELF1`, `FILTER_HIGHSHELF1`, and the crossover BW1 / odd-order 1st-order sections) cannot use the 2nd-order SVF, so below `Fs/7.5` they run a one-pole TPT integrator instead: `v1 = sva2*in + sva1*ic1; ic1 = 2*v1 - ic1`, output `m0*in + m1*v1 + m2*(in - v1)` (lp = v1, hp = in - v1). The `1/(1+g)` reciprocal is folded into `sva1` (with `sva2 = g*sva1`) so the loop is multiply-only; only `svic1eq` is used. The path is gated by `bq->svf_first_order`. Above `Fs/7.5` these run a degenerate TDF2 biquad, exactly as the 2nd-order types switch to biquad. This makes first-order types follow the identical hybrid rule as every other type (previously they were forced to TDF2 at every frequency).
+
+**Linkwitz Transform SVF (added 2026-07-12):** The Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM`) is realized on the hybrid path as a full 2nd-order Simper SVF tuned at the **pole** pair: `g = tan(pi*fp/Fs)`, `k = 1/Qp`, with the output mix `m0 = 1`, `m1 = (g0/g)/Q0 - k`, `m2 = (g0/g)^2 - 1` (where `g0 = tan(pi*f0/Fs)` encodes the driver's measured corner). The SVF form is used only when **both** corners (`f0` and `fp`) sit below `Fs/7.5`; if either corner is at or above the boundary the band falls back to the exact-bilinear TDF2 biquad with both corners independently prewarped. This both-corners rule differs from the single-frequency test the other types use, because the transform's zero and pole must both be in the SVF-accurate region for the realizations to match.
 
 **State reset:** When a band changes filter topology — crossing the SVF/biquad boundary (e.g. due to sample rate change) or switching between the one-pole and 2nd-order SVF (`bq->svf_first_order` flips) — both biquad state (`s1`, `s2`) and SVF state (`svic1eq`, `svic2eq`) are reset to zero to prevent transients.
 
@@ -1651,7 +1656,15 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-08 (multichannel leveller ring pool BSS)*
+*Last updated: 2026-07-12 (Linkwitz Transform qp sidecar BSS)*
+
+> **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
+> fourth parameter (`Qp`) is stored out-of-band in a new BSS array
+> `peq_qp_x512[NUM_CHANNELS][MAX_BANDS]` of `uint16` (`Q*512`): **408 B on RP2350**
+> (17 channels x 12 bands x 2) and **168 B on RP2040** (7 x 12 x 2). Flash grows
+> too: `PresetSlot` tail-appends a matching `peq_qp_x512` array, bumping
+> `SLOT_DATA_VERSION` to 30 (V21..V29 slots still load, `qp` defaulting to 0 =
+> 0.707). The array is zeroed at init and on preset load from a pre-V30 slot.
 
 > **Multichannel volume leveller (2026-07-08).** The leveller now holds one
 > lookahead ring per input channel (`LevellerState.lookahead_buf[NUM_INPUT_CHANNELS][240]`)
@@ -2271,7 +2284,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-10 (crossfeed output-pair mask 0xFC/0xFD)*
+*Last updated: 2026-07-12 (Linkwitz Transform qp sidecar on 0x42/0x43)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2287,8 +2300,8 @@ op state ~400 B).
 
 | Command | Code | Direction | Description |
 |---------|------|-----------|-------------|
-| REQ_SET_EQ_PARAM | 0x42 | OUT | Set EQ band parameters |
-| REQ_GET_EQ_PARAM | 0x43 | IN | Get EQ band parameters |
+| REQ_SET_EQ_PARAM | 0x42 | OUT | Set EQ band parameters; optional 18-byte payload appends a `uint16` LE Linkwitz-Transform `qp` (`Q*512`) at offsets 16-17 (a 16-byte payload preserves the stored `qp`) |
+| REQ_GET_EQ_PARAM | 0x43 | IN | Get one EQ scalar; param codes 0-4 as before (type/freq/Q/gain_db/bypass), param code 5 returns `qp_x512` as a `u32` |
 | REQ_SET_PREAMP | 0x44 | OUT | Set preamp gain (legacy: sets all input channels) |
 | REQ_GET_PREAMP | 0x45 | IN | Get preamp gain (legacy: returns channel 0) |
 | REQ_SET_BYPASS | 0x46 | OUT | Set master EQ bypass |
@@ -2443,11 +2456,11 @@ op state ~400 B).
 | REQ_GET_I2S_CLOCK_PIN_MODE | 0xFF | IN | Get live I2S clock-pin mode (returns uint8_t: 0 = unified, 1 = split) |
 
 ### Bulk Parameter Transfer
-*Last updated: 2026-07-10 (wire V20: crossfeed output_pair_mask)*
+*Last updated: 2026-07-12 (wire V22: Linkwitz Transform qp in EQ reserved bytes)*
 
 Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 12); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 12); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.)
 
 **Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 

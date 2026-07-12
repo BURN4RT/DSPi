@@ -522,6 +522,16 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                     bool is_peq = (b < channel_band_counts[ch]);
                     bool is_xover = (b >= XOVER_BAND_BASE && b < XOVER_BAND_BASE + MAX_XOVER_BANDS);
                     if (is_peq || (is_xover && ch >= CH_OUT_1)) {
+                        // Latch the LT target Qp (Q*512, LE) before signalling
+                        // the consumer so it never reads a stale value.  Hosts
+                        // may append it after the 16-byte packet; otherwise
+                        // preserve the current PEQ value (0 for crossover).
+                        if (buffer->data_len >= sizeof(EqParamPacket) + 2) {
+                            pending_eq_qp_x512 = (uint16_t)(vendor_rx_buf[16] |
+                                                 ((uint16_t)vendor_rx_buf[17] << 8));
+                        } else {
+                            pending_eq_qp_x512 = is_peq ? peq_qp_x512[ch][b] : 0;
+                        }
                         eq_update_pending = true;
                     }
                 }
@@ -556,6 +566,10 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                     p.band    = band;
                     p.bypass  = (vendor_rx_buf[0] == 1) ? 1 : 0;
                     memcpy((void*)&pending_packet, &p, sizeof(EqParamPacket));
+                    // Rebuild the LT target Qp from stored recipe state (0 for
+                    // crossover bands) before signalling the consumer.
+                    pending_eq_qp_x512 = (band < channel_band_counts[channel])
+                                         ? peq_qp_x512[channel][band] : 0;
                     eq_update_pending = true;
                 }
             }
@@ -1710,8 +1724,8 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_EQ_PARAM: {
                 // wValue: bits[15:8]=channel, bits[7:3]=band (5 bits, 0..31),
                 //         bits[2:0]=param (0=type, 1=freq, 2=Q, 3=gain_db,
-                //         4=bypass).  Returns 4 bytes regardless of which
-                //         scalar; the unused bytes are zeroed.
+                //         4=bypass, 5=LT target Qp as Q*512).  Returns 4
+                //         bytes regardless of which scalar; unused zeroed.
                 //
                 // The band field is 5 bits (not the original 4) so crossover
                 // bands at XOVER_BAND_BASE..+3 (= 20..23) remain addressable
@@ -1736,6 +1750,9 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                             case 2: memcpy(&val_to_send, &p->Q, 4); break;
                             case 3: memcpy(&val_to_send, &p->gain_db, 4); break;
                             case 4: val_to_send = (p->bypass == 1) ? 1u : 0u; break;
+                            // LT target Qp (Q*512); 0 for crossover bands.
+                            case 5: val_to_send = (band < channel_band_counts[channel])
+                                        ? (uint32_t)peq_qp_x512[channel][band] : 0u; break;
                         }
                         usb_start_tiny_control_in_transfer(val_to_send, 4);
                         return true;

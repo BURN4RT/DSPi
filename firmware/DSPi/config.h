@@ -796,7 +796,8 @@ typedef struct {
 //     0..7    PEQ types        FILTER_FLAT .. FILTER_ALLPASS
 //     8       FILTER_ALLPASS1  first-order all-pass
 //     9..10   FILTER_LOWSHELF1, FILTER_HIGHSHELF1  first-order shelves
-//     11..31  reserved for future PEQ types (the PEQ block is everything
+//     11      FILTER_LINKWITZ_TRANSFORM  pole/zero bass-extension biquad
+//     12..31  reserved for future PEQ types (the PEQ block is everything
 //             below FILTER_XOVER_FIRST; see filter_is_peq_type())
 //     32..63  crossover types  FILTER_XOVER_FIRST .. FILTER_XOVER_LAST
 //     64..    reserved for future crossover types (they must stay contiguous
@@ -820,7 +821,14 @@ enum FilterType {
     // 2nd-order shelves).
     FILTER_LOWSHELF1 = 9, FILTER_HIGHSHELF1 = 10,
 
-    // 11..31 reserved for future PEQ types.
+    // Linkwitz Transform: pole/zero biquad that replaces a driver's measured
+    // 2nd-order rolloff (f0, Q0) with a target alignment (fp, Qp).  Wire
+    // mapping: freq = f0, Q = Q0, gain_db carries fp in Hz (gain is unused by
+    // this type), Qp travels separately as uint16 Q*512 (0 = 0.707 default);
+    // see peq_qp_x512[] and Documentation/Features/peq_filters.md.
+    FILTER_LINKWITZ_TRANSFORM = 11,
+
+    // 12..31 reserved for future PEQ types.
 
     // Crossover filter types — indices 32..63. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.
@@ -860,6 +868,7 @@ static inline bool filter_is_peq_type(uint8_t t) { return t < FILTER_XOVER_FIRST
 _Static_assert(FILTER_ALLPASS  < FILTER_XOVER_FIRST, "core PEQ block must precede the crossover range");
 _Static_assert(FILTER_ALLPASS1 < FILTER_XOVER_FIRST, "first-order all-pass must sit in the PEQ block");
 _Static_assert(FILTER_HIGHSHELF1 < FILTER_XOVER_FIRST, "first-order shelves must sit in the PEQ block");
+_Static_assert(FILTER_LINKWITZ_TRANSFORM < FILTER_XOVER_FIRST, "Linkwitz Transform must sit in the PEQ block");
 
 typedef struct __attribute__((packed)) {
     uint8_t channel;

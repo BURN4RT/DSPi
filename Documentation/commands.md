@@ -215,6 +215,15 @@ is in the **16-byte payload** (`EqParamPacket`):
 The write is ignored if `channel`/`band` is out of range or a crossover band is
 addressed on a master channel.
 
+**Optional 18-byte payload (Linkwitz Transform target Q).** For the Linkwitz
+Transform type (`11`, see 4.3) the band needs a fourth parameter, `Qp`, that does
+not fit the 16-byte packet. Send an **18-byte** payload: the 16-byte `EqParamPacket`
+followed by a `uint16` LE `qp` at offsets 16-17, encoded as `Q*512` (`0` = the
+0.707 default). A plain **16-byte** payload is still accepted and **preserves the
+stored `qp`** for that band (so non-LT writes never need the extra bytes). For a
+Linkwitz Transform band, `freq` = `f0`, `Q` = `Q0`, and `gain_db` carries `fp` in
+Hz (the `gain_db` field is otherwise unused for this type).
+
 ### 4.2 Read one EQ scalar (`REQ_GET_EQ_PARAM`, 0x43, read)
 
 `bmRequestType=0xC1`. There is **no full-packet read**; you read one scalar at a
@@ -226,10 +235,12 @@ wValue = (channel << 8) | (band << 3) | param
 
 * `channel`: bits [15:8]
 * `band`: bits [7:3] (5 bits, 0..31, so crossover bands 20..23 are addressable)
-* `param`: bits [2:0]: `0`=type, `1`=freq, `2`=Q, `3`=gain_db, `4`=bypass
+* `param`: bits [2:0]: `0`=type, `1`=freq, `2`=Q, `3`=gain_db, `4`=bypass,
+  `5`=Linkwitz-Transform `qp_x512`
 
 Response is always **4 bytes**. For `param=0` and `param=4` the value is a small
-integer in the low byte (remaining bytes zero); for `1/2/3` it is an f32.
+integer in the low byte (remaining bytes zero); for `1/2/3` it is an f32. For
+`param=5` it is the stored `qp_x512` (`Q*512`) as a `u32` (`0` = the 0.707 default).
 
 To read an entire band, issue 5 reads, or read everything at once via
 `REQ_GET_ALL_PARAMS` (Section 13).
@@ -249,7 +260,8 @@ To read an entire band, issue 5 reads, or read everything at once via
 | 8 | First-order all pass (`FILTER_ALLPASS1`) |
 | 9 | First-order low shelf (`FILTER_LOWSHELF1`) |
 | 10 | First-order high shelf (`FILTER_HIGHSHELF1`) |
-| 11..31 | Reserved (future PEQ types) |
+| 11 | Linkwitz Transform (`FILTER_LINKWITZ_TRANSFORM`): `freq`/`Q`/`gain_db` map to `f0`/`Q0`/`fp` (Hz); `Qp` is the sidecar (see 4.1 / param 5) |
+| 12..31 | Reserved (future PEQ types) |
 | 32..63 | Crossover types (LR/Butterworth/Bessel, see below) |
 
 Crossover encoding (used in crossover bands 20..23):
@@ -611,12 +623,19 @@ On bulk SET, only `enabled` is honored in the `lg_sound_sync` section; `present`
 |--------|------|-------|
 | 0 | u8 | `type` (FilterType enum) |
 | 1 | u8 | `bypass` (1 = bypassed, else active) |
-| 2 | u8[2] | reserved (must be 0) |
+| 2 | u8[2] | reserved; carries the Linkwitz-Transform `qp` (u16 LE, `Q*512`) for LT bands (`type` = 11), else must be 0 (wire format V22+) |
 | 4 | f32 | `freq` (Hz) |
 | 8 | f32 | `q` |
 | 12 | f32 | `gain_db` |
 
 The band index is implicit in array position (row = channel, column = band).
+
+> **Wire format version.** The `reserved[2]` reuse for the Linkwitz-Transform
+> `qp` bumped `WIRE_FORMAT_VERSION` to **22** (byte layout and struct size are
+> unchanged). Unlike the single-band command, the bulk bytes are authoritative:
+> apply always overwrites the stored `qp` (for an LT band `0` selects the 0.707
+> default; for any other type it is forced to `0`). For an LT band,
+> `freq`/`q`/`gain_db` hold `f0`/`Q0`/`fp` (Hz).
 
 ---
 

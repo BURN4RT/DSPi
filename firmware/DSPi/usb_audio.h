@@ -106,6 +106,8 @@ extern MatrixMixer matrix_mixer;
 
 extern volatile bool eq_update_pending;
 extern volatile EqParamPacket pending_packet;
+// Linkwitz Transform target Qp (Q*512); latched with pending_packet, consumed by the eq_update_pending handler.
+extern volatile uint16_t pending_eq_qp_x512;
 extern volatile bool rate_change_pending;
 extern volatile uint32_t pending_rate;
 extern volatile bool bulk_params_pending;

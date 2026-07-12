@@ -2161,6 +2161,7 @@ int main(void) {
         // Anything else is invalid and would have been rejected upstream.
         if (eq_update_pending) {
             EqParamPacket p = pending_packet;
+            uint16_t qpx = pending_eq_qp_x512;
             eq_update_pending = false;
 
             bool is_xover = (p.band >= XOVER_BAND_BASE &&
@@ -2185,6 +2186,9 @@ int main(void) {
                     + ((uint16_t)p.channel * WIRE_MAX_XOVER_BANDS + local) * sizeof(WireBandParams));
                 notify_param_write(off, sizeof(WireBandParams), &wbp);
             } else {
+                // Store the LT target Qp before filter_recipes so it is in
+                // place ahead of the dsp_compute_coefficients call below.
+                peq_qp_x512[p.channel][p.band] = qpx;
                 filter_recipes[p.channel][p.band] = p;
                 WireBandParams wbp;
                 memset(&wbp, 0, sizeof(wbp));
@@ -2193,6 +2197,12 @@ int main(void) {
                 wbp.freq    = p.freq;
                 wbp.q       = p.Q;
                 wbp.gain_db = p.gain_db;
+                // LT bands carry Qp (Q*512, LE) in the otherwise-zero reserved
+                // bytes so notification readers can recover the 4th parameter.
+                if (p.type == FILTER_LINKWITZ_TRANSFORM) {
+                    wbp.reserved[0] = (uint8_t)(qpx & 0xFF);
+                    wbp.reserved[1] = (uint8_t)((qpx >> 8) & 0xFF);
+                }
                 uint16_t off = (uint16_t)(offsetof(WireBulkParams, eq)
                     + ((uint16_t)p.channel * WIRE_MAX_BANDS + p.band) * sizeof(WireBandParams));
                 notify_param_write(off, sizeof(WireBandParams), &wbp);
