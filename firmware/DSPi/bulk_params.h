@@ -31,7 +31,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      23   // V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
+#define WIRE_FORMAT_VERSION      24   // V24: ADAT input config (pin/enable/clock mode) claimed from the input-config reserved bytes (struct size unchanged). V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -221,7 +221,14 @@ typedef struct __attribute__((packed)) {
     uint8_t  i2s_clock_mode;         // I2S clock: 0=master, 1=slave.  Valid from wire V21;
                                      // pre-V21 readers see this as a reserved (zero) byte,
                                      // which decodes as master (the correct legacy default).
-    uint8_t  reserved[4];            // Future expansion (pad to 16 bytes)
+    // ADAT input (V24+, RP2350), claimed from the reserved bytes with the
+    // same 0 = "absent, keep live value" convention as the SPDIF ext fields
+    // (enable and clock mode stored PLUS ONE so an old host's zeros are
+    // absent, not "disable/master").
+    uint8_t  adat_input_pin;         // ADAT RX GPIO (0 = absent, keep live)
+    uint8_t  adat_input_enabled_p1;  // enable + 1 (0 absent, 1 disabled, 2 enabled)
+    uint8_t  adat_clock_mode_p1;     // clock mode + 1 (0 absent, 1 master, 2 slave)
+    uint8_t  reserved[1];            // Future expansion (pad to 16 bytes)
 } WireInputConfig;                   // 16 bytes
 
 // ============================================================================

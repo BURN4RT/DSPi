@@ -69,6 +69,12 @@
 // only for DONE (CS_IR_PROTO_* / the learned code).
 #define NOTIFY_EVT_CS_IR_LEARN       0x0A
 
+// v2 ADAT input lock-state event (RP2350): acquiring, syncing, locked,
+// relocking, inactive (see adat_input.h).
+// Packet (10 bytes): [ver=2, evt=0x0B, flags=0, seq, state, rate_LE(4),
+// clock_mode]; rate = 0 unless LOCKED.
+#define NOTIFY_EVT_ADAT_INPUT_STATE  0x0B
+
 // v2 protocol version byte (first byte of every v2 packet)
 #define NOTIFY_V2_VERSION            0x02
 
@@ -141,6 +147,9 @@ void notify_push_siggen_state(uint8_t state, uint8_t reason,
 void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin);
 // I2S clock-slave lock state changed (see i2s_input.h).
 void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz);
+// ADAT input lock state changed (RP2350; see adat_input.h).
+void notify_push_adat_input_state(uint8_t state, uint32_t rate_hz,
+                                  uint8_t clock_mode);
 // Control Surfaces IR learn finished (state = CS_IR_LEARN_DONE / _TIMEOUT).
 void notify_push_cs_ir_learn(uint8_t state, uint8_t protocol, uint32_t code);
 

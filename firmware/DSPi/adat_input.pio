@@ -1,0 +1,41 @@
+; adat_input.pio; ADAT lightpipe NRZI receiver (RP2350 only)
+;
+; Recovers the decoded ADAT bitstream from an optical receiver's TTL output.
+; C = 8 PIO cycles per wire bit cell (PIO clock = 2048 x Fs). Two mirrored
+; halves track the current line level; each polls the JMP pin twice per cell
+; (C/2 apart). No change at either poll decodes a 0; a change decodes a 1 and
+; re-anchors the cell grid to the detecting poll, so sampling phase error is
+; re-bounded at every transition. ADAT guarantees a transition at least every
+; 11 cells (the sync header's 10-zero run), so ~2% clock accuracy suffices;
+; the 16.8 divider error is under 300 ppm. Every path emits exactly one bit
+; per cell and reaches the opposite half's first poll exactly C cycles after
+; the edge-detecting poll (verified per path below).
+;
+; Setup: y preloaded to 1, IN shift left (MSB first, ADAT wire order),
+; autopush 32, RX FIFO join, jmp_pin = the RX GPIO. No out/set/side pins.
+
+.program adat_rx
+
+l_one:                     ; entered 2 cycles after a fall poll; 6 cycles here
+    in y, 1        [5]     ; emit 1; l_p0 lands C after the detecting poll
+.wrap_target
+l_p0:
+    jmp pin h_one          ; rose: 1-cell (h_one takes 7, poll spacing = C)
+    nop            [2]
+l_p1:
+    jmp pin h_one          ; rose: 1-cell
+    in null, 1     [2]     ; still low: emit 0, wrap (poll spacing C/2 = 4)
+.wrap
+h_one:                     ; entered 1 cycle after a rise poll; 7 cycles here
+    in y, 1        [6]     ; emit 1; h_p0 lands C after the detecting poll
+h_p0:
+    jmp pin h_s0           ; still high
+    jmp l_one              ; fell: 1-cell
+h_s0:
+    nop            [2]
+h_p1:
+    jmp pin h_s1           ; still high
+    jmp l_one              ; fell: 1-cell
+h_s1:
+    in null, 1     [1]     ; still high: emit 0
+    jmp h_p0               ; poll spacing C/2 = 4

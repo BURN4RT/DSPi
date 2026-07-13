@@ -34,6 +34,7 @@
 #include "pdm_generator.h"
 #include "siggen.h"
 #include "adat_output.h"
+#include "adat_input.h"
 #include "usb_descriptors.h"
 #include "tusb.h"
 #include "pico/audio_spdif.h"
@@ -335,6 +336,10 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
 #if PICO_RP2350
     // ADAT data pin: claimed only while ADAT is config-enabled (mirrors MCK).
     if (adat_output_config_enabled() && pin == adat_output_pin()) return true;
+    // ADAT input pin: claimed only while the input is enabled (mirrors above).
+    // Direction-agnostic; the TX-pin-sharing exception lives at the ADAT-input
+    // validation sites, not here.
+    if (adat_input_enabled && pin == adat_input_pin) return true;
 #endif
     if (pin == spdif_rx_pin) return true;                     // SPDIF RX input 1 (always claimed)
     // Optional SPDIF inputs 2/3: a pin is claimed only while that input is
@@ -459,6 +464,16 @@ bool i2s_bck_pin_acceptable(uint8_t bck_pin) {
 bool adat_pin_acceptable(uint8_t pin) {
     if (!is_valid_gpio_pin(pin)) return false;
     if (adat_output_config_enabled() && pin == adat_output_pin()) return true;
+    return !is_pin_in_use(pin, 0xFF);
+}
+
+// True if `pin` is acceptable as the ADAT input (RX) GPIO for the bulk/preset
+// restore paths.  The RX only listens (input-enable, no funcsel), so sharing
+// the ADAT TX pin is the supported zero-hardware loopback self-test; any other
+// owned pin is a conflict.
+bool adat_input_pin_acceptable(uint8_t pin) {
+    if (!is_valid_gpio_pin(pin)) return false;
+    if (pin == adat_output_pin()) return true;
     return !is_pin_in_use(pin, 0xFF);
 }
 #endif
@@ -1370,12 +1385,17 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                     notify_param_write(offsetof(WireBulkParams,
                                                 input_config.i2s_input_rate),
                                        1, &enc);
-                    // In slave mode the external master defines the rate
-                    // (auto-detected); the stored rate applies only once we
-                    // are back in master mode, so don't arm a live change here.
-                    if (active_input_source == INPUT_SOURCE_I2S &&
-                        !i2s_slave_mode_active() &&
-                        rate != audio_state.freq) {
+                    // The device is the rate authority in I2S master mode and
+                    // in ADAT master mode (both share i2s_input_rate); arm a
+                    // live change only then.  In either slave mode the external
+                    // master defines the rate (auto-detected), so the stored
+                    // rate applies only once back in master mode.
+                    bool rate_authority_active =
+                        (active_input_source == INPUT_SOURCE_I2S &&
+                         !i2s_slave_mode_active()) ||
+                        (active_input_source == INPUT_SOURCE_ADAT &&
+                         adat_clock_mode == ADAT_CLOCK_MODE_MASTER);
+                    if (rate_authority_active && rate != audio_state.freq) {
                         pending_rate = rate;
                         __dmb();
                         rate_change_pending = true;
@@ -3063,6 +3083,155 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 resp_buf[3] = spdif_rx_pin_for_index(1);
                 resp_buf[4] = spdif_rx_pin_for_index(2);
                 vendor_send_response(resp_buf, 5);
+                return true;
+            }
+
+            // ---- ADAT Input Commands (RP2350 only; state round-trips on RP2040) ----
+
+            case REQ_SET_ADAT_INPUT_ENABLE: {
+#if !PICO_RP2350
+                resp_buf[0] = PIN_CONFIG_INVALID_OUTPUT;
+#else
+                uint8_t value = setup->wValue & 0xFF;
+                uint8_t status;
+                if (value > 1) {
+                    status = PIN_CONFIG_INVALID_PARAM;
+                } else if (value == (adat_input_enabled ? 1 : 0)) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op: already in this state
+                } else if (value != 0) {
+                    // Enabling: needs a validated pin.  The RX only listens, so
+                    // sharing the ADAT TX pin is the supported loopback
+                    // self-test; ADAT input is not yet enabled, never self-blocks.
+                    uint8_t pin = adat_input_pin;
+                    if (pin == 0xFF || !is_valid_gpio_pin(pin)) {
+                        status = PIN_CONFIG_INVALID_PIN;
+                    } else if (pin != adat_output_pin() && is_pin_in_use(pin, 0xFF)) {
+                        status = PIN_CONFIG_PIN_IN_USE;
+                    } else {
+                        adat_input_enabled = 1;
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                } else {
+                    // Disabling: refuse while ADAT is the live source or a
+                    // pending switch targets it; the host must switch away first
+                    // (mirrors REQ_SET_SPDIF_INPUT_ENABLE).
+                    bool is_active  = (active_input_source == INPUT_SOURCE_ADAT);
+                    bool is_pending = input_source_change_pending &&
+                                      pending_input_source == INPUT_SOURCE_ADAT;
+                    if (is_active || is_pending) {
+                        status = PIN_CONFIG_PIN_IN_USE;
+                    } else {
+                        adat_input_enabled = 0;
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                }
+                if (status == PIN_CONFIG_SUCCESS) {
+                    // Wire sentinel is the enable PLUS ONE (0 = absent).
+                    uint8_t enc = (uint8_t)(adat_input_enabled + 1);
+                    notify_param_write(offsetof(WireBulkParams,
+                                                input_config.adat_input_enabled_p1),
+                                       1, &enc);
+                }
+                resp_buf[0] = status;
+#endif
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_INPUT_ENABLE: {
+                resp_buf[0] = adat_input_enabled;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_ADAT_INPUT_PIN: {
+#if !PICO_RP2350
+                resp_buf[0] = PIN_CONFIG_INVALID_OUTPUT;
+#else
+                uint8_t pin = setup->wValue & 0xFF;
+                uint8_t status;
+                if (pin == 0xFF) {
+                    // Clearing is only allowed while disabled; a cleared pin
+                    // would make an enabled input unselectable.
+                    if (adat_input_enabled) {
+                        status = PIN_CONFIG_PIN_IN_USE;
+                    } else {
+                        adat_input_pin = 0xFF;
+                        status = PIN_CONFIG_SUCCESS;
+                    }
+                } else if (!is_valid_gpio_pin(pin)) {
+                    status = PIN_CONFIG_INVALID_PIN;
+                } else if (pin == adat_input_pin) {
+                    status = PIN_CONFIG_SUCCESS;  // No-op
+                } else if (pin != adat_output_pin() && is_pin_in_use(pin, 0xFF)) {
+                    // New pin differs from the current ADAT input pin, so it
+                    // never self-blocks; the TX-pin exception allows loopback.
+                    status = PIN_CONFIG_PIN_IN_USE;
+                } else {
+                    adat_input_pin = pin;
+                    if (active_input_source == INPUT_SOURCE_ADAT) {
+                        // Live re-route: main loop restarts the input under mute.
+                        adat_input_restart_pending = true;
+                    }
+                    status = PIN_CONFIG_SUCCESS;
+                }
+                if (status == PIN_CONFIG_SUCCESS) {
+                    // Wire encoding: 0 = absent/unset, else the raw GPIO.
+                    uint8_t wire_pin = (adat_input_pin == 0xFF) ? 0 : adat_input_pin;
+                    notify_param_write(offsetof(WireBulkParams,
+                                                input_config.adat_input_pin),
+                                       1, &wire_pin);
+                }
+                resp_buf[0] = status;
+#endif
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_INPUT_PIN: {
+                resp_buf[0] = adat_input_pin;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_SET_ADAT_INPUT_CLOCK_MODE: {
+                // wValue = 0 (master) / 1 (slave).  Deferred; the main-loop
+                // handler notifies at apply time (dormant and live paths).
+                // Accepted on both platforms so presets round-trip.
+                uint8_t v = setup->wValue & 0xFF;
+                uint8_t status;
+                if (v > 1) {
+                    status = PIN_CONFIG_INVALID_PARAM;
+                } else {
+                    if (v == adat_clock_mode && !adat_clock_mode_change_pending) {
+                        // Already in this mode with nothing armed; no-op.
+                    } else {
+                        pending_adat_clock_mode = v;
+                        __dmb();
+                        adat_clock_mode_change_pending = true;
+                    }
+                    status = PIN_CONFIG_SUCCESS;
+                }
+                resp_buf[0] = status;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_INPUT_CLOCK_MODE: {
+                // Live mode; a pending SET is not reflected until applied.
+                resp_buf[0] = adat_clock_mode;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_ADAT_INPUT_STATUS: {
+                AdatInputStatusPacket s;
+#if PICO_RP2350
+                adat_input_get_status(&s);
+#else
+                memset(&s, 0, sizeof(s));  // ADAT unavailable: 20 zero bytes
+#endif
+                vendor_send_response(&s, sizeof(s));
                 return true;
             }
 

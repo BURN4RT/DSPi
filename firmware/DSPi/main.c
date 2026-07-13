@@ -30,6 +30,7 @@
 #include "flash_storage.h"
 #include "pico/audio_i2s_multi.h"
 #include "adat_output.h"
+#include "adat_input.h"
 #include "pdm_generator.h"
 #include "siggen.h"
 #include "usb_audio.h"
@@ -207,6 +208,10 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
     // complete_pipeline_reset() below restarts the stream when the rate is
     // valid and the output is configured enabled.
     adat_output_on_rate_change(new_freq);
+    // ADAT input mirrors the policy: master mode retunes its RX divider and
+    // re-syncs (or parks above 48 kHz); slave mode is a no-op (the detected
+    // wire rate drove this change, so its divider is already nominal).
+    adat_input_on_rate_change(new_freq);
 #endif
 
     // Atomically update all I2S instances and restart in sync (avoids brief
@@ -351,6 +356,11 @@ static bool spdif_prefilling = false;
 // Cleared by prepare_pipeline_reset() so every disruptive op restarts the
 // handshake cleanly. Driven by the main-loop I2S block.
 static bool i2s_prefilling = false;
+
+// ADAT input prefill: SPDIF-style lock-gated handshake in both clock modes
+// (frame sync must be verified before audio flows). Cleared by
+// prepare_pipeline_reset(). Driven by the main-loop ADAT block (RP2350).
+static bool adat_prefilling = false;
 
 // ---------------------------------------------------------------------------
 // process_type_switches — unified output type transition handler
@@ -811,10 +821,12 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
     }
     preset_mute_counter = mute_samples;
     preset_loading = true;
-    // Cancel any in-progress I2S prefill: this disruptive op will re-trigger
-    // the handshake via preset_loading once it completes. (No effect on the
-    // SPDIF path, which manages spdif_prefilling at its own call sites.)
+    // Cancel any in-progress I2S/ADAT prefill: this disruptive op will
+    // re-trigger the handshake via preset_loading once it completes. (No
+    // effect on the SPDIF path, which manages spdif_prefilling at its own
+    // call sites.)
     i2s_prefilling = false;
+    adat_prefilling = false;
     __dmb();
     dac_hw_mute_assert();
 }
@@ -1457,6 +1469,7 @@ void core0_init() {
     // Templates only, no hardware; must precede the first adat_output_resync()
     // (reachable via process_type_switches -> complete_pipeline_reset below).
     adat_output_init();
+    adat_input_init();
 #endif
 
     // Initialize feedback controller and nominal rate
@@ -1638,6 +1651,22 @@ void core0_init() {
         prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
         i2s_input_bringup_prefill();
     }
+#if PICO_RP2350
+    else if (active_input_source == INPUT_SOURCE_ADAT) {
+        // Same parity for boot-into-ADAT: outputs stay muted until the
+        // receiver locks; the main-loop ADAT block owns drain/prefill/enable.
+        prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+        // Master mode: the device is the rate authority (shared with I2S
+        // master mode); apply the selected rate before starting.  Slave mode
+        // detects the wire rate and arms its own change after lock.
+        if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER &&
+            i2s_input_rate != audio_state.freq) {
+            perform_rate_change(i2s_input_rate, true);
+            dsp_update_delay_samples((float)i2s_input_rate);
+        }
+        adat_input_start();
+    }
+#endif
 
     // Baseline the notification shadow from the fully-initialised live state.
     // Must come after preset_boot_load() / apply_factory_defaults() so any
@@ -1797,6 +1826,55 @@ int main(void) {
             // Adjust output PIO dividers to track SPDIF input clock
             spdif_input_update_clock_servo();
         }
+
+#if PICO_RP2350
+        // Poll ADAT input when active.  Both clock modes run the SPDIF-style
+        // lock-gated flow: frame sync must be found and verified before audio
+        // flows, and outputs prefill against real input audio.  Master mode
+        // simply has no rate detection or servo behind the same states.
+        else if (active_input_source == INPUT_SOURCE_ADAT) {
+            AdatInputState ad_state = adat_input_get_state();
+
+            // Lock acquired: drain outputs, prefill, then start (same gating
+            // as the SPDIF block; see its comment for the DAC-mute hold).
+            // In slave mode a detected-rate mismatch defers a rate change
+            // instead; prefill re-triggers once the pipeline rate matches.
+            if (ad_state == ADAT_INPUT_LOCKED && preset_loading && !adat_prefilling
+                    && dac_hw_mute_hold_elapsed()) {
+                if (!adat_input_check_rate_change()) {
+                    drain_and_disable_outputs();
+                    preset_loading = false;
+                    preset_mute_counter = 0;
+                    adat_prefilling = true;
+                }
+            }
+
+            // The LOCKED gate matters (mirrors the I2S slave prefill): never
+            // enable outputs against a receiver that lost sync mid-prefill.
+            if (adat_prefilling && ad_state == ADAT_INPUT_LOCKED &&
+                get_slot_consumer_fill(0) >= SPDIF_CONSUMER_BUFFER_COUNT / 2) {
+                enable_outputs_in_sync();
+                adat_prefilling = false;
+                // Release the DAC hardware mute now that clocks are running
+                // (Phase 4 ordering, same as the SPDIF prefill path).
+                dac_hw_mute_release();
+            }
+
+            // Sync or signal loss: mute. No receiver restart is needed
+            // (unlike the I2S slave's stalled wait-driven SMs): the RX PIO
+            // free-runs and the poll re-acquires frame sync in software.
+            if (ad_state == ADAT_INPUT_RELOCKING && !preset_loading) {
+                prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+                pipeline_reset_cpu_metering();
+            }
+
+            // Rate machine + sync search + decode + pipeline feed
+            adat_input_poll();
+
+            // Slave mode + LOCKED only; cheap no-op otherwise
+            adat_input_update_clock_servo();
+        }
+#endif
 
         // Poll I2S input when active.
         else if (active_input_source == INPUT_SOURCE_I2S &&
@@ -2254,10 +2332,12 @@ int main(void) {
             uint32_t r = pending_rate;
             rate_change_pending = false;
             usb_audio_drain_ring();  // Process old-rate packets before clock switch
-            // For I2S input the main-loop prefill block owns the output restart
-            // + mute release; defer so complete_pipeline_reset() doesn't release
-            // the mute before that block's drain.  USB/SPDIF restart here.
-            perform_rate_change(r, active_input_source == INPUT_SOURCE_I2S);
+            // For I2S/ADAT input the main-loop prefill block owns the output
+            // restart + mute release; defer so complete_pipeline_reset()
+            // doesn't release the mute before that block's drain (for ADAT,
+            // before the receiver has even re-locked).  USB/SPDIF restart here.
+            perform_rate_change(r, active_input_source == INPUT_SOURCE_I2S ||
+                                   active_input_source == INPUT_SOURCE_ADAT);
         }
 
         // Handle loudness table recomputation
@@ -2989,6 +3069,57 @@ int main(void) {
             }
         }
 
+        // Handle deferred ADAT clock-mode change.  Much lighter than the I2S
+        // flip: the receiver is receive-only, so outputs need no structural
+        // rebuild; restart the receiver in the new mode and restore the rate
+        // authority.
+        if (adat_clock_mode_change_pending) {
+            if (pending_adat_clock_mode == adat_clock_mode) {
+                adat_clock_mode_change_pending = false;
+                __dmb();
+            } else if (active_input_source != INPUT_SOURCE_ADAT) {
+                // Dormant flip: nothing running, just adopt the mode.
+                adat_clock_mode_change_pending = false;
+                __dmb();
+                adat_clock_mode = pending_adat_clock_mode;
+                uint8_t wire_mode_p1 = (uint8_t)(adat_clock_mode + 1);
+                notify_param_write(offsetof(WireBulkParams,
+                                            input_config.adat_clock_mode_p1),
+                                   1, &wire_mode_p1);
+            } else if (pipeline_reset_ready()) {
+                adat_clock_mode_change_pending = false;
+                __dmb();
+#if PICO_RP2350
+                prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+                adat_input_stop();
+                adat_clock_mode = pending_adat_clock_mode;
+                if (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) {
+                    // The wire rate is re-detected after lock; drop any
+                    // stored-rate change that raced the flip (mirrors the
+                    // I2S clock-mode handler's clear).
+                    rate_change_pending = false;
+                } else {
+                    // Back to master: return to the selected device rate and
+                    // clear the slave servo's divider trim (see the I2S
+                    // handler's identical branch for the rationale).
+                    if (i2s_input_rate != audio_state.freq) {
+                        perform_rate_change(i2s_input_rate, true);
+                    } else {
+                        restore_nominal_spdif_dividers(audio_state.freq);
+                    }
+                }
+                adat_input_start();
+                // The ADAT main-loop block owns drain/prefill/enable and the
+                // DAC-mute release (preset_loading is set).
+
+                uint8_t wire_mode_p1 = (uint8_t)(adat_clock_mode + 1);
+                notify_param_write(offsetof(WireBulkParams,
+                                            input_config.adat_clock_mode_p1),
+                                   1, &wire_mode_p1);
+#endif
+            }
+        }
+
         // Handle deferred input source switch
         if (input_source_change_pending) {
             uint8_t new_source = pending_input_source;
@@ -3037,6 +3168,10 @@ int main(void) {
                     } else if (new_source == INPUT_SOURCE_I2S &&
                                i2s_clock_mode != I2S_CLOCK_MODE_SLAVE) {
                         target_rate = i2s_input_rate;
+                    } else if (new_source == INPUT_SOURCE_ADAT &&
+                               adat_clock_mode != ADAT_CLOCK_MODE_SLAVE) {
+                        // ADAT master mode shares the I2S device rate authority
+                        target_rate = i2s_input_rate;
                     }
                     // Switching INTO I2S: defer the output restart + mute release
                     // to the I2S prefill block (active_input_source is still
@@ -3044,10 +3179,12 @@ int main(void) {
                     // fire).  Switching INTO another SPDIF input: defer likewise,
                     // so the SPDIF lock/prefill block owns the restart and the
                     // outputs stay muted until the new input locks (same flow as
-                    // USB to SPDIF).  Switching to USB: complete_pipeline_reset()
-                    // runs here.
+                    // USB to SPDIF).  Switching INTO ADAT: defer to its
+                    // lock/prefill block the same way.  Switching to USB:
+                    // complete_pipeline_reset() runs here.
                     perform_rate_change(target_rate,
                                         new_source == INPUT_SOURCE_I2S ||
+                                        new_source == INPUT_SOURCE_ADAT ||
                                         input_source_is_spdif(new_source));
                     dsp_update_delay_samples((float)target_rate);
 
@@ -3087,6 +3224,31 @@ int main(void) {
                     leveller_reset_pending = true;
                     pipeline_reset_cpu_metering();
                 }
+#if PICO_RP2350
+                else if (old_source == INPUT_SOURCE_ADAT) {
+                    adat_input_stop();
+                    adat_prefilling = false;
+
+                    // Slave-mode servo may have trimmed the output dividers to
+                    // the departed external clock; restore nominal (same
+                    // rationale as the I2S branch above).
+                    restore_nominal_spdif_dividers(audio_state.freq);
+
+                    // USB endpoint rate is retained while another source is
+                    // active; apply it now (mirrors the I2S branch).
+                    if (new_source == INPUT_SOURCE_USB) {
+                        uint32_t target_rate = usb_audio_get_selected_rate();
+                        if (target_rate != audio_state.freq) {
+                            perform_rate_change(target_rate, false);
+                            dsp_update_delay_samples((float)target_rate);
+                        }
+                    }
+
+                    // Reset DSP state to prevent stale ADAT data leaking
+                    leveller_reset_pending = true;
+                    pipeline_reset_cpu_metering();
+                }
+#endif
 
                 // Regenerate input-channel default names for the new source —
                 // ALL input channels, including the multichannel extras (2..7),
@@ -3159,7 +3321,24 @@ int main(void) {
                     // fill margin as USB/SPDIF instead of whatever low level the
                     // transient leaves.
                     i2s_input_bringup_prefill();
-                } else {
+                }
+#if PICO_RP2350
+                else if (new_source == INPUT_SOURCE_ADAT) {
+                    // Master mode: apply the selected device rate (shared with
+                    // I2S master mode) if the old-source branch above did not
+                    // already retune to it.  Slave mode detects the wire rate
+                    // and arms its own change after lock.
+                    if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER &&
+                        i2s_input_rate != audio_state.freq) {
+                        perform_rate_change(i2s_input_rate, true);
+                        dsp_update_delay_samples((float)i2s_input_rate);
+                    }
+                    adat_input_start();
+                    // Outputs stay muted until frame sync locks; the main-loop
+                    // ADAT block owns drain/prefill/enable + the mute release.
+                }
+#endif
+                else {
                     // Switching to USB: flush stale ring data, complete reset
                     usb_audio_flush_ring();
                     complete_pipeline_reset();
@@ -3223,6 +3402,22 @@ int main(void) {
                 prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
                 spdif_input_start();
             }
+        }
+
+        // Handle deferred ADAT input restart: pin hot-swap while ADAT is the
+        // live source (same shape as the SPDIF pin swap above).  When ADAT
+        // is not the active source the new pin is only a stored preference.
+        if (adat_input_restart_pending) {
+            adat_input_restart_pending = false;
+#if PICO_RP2350
+            if (active_input_source == INPUT_SOURCE_ADAT &&
+                adat_input_get_state() != ADAT_INPUT_INACTIVE) {
+                adat_input_stop();
+                adat_prefilling = false;
+                prepare_pipeline_reset(PRESET_MUTE_SAMPLES);
+                adat_input_start();
+            }
+#endif
         }
 
         // Handle deferred I2S RX restarts: data-pin hot-swap and full

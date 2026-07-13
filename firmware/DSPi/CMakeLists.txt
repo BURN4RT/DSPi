@@ -5,11 +5,13 @@ add_compile_options(-O2)
 
 # Use -O3 for DSP-critical files
 set_source_files_properties(
-    dsp_pipeline.c usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c spdif_input.c i2s_input.c lg_sound_sync.c dac_hw_mute.c siggen.c adat_output.c
+    dsp_pipeline.c usb_audio.c vendor_commands.c audio_pipeline.c crossfeed.c loudness.c psybass.c leveller.c crossover.c spdif_input.c i2s_input.c input_servo.c lg_sound_sync.c dac_hw_mute.c siggen.c adat_output.c adat_input.c
     PROPERTIES COMPILE_FLAGS "-O3"
 )
 
 add_executable(DSPi
+    adat_input.c
+    adat_input.h
     adat_output.c
     adat_output.h
     audio_input.c
@@ -41,6 +43,8 @@ add_executable(DSPi
     i2c_control.h
     i2s_input.c
     i2s_input.h
+    input_servo.c
+    input_servo.h
     leveller.c
     leveller.h
     lg_sound_sync.c
@@ -115,6 +119,7 @@ else()
 endif()
 
 pico_generate_pio_header(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/i2s_input.pio)
+pico_generate_pio_header(DSPi ${CMAKE_CURRENT_SOURCE_DIR}/adat_input.pio)
 
 target_include_directories(DSPi PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}

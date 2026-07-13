@@ -380,6 +380,22 @@ void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz) {
     restore_interrupts(flags);
 }
 
+// Implemented unconditionally so it links on RP2040 (where ADAT input is
+// absent and this is never called).
+void notify_push_adat_input_state(uint8_t state, uint32_t rate_hz,
+                                  uint8_t clock_mode) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_ADAT_INPUT_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = state;
+    memcpy(&e.value[1], &rate_hz, 4);
+    e.value[5] = clock_mode;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 void notify_push_siggen_state(uint8_t state, uint8_t reason,
                               uint8_t signal_type, uint8_t channel) {
     uint32_t flags = save_and_disable_interrupts();
@@ -598,6 +614,19 @@ uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_l
             out_buf[6] = e.value[2];
             out_buf[7] = e.value[3];
             return 8;
+        }
+
+        case NOTIFY_EVT_ADAT_INPUT_STATE: {
+            // 10 bytes: state, detected rate (Hz, LE), clock mode.
+            if (max_len < 10) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_ADAT_INPUT_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            memcpy(&out_buf[5], &e.value[1], 4);
+            out_buf[9] = e.value[5];
+            return 10;
         }
 
         case NOTIFY_EVT_CS_IR_LEARN: {

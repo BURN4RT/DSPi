@@ -293,6 +293,7 @@ void get_default_channel_name(int ch, uint8_t input_source,
         //   I2S   - stereo pairs: "I2S 1 L", "I2S 1 R", "I2S 2 L", ... (matches
         //           the output naming style; I2S input can be 1..4 pairs).
         //   SPDIF - a single stereo pair: "SPDIF L" / "SPDIF R".
+        //   ADAT  - 8 discrete channels: "ADAT 1" .. "ADAT 8" (like USB).
         if (input_source == INPUT_SOURCE_I2S) {
             snprintf(buf, PRESET_NAME_LEN, "I2S %d %c",
                      ch / 2 + 1, (ch % 2 == 0) ? 'L' : 'R');
@@ -305,6 +306,9 @@ void get_default_channel_name(int ch, uint8_t input_source,
             else
                 snprintf(buf, PRESET_NAME_LEN, "SPDIF %u %c",
                          (unsigned)(idx + 1), (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source == INPUT_SOURCE_ADAT) {
+            // ADAT lightpipe carries 8 discrete channels; number them like USB.
+            snprintf(buf, PRESET_NAME_LEN, "ADAT %d", ch + 1);
         } else {  // USB (and any future per-channel source)
             snprintf(buf, PRESET_NAME_LEN, "USB %d", ch + 1);
         }

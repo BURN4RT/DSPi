@@ -17,12 +17,12 @@ typedef enum {
     INPUT_SOURCE_USB    = 0,
     INPUT_SOURCE_SPDIF  = 1,   // SPDIF input 1 (always enabled)
     INPUT_SOURCE_I2S    = 2,
-    // 3 reserved: future INPUT_SOURCE_ADAT
+    INPUT_SOURCE_ADAT   = 3,   // 8-channel ADAT input (RP2350 only, disabled until enabled by host)
     INPUT_SOURCE_SPDIF2 = 4,   // Optional SPDIF input 2 (disabled until enabled by host)
     INPUT_SOURCE_SPDIF3 = 5,   // Optional SPDIF input 3 (disabled until enabled by host)
 } InputSource;
 
-#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF3   // Highest valid value (3 is a gap)
+#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF3   // Highest valid value
 
 // Number of selectable SPDIF inputs. Input 0 (INPUT_SOURCE_SPDIF) is the
 // always-present one; inputs 1..2 (SPDIF2/SPDIF3) are optional and share the
@@ -177,9 +177,43 @@ static inline bool i2s_slave_mode_active(void) {
            active_input_source == INPUT_SOURCE_I2S;
 }
 
-// Structurally valid input source value (3 is the reserved ADAT gap)
+// ADAT input clock mode: who owns the clock domain of the incoming stream.
+// MASTER (default) = the far end locks to DSPi's ADAT output, so the return
+// stream is already in our clock domain: no rate detection, no servo; the
+// device is the rate authority via REQ_SET_INPUT_RATE (shared with I2S
+// master mode). SLAVE = external gear owns the clock; the wire rate is
+// auto-detected and every output is servo rate-matched to it, exactly like
+// SPDIF input. Has no effect while the input source is not ADAT.
+typedef enum {
+    ADAT_CLOCK_MODE_MASTER = 0,
+    ADAT_CLOCK_MODE_SLAVE  = 1,
+} AdatClockMode;
+
+// ADAT input config (defined in audio_input.c; persists like the optional
+// SPDIF inputs: disabled by default, pin 0xFF = unset, GPIO claimed only
+// while ADAT is the active source). RP2040 keeps the state for wire/preset
+// round-trips but can never select the source.
+extern uint8_t adat_input_enabled;
+extern uint8_t adat_input_pin;
+extern uint8_t adat_clock_mode;
+
+// Deferred ADAT applies (handled in main loop): clock-mode flip, and input
+// restart after an enable/pin change while ADAT is the active source.
+extern volatile bool adat_clock_mode_change_pending;
+extern volatile uint8_t pending_adat_clock_mode;
+extern volatile bool adat_input_restart_pending;
+
+// True when ADAT slave clocking is in force (SLAVE selected AND ADAT is the
+// active input source)
+static inline bool adat_slave_mode_active(void) {
+    return adat_clock_mode == ADAT_CLOCK_MODE_SLAVE &&
+           active_input_source == INPUT_SOURCE_ADAT;
+}
+
+// Structurally valid input source value. ADAT (3) is structurally valid on
+// both platforms so presets round-trip; selectability is gated separately.
 static inline bool input_source_valid(uint8_t src) {
-    return src <= INPUT_SOURCE_MAX && src != 3;
+    return src <= INPUT_SOURCE_MAX;
 }
 
 // True for any of the three SPDIF inputs
@@ -212,9 +246,17 @@ static inline bool spdif_input_enabled(uint8_t idx) {
     return idx == 0 || ((spdif_rx_enabled_ext >> (idx - 1)) & 1u) != 0;
 }
 
-// Valid AND currently offered in the source list (disabled SPDIF 2/3 are not)
+// Valid AND currently offered in the source list (disabled SPDIF 2/3 and
+// disabled/unsupported ADAT are not)
 static inline bool input_source_selectable(uint8_t src) {
     if (!input_source_valid(src)) return false;
+    if (src == INPUT_SOURCE_ADAT) {
+#if PICO_RP2350
+        return adat_input_enabled != 0 && adat_input_pin != 0xFF;
+#else
+        return false;   // no PIO/DMA/channel budget on RP2040
+#endif
+    }
     if (!input_source_is_spdif(src)) return true;
     return spdif_input_enabled(spdif_index_for_source(src));
 }
@@ -250,6 +292,13 @@ bool i2s_bck_pin_acceptable(uint8_t bck_pin);
 // vendor_commands.c (alongside the other pin helpers); declared here so the
 // bulk/preset restore paths can validate a stored enable before applying it.
 bool spdif_input_enable_acceptable(uint8_t idx);
+
+// True if `pin` could be the ADAT input (RX) GPIO right now: valid GPIO and
+// either the ADAT output's configured pin (the supported loopback self-test,
+// since the RX only listens) or not claimed by any other function.  Defined in
+// vendor_commands.c (RP2350 only); declared here so the bulk/preset restore
+// paths can validate a stored ADAT input pin before applying it.
+bool adat_input_pin_acceptable(uint8_t pin);
 
 // I2S input rate wire/flash encoding (1 byte): 0 = 44100, 1 = 48000,
 // 2 = 96000. Unknown values decode to 48000.

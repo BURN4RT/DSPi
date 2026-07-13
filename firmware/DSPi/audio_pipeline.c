@@ -192,6 +192,8 @@ uint8_t __not_in_flash_func(active_input_channel_count)(void) {
         n = usb_input_channels;
     else if (active_input_source == INPUT_SOURCE_I2S)
         n = i2s_input_channels;
+    else if (active_input_source == INPUT_SOURCE_ADAT)
+        n = 8;                            // ADAT is always 8 channels
     else
         n = NUM_STEREO_INPUTS;            // S/PDIF (and any future stereo source)
     if (n > NUM_INPUT_CHANNELS) n = NUM_INPUT_CHANNELS;

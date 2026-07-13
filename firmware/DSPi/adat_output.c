@@ -49,6 +49,7 @@
 #include "usb_audio.h"
 #include "spdif_input.h"
 #include "i2s_input.h"
+#include "adat_input.h"
 #include "notify.h"
 
 #define ADAT_PIO                pio1   // PDM owns SM 0 on this block
@@ -402,6 +403,7 @@ void adat_output_resync(void) {
     }
     adat_servo_div = spdif_input_current_tx_divider();
     if (adat_servo_div == 0) adat_servo_div = i2s_slave_current_tx_divider();
+    if (adat_servo_div == 0) adat_servo_div = adat_input_current_tx_divider();
     adat_sm_configure();
 
     // Line starts low: force the pin and seed the NRZI encoder to match.

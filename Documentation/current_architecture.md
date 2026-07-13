@@ -265,7 +265,7 @@ Any host-driven format change — SET_INTERFACE between AS alts (bit-depth switc
 **Persistence (compat-breaking).** Wire `WIRE_FORMAT_VERSION=16` (direct 8-input matrix/preamp + 17-channel EQ; no tail-append/version gates; 5864 B). Flash `SLOT_DATA_VERSION=21` (direct layout; the slot spans **2 flash sectors** on RP2350; 1 on RP2040). No migration — pre-version data loads factory defaults.
 
 ### Notification Endpoint (device→host push)
-*Last updated: 2026-07-07 (NOTIFY_EVT_CS_IR_LEARN 0x0A added)*
+*Last updated: 2026-07-13 (NOTIFY_EVT_ADAT_INPUT_STATE 0x0B added)*
 
 The vendor interface carries one **bulk IN** endpoint (EP 0x83, wMaxPacketSize = 64) for out-of-band device→host notifications. The transport runs two protocol versions in parallel: v1 (8-byte `MASTER_VOLUME` packets, kept for existing host apps) and v2 (generic `PARAM_CHANGED` + discrete events, the primary protocol going forward). `USB_BCD_DEVICE = 0x0201` so Windows re-reads descriptors after the 8→64 byte EP bump.
 
@@ -298,7 +298,7 @@ See `Documentation/Features/notification_protocol_v2_spec.md` for the full proto
 
 **Bulk operations** (preset load, factory reset, bulk SET): wrapped in `notify_begin_bulk(source)` / `notify_end_bulk()`. Per-field writes don't flood the ring; the host sees one `BULK_INVALIDATED` and reads `REQ_GET_ALL_PARAMS` for the full state. Preset load also emits `NOTIFY_EVT_PRESET_LOADED(slot)` before the bulk opens.
 
-**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), `NOTIFY_EVT_SIGGEN_STATE` (0x07), `NOTIFY_EVT_ADAT_STATE` (0x08), `NOTIFY_EVT_I2S_SLAVE_STATE` (0x09, 9-byte packet `[ver=2, 0x09, flags=0, seq, state, rate_LE32]`; pushed on every I2S clock-slave lock-state transition), and `NOTIFY_EVT_CS_IR_LEARN` (0x0A). Siggen announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator"). CS_IR_LEARN announces IR learn completion as a 12-byte packet `[ver=2, 0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]` (state = `CS_IR_LEARN_DONE`/`_TIMEOUT`), pushed from the Control Surfaces tick.
+**Discrete event IDs** on this transport: `NOTIFY_EVT_PARAM_CHANGED` (0x02), `NOTIFY_EVT_BULK_INVALIDATED` (0x03), `NOTIFY_EVT_PRESET_LOADED` (0x04), `NOTIFY_EVT_INPUT_FORMAT` (0x05), `NOTIFY_EVT_SIGGEN_STATE` (0x07), `NOTIFY_EVT_ADAT_STATE` (0x08), `NOTIFY_EVT_I2S_SLAVE_STATE` (0x09, 9-byte packet `[ver=2, 0x09, flags=0, seq, state, rate_LE32]`; pushed on every I2S clock-slave lock-state transition), `NOTIFY_EVT_CS_IR_LEARN` (0x0A), and `NOTIFY_EVT_ADAT_INPUT_STATE` (0x0B). Siggen announces test-signal-generator start/stop/completion as an 8-byte packet `[ver=2, 0x07, flags=0, seq, state, reason, signal_type, channel]` (state = `SiggenState`, reason = `SIGGEN_STOP_*`, channel = walk channel or 0xFF); pushed from `siggen_service()` in the main loop, never from the render path (see "Test Signal Generator"). CS_IR_LEARN announces IR learn completion as a 12-byte packet `[ver=2, 0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]` (state = `CS_IR_LEARN_DONE`/`_TIMEOUT`), pushed from the Control Surfaces tick. ADAT_INPUT_STATE (RP2350) announces every ADAT input lock-state transition as a 10-byte packet `[ver=2, 0x0B, flags=0, seq, state, rate_LE32, clock_mode]` (state = `AdatInputState`; rate = 0 unless LOCKED), pushed from the ADAT RX poll (see "ADAT Input").
 
 **Drain:** each consumer drains its own tail via `notify_peek_next_for(consumer, ...)` / `notify_commit_pop_for(consumer)`. The USB consumer (`usb_notify_drain` in usb_audio.c) claims EP 0x83 via `usbd_edpt_claim`, formats the next packet into the stable TX buffer, and submits via `usbd_edpt_xfer`; on success `notify_commit_pop_for(USB)` advances the USB tail, and on xfer rejection the entry stays queued for the next tick. The UART consumer drains from `uart_ctrl_poll` (see "Multi-consumer ring").
 
@@ -1609,7 +1609,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-13 (psychoacoustic bass row added; wire/slot version row now V23 / V31)*
+*Last updated: 2026-07-13 (ADAT input row added, RP2350 only; wire/slot version row now V24 / V32)*
 
 ### Hardware
 
@@ -1650,9 +1650,10 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | ADAT bulk output | No | Yes (8 ch mirror of outputs 1-8; 44.1/48 kHz, auto-suspends above) |
 | USB input channels | 2 (stereo) | 2 / 4 / 6 / 8 |
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
+| ADAT input | Config state only (never selectable) | Yes (8 ch, 24-bit, 44.1/48 kHz; master/slave clock; PIO1 SM2 + DMA CH15) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V23 / V31 | V23 / V31 |
+| Wire / slot version | V24 / V32 | V24 / V32 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
@@ -1684,7 +1685,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Crossover-stage availability when PDM enabled | Single-core (Core 0 only) | Single-core (Core 0 only) |
 
 ### DMA
-*Last updated: 2026-06-28 (multichannel I2S RX: up to 4 ring pairs on RP2350; TX channel sharing)*
+*Last updated: 2026-07-13 (ADAT input RX ring on CH15, RP2350)*
 
 | Feature | RP2040 | RP2350 |
 |---------|--------|--------|
@@ -1697,7 +1698,8 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | I2S RX channels | CH4, CH5 (1 pair; shared with SPDIF RX) | CH5/6 + 7/8 + 9/10 + 11/12 (up to 4 pairs; pair 0 shared with SPDIF RX) |
 | I2S RX IRQ | IRQ-less (chained ring) | IRQ-less (chained rings) |
 | PDM channel | Dynamic (`dma_claim_unused_channel`) | Dynamic (`dma_claim_unused_channel`) |
-| ADAT channels | N/A | CH13 (data) + CH14 (control), IRQ-less chained ring |
+| ADAT output channels | N/A | CH13 (data) + CH14 (control), IRQ-less chained ring |
+| ADAT input channel | N/A | CH15 (RX ring, ENDLESS mode, no IRQ, no reload channel) |
 
 **Per-slot DMA channel sharing (2026-06-27).** Each output slot owns exactly one
 DMA channel (channel index == slot index), used by whichever output type is
@@ -1731,7 +1733,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-13 (ADAT encoder LUT tables; in-place S24 finalization adds no RAM)*
+*Last updated: 2026-07-13 (ADAT input receiver: +8 KB RX ring BSS + ~3 KB RAM-pinned decode, RP2350; .data budget raised to 72K)*
 
 > **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
 > fourth parameter (`Qp`) is stored out-of-band in a new BSS array
@@ -1765,6 +1767,16 @@ masked, and PDM claims its channel once at init.
 > for the mode snapshot) are RAM-resident (`DSP_TIME_CRITICAL`); all other
 > control paths stay cold in flash. RP2040 compiles the engine out entirely
 > (zero cost). See "ADAT Bulk Output".
+
+> **ADAT bulk input (2026-07-13, RP2350 only).** The ADAT receiver adds a fixed
+> **8 KB BSS ring** (`adat_rx_ring`, 2048 x uint32, aligned to its own size for the
+> DMA write-address wrap) plus a few dozen bytes of state, and roughly **3 KB of
+> RAM-pinned decode code**: the `DSP_TIME_CRITICAL` poll body, header check, frame
+> decoder, slave-mode rate machine, and clock servo. The bounded sync-search scan
+> is `noinline` and stays cold in flash (it runs only while the pipeline is muted).
+> RP2040 compiles the receiver out entirely (config state only). This lifted the
+> RP2350 `.data` budget in `scripts/check_ram_placement.py` from 64K to 72K. See
+> "ADAT Input".
 
 > **Test signal generator (2026-07-05).** The siggen subsystem adds a small amount
 > of BSS (well under 1 KB: applied + staged `SiggenConfig`, three 44.1/48/96 kHz
@@ -1860,7 +1872,8 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 > B2 scans Core-1 function bodies for flash-range literal-pool pointers
 > (whitelisting two provably init-time-only references); Check C compares sizes
 > against `scripts/ram_baseline.json` (the recorded copy_to_ram baseline) and
-> enforces the `.data` budgets (60 KB RP2040, 64 KB RP2350). All four build
+> enforces the `.data` budgets (60 KB RP2040, 72 KB RP2350; RP2350 raised from
+> 64K for the ADAT input receiver's RAM-pinned decode code). All four build
 > variants currently pass with 0 FAIL.
 
 > **Control Surfaces footprint (2026-07-06, format v2).** The engine adds
@@ -1922,6 +1935,7 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | Loudness tables + per-output state (2 × 61 × 2 coeffs + 9 × 16 B) | ~3 KB |
 | Consumer pools + silence (static, 4 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~55 KB |
 | I2S RX DMA ring (2048 × 4, 8 KB aligned) | 8 KB |
+| ADAT RX ring (`adat_rx_ring`, 2048 × 4, 8 KB aligned) | 8 KB |
 | Other BSS | ~24 KB |
 | **Total BSS** | **~284 KB** (measured: 291,052 B; unchanged by the XIP migration) |
 | RAM code+rodata+data (.data section, hot set only) | 48,688 B (was 147,332 under copy_to_ram) |
@@ -2368,7 +2382,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-13 (psychoacoustic bass commands 0x30-0x3D)*
+*Last updated: 2026-07-13 (ADAT input commands 0x68-0x6E)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2430,6 +2444,13 @@ op state ~400 B).
 | REQ_GET_CROSSFEED_FEED | 0x65 | IN | Get custom crossfeed level |
 | REQ_SET_CROSSFEED_ITD | 0x66 | OUT | Set crossfeed ITD |
 | REQ_GET_CROSSFEED_ITD | 0x67 | IN | Get crossfeed ITD |
+| REQ_SET_ADAT_INPUT_ENABLE | 0x68 | OUT | Enable/disable ADAT input (1 byte, 0/1; RP2350 only). Selectable only when enabled AND a pin is set |
+| REQ_GET_ADAT_INPUT_ENABLE | 0x69 | IN | Get ADAT input enable state (1 byte) |
+| REQ_SET_ADAT_INPUT_PIN | 0x6A | OUT | Set ADAT RX GPIO (1 byte; 0xFF = unset). May equal the ADAT output pin for a zero-hardware loopback self-test |
+| REQ_GET_ADAT_INPUT_PIN | 0x6B | IN | Get ADAT RX GPIO (1 byte) |
+| REQ_SET_ADAT_INPUT_CLOCK_MODE | 0x6C | OUT | Set ADAT clock mode (1 byte: 0 = master, 1 = slave); deferred apply |
+| REQ_GET_ADAT_INPUT_CLOCK_MODE | 0x6D | IN | Get ADAT clock mode (1 byte) |
+| REQ_GET_ADAT_INPUT_STATUS | 0x6E | IN | Get 20-byte AdatInputStatusPacket (state, clock_mode, enabled, pin, rate_ok, lock/loss/slip counts, header_err, detected_rate, measured_hz). 0x6F reserved |
 | REQ_SET_MATRIX_ROUTE | 0x70 | OUT | Set matrix crosspoint |
 | REQ_GET_MATRIX_ROUTE | 0x71 | IN | Get matrix crosspoint |
 | REQ_SET_OUTPUT_ENABLE | 0x72 | OUT | Enable/disable output |
@@ -2526,7 +2547,7 @@ op state ~400 B).
 | REQ_SET_I2S_CLOCK_MODE | 0x88 | OUT | Set I2S clock mode (uint8_t: 0=master, 1=slave); deferred apply, only meaningful while input source is I2S |
 | REQ_GET_I2S_CLOCK_MODE | 0x89 | IN | Get live I2S clock mode (pending change not reflected until applied) |
 | REQ_GET_I2S_SLAVE_STATUS | 0x8A | IN | Get 16-byte I2sSlaveStatusPacket (state, clock_mode, lock/loss/slip counts, detected + measured rate) |
-| REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF, 2=I2S, 4=SPDIF2, 5=SPDIF3; 3 reserved for future ADAT). SPDIF2/3 rejected unless enabled |
+| REQ_SET_INPUT_SOURCE | 0xE0 | OUT | Set active input source (0=USB, 1=SPDIF, 2=I2S, 3=ADAT, 4=SPDIF2, 5=SPDIF3). SPDIF2/3 rejected unless enabled; ADAT rejected unless enabled with a pin set (RP2350) |
 | REQ_GET_INPUT_SOURCE | 0xE1 | IN | Get active input source |
 | REQ_GET_SPDIF_RX_STATUS | 0xE2 | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | REQ_GET_SPDIF_RX_CH_STATUS | 0xE3 | IN | Get IEC 60958 channel status (24 bytes) |
@@ -2558,7 +2579,7 @@ op state ~400 B).
 
 Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 23, total 5900 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 24, total 5900 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes. **V24** claims three `WireInputConfig` reserved bytes for the ADAT input (`adat_input_pin`, `adat_input_enabled_p1`, `adat_clock_mode_p1`, each 0 = absent/keep-live); struct sizes and the 5900-byte total are unchanged.
 
 **Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 
@@ -2859,9 +2880,9 @@ Master volume is re-derived on every preset *context* change (preset load, activ
 ---
 
 ## Audio Input Source System
-*Last updated: 2026-07-08 (up to three selectable SPDIF inputs sharing one RX SM/DMA)*
+*Last updated: 2026-07-13 (ADAT input added as source 3, RP2350 only; see "ADAT Input")*
 
-Abstraction layer enabling selection between multiple audio input sources. Currently supports USB (default), up to three SPDIF inputs, and I2S. Designed for future extensibility to ADAT input without restructuring.
+Abstraction layer enabling selection between multiple audio input sources. Supports USB (default), up to three SPDIF inputs, I2S, and (RP2350 only) an 8-channel ADAT lightpipe input.
 
 ### Files
 
@@ -2875,13 +2896,13 @@ typedef enum {
     INPUT_SOURCE_USB    = 0,
     INPUT_SOURCE_SPDIF  = 1,   // SPDIF input 1 (always enabled)
     INPUT_SOURCE_I2S    = 2,
-    // 3 reserved: future INPUT_SOURCE_ADAT
+    INPUT_SOURCE_ADAT   = 3,   // 8-channel ADAT input (RP2350 only; disabled until enabled)
     INPUT_SOURCE_SPDIF2 = 4,   // Optional SPDIF input 2 (disabled until enabled by host)
     INPUT_SOURCE_SPDIF3 = 5,   // Optional SPDIF input 3 (disabled until enabled by host)
 } InputSource;
 ```
 
-`input_source_valid()` accepts every value except the reserved 3; `input_source_selectable()` additionally requires that a SPDIF 2/3 be enabled before it is offered. `input_source_is_spdif()`, `spdif_index_for_source()` (0..2), and `spdif_source_for_index()` map between the two SPDIF representations.
+`input_source_valid()` accepts every value 0..5 (ADAT = 3 is structurally valid on both platforms so presets round-trip; RP2040 keeps only the config state and can never select it); `input_source_selectable()` additionally requires that a SPDIF 2/3 be enabled, or that ADAT be enabled with a pin set on RP2350, before it is offered. `input_source_is_spdif()`, `spdif_index_for_source()` (0..2), and `spdif_source_for_index()` map between the two SPDIF representations.
 
 ### Multiple Selectable SPDIF Inputs
 *Last updated: 2026-07-08*
@@ -2961,7 +2982,7 @@ This matches the user's product-level decision; it differs from the industry-sta
 - Loss: 10ms timeout
 - Audio extraction: FIFO → 24-bit decode → per-channel preamp → buf_l/buf_r → process_input_block(). RP2040 scales decoded samples into Q28 with the same `sample << 6` full-scale convention as USB 24-bit input; RP2350 scales to float full-scale.
 
-**Clock Servo**: PI controller in `spdif_input_update_clock_servo()` adjusts all output PIO dividers based on FIFO fill level (target 50%). Gains: KP=0.0005, KI=0.000005, deadband ±2 blocks. MCK divider is servoed alongside I2S data SM dividers when MCK is enabled, using `audio_i2s_mck_set_divider()` to keep master clock frequency-locked to the servoed output rate. *Last updated: 2026-04-12*
+**Clock Servo**: PI controller in `spdif_input_update_clock_servo()` adjusts all output PIO dividers based on FIFO fill level (target 50%). Gains: KP=0.0005, KI=0.000005, deadband ±2 blocks. MCK divider is servoed alongside I2S data SM dividers when MCK is enabled, using `audio_i2s_mck_set_divider()` to keep master clock frequency-locked to the servoed output rate. The divider-math and PIO/MCK-write actuation body (all output slots, the ADAT output, and MCK, with a proportional fill trim) is now factored out into `input_servo.c` (`input_servo_apply()` / `input_servo_reset()` / `input_servo_current_divider()`) and shared verbatim by SPDIF input and ADAT slave-clock mode; callers own their own lock gating, rate limiting, and input-rate measurement. I2S slave mode keeps its own servo variant (`i2s_slave_update_clock_servo()`), referenced to the first SPDIF-type slot rather than a consumer FIFO. *Last updated: 2026-07-13*
 
 **Output Prefill**: On SPDIF lock acquisition, outputs are disabled and consumer buffers drained via `drain_and_disable_outputs()`. The pipeline then feeds real audio into consumer buffers while outputs are stopped. Once slot 0 consumer fill reaches 50% (8 of 16 buffers), outputs are started in sync via `enable_outputs_in_sync()`. This eliminates initial underruns after lock acquisition. Controlled by `spdif_prefilling` flag in `main.c`. *Last updated: 2026-04-12*
 
@@ -3008,7 +3029,7 @@ How the pools get filled depends on the input's clock role, because the prefill 
 
 | Code | Command | Direction | Description |
 |------|---------|-----------|-------------|
-| 0xE0 | REQ_SET_INPUT_SOURCE | OUT | Set active input source (uint8_t payload; 2 = I2S, 4 = SPDIF2, 5 = SPDIF3; SPDIF2/3 rejected unless enabled) |
+| 0xE0 | REQ_SET_INPUT_SOURCE | OUT | Set active input source (uint8_t payload; 2 = I2S, 3 = ADAT, 4 = SPDIF2, 5 = SPDIF3; SPDIF2/3 rejected unless enabled, ADAT rejected unless enabled + pin set on RP2350) |
 | 0xE1 | REQ_GET_INPUT_SOURCE | IN | Get active input source (returns uint8_t) |
 | 0xE2 | REQ_GET_SPDIF_RX_STATUS | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | 0xE3 | REQ_GET_SPDIF_RX_CH_STATUS | IN | Get IEC 60958 channel status (24 bytes) |
@@ -3027,11 +3048,18 @@ How the pools get filled depends on the input's clock role, because the prefill 
 | 0xEF | REQ_GET_SPDIF_INPUT_CONFIG | IN | Returns 5 bytes: input count (3), enable mask (bit 0 = input 1, always set), GPIOs for inputs 1..3 |
 | 0xF1 | REQ_SET_I2S_RX_PIN | IN* | Set I2S RX data pin (wValue=pin, returns status byte) |
 | 0xF2 | REQ_GET_I2S_RX_PIN | IN | Get I2S RX data pin (returns uint8_t) |
+| 0x68 | REQ_SET_ADAT_INPUT_ENABLE | OUT | Enable/disable ADAT input (1 byte 0/1; RP2350 only) |
+| 0x69 | REQ_GET_ADAT_INPUT_ENABLE | IN | Get ADAT input enable state (uint8_t) |
+| 0x6A | REQ_SET_ADAT_INPUT_PIN | OUT | Set ADAT RX GPIO (uint8_t; 0xFF = unset; may equal the ADAT output pin for loopback self-test) |
+| 0x6B | REQ_GET_ADAT_INPUT_PIN | IN | Get ADAT RX GPIO (uint8_t) |
+| 0x6C | REQ_SET_ADAT_INPUT_CLOCK_MODE | OUT | Set ADAT clock mode (uint8_t 0=master, 1=slave); deferred apply |
+| 0x6D | REQ_GET_ADAT_INPUT_CLOCK_MODE | IN | Get ADAT clock mode (uint8_t) |
+| 0x6E | REQ_GET_ADAT_INPUT_STATUS | IN | Get 20-byte AdatInputStatusPacket (0x6F reserved) |
 
 *0xE4/0xE9/0xF1 use the immediate-response SET pattern (same as `REQ_SET_I2S_BCK_PIN`).
 
 ### Persistence
-*Last updated: 2026-07-11 (I2S clock-pin mode persisted: slot V29, directory V14, FlashOutputConfig 31 bytes; wire claims two reserved bytes, no version bump)*
+*Last updated: 2026-07-13 (ADAT input config persisted: wire V24, slot V32, directory V15)*
 
 - `SLOT_DATA_VERSION` 13 adds `input_source` (uint8_t) to `PresetSlot`
 - Slots with version < 13 leave input source at its current value (USB by default)
@@ -3048,6 +3076,7 @@ How the pools get filled depends on the input's clock role, because the prefill 
 - `SLOT_DATA_VERSION` 29 appends `i2s_clock_pin_mode` (uint8_t; 0=unified, 1=split) and `i2s_bck_pin_slave` (uint8_t; slave-mode BCK GPIO, 0 = unset → `PICO_I2S_BCK_PIN_SLAVE`) to `PresetSlot` (struct grows 2 bytes; tail-append with the same per-version CRC-range mechanism as V28, `SLOT_DATA_SIZE_V29`). Pre-V29 slots read the missing bytes as 0 (= unified + unset), the correct defaults. Both fields are gated on `slot->version >= 29` in `io_config_from_slot()` and follow `output_config_mode` exactly like the other IO fields (WITH_PRESET resolves device-global baseline then slot override; INDEPENDENT uses the device-global directory value). Unlike `i2s_clock_mode` the pin mode has no pending mechanism: `io_config_apply()` installs it live (after the master BCK, before RX validation, since the RX check reads the live pin mode / slave pin), and arms a deferred input restart only if `i2s_effective_bck_pin()` actually moved while I2S is the live source.
 - `WireI2SConfig` claims two of its reserved bytes for `clock_pin_mode_p1` (+1 sentinel, 0 = absent/keep-live; 1 = unified, 2 = split) and `bck_pin_slave` (0 = absent/keep-live); size unchanged, **no `WIRE_FORMAT_VERSION` bump** (stays 21; old hosts send zeros here). Apply validates the RX set against the values that will actually be installed, installs the pin mode live and the slave pin only if acceptable and non-overlapping with the master pair, and arms a deferred restart if the effective input pair moved.
 - `FlashOutputConfig` grows 2 more bytes for `i2s_clock_pin_mode` + `i2s_bck_pin_slave`, bumping `DIR_VERSION_CURRENT` 13→14 (29 → 31 bytes) with a V13→V14 directory migration (`FlashOutputConfig_v13`/`PresetDirectory_v13` frozen snapshots; the new bytes default to 0 = unified + unset). The V12→V14 and earlier migrations copy their shorter configs forward with the trailing clock/clock-pin bytes staying 0. The device-global values survive boot in independent IO mode via `REQ_SAVE_OUTPUT_CONFIG`.
+- **ADAT input (RP2350).** `WireInputConfig` gains `adat_input_pin`, `adat_input_enabled_p1` (enable + 1; 0 = absent), and `adat_clock_mode_p1` (mode + 1; 0 = absent, 1 = master, 2 = slave), bumping `WIRE_FORMAT_VERSION` to 24. `PresetSlot` tail-appends the same fields (`SLOT_DATA_VERSION` 32; pre-V32 slots load ADAT disabled / pin unset / master) and `FlashOutputConfig` carries them for the device-global path (`DIR_VERSION_CURRENT` 15), honoring `output_config_mode` exactly like the other physical-IO config. RP2040 stores and round-trips the fields but can never select the source.
 
 
 ### I2S Clock-Slave Input Mode
@@ -3075,6 +3104,31 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 **Role election and transitions.** `i2s_input_should_be_master()` returns false in slave mode and `i2s_input_start()` derives the external role itself (`i2s_role_extclk`); `i2s_input_resync()` is a no-op for the external role (output restarts never glitch the external LRCLK). `process_type_switches()` waits out a freshly armed DAC hardware-mute hold after its own mute assert (instant for pre-gated callers; protects rebuilds that run after a completed reset already released the mute) and treats a same-type I2S slot whose live `clock_master`/`external_clock`/`clock_pin_base` state mismatches the target as a change, which is how clock-mode and input-source transitions rebuild slot clocking without a type diff (`rebuild_i2s_output_clocking()`); its MCK block enforces the slave-mode force-off. Mode changes are deferred (`pending_i2s_clock_mode` + `i2s_clock_mode_change_pending`, handler placed before the input-source switch handler): dormant applies just record the global; a live apply mutes, restarts the input, rebuilds I2S output clocking, restores the selected rate + MCK policy when returning to master mode, and emits the apply-time `PARAM_CHANGED`. The input-source switch handler rebuilds I2S slot clocking whenever a switch crosses the slave-clocked I2S boundary, and the preset-load / preset-delete / factory-reset / bulk-apply flows call the same rebuild after applying IO config, covering restores that install a new `i2s_bck_pin`, slave pin, or clock-pin mode with an unchanged type map (the mismatch detection compares the instance's `clock_pin_base` against `i2s_effective_bck_pin()`, so a UNIFIED↔SPLIT flip under slave clocking rebuilds the slots onto the newly effective pair). In slave mode the stored master-mode `i2s_input_rate` is fully dormant: the vendor SET, the source-switch target rate, and the preset/bulk restart paths all skip arming it, leaving the detected external rate as the only authority. The restart-path gates check the EFFECTIVE mode (`pending_i2s_clock_mode` when a flip is deferred, else the live global), since a restore can defer a master-to-slave flip in the same apply; the mode handler additionally drops any pending rate change that raced the flip into slave.
 
 **Hardware notes.** The external master must run BCK = 64 x Fs with standard LRCLK polarity (no runtime format detection). Whenever the device is NOT in slave-clocked I2S operation it drives BCK/LRCLK itself if any I2S output or I2S input is active, so a hard-wired external master and the device can transiently both drive the pins across boots and mode/source transitions (documented user constraint; the firmware minimizes the windows). SPLIT clock-pin mode addresses this directly: because master (and every non-slave) role drives `i2s_bck_pin` while the external master feeds the separate `i2s_bck_pin_slave` pair, the two never contend on the same GPIOs; the dual-driver caveat applies only in UNIFIED mode where both share one pair.
+
+### ADAT Input (RP2350 only)
+*Last updated: 2026-07-13*
+
+`INPUT_SOURCE_ADAT` (3) is an 8-channel, 24-bit ADAT lightpipe input from one TOSLINK receiver, 44.1/48 kHz only (no SMUX/96k). Disabled by default; selectable only when `adat_input_enabled != 0` AND `adat_input_pin != 0xFF`, and only on RP2350 (RP2040 keeps the config state for wire/preset round-trips but has no PIO/DMA budget for the receiver). Files: `adat_input.c/h`, `adat_input.pio`.
+
+**Receiver architecture.** PIO1 SM2 runs the `adat_rx` NRZI decoder (`adat_input.pio`, 13 instructions) at 2048 x Fs (8 PIO cycles per wire bit). Two mirrored halves each poll the JMP (RX) pin twice per bit cell (C/2 apart): no change at either poll decodes a 0, a change decodes a 1 and re-anchors the cell grid to the detecting poll, so sampling-phase error is re-bounded at every transition (~2% clock accuracy suffices; the 16.8 divider error is under 300 ppm and is never servoed). The SM emits the decoded bitstream MSB-first, autopushed every 32 bits. DMA channel 15 (the one permanently free channel) streams the words into an 8 KB / 2048-word ring in ENDLESS transfer-count mode with a hardware write-address wrap: a free-running ring with no IRQ and no reload channel. Frame handling is entirely CPU-side in the main-loop poll.
+
+**Frame sync and loss detection.** The sync header's 10-zero run cannot occur in channel data (ADAT forces a 1 every 5th bit, bounding data runs to 4), so `adat_rx_scan()` searches fresh decoded bits for the 12-bit structural pattern `[1][10x0][1]` (`0x801`) to find the frame boundary. Once found, frames sit at a fixed bit offset (edge resync in the PIO absorbs clock offset, so exactly 256 bits arrive per frame) and `adat_rx_decode_frame()` unstuffs the 8 channel fields (exact inverse of `adat_encode_frame` in adat_output.c) into int32 full-scale. Each frame's header is verified before its samples are trusted; header verification doubles as the loss detector, since a dark or unplugged line decodes as zeros and never matches the header. An isolated bad frame is skipped while the lock holds; `ADAT_HDR_FAIL_LIMIT` (2) consecutive bad headers drop the lock (`slip_count`++).
+
+**Lock machine** (`AdatInputState`): INACTIVE (hardware stopped) -> ACQUIRING (slave: measuring wire rate; master: waiting for a valid device rate) -> SYNCING (searching for / verifying the frame sync, `ADAT_SYNC_VERIFY_FRAMES` = 8 consecutive good headers) -> LOCKED (decoding audio) -> RELOCKING (signal or rate lost; outputs muted exactly like a SPDIF lock loss). The main loop reacts to RELOCKING with the same mute/drain/prefill flow as SPDIF.
+
+**Clock modes** (`adat_clock_mode`, default MASTER):
+- **MASTER:** the far end locks to DSPi's ADAT output, so the return stream is already in our clock domain; no rate detection, no servo. The device is the rate authority via `REQ_SET_INPUT_RATE` (shared with I2S master mode). Above 48 kHz the input parks with `rate_ok = false` (outputs stay muted through a never-completing prefill), mirroring the ADAT output's suspension above 48k.
+- **SLAVE:** external gear owns the clock. The wire rate is auto-detected from the RX DMA write pointer (i2s_input.c slave-machine pattern: 32 ms fast windows snapped to 44.1/48 kHz with 2% tolerance, plus a dual-anchor 8-16 s long window for a ~0.1 ppm servo reference), and all outputs (SPDIF/I2S/ADAT TX dividers + MCK) are servoed to it via `input_servo_apply()`, exactly like SPDIF input. `adat_input_check_rate_change()` feeds the standard deferred `pending_rate` mechanism when the detected rate differs from `audio_state.freq`.
+
+**Prefill flow.** On lock the poll batches whole frames (`ADAT_INPUT_MIN_BLOCK` = 48, ~1 ms at 48k, capped at 192/poll), decodes each into the pipeline input buffers (`buf_l`/`buf_r` + `buf_in_ext[0..5]`) with per-channel preamp, and calls `process_input_block()`. A lap guard skips whole frames (preserving frame phase, since the ring holds an exact number of frames) before the reader can be overwritten.
+
+**Loopback self-test.** The RX pin may deliberately equal the ADAT output pin: `adat_input_start()` only sets the pad's input enable and never touches funcsel, so the PIO reads the pad the ADAT TX drives; this is a zero-hardware loopback self-test. `adat_input_stop()` clears input-enable only, safe on the shared pin.
+
+**Main-loop integration** (`main.c`): the poll + prefill block, the source-switch branches, the deferred clock-mode handler (`adat_clock_mode_change_pending`), boot-into-ADAT, the `adat_input_restart_pending` handler (enable/pin change while ADAT is the live source), and the `perform_rate_change` hook (`adat_input_on_rate_change`) mirror the SPDIF/I2S input plumbing. Status is surfaced by `REQ_GET_ADAT_INPUT_STATUS` (0x6E, 20-byte `AdatInputStatusPacket`) and `NOTIFY_EVT_ADAT_INPUT_STATE` (0x0B) on every state change.
+
+**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` is fixed BSS; the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the sync-search scan stays cold in flash, since it runs only while muted). See "Memory Layout".
+
+**Persistence.** ADAT input config persists like the optional SPDIF inputs (disabled by default, pin `0xFF` = unset, GPIO claimed only while ADAT is the active source). `WireInputConfig` (V24) gains `adat_input_pin`, `adat_input_enabled_p1` (enable + 1; 0 absent), and `adat_clock_mode_p1` (mode + 1; 0 absent, 1 master, 2 slave). The fields also ride `PresetSlot` (`SLOT_DATA_VERSION` 32) and the device-global `FlashOutputConfig` (`DIR_VERSION` 15), honoring `output_config_mode` exactly like the other physical-IO config. Vendor commands: `REQ_SET/GET_ADAT_INPUT_ENABLE` (0x68/0x69), `REQ_SET/GET_ADAT_INPUT_PIN` (0x6A/0x6B), `REQ_SET/GET_ADAT_INPUT_CLOCK_MODE` (0x6C/0x6D), `REQ_GET_ADAT_INPUT_STATUS` (0x6E); 0x6F reserved.
 
 ---
 

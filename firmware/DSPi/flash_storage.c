@@ -156,7 +156,12 @@
 //        tail-append like V22..V30: V21..V30 slots still load via
 //        slot_data_size_for_version; older slots have no psybass data and load
 //        the disabled/all-outputs defaults (see apply_slot_to_live).
-#define SLOT_DATA_VERSION       31
+//   V32: ADAT input config appended (adat_input_pin + adat_input_enabled +
+//        adat_input_clock_mode; struct grows by 3 bytes).  Backward-compatible
+//        tail-append like V22..V31: V21..V31 slots still load via
+//        slot_data_size_for_version; older slots decode as disabled / pin unset
+//        (0xFF) / master since io_config_from_slot gates the read on version >= 32.
+#define SLOT_DATA_VERSION       32
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -225,7 +230,13 @@ typedef struct __attribute__((packed)) {
                                      // zero-filled/missing byte
     uint8_t i2s_bck_pin_slave;       // Slave-mode BCK GPIO (SPLIT only); LRCLK = +1
                                      // (0 = unset → PICO_I2S_BCK_PIN_SLAVE)
-} FlashOutputConfig;                 // 31 bytes
+    uint8_t adat_input_pin;          // ADAT RX GPIO (DIR V15+; 0xFF = unset).  Grows the
+                                     // struct by 3 bytes, so the V14→V15 directory migration
+                                     // reads old configs via FlashOutputConfig_v14; the pin
+                                     // is seeded to 0xFF (not the zero-fill 0) on that path
+    uint8_t adat_input_enabled;      // ADAT input enable (0/1)
+    uint8_t adat_input_clock_mode;   // ADAT input clock: 0=master, 1=slave
+} FlashOutputConfig;                 // 34 bytes
 
 // Historical 20-byte device-global IO config (directory V4), before the I2S
 // multichannel input fields were appended.  Read only by the V4→V5 directory
@@ -350,6 +361,32 @@ typedef struct __attribute__((packed)) {
     uint8_t i2s_clock_mode;
 } FlashOutputConfig_v13;             // 29 bytes
 
+// Historical 31-byte device-global IO config (directory V14), before the ADAT
+// input fields were appended.  A strict prefix of the live FlashOutputConfig;
+// read only by the V14→V15 directory migration (prefix memcpy widens it; the
+// migration explicitly seeds adat_input_pin = 0xFF since the zero-fill tail
+// would misread as GPIO 0).
+typedef struct __attribute__((packed)) {
+    uint8_t output_pins[8];
+    uint8_t output_types[4];
+    uint8_t i2s_bck_pin;
+    uint8_t i2s_mck_pin;
+    uint8_t i2s_mck_enabled;
+    uint8_t i2s_mck_multiplier;
+    uint8_t spdif_rx_pin;
+    uint8_t i2s_rx_pin;
+    uint8_t i2s_input_rate_p1;
+    uint8_t i2s_input_channels;
+    uint8_t i2s_rx_pin_ext[3];
+    uint8_t adat_enabled;
+    uint8_t adat_pin;
+    uint8_t spdif_rx_enabled_ext;
+    uint8_t spdif_rx_pin_ext[2];
+    uint8_t i2s_clock_mode;
+    uint8_t i2s_clock_pin_mode;
+    uint8_t i2s_bck_pin_slave;
+} FlashOutputConfig_v14;             // 31 bytes
+
 // --- Preset Directory v1 (legacy — kept only for upgrade migration) ---
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -461,6 +498,12 @@ typedef struct __attribute__((packed)) {
 //
 // V14 grows the device-global output_config by 2 bytes (I2S clock-pin mode:
 // i2s_clock_pin_mode + i2s_bck_pin_slave); same INDEPENDENT/WITH_PRESET model.
+//
+// V15 grows the device-global output_config by 3 bytes (ADAT input:
+// adat_input_pin + adat_input_enabled + adat_input_clock_mode); same
+// INDEPENDENT/WITH_PRESET model.  The V14→V15 migration reads the old layout
+// through FlashOutputConfig_v14 / PresetDirectory_v14 and seeds adat_input_pin
+// to 0xFF (the zero-fill 0 would misread as GPIO 0).
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -490,7 +533,9 @@ typedef struct __attribute__((packed)) {
     // V13 grows it by 1 byte (I2S clock master/slave mode: i2s_clock_mode).
     // V14 grows it by 2 bytes (I2S clock-pin mode: i2s_clock_pin_mode +
     // i2s_bck_pin_slave).
-    FlashOutputConfig output_config;         // 31 bytes
+    // V15 grows it by 3 bytes (ADAT input: adat_input_pin + adat_input_enabled +
+    // adat_input_clock_mode).
+    FlashOutputConfig output_config;         // 34 bytes
 
     // V6 addition: device-level external control-interface config (board-level).
     UartCtrlConfig uart_ctrl;                // 8 bytes; enabled=0 by default
@@ -759,7 +804,34 @@ typedef struct __attribute__((packed)) {
     CsIrConfig cs_ir;                        // 132 bytes
 } PresetDirectory_v13;
 
-#define DIR_VERSION_CURRENT  14
+// Historical directory layout at V14, before the ADAT input fields grew the
+// device-global output_config.  Read only by the V14->V15 migration in
+// load_directory(); identical to the current PresetDirectory except
+// output_config is the frozen 31-byte FlashOutputConfig_v14 (no adat_input_*).
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t reserved;
+    uint32_t crc32;
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig_v14 output_config;     // 31 bytes (frozen pre-ADAT-input layout)
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+    CsIrConfig cs_ir;                        // 132 bytes
+} PresetDirectory_v14;
+
+#define DIR_VERSION_CURRENT  15
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -941,6 +1013,17 @@ typedef struct __attribute__((packed)) {
     float    psybass_drive_db;
     float    psybass_character_pct;
     float    psybass_original_db;
+
+    // ADAT input (V32+, struct grows by 3 bytes).  Raw values: adat_input_pin
+    // 0xFF = unset; adat_input_enabled 0/1; adat_input_clock_mode 0=master,
+    // 1=slave.  Gated on version >= 32 in io_config_from_slot() so older slots
+    // decode as disabled / pin unset / master (a zero-filled adat_input_pin
+    // would misread as GPIO 0, hence the version gate rather than a 0 sentinel).
+    // Fields are always stored (both platforms); RP2040 keeps them for
+    // round-trips but never selects the source.
+    uint8_t adat_input_pin;          // 0xFF = unset
+    uint8_t adat_input_enabled;      // 0/1
+    uint8_t adat_input_clock_mode;   // 0=master, 1=slave
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -1165,6 +1248,46 @@ static bool dir_load_cache(void) {
         return true;
     }
 
+    if (flash_dir->version == 14) {
+        // V14 -> V15 migration.  V15 grows the device-global output_config by
+        // 3 bytes (ADAT input: adat_input_pin + adat_input_enabled +
+        // adat_input_clock_mode).  Validate the v14 CRC, copy every field
+        // forward, and widen the 31-byte output_config by prefix memcpy; the new
+        // tail bytes stay 0 from the memset (= disabled + master), then seed
+        // adat_input_pin to 0xFF (the zero-fill 0 would misread as GPIO 0).
+        const PresetDirectory_v14 *v14 = (const PresetDirectory_v14 *)flash_dir;
+        const uint8_t *v14_data_start = (const uint8_t *)&v14->startup_mode;
+        size_t v14_data_len = sizeof(PresetDirectory_v14) - offsetof(PresetDirectory_v14, startup_mode);
+        if (crc32(v14_data_start, v14_data_len) != v14->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v14->startup_mode;
+        dir_cache.default_slot       = v14->default_slot;
+        dir_cache.last_active_slot   = v14->last_active_slot;
+        dir_cache.output_config_mode = v14->output_config_mode;
+        dir_cache.slot_occupied      = v14->slot_occupied;
+        dir_cache.master_volume_mode = v14->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v14->spdif_rx_pin;
+        dir_cache.master_volume_db   = v14->master_volume_db;
+        memcpy(dir_cache.slot_names, v14->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v14->dac_hw_mute;
+        memcpy(&dir_cache.output_config, &v14->output_config, sizeof(v14->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // unset (not the zero-fill 0)
+        dir_cache.uart_ctrl          = v14->uart_ctrl;
+        dir_cache.i2c_ctrl           = v14->i2c_ctrl;
+        dir_cache.cs_config          = v14->cs_config;
+        memcpy(dir_cache.cs_names, v14->cs_names, sizeof(dir_cache.cs_names));
+        dir_cache.cs_ir              = v14->cs_ir;
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
+        return true;
+    }
+
     if (flash_dir->version == 13) {
         // V13 -> V14 migration.  V14 grows the device-global output_config by
         // 2 bytes (I2S clock-pin mode: i2s_clock_pin_mode + i2s_bck_pin_slave).
@@ -1190,6 +1313,7 @@ static bool dir_load_cache(void) {
         memcpy(dir_cache.slot_names, v13->slot_names, sizeof(dir_cache.slot_names));
         dir_cache.dac_hw_mute        = v13->dac_hw_mute;
         memcpy(&dir_cache.output_config, &v13->output_config, sizeof(v13->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v13->uart_ctrl;
         dir_cache.i2c_ctrl           = v13->i2c_ctrl;
         dir_cache.cs_config          = v13->cs_config;
@@ -1229,6 +1353,7 @@ static bool dir_load_cache(void) {
         memcpy(dir_cache.slot_names, v12->slot_names, sizeof(dir_cache.slot_names));
         dir_cache.dac_hw_mute        = v12->dac_hw_mute;
         memcpy(&dir_cache.output_config, &v12->output_config, sizeof(v12->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v12->uart_ctrl;
         dir_cache.i2c_ctrl           = v12->i2c_ctrl;
         dir_cache.cs_config          = v12->cs_config;
@@ -1267,6 +1392,7 @@ static bool dir_load_cache(void) {
         memcpy(dir_cache.slot_names, v11->slot_names, sizeof(dir_cache.slot_names));
         dir_cache.dac_hw_mute        = v11->dac_hw_mute;
         memcpy(&dir_cache.output_config, &v11->output_config, sizeof(v11->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v11->uart_ctrl;
         dir_cache.i2c_ctrl           = v11->i2c_ctrl;
         dir_cache.cs_config          = v11->cs_config;
@@ -1305,6 +1431,7 @@ static bool dir_load_cache(void) {
         dir_cache.dac_hw_mute        = v10->dac_hw_mute;
         // 25-byte v11 config into the 28-byte field; SPDIF 2/3 bytes stay 0
         memcpy(&dir_cache.output_config, &v10->output_config, sizeof(v10->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v10->uart_ctrl;
         dir_cache.i2c_ctrl           = v10->i2c_ctrl;
         dir_cache.cs_config          = v10->cs_config;   // already format v2
@@ -1342,6 +1469,7 @@ static bool dir_load_cache(void) {
         dir_cache.dac_hw_mute        = v9->dac_hw_mute;
         // 25-byte v11 config into the 31-byte field; new tail bytes stay 0
         memcpy(&dir_cache.output_config, &v9->output_config, sizeof(v9->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v9->uart_ctrl;
         dir_cache.i2c_ctrl           = v9->i2c_ctrl;
         dir_cache.cs_config          = v9->cs_config;   // already format v2
@@ -1380,6 +1508,7 @@ static bool dir_load_cache(void) {
         dir_cache.dac_hw_mute        = v8->dac_hw_mute;
         // 25-byte v11 config into the 31-byte field; new tail bytes stay 0
         memcpy(&dir_cache.output_config, &v8->output_config, sizeof(v8->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v8->uart_ctrl;
         dir_cache.i2c_ctrl           = v8->i2c_ctrl;
         cs_config_from_v1(&dir_cache.cs_config, &v8->cs_config);
@@ -1415,6 +1544,7 @@ static bool dir_load_cache(void) {
         memcpy(dir_cache.slot_names, v7->slot_names, sizeof(dir_cache.slot_names));
         dir_cache.dac_hw_mute        = v7->dac_hw_mute;
         memcpy(&dir_cache.output_config, &v7->output_config, sizeof(v7->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.output_config.adat_enabled = 0;
 #if PICO_RP2350
         dir_cache.output_config.adat_pin = PICO_ADAT_PIN;
@@ -1453,6 +1583,7 @@ static bool dir_load_cache(void) {
         dir_cache.dac_hw_mute        = v6->dac_hw_mute;
         // 23-byte v7 config into the 28-byte field; adat + clock/clock-pin bytes stay 0 (unset/master/unified)
         memcpy(&dir_cache.output_config, &v6->output_config, sizeof(v6->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         dir_cache.uart_ctrl          = v6->uart_ctrl;
         dir_cache.i2c_ctrl           = v6->i2c_ctrl;
         dir_cache.cs_config.version  = CS_CONFIG_VERSION;
@@ -1485,6 +1616,7 @@ static bool dir_load_cache(void) {
         dir_cache.dac_hw_mute        = v5->dac_hw_mute;
         // 23-byte v7 config into the 28-byte field; adat + clock/clock-pin bytes stay 0 (unset/master/unified)
         memcpy(&dir_cache.output_config, &v5->output_config, sizeof(v5->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);
         dir_cache_valid = true;
         (void)dir_flush();   // persist at the current version
@@ -1517,6 +1649,7 @@ static bool dir_load_cache(void) {
         memcpy(dir_cache.slot_names, v4->slot_names, sizeof(dir_cache.slot_names));
         dir_cache.dac_hw_mute        = v4->dac_hw_mute;
         memcpy(&dir_cache.output_config, &v4->output_config, sizeof(v4->output_config));
+        dir_cache.output_config.adat_input_pin = 0xFF;   // V15 field: unset (not zero-fill 0)
         ctrl_iface_defaults(&dir_cache.uart_ctrl, &dir_cache.i2c_ctrl);  // V6 blocks
         dir_cache_valid = true;
         (void)dir_flush();   // persist as V5
@@ -1888,6 +2021,10 @@ static void io_config_defaults(FlashOutputConfig *cfg) {
     cfg->i2s_clock_mode = I2S_CLOCK_MODE_MASTER;   // master (0) is the default
     cfg->i2s_clock_pin_mode = I2S_CLOCK_PIN_MODE_UNIFIED;  // unified (0) is the default
     cfg->i2s_bck_pin_slave  = PICO_I2S_BCK_PIN_SLAVE;
+    // ADAT input: disabled, pin unset (0xFF), master clock.
+    cfg->adat_input_pin        = 0xFF;
+    cfg->adat_input_enabled    = 0;
+    cfg->adat_input_clock_mode = ADAT_CLOCK_MODE_MASTER;
 }
 
 // Snapshot the live IO globals into cfg (for REQ_SAVE_OUTPUT_CONFIG).
@@ -1921,6 +2058,10 @@ static void io_config_from_live(FlashOutputConfig *cfg) {
     // I2S clock-pin mode + slave-pair BCK (both platforms).
     cfg->i2s_clock_pin_mode = i2s_clock_pin_mode;
     cfg->i2s_bck_pin_slave  = i2s_bck_pin_slave;
+    // ADAT input (both platforms; RP2040 keeps state for round-trips).
+    cfg->adat_input_pin        = adat_input_pin;
+    cfg->adat_input_enabled    = adat_input_enabled ? 1 : 0;
+    cfg->adat_input_clock_mode = adat_clock_mode;
 }
 
 // Extract a slot's IO config into cfg, honoring the slot's data version
@@ -2035,6 +2176,21 @@ static void io_config_from_slot(const PresetSlot *slot, FlashOutputConfig *cfg) 
         }
         cfg->i2s_clock_pin_mode = pm;
         cfg->i2s_bck_pin_slave  = sp;
+    }
+
+    // ADAT input (V32+): device-global baseline, slot overrides.  adat_input_pin
+    // 0xFF = unset (keep baseline); enable + clock mode override wholesale.  The
+    // version gate keeps a pre-V32 slot's zero-filled tail from misreading as
+    // GPIO 0 / disabled / master, defaulting to the device baseline instead.
+    cfg->adat_input_pin        = dir_cache.output_config.adat_input_pin;
+    cfg->adat_input_enabled    = dir_cache.output_config.adat_input_enabled;
+    cfg->adat_input_clock_mode = dir_cache.output_config.adat_input_clock_mode;
+    if (slot->version >= 32) {
+        cfg->adat_input_enabled = slot->adat_input_enabled ? 1 : 0;
+        if (slot->adat_input_clock_mode <= 1)
+            cfg->adat_input_clock_mode = slot->adat_input_clock_mode;
+        if (slot->adat_input_pin != 0xFF)
+            cfg->adat_input_pin = slot->adat_input_pin;
     }
 }
 
@@ -2254,6 +2410,52 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
         adat_output_set_config(cfg->adat_enabled != 0 && pin_ok, pin);
     }
 #endif
+
+#if PICO_RP2350
+    // ADAT input pin + enable (RP2350).  adat_input_pin 0xFF = unset.  A stored
+    // pin that differs from the live one and fails the ownership check falls back
+    // to unset + disabled (an enabled input with no valid pin is inconsistent and
+    // unselectable).  A disable of the live source is refused (mirrors the
+    // SPDIF-ext precedent); a pin/enable change while ADAT is active arms a
+    // deferred input restart.
+    {
+        uint8_t pin = cfg->adat_input_pin;
+        uint8_t en  = cfg->adat_input_enabled ? 1 : 0;
+        if (pin != 0xFF && pin != adat_input_pin && !adat_input_pin_acceptable(pin)) {
+            printf("io_config: ADAT input pin %u rejected (invalid/conflict); unset\n",
+                   (unsigned)pin);
+            pin = 0xFF;
+        }
+        if (pin == 0xFF) en = 0;   // no valid pin -> cannot be enabled
+        if (en == 0 && adat_input_enabled &&
+            (active_input_source == INPUT_SOURCE_ADAT ||
+             (input_source_change_pending &&
+              pending_input_source == INPUT_SOURCE_ADAT))) {
+            printf("io_config: ADAT input kept enabled (active source)\n");
+            pin = adat_input_pin;
+            en  = 1;
+        }
+        bool changed = (pin != adat_input_pin) || (en != adat_input_enabled);
+        adat_input_pin     = pin;
+        adat_input_enabled = en;
+        if (changed && active_input_source == INPUT_SOURCE_ADAT)
+            adat_input_restart_pending = true;
+    }
+#endif
+
+    // ADAT input clock master/slave mode (both platforms; round-trips on RP2040).
+    // Live-vs-dormant split like i2s_clock_mode: dormant writes the global
+    // directly; live defers to the main-loop handler.
+    if (cfg->adat_input_clock_mode <= 1 &&
+        cfg->adat_input_clock_mode != adat_clock_mode) {
+        if (active_input_source == INPUT_SOURCE_ADAT) {
+            pending_adat_clock_mode = cfg->adat_input_clock_mode;
+            __dmb();
+            adat_clock_mode_change_pending = true;
+        } else {
+            adat_clock_mode = cfg->adat_input_clock_mode;   // dormant/boot apply
+        }
+    }
 }
 
 // Re-derive the live physical IO config for a preset *context* change — the
@@ -2389,6 +2591,12 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->psybass_drive_db      = psybass_config.drive_db;
     slot->psybass_character_pct = psybass_config.character_pct;
     slot->psybass_original_db   = psybass_config.original_db;
+
+    // ADAT input (V32): raw pin (0xFF unset) + enable + clock mode (both
+    // platforms; RP2040 stores its default state for round-trips).
+    slot->adat_input_pin        = adat_input_pin;
+    slot->adat_input_enabled    = adat_input_enabled ? 1 : 0;
+    slot->adat_input_clock_mode = adat_clock_mode;
 
     // Channel names
     memcpy(slot->channel_names, channel_names, sizeof(slot->channel_names));
@@ -2774,8 +2982,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // SPDIF inputs 2/3; V25 appended the leveller channel masks; V26 appended the
 // loudness output mask; V27 appended the crossfeed output pair mask; V28
 // appended i2s_clock_mode; V29 appended i2s_clock_pin_mode + i2s_bck_pin_slave;
-// V30 appended peq_qp_x512, so V29's range stops where that begins (a stored
-// slot's CRC was computed without the fields its version predates).
+// V30 appended peq_qp_x512; V31 appended psybass; V32 appended the ADAT input
+// fields, so V31's range stops where those begin (a stored slot's CRC was
+// computed without the fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -2797,19 +3006,23 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V30 \
     (offsetof(PresetSlot, psybass_enabled) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V31 \
+    (offsetof(PresetSlot, adat_input_pin) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V32 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
 // (I2S clock master/slave mode), V29 (I2S clock-pin mode), V30 (Linkwitz
-// Transform per-band target Q) and V31 (psychoacoustic bass) are
-// backward-compatible tail-appends.  V21..V31 slots are all accepted (an older
-// slot loads with the newer fields defaulted to unset) while older/unknown
+// Transform per-band target Q), V31 (psychoacoustic bass) and V32 (ADAT input)
+// are backward-compatible tail-appends.  V21..V32 slots are all accepted (an
+// older slot loads with the newer fields defaulted to unset) while older/unknown
 // versions are invalidated and the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 31
+        case SLOT_DATA_VERSION:   // 32
+            return SLOT_DATA_SIZE_V32;
+        case 31:
             return SLOT_DATA_SIZE_V31;
         case 30:
             return SLOT_DATA_SIZE_V30;

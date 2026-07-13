@@ -188,6 +188,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_CROSSFEED_ITD       0x66
 #define REQ_GET_CROSSFEED_ITD       0x67
 
+// ADAT Input Commands (RP2350 only; state round-trips on RP2040). 0x6F reserved.
+#define REQ_SET_ADAT_INPUT_ENABLE      0x68
+#define REQ_GET_ADAT_INPUT_ENABLE      0x69
+#define REQ_SET_ADAT_INPUT_PIN         0x6A
+#define REQ_GET_ADAT_INPUT_PIN         0x6B
+#define REQ_SET_ADAT_INPUT_CLOCK_MODE  0x6C
+#define REQ_GET_ADAT_INPUT_CLOCK_MODE  0x6D
+#define REQ_GET_ADAT_INPUT_STATUS      0x6E
+
 // Matrix Mixer Commands
 #define REQ_SET_MATRIX_ROUTE        0x70
 #define REQ_GET_MATRIX_ROUTE        0x71

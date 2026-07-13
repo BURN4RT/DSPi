@@ -1,0 +1,316 @@
+# ADAT Input
+
+*Last updated: 2026-07-13*
+
+## Overview
+
+The ADAT input is a selectable 8-channel input source: one TOSLINK receiver
+delivers ADAT lightpipe audio into the DSP pipeline, where the 8 channels
+become input channels 0..7 of the unified channel model (per-input PEQ,
+metering, and the full 8x9 routing matrix all apply, exactly as they do for
+8-channel USB input). Together with the ADAT output it turns DSPi plus an
+outboard ADC/DAC box (for example a Behringer ADA8200) into a complete
+analog-in to analog-out processor.
+
+| Property | Value |
+|---|---|
+| Platform | RP2350 only (RP2040 lacks the channels, PIO and DMA budget) |
+| Input source value | 3 (`INPUT_SOURCE_ADAT`, `REQ_SET_INPUT_SOURCE` 0xE0) |
+| Channels | 8 (input channels 0..7) |
+| Sample rates | 44.1 kHz and 48 kHz only |
+| Bit depth | 24-bit |
+| S/MUX (96 kHz) | Not supported; an S/MUX stream never locks |
+| Default GPIO | None free; pin ships unset (0xFF) and must be assigned |
+| Enable state | Disabled by default; must be enabled before it is selectable |
+| Signal | 3.3 V logic NRZI at 256 x Fs from a TOSLINK receiver (~12.3 Mbit/s capable) |
+
+Like the optional SPDIF inputs 2/3, a disabled ADAT input reserves nothing:
+its stored pin is invisible to pin-conflict validation and the GPIO is only
+used while ADAT is enabled. Input sources are exclusive; selecting ADAT
+replaces USB/SPDIF/I2S as the audio source (USB control/config always works).
+
+## Clock modes
+
+The receiver hardware is identical in both modes; the modes differ only in
+who owns the sample rate and whether the output clock servo runs.
+
+### MASTER (0, default)
+
+DSPi is the clock master of the whole chain. The intended wiring:
+
+```
+DSPi ADAT OUT  ->  ADC/DAC box ADAT IN   (box syncs to this stream)
+DSPi ADAT IN   <-  ADC/DAC box ADAT OUT  (returns at the same clock)
+```
+
+Because the box locks to DSPi's ADAT output, the stream returning into the
+ADAT input is already in DSPi's own clock domain. There is no rate
+detection, no clock servo, and no drift by construction. The device is the
+sample-rate authority via `REQ_SET_INPUT_RATE` (0xED), shared with I2S
+master mode (same stored rate). Only 44.1/48 kHz are usable: selecting a
+higher device rate parks the input (`rate_ok = 0` in the status packet,
+outputs muted) until the rate returns to 44.1/48 kHz; this mirrors the ADAT
+output's auto-suspend and needs no host recovery action.
+
+### SLAVE (1)
+
+External gear owns the clock (for example DSPi hangs off an audio
+interface's ADAT output). The wire rate is auto-detected from the receiver's
+DMA word rate (32 ms windows snapped to 44.1/48 kHz, two agreeing windows),
+the pipeline rate follows it through the standard deferred rate-change path,
+and every output (SPDIF and I2S slot dividers, the ADAT output divider, and
+MCK) is servo rate-matched to the recovered clock, exactly like SPDIF input.
+An 8-16 s dual-anchor long window gives the servo a ~0.1 ppm rate reference.
+
+Clock-slaving to ADAT is only in force while ADAT is the active input
+source; switching to any other source restores nominal output dividers.
+
+## Lock states
+
+`state` in the status packet and in every 0x0B notify event:
+
+| Value | State | Meaning |
+|---|---|---|
+| 0 | INACTIVE | Hardware stopped (ADAT is not the active source) |
+| 1 | ACQUIRING | Slave: measuring the wire rate. Master: parked, waiting for a valid (<= 48 kHz) device rate |
+| 2 | SYNCING | Rate known; searching for / verifying the frame sync header |
+| 3 | LOCKED | Decoding audio; outputs enabled after the prefill completes |
+| 4 | RELOCKING | Signal lost or rate changed; outputs muted, re-acquiring |
+
+Loss detection is header-based: every frame's sync header is verified, and
+two consecutive mismatches drop the lock (a dark or unplugged line decodes
+as zeros and never matches). Lock acquisition after a loss is automatic.
+Audio is muted in every state except LOCKED; on each transition into LOCKED
+the outputs are drained, prefilled to 50% with real input audio, and started
+in sync (the same handshake USB/SPDIF/I2S use), so inter-output-slot sample
+alignment is preserved through every ADAT event.
+
+## Vendor commands
+
+Standard vendor EP0 conventions (also reachable over the UART and I2C
+control transports). SET payloads ride in `wValue`; SETs return one status
+byte from the shared `PIN_CONFIG_*` set (config.h): `0x00` SUCCESS, `0x01`
+INVALID_PIN, `0x02` PIN_IN_USE, `0x03` INVALID_OUTPUT, `0x05` INVALID_PARAM.
+
+| Command | ID | Direction | wValue | Response |
+|---|---|---|---|---|
+| `REQ_SET_ADAT_INPUT_ENABLE` | 0x68 | SET | 0 = disable, 1 = enable | 1 status byte |
+| `REQ_GET_ADAT_INPUT_ENABLE` | 0x69 | GET | - | 1 byte: enable (0/1) |
+| `REQ_SET_ADAT_INPUT_PIN` | 0x6A | SET | GPIO, or 0xFF to clear | 1 status byte |
+| `REQ_GET_ADAT_INPUT_PIN` | 0x6B | GET | - | 1 byte: GPIO (0xFF = unset) |
+| `REQ_SET_ADAT_INPUT_CLOCK_MODE` | 0x6C | SET | 0 = master, 1 = slave | 1 status byte |
+| `REQ_GET_ADAT_INPUT_CLOCK_MODE` | 0x6D | GET | - | 1 byte: live mode (0/1) |
+| `REQ_GET_ADAT_INPUT_STATUS` | 0x6E | GET | - | 20-byte `AdatInputStatusPacket` |
+
+0x6F is reserved for future ADAT-input use. Source selection itself is the
+existing `REQ_SET_INPUT_SOURCE` (0xE0) with value 3.
+
+Behavioral notes:
+
+- Order matters: set the pin (0x6A) BEFORE enabling (0x68). Enabling with no
+  pin returns INVALID_PIN. Selecting source 3 while disabled or pin-less is
+  consumed as a no-op by the switch handler.
+- `0x6A` validates the GPIO and rejects conflicts with any owned pin
+  (PIN_IN_USE), with one deliberate exception: the pin MAY equal the ADAT
+  output's pin. The receiver only listens (input-enable, never drives), so
+  jumpering or simply sharing the TX GPIO is the supported zero-hardware
+  loopback self-test (see below). Setting the current pin again is a no-op
+  success. `0xFF` (clear) is accepted only while disabled. If ADAT is the
+  live source, a pin change re-routes under a brief muted restart.
+- `0x68` disable is REFUSED (PIN_IN_USE) while ADAT is the active source or
+  the target of a pending source switch; switch away first. Enable
+  re-validates the stored pin.
+- `0x6C` is deferred: the main loop applies it, instantly when ADAT is not
+  the active source, or under a muted receiver restart when it is. `0x6D`
+  reports the LIVE mode, so a just-sent change may read back stale for a few
+  milliseconds; the apply emits the PARAM_CHANGED notify for the wire field.
+- While ADAT input is enabled its GPIO counts as owned: other pin-assignment
+  commands reject it with PIN_IN_USE (the ADAT output keeps its own claim;
+  the sharing exception is one-directional, input onto output).
+- Rate selection in master mode uses the existing `REQ_SET_INPUT_RATE`
+  (0xED) / `REQ_GET_INPUT_RATE` (0xEE), the same stored rate I2S master mode
+  uses. 96000 is accepted by 0xED but parks the ADAT input (`rate_ok = 0`);
+  hosts should grey out 96 kHz while source 3 is active in master mode.
+  In slave mode 0xED is ignored for ADAT (the wire rate is the authority).
+- On RP2040: 0x68/0x6A SETs return INVALID_OUTPUT, 0x6E returns 20 zero
+  bytes; 0x69/0x6B/0x6D GETs and 0x6C SET still round-trip the stored config
+  so presets and bulk pushes behave identically on both platforms.
+
+### `AdatInputStatusPacket` (REQ_GET_ADAT_INPUT_STATUS, 20 bytes, packed, little-endian)
+
+| Offset | Type | Field | Meaning |
+|---|---|---|---|
+| 0 | u8 | `state` | Lock state (table above) |
+| 1 | u8 | `clock_mode` | Live clock mode: 0 master, 1 slave |
+| 2 | u8 | `enabled` | Configured enable |
+| 3 | u8 | `pin` | Configured RX GPIO (0xFF = unset) |
+| 4 | u8 | `rate_ok` | 0 while parked because the device rate is above 48 kHz |
+| 5 | u8 | `lock_count` | Locks since input start (saturates at 255) |
+| 6 | u8 | `loss_count` | Lock losses since input start (saturates at 255) |
+| 7 | u8 | `slip_count` | Losses caused by header verification failure (bit slips / signal loss) |
+| 8 | u16 | `header_err` | Cumulative header mismatches, including isolated single-frame errors that did not drop the lock (wraps) |
+| 10 | u16 | `reserved` | 0 |
+| 12 | u32 | `detected_rate` | Hz. Slave: the snapped wire rate (valid from SYNCING). Master: the device rate. 0 when unknown/parked |
+| 16 | u32 | `measured_hz` | Slave: raw measured wire rate from the last fast window; 0 in master mode |
+
+A healthy locked link shows `header_err` static and `slip_count = 0`. A
+slowly growing `header_err` with the lock held indicates marginal optical
+signal (isolated bit errors); growing `slip_count`/`loss_count` indicates
+signal dropouts or a rate change upstream.
+
+## Notify event
+
+`NOTIFY_EVT_ADAT_INPUT_STATE` (0x0B), pushed on every lock-state transition.
+10-byte v2 packet:
+
+```
+[0] 0x02 (version)  [1] 0x0B (event)  [2] 0 (flags)  [3] seq
+[4] state           [5..8] detected rate, Hz LE32 (0 unless LOCKED)
+[9] clock_mode
+```
+
+Apps that track ADAT input state should consume this instead of polling
+0x6E. Config changes (enable/pin/clock mode) additionally produce the usual
+`PARAM_CHANGED` events for the `WireInputConfig` fields below.
+
+## Bulk params (REQ_GET/SET_ALL_PARAMS)
+
+`WIRE_FORMAT_VERSION` is **24** (was 23). The three fields claim reserved
+bytes of `WireInputConfig` (Section 15), so the total wire size is unchanged
+(5900 bytes). All three use the 0 = "absent, keep live value" convention so
+zeros pushed by an old host change nothing:
+
+| Field | Encoding |
+|---|---|
+| `adat_input_pin` | 0 = absent/keep, else raw GPIO (0xFF is never on the wire; an unset pin collects as 0) |
+| `adat_input_enabled_p1` | 0 = absent, 1 = disabled, 2 = enabled |
+| `adat_clock_mode_p1` | 0 = absent, 1 = master, 2 = slave |
+
+Apply validates the pin (invalid or conflicting pins keep the live value;
+the ADAT-output-pin sharing exception applies), refuses to disable the live
+source, and routes the clock mode through the same deferred apply as 0x6C.
+
+## Persistence
+
+Same dual-layer model as the other physical IO config:
+
+- Per-preset: `SLOT_DATA_VERSION` **32** adds `adat_input_pin`,
+  `adat_input_enabled`, `adat_input_clock_mode` to each preset slot. Slots
+  saved before V32 read as pin unset / disabled / master, leaving the
+  device-level config in charge.
+- Device-level: directory version **15** mirrors the same three fields;
+  applied at boot; upgrades from older directories seed the defaults.
+- On preset load/boot, a stored pin that now conflicts falls back to unset
+  (with enable forced off) instead of stealing the GPIO; a stored clock mode
+  applies dormantly when ADAT is not the live source.
+
+## App integration patterns
+
+### Bring-up (typical, master mode with an ADA8200-class box)
+
+1. `REQ_SET_ADAT_INPUT_PIN` (0x6A) with the wired GPIO; check status.
+2. `REQ_SET_ADAT_INPUT_CLOCK_MODE` (0x6C) wValue 0 (master; the default).
+3. Configure the ADAT OUTPUT (0xCA/0xCC, see adat_output_spec.md) and
+   connect it to the box's ADAT input; set the box to sync to ADAT.
+4. `REQ_SET_ADAT_INPUT_ENABLE` (0x68) wValue 1; check status.
+5. `REQ_SET_INPUT_SOURCE` (0xE0) wValue 3.
+6. Wait for `NOTIFY_EVT_ADAT_INPUT_STATE` with state 3 (LOCKED), or poll
+   0x6E. Audio flows once the prefill completes (milliseconds after lock).
+7. Route the 8 input channels through the matrix (`REQ_SET_MATRIX_ROUTE`
+   0x70) as with 8-channel USB; per-input PEQ and metering work unchanged.
+8. Persist by saving the preset.
+
+### Slave mode (DSPi hangs off an interface's ADAT out)
+
+Same flow with 0x6C wValue 1. After selecting the source, the device
+detects the wire rate (well under a second), retunes the pipeline if
+needed, locks, and servoes all outputs to the external clock. Rate changes
+at the source are followed automatically (brief mute + relock). Unplugging
+the cable produces state 4 (RELOCKING) and mute; replugging relocks
+automatically.
+
+### Zero-hardware loopback self-test
+
+Because the RX pin may equal the ADAT output pin, a board with ADAT output
+enabled can validate the entire input path with no cabling:
+
+1. Enable ADAT output (0xCA) on its pin.
+2. Set the ADAT input pin (0x6A) to THE SAME GPIO; enable (0x68); master
+   mode; select source 3.
+3. The receiver locks onto the device's own transmitted frames. Play audio
+   into the outputs (USB is not the source, so use the signal generator,
+   cmds 0xA4-0xA8, injected on output channels) and observe the input
+   meters; assert state LOCKED, `header_err` static, `slip_count` 0.
+
+The same test with a physical jumper between two GPIOs exercises real pad
+transitions; with clock mode slave it exercises rate detection and servo
+convergence (the servo settles at the nominal divider since both ends share
+the clock).
+
+### Detection / capability probing
+
+Treat 0x68 returning INVALID_OUTPUT (or the platform ID = RP2040) as "ADAT
+input unavailable". There is no free default GPIO, so a host UI must always
+collect a pin from the user before offering enable.
+
+### Channel names and metering
+
+While source 3 is active the default input channel names are "ADAT 1" ..
+"ADAT 8" (custom names persist as usual). Input metering (`REQ_GET_METERING`
+family) covers all 8 channels, which is what the loopback self-test reads to
+verify channel ordering end to end.
+
+## Signal path and latency
+
+Decoded samples pass through per-channel preamp, per-input PEQ, the
+leveller, and the 8x9 matrix, then the per-output chain; identical to
+8-channel USB input. Input batching adds about 1-4 ms (48-frame minimum
+block, 5.3 ms ring); the output consumer pools add their usual 50% prefill.
+The path is bit-transparent up to the preamp: a 24-bit sample arrives as the
+identical 24-bit value the far end transmitted.
+
+## Wire format (receiver side)
+
+See adat_output_spec.md "Wire format" for the frame layout; the input
+implements the exact inverse. Reception details:
+
+- The PIO program (`adat_input.pio`, PIO1 SM2, 13 instructions) is an NRZI
+  decoder sampling at 8 PIO cycles per wire bit (PIO clock 2048 x Fs). Two
+  mirrored code halves track the line level and poll twice per bit cell; a
+  detected transition emits a 1 and re-anchors the sampling grid, so clock
+  offset never accumulates past one cell (tolerance ~2%, actual worst-case
+  error ~0.4% of a cell). The RX divider is set once per rate and never
+  servoed.
+- DMA channel 15 streams decoded bits into an 8 KB ring using the RP2350
+  ENDLESS transfer-count mode plus hardware address wrap: a free-running
+  ring with no IRQ and no reload channel.
+- Frame sync is found on the CPU: the header's 10-zero run cannot occur in
+  channel data (a forced 1 every 5th bit bounds data runs to 4 zeros), so a
+  single scan fixes the frame boundary; after that, frames sit at a constant
+  bit offset and only the 12 structural header bits are checked per frame
+  (user bits from external gear are ignored, not assumed zero).
+- The decoder was verified bit-exact against the firmware's own ADAT
+  encoder by a host-side round trip at all 32 possible bit offsets
+  (tools/adat_rx_test/adat_rx_roundtrip.c). Hardware interop with a real
+  ADAT transmitter (e.g. ADA8200) is untested as of 2026-07-13.
+
+## Firmware internals (summary)
+
+- Engine: `firmware/DSPi/adat_input.c` (all `#if PICO_RP2350`); RP2040
+  keeps only the four config globals for round-trips.
+- Main-loop poll decodes in >= 48-frame batches (cap 192) into
+  `buf_l`/`buf_r`/`buf_in_ext[0..5]` and calls `process_input_block()`;
+  nibble unstuffing is shift/mask (no LUTs, no RAM tables).
+- Slave-mode servo actuation is the shared `input_servo_apply()`
+  (input_servo.c), extracted verbatim from the SPDIF input servo; the ADAT
+  output picks the servoed divider up on resync via
+  `adat_input_current_tx_divider()`.
+- Rate policy hooks in `perform_rate_change()` (master-mode retune / park);
+  source switching, prefill, clock-mode apply, and pin hot-swap all ride the
+  existing deferred main-loop handlers.
+- RAM cost: 8 KB ring + ~130 B state + ~3 KB RAM-pinned hot code (the
+  RP2350 RAM-image budget in scripts/check_ram_placement.py was raised from
+  64 KB to 72 KB for this).
+- No flash-write or output-type-switch suspension is needed: the receiver
+  has no IRQs, the ring survives stalls (whole-frame lap skip preserves
+  frame phase), and header verification catches anything else.

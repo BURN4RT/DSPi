@@ -56,3 +56,17 @@ volatile uint8_t pending_i2s_clock_mode = I2S_CLOCK_MODE_MASTER;
 // Deferred I2S RX hot-swaps (handled in main loop)
 volatile bool i2s_rx_pin_change_pending = false;
 volatile bool i2s_input_restart_pending = false;
+
+// ADAT input (RP2350 only; the state exists on both platforms so vendor
+// GET/persistence round-trips work everywhere). Disabled by default; no free
+// default GPIO remains, so the pin ships unset and must be assigned by the
+// host before the input can be enabled. Same reserve-nothing-while-disabled
+// model as the optional SPDIF inputs.
+uint8_t adat_input_enabled = 0;
+uint8_t adat_input_pin = 0xFF;
+uint8_t adat_clock_mode = ADAT_CLOCK_MODE_MASTER;
+
+// Deferred ADAT input applies (handled in main loop)
+volatile bool adat_clock_mode_change_pending = false;
+volatile uint8_t pending_adat_clock_mode = ADAT_CLOCK_MODE_MASTER;
+volatile bool adat_input_restart_pending = false;

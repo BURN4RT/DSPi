@@ -232,6 +232,10 @@ void bulk_params_collect(WireBulkParams *out) {
     out->input_config.spdif_rx_enabled_ext_p1 = (uint8_t)(spdif_rx_enabled_ext + 1);
     // I2S clock master/slave mode (V21+).
     out->input_config.i2s_clock_mode = i2s_clock_mode;
+    // ADAT input (V24+): live pin (0xFF unset → 0 absent), enable + 1, mode + 1.
+    out->input_config.adat_input_pin        = (adat_input_pin == 0xFF) ? 0 : adat_input_pin;
+    out->input_config.adat_input_enabled_p1 = (uint8_t)(adat_input_enabled + 1);
+    out->input_config.adat_clock_mode_p1    = (uint8_t)(adat_clock_mode + 1);
 
     // LG Sound Sync (V8+).  All four fields are filled here so a single
     // GET round-trips both the user toggle and the runtime observation.
@@ -566,6 +570,50 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
                 printf("Bulk apply: I2S RX pin/count config rejected (conflict); kept live\n");
             }
         }
+
+        // ADAT input pin + enable (V24+, RP2350).  0 = absent (keep live) for the
+        // pin; enable encoded PLUS ONE (0 absent, 1 disabled, 2 enabled).  Pin
+        // validated with adat_input_pin_acceptable; enable applied after so an
+        // enable+pin pair validates against the new pin (mirrors the SPDIF-ext
+        // ordering).  Enabling needs a valid pin (mirrors REQ_SET_ADAT_INPUT_ENABLE);
+        // a disable of the live source is refused (mirrors the SPDIF-ext precedent).
+        // A pin/enable change while ADAT is active arms a deferred input restart.
+#if PICO_RP2350
+        {
+            uint8_t pin = in->input_config.adat_input_pin;
+            if (pin != 0 && pin != adat_input_pin) {
+                if (adat_input_pin_acceptable(pin)) {
+                    adat_input_pin = pin;
+                    if (active_input_source == INPUT_SOURCE_ADAT)
+                        adat_input_restart_pending = true;
+                } else {
+                    printf("Bulk apply: ADAT input pin %u rejected (invalid/conflict); kept live\n",
+                           (unsigned)pin);
+                }
+            }
+            uint8_t enc = in->input_config.adat_input_enabled_p1;
+            if (enc == 1 || enc == 2) {
+                uint8_t want = (enc == 2) ? 1 : 0;
+                if (want && !adat_input_enabled) {
+                    if (adat_input_pin != 0xFF && adat_input_pin_acceptable(adat_input_pin)) {
+                        adat_input_enabled = 1;
+                        if (active_input_source == INPUT_SOURCE_ADAT)
+                            adat_input_restart_pending = true;
+                    } else {
+                        printf("Bulk apply: ADAT input enable rejected (pin unset/conflict); left disabled\n");
+                    }
+                } else if (!want && adat_input_enabled) {
+                    if (active_input_source == INPUT_SOURCE_ADAT ||
+                        (input_source_change_pending &&
+                         pending_input_source == INPUT_SOURCE_ADAT)) {
+                        printf("Bulk apply: ADAT input disable ignored (active source); kept enabled\n");
+                    } else {
+                        adat_input_enabled = 0;
+                    }
+                }
+            }
+        }
+#endif
     }
 
     // EQ bands
@@ -728,6 +776,21 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         pending_i2s_clock_mode = in->input_config.i2s_clock_mode;
         __dmb();
         i2s_clock_mode_change_pending = true;
+    }
+
+    // ADAT input clock master/slave mode (V24+).  Deferred like i2s_clock_mode;
+    // the main-loop handler applies dormant or live and notifies at apply time.
+    // enc PLUS ONE on the wire: 0 = absent (keep live), 1 = master, 2 = slave.
+    {
+        uint8_t enc = in->input_config.adat_clock_mode_p1;
+        if (enc == 1 || enc == 2) {
+            uint8_t m = (uint8_t)(enc - 1);
+            if (m != adat_clock_mode || adat_clock_mode_change_pending) {
+                pending_adat_clock_mode = m;
+                __dmb();
+                adat_clock_mode_change_pending = true;
+            }
+        }
     }
 
     // LG Sound Sync (V8+ payloads).  Only `enabled` is honored — the
