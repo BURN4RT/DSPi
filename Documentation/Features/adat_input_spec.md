@@ -274,13 +274,16 @@ identical 24-bit value the far end transmitted.
 See adat_output_spec.md "Wire format" for the frame layout; the input
 implements the exact inverse. Reception details:
 
-- The PIO program (`adat_input.pio`, PIO1 SM2, 13 instructions) is an NRZI
-  decoder sampling at 8 PIO cycles per wire bit (PIO clock 2048 x Fs). Two
-  mirrored code halves track the line level and poll twice per bit cell; a
-  detected transition emits a 1 and re-anchors the sampling grid, so clock
-  offset never accumulates past one cell (tolerance ~2%, actual worst-case
-  error ~0.4% of a cell). The RX divider is set once per rate and never
-  servoed.
+- The PIO program (`adat_input.pio`, PIO1 SM2, 15 instructions) is an NRZI
+  decoder running at clock divider 1.0 (full 307.2 MHz, so zero divider
+  jitter). Each bit cell is counted by a 2-cycle poll loop whose length is
+  set per rate via the Y register (27 sys cycles at 44.1 kHz, 25 at 48 kHz);
+  a detected transition emits a 1 and re-anchors the cell grid within 2 sys
+  cycles in BOTH directions, so clock offset of either sign never
+  accumulates. Verified bit-exact by a cycle-accurate program model across
+  at least +-1000 ppm of source offset at both rates
+  (tools/adat_rx_test/adat_rx_bitdiff.c). The cell length is set once per
+  rate and never servoed.
 - DMA channel 15 streams decoded bits into an 8 KB ring using the RP2350
   ENDLESS transfer-count mode plus hardware address wrap: a free-running
   ring with no IRQ and no reload channel.

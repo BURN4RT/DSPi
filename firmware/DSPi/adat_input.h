@@ -74,7 +74,7 @@ void adat_input_update_clock_servo(void);
 bool adat_input_check_rate_change(void);
 
 // Device rate changed (called from perform_rate_change). Master mode: retune
-// the RX divider and re-sync, or park with rate_ok = false above 48 kHz.
+// the RX cell period and re-sync, or park with rate_ok = false above 48 kHz.
 void adat_input_on_rate_change(uint32_t freq);
 
 // Last servo-applied SPDIF TX divider (16.8), 0 unless slave mode + LOCKED.

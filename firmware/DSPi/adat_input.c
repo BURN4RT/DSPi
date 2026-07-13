@@ -2,12 +2,14 @@
  * adat_input.c; ADAT lightpipe 8-channel input (RP2350 only)
  *
  * Receiver architecture:
- *   PIO1 SM2 runs the adat_rx NRZI decoder (adat_input.pio) at 2048 x Fs
- *   (8 PIO cycles per wire bit). It emits the DECODED bitstream (1 = line
- *   transition), MSB first, autopushed every 32 bits. DMA channel 15
- *   streams the words into an 8 KB ring (ENDLESS transfer count + hardware
- *   write-address wrap: a free-running ring with no IRQ and no reload
- *   channel). The main-loop poll consumes the ring as a bit stream.
+ *   PIO1 SM2 runs the adat_rx NRZI decoder (adat_input.pio) at clock
+ *   divider 1.0, counting each wire bit cell with a 2-cycle poll loop
+ *   whose length is set per sample rate (see adat_rx_set_cell). It emits
+ *   the DECODED bitstream (1 = line transition), MSB first, autopushed
+ *   every 32 bits. DMA channel 15 streams the words into an 8 KB ring
+ *   (ENDLESS transfer count + hardware write-address wrap: a free-running
+ *   ring with no IRQ and no reload channel). The main-loop poll consumes
+ *   the ring as a bit stream.
  *
  * Frame handling is CPU-side. The sync header's 10-zero run cannot occur in
  * channel data (a forced 1 every 5th bit bounds data runs to 4), so a scan
@@ -147,15 +149,22 @@ static void adat_rx_set_state(AdatInputState st) {
                                  adat_clock_mode);
 }
 
-// PIO clock = 2048 x Fs, 16.8 divider rounded to nearest. The decoder
-// re-anchors on every wire transition, so sub-percent divider error is
-// irrelevant; this divider is never servoed.
-static void adat_rx_set_divider(uint32_t fs) {
+// Per-rate cell period. The SM runs at divider 1.0; the cell length is
+// 2*Y+5 sys cycles via the Y reload (adat_input.pio). Cells must be odd
+// (the poll loop counts in 2-cycle steps): at 307.2 MHz both rates are
+// (27 at 44.1 kHz, 25 at 48 kHz). The 150 MHz fallback sys clock yields
+// an even cell with degraded margins; ADAT input simply fails to lock
+// there, which is acceptable for a safety-net clock. Never servoed: the
+// per-edge re-anchoring absorbs percent-level offsets in both directions.
+static void adat_rx_set_cell(uint32_t fs) {
     uint32_t sys = clock_get_hz(clk_sys);
-    uint64_t denom = 2048ull * fs;
-    uint32_t div_16_8 = (uint32_t)(((uint64_t)sys * 256ull + denom / 2u) / denom);
-    pio_sm_set_clkdiv_int_frac(ADAT_RX_PIO, ADAT_RX_SM,
-                               div_16_8 >> 8, div_16_8 & 0xFFu);
+    uint32_t denom = 256u * fs;
+    uint32_t cell = (sys + denom / 2u) / denom;
+    if ((cell & 1u) == 0) cell -= 1u;
+    uint32_t yv = (cell - 5u) / 2u;
+    if (yv < 2u) yv = 2u;
+    if (yv > 31u) yv = 31u;   // set-immediate range
+    pio_sm_exec(ADAT_RX_PIO, ADAT_RX_SM, pio_encode_set(pio_y, yv));
 }
 
 // Restart the sync search from ring position `from` (frames decoded so far
@@ -355,7 +364,7 @@ static void adat_rx_rate_machine(uint64_t now, uint32_t widx, bool stall) {
         if (snapped && snapped == lock_candidate) {
             if (++lock_agree >= ADAT_RX_LOCK_WINDOWS) {
                 adat_rx_detected_rate = snapped;
-                adat_rx_set_divider(snapped);
+                adat_rx_set_cell(snapped);
                 adat_rx_resync_scan(widx);   // bits before the retune are stale
                 meas_hz_smooth = hz;
                 long_us[0] = long_us[1] = now;
@@ -401,13 +410,15 @@ void adat_input_start(void) {
     sm_config_set_jmp_pin(&c, pin);
     sm_config_set_in_shift(&c, false, true, 32);   // shift left (MSB first), autopush
     sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+    sm_config_set_clkdiv_int_frac(&c, 1, 0);       // full sys_clk, no jitter
     pio_sm_init(ADAT_RX_PIO, ADAT_RX_SM,
                 adat_rx_prog_offset + adat_rx_wrap_target, &c);
-    pio_sm_exec(ADAT_RX_PIO, ADAT_RX_SM, pio_encode_set(pio_y, 1));
+    // OSR = all-ones so `in osr, 1` emits a 1 (X and Y are both counters)
+    pio_sm_exec(ADAT_RX_PIO, ADAT_RX_SM, pio_encode_mov_not(pio_osr, pio_null));
 
     adat_rx_rate_ok = (audio_state.freq <= 48000u);
     uint32_t fs = adat_rx_rate_ok ? audio_state.freq : 48000u;
-    adat_rx_set_divider((adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) ? 48000u : fs);
+    adat_rx_set_cell((adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) ? 48000u : fs);
 
     // Free-running ring: ENDLESS transfer count (never decrements) plus the
     // hardware write-address wrap. One channel, no IRQ, no reload channel.
@@ -607,7 +618,7 @@ void adat_input_on_rate_change(uint32_t freq) {
             adat_rx_set_state(ADAT_INPUT_ACQUIRING);
             return;
         }
-        adat_rx_set_divider(freq);
+        adat_rx_set_cell(freq);
         adat_rx_detected_rate = freq;
         adat_rx_resync_scan(adat_rx_write_index());
         adat_rx_set_state(ADAT_INPUT_SYNCING);

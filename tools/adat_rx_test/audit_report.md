@@ -271,3 +271,33 @@ The remaining items are cosmetic or defensive.
 - MIN-003: ACCEPTED AS-IS. The double restart on a simultaneous clock-mode
   flip + pin change is muted and harmless; serializing the two handlers would
   add ordering complexity for no audible benefit.
+
+---
+
+## Post-release timing defect and redesign (2026-07-13, second addendum)
+
+An external review reported that the RX PIO divider rounding could not be
+absorbed by transition re-anchoring, predicting bit deletion at 44.1 kHz. A
+cycle-accurate simulation of the generated program including the fractional
+clock divider (tools/adat_rx_test/adat_rx_bitdiff.c) CONFIRMED the defect
+and showed it to be worse than reported: the original decoder's poll
+schedule (next poll one full cell after each detected edge) is a one-way
+ratchet, so any interval where the decoder runs locally slower than the
+wire converts to permanent phase debt repaid only by deleting bits. The
+fractional divider guarantees locally slow cells at 44.1 kHz (27/28-cycle
+cell modulation), so 44.1 kHz could never lock at ANY nearby divider, and
+both proposed mitigations were insufficient: fast-biasing the divider
+(empirical law: clean only when the stream bit is at least the longest
+INSTANTANEOUS cell, not the mean) and an added early poll (defeated by the
+same cell-length modulation).
+
+Fix: the decoder was redesigned to run at clock divider 1.0 (no fractional
+jitter at all) counting each cell with a 2-cycle poll loop (length per rate
+via the Y register: 27/25 sys cycles), with a post-edge window placed so
+edges re-anchor the grid within 2 sys cycles in both directions. The
+cycle-accurate model proves the new program bit-exact at 44.1 and 48 kHz
+across at least +-1000 ppm of source clock offset, that cross-rate
+acquisition (44.1 kHz stream on the 48 kHz cell) keeps rate-measurement
+error inside the 2 percent snap window, and that the original program's
+failures still reproduce (model fidelity check). The 150 MHz fallback sys
+clock is documented as unsupported for ADAT input.
