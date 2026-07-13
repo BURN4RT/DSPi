@@ -1085,21 +1085,26 @@ static void complete_pipeline_reset(void) {
     // and returns; dac_hw_mute_tick() deasserts it later so the input
     // pipeline keeps draining while the DAC remains muted.
     //
-    // EXCEPTION: I2S or SPDIF input with a pending prefill (preset_loading
-    // still set): the main-loop prefill block for that source (gated on
-    // preset_loading) will DRAIN and disable the outputs again after this
-    // returns, then re-enable in sync and own the release (right after its
+    // EXCEPTION: I2S, SPDIF, or ADAT input with a pending prefill
+    // (preset_loading still set): the main-loop prefill block for that source
+    // (gated on preset_loading) will DRAIN and disable the outputs again after
+    // this returns, then re-enable in sync and own the release (right after its
     // enable_outputs_in_sync()).  Releasing here would un-mute before that
     // drain stops the clocks, and with the default release_ms == 0 the pin
     // deasserts immediately, so the clock-stop click is fully exposed.  Defer
     // to the prefill block in those cases.  (USB has no such prefill drain,
     // so it releases here as before.  The prefill blocks always run while
-    // their source is active and preset_loading is set; SPDIF holds the
-    // mute until lock, which is the intended mute-until-lock behavior, so
-    // the mute is never left stuck asserted.)
+    // their source is active and preset_loading is set; SPDIF and ADAT hold
+    // the mute until lock, which is the intended mute-until-lock behavior, so
+    // the mute is never left stuck asserted.  INPUT_SOURCE_ADAT is defined on
+    // both platforms but never active on RP2040, so no #if is needed.)
+    // input_source_is_spdif() matches the prefill block's own gate, covering
+    // SPDIF inputs 2/3 as well; a bare == INPUT_SOURCE_SPDIF here once left
+    // those two sources releasing early through this same path.
     if (!(preset_loading &&
           (active_input_source == INPUT_SOURCE_I2S ||
-           active_input_source == INPUT_SOURCE_SPDIF))) {
+           input_source_is_spdif(active_input_source) ||
+           active_input_source == INPUT_SOURCE_ADAT))) {
         dac_hw_mute_release();
     }
 
