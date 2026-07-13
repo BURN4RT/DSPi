@@ -305,6 +305,13 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     const CrossfeedCoeffs *xf_coeffs = (const CrossfeedCoeffs *)current_crossfeed_coeffs;
     uint8_t xf_mask = crossfeed_config.output_pair_mask;
 
+    // Psychoacoustic bass snapshot for this packet: published coefficient
+    // pointer (NULL = disabled) + output mask, shared with Core 1 via
+    // core1_eq_work.  Runs per output pre-crossover in PASS 5-7 (it must see
+    // the low band before any high-pass crossover removes it).
+    const PsybassCoeffs *pb_coeffs = (const PsybassCoeffs *)current_psybass_coeffs;
+    uint16_t pb_mask = psybass_config.output_mask;
+
     // Pre-compute PDM scale factor
     const float pdm_scale = (float)(1 << 28);
 
@@ -414,6 +421,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.loud_mask = loud_mask;
         core1_eq_work.xfeed_coeffs = xf_coeffs;
         core1_eq_work.xfeed_mask = xf_mask;
+        core1_eq_work.psybass_coeffs = pb_coeffs;
+        core1_eq_work.psybass_mask = pb_mask;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[1] = audio_buf[2] ? (int32_t *)audio_buf[2]->buffer->bytes : NULL;
         core1_eq_work.spdif_out[2] = audio_buf[3] ? (int32_t *)audio_buf[3]->buffer->bytes : NULL;
@@ -431,7 +440,19 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
+                psybass_reset_output_state(&psybass_output_state[out]);
                 continue;
+            }
+            // Psychoacoustic bass on masked outputs, pre-crossover (must see
+            // the low band before any high-pass crossover removes it).
+            // Skipped-and-cleared when masked off, muted, or RAW.
+            if (pb_coeffs && ((pb_mask >> out) & 1u)
+                && !matrix_mixer.outputs[out].mute
+                && !(siggen_raw_mask & (1u << out))) {
+                psybass_process_output_block(pb_coeffs, &psybass_output_state[out],
+                                             buf_out[out], sample_count);
+            } else {
+                psybass_reset_output_state(&psybass_output_state[out]);
             }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
@@ -483,9 +504,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
 
         // PDM is inactive in EQ_WORKER mode and owned by neither core's
-        // output loop; keep its loudness state cleared so the first packet
-        // after a switch back to single-core starts clean.
+        // output loop; keep its loudness/psybass state cleared so the first
+        // packet after a switch back to single-core starts clean.
         loudness_reset_output_state(&loudness_output_state[NUM_OUTPUT_CHANNELS - 1]);
+        psybass_reset_output_state(&psybass_output_state[NUM_OUTPUT_CHANNELS - 1]);
 
         // Core 0: Delay for outputs 0-1
         if (any_delay_active) {
@@ -559,7 +581,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
+                psybass_reset_output_state(&psybass_output_state[out]);
                 continue;
+            }
+            // Psychoacoustic bass, pre-crossover (see dual-core branch above).
+            if (pb_coeffs && ((pb_mask >> out) & 1u)
+                && !matrix_mixer.outputs[out].mute
+                && !(siggen_raw_mask & (1u << out))) {
+                psybass_process_output_block(pb_coeffs, &psybass_output_state[out],
+                                             buf_out[out], sample_count);
+            } else {
+                psybass_reset_output_state(&psybass_output_state[out]);
             }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
@@ -721,6 +753,11 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
     const CrossfeedCoeffs *xf_coeffs = (const CrossfeedCoeffs *)current_crossfeed_coeffs;
     uint8_t xf_mask = crossfeed_config.output_pair_mask;
 
+    // Psychoacoustic bass snapshot for this packet (see RP2350 branch above):
+    // runs per output pre-crossover, shared with Core 1 via core1_eq_work.
+    const PsybassCoeffs *pb_coeffs = (const PsybassCoeffs *)current_psybass_coeffs;
+    uint16_t pb_mask = psybass_config.output_mask;
+
     // ========== PASS 2: Per-Input EQ + Metering ========== (RP2040: 2 inputs)
     for (int k = 0; k < NUM_INPUT_CHANNELS; k++) {
         int32_t *ibuf = input_bufs[k];
@@ -792,6 +829,8 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         core1_eq_work.loud_mask = loud_mask;
         core1_eq_work.xfeed_coeffs = xf_coeffs;
         core1_eq_work.xfeed_mask = xf_mask;
+        core1_eq_work.psybass_coeffs = pb_coeffs;
+        core1_eq_work.psybass_mask = pb_mask;
         core1_eq_work.spdif_out[0] = audio_buf[1] ? (int32_t *)audio_buf[1]->buffer->bytes : NULL;
         core1_eq_work.work_done = false;
         __dmb();
@@ -806,7 +845,19 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         for (int out = 0; out < CORE1_EQ_FIRST_OUTPUT; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
+                psybass_reset_output_state(&psybass_output_state[out]);
                 continue;
+            }
+            // Psychoacoustic bass on masked outputs, pre-crossover (must see
+            // the low band before any high-pass crossover removes it).
+            // Skipped-and-cleared when masked off, muted, or RAW.
+            if (pb_coeffs && ((pb_mask >> out) & 1u)
+                && !matrix_mixer.outputs[out].mute
+                && !(siggen_raw_mask & (1u << out))) {
+                psybass_process_output_block(pb_coeffs, &psybass_output_state[out],
+                                             buf_out[out], sample_count);
+            } else {
+                psybass_reset_output_state(&psybass_output_state[out]);
             }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;
@@ -854,9 +905,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
 
         // PDM is inactive in EQ_WORKER mode and owned by neither core's
-        // output loop; keep its loudness state cleared so the first packet
-        // after a switch back to single-core starts clean.
+        // output loop; keep its loudness/psybass state cleared so the first
+        // packet after a switch back to single-core starts clean.
         loudness_reset_output_state(&loudness_output_state[NUM_OUTPUT_CHANNELS - 1]);
+        psybass_reset_output_state(&psybass_output_state[NUM_OUTPUT_CHANNELS - 1]);
 
         // Core 0: Delay for outputs 0-1
         if (any_delay_active) {
@@ -923,7 +975,17 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
             if (!matrix_mixer.outputs[out].enabled) {
                 loudness_reset_output_state(&loudness_output_state[out]);
+                psybass_reset_output_state(&psybass_output_state[out]);
                 continue;
+            }
+            // Psychoacoustic bass, pre-crossover (see dual-core branch above).
+            if (pb_coeffs && ((pb_mask >> out) & 1u)
+                && !matrix_mixer.outputs[out].mute
+                && !(siggen_raw_mask & (1u << out))) {
+                psybass_process_output_block(pb_coeffs, &psybass_output_state[out],
+                                             buf_out[out], sample_count);
+            } else {
+                psybass_reset_output_state(&psybass_output_state[out]);
             }
             if (!matrix_mixer.outputs[out].mute && !(siggen_raw_mask & (1u << out))) {
                 uint8_t eq_ch = CH_OUT_1 + out;

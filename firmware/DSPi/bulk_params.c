@@ -291,6 +291,17 @@ void bulk_params_collect(WireBulkParams *out) {
     out->adat_config.enabled = adat_output_config_enabled() ? 1 : 0;
     out->adat_config.pin     = adat_output_pin();
 #endif
+
+    // Psychoacoustic bass (V23+).  One global config: enabled + output mask +
+    // five float parameters, copied straight from the live config.
+    out->psybass.enabled       = psybass_config.enabled ? 1 : 0;
+    out->psybass.reserved0     = 0;
+    out->psybass.output_mask   = psybass_config.output_mask;
+    out->psybass.cutoff_hz     = psybass_config.cutoff_hz;
+    out->psybass.harmonics_db  = psybass_config.harmonics_db;
+    out->psybass.drive_db      = psybass_config.drive_db;
+    out->psybass.character_pct = psybass_config.character_pct;
+    out->psybass.original_db   = psybass_config.original_db;
 }
 
 // ============================================================================
@@ -790,6 +801,18 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         adat_output_set_config(enabled != 0, pin);
     }
 #endif
+
+    // Psychoacoustic bass (V23+).  One global config copied straight in; the
+    // main loop recomputes coefficients from the raised pending flag, mirroring
+    // crossfeed_update_pending above.
+    psybass_config.enabled       = (in->psybass.enabled != 0);
+    psybass_config.output_mask   = in->psybass.output_mask;
+    psybass_config.cutoff_hz     = in->psybass.cutoff_hz;
+    psybass_config.harmonics_db  = in->psybass.harmonics_db;
+    psybass_config.drive_db      = in->psybass.drive_db;
+    psybass_config.character_pct = in->psybass.character_pct;
+    psybass_config.original_db   = in->psybass.original_db;
+    psybass_update_pending = true;
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).
     notify_end_bulk();

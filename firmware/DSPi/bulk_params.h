@@ -31,7 +31,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      22   // V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
+#define WIRE_FORMAT_VERSION      23   // V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -324,6 +324,24 @@ typedef struct __attribute__((packed)) {
 } WireAdatConfig;                    // 8 bytes
 
 // ============================================================================
+// Section 21: Psychoacoustic Bass (24 bytes); V23+
+// ============================================================================
+//
+// Missing-fundamental bass enhancement (see psybass.h and
+// Documentation/Features/psychoacoustic_bass_spec.md).  One global parameter
+// set applied to the output channels selected by output_mask.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  reserved0;              // Zero
+    uint16_t output_mask;            // Bit k: psybass processes output channel k
+    float    cutoff_hz;              // Speaker LF limit, 30-300 Hz
+    float    harmonics_db;           // Harmonic mix level, -24..+12 dB
+    float    drive_db;               // Odd-path clipper drive, 0..18 dB
+    float    character_pct;          // Even<->odd harmonic blend, 0..100
+    float    original_db;            // Original low-band level, -60..0 dB
+} WirePsybassParams;                 // 24 bytes
+
+// ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
@@ -347,19 +365,20 @@ typedef struct __attribute__((packed)) {
     WireDacHwMute       dac_hw_mute;     //   16
     WireCrossoverConfig crossovers;      // 1088 (17×4; input rows unused)
     WireAdatConfig      adat_config;     //    8
-} WireBulkParams;                        // Total: 5876 bytes (V21; V21 claims a reserved input-config byte, size unchanged)
+    WirePsybassParams   psybass;         //   24  (V23+)
+} WireBulkParams;                        // Total: 5900 bytes (V23 appends the 24-byte psybass section)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
 // Backward compatibility is intentionally broken at V16 (unified channel model).
-// Only the current full-size V21 layout is accepted; there are no legacy size
+// Only the current full-size layout is accepted; there are no legacy size
 // anchors or per-section version gates; every section is always present.
-// bulk_params_apply() rejects any payload whose format_version != V21 or whose
-// length != sizeof(WireBulkParams).
+// bulk_params_apply() rejects any payload whose format_version != current or
+// whose length != sizeof(WireBulkParams).
 #define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
 // Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
-// V21 is 5876 bytes (17-channel EQ/names/crossover + ADAT + leveller masks); 8192 is the next power of 2.
+// V23 is 5900 bytes (17-channel EQ/names/crossover + ADAT + leveller masks + psybass); 8192 is the next power of 2.
 // Shared by both platforms (the wire format is platform-independent).
 #define WIRE_BULK_BUF_SIZE     8192
 

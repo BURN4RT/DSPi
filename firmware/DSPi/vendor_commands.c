@@ -807,6 +807,92 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             }
             break;
 
+        // Psychoacoustic Bass Commands
+        case REQ_SET_PSYBASS:
+            if (buffer->data_len >= 1) {
+                psybass_config.enabled = (vendor_rx_buf[0] != 0);
+                psybass_update_pending = true;
+                uint8_t v = psybass_config.enabled ? 1 : 0;
+                notify_param_write(offsetof(WireBulkParams, psybass.enabled), 1, &v);
+            }
+            break;
+
+        case REQ_SET_PSYBASS_CUTOFF:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < PSYBASS_CUTOFF_MIN) val = PSYBASS_CUTOFF_MIN;
+                if (val > PSYBASS_CUTOFF_MAX) val = PSYBASS_CUTOFF_MAX;
+                psybass_config.cutoff_hz = val;
+                psybass_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, psybass.cutoff_hz),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_PSYBASS_HARMONICS:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < PSYBASS_HARMONICS_MIN) val = PSYBASS_HARMONICS_MIN;
+                if (val > PSYBASS_HARMONICS_MAX) val = PSYBASS_HARMONICS_MAX;
+                psybass_config.harmonics_db = val;
+                psybass_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, psybass.harmonics_db),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_PSYBASS_DRIVE:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < PSYBASS_DRIVE_MIN) val = PSYBASS_DRIVE_MIN;
+                if (val > PSYBASS_DRIVE_MAX) val = PSYBASS_DRIVE_MAX;
+                psybass_config.drive_db = val;
+                psybass_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, psybass.drive_db),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_PSYBASS_CHARACTER:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < PSYBASS_CHARACTER_MIN) val = PSYBASS_CHARACTER_MIN;
+                if (val > PSYBASS_CHARACTER_MAX) val = PSYBASS_CHARACTER_MAX;
+                psybass_config.character_pct = val;
+                psybass_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, psybass.character_pct),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_PSYBASS_ORIGINAL:
+            if (buffer->data_len >= 4) {
+                float val;
+                memcpy(&val, vendor_rx_buf, 4);
+                if (val < PSYBASS_ORIGINAL_MIN) val = PSYBASS_ORIGINAL_MIN;
+                if (val > PSYBASS_ORIGINAL_MAX) val = PSYBASS_ORIGINAL_MAX;
+                psybass_config.original_db = val;
+                psybass_update_pending = true;
+                notify_param_write(offsetof(WireBulkParams, psybass.original_db),
+                                   sizeof(float), &val);
+            }
+            break;
+
+        case REQ_SET_PSYBASS_MASK:
+            if (buffer->data_len >= 2) {
+                psybass_config.output_mask = (uint16_t)(vendor_rx_buf[0] | (vendor_rx_buf[1] << 8));
+                // No psybass_update_pending; the pipeline reads the mask live
+                // each packet and resets skipped outputs, so no recompute is needed.
+                uint16_t m = psybass_config.output_mask;
+                notify_param_write(offsetof(WireBulkParams, psybass.output_mask),
+                                   2, (const uint8_t *)&m);
+            }
+            break;
+
         // Volume Leveller Commands
         case REQ_SET_LEVELLER_ENABLE:
             if (buffer->data_len >= 1) {
@@ -1536,6 +1622,56 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_GET_CROSSFEED_OUTPUTS: {
                 resp_buf[0] = crossfeed_config.output_pair_mask;
                 vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            // Psychoacoustic Bass GET commands
+            case REQ_GET_PSYBASS: {
+                resp_buf[0] = psybass_config.enabled ? 1 : 0;
+                vendor_send_response(resp_buf, 1);
+                return true;
+            }
+
+            case REQ_GET_PSYBASS_CUTOFF: {
+                float val = psybass_config.cutoff_hz;
+                memcpy(resp_buf, &val, 4);
+                vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_PSYBASS_HARMONICS: {
+                float val = psybass_config.harmonics_db;
+                memcpy(resp_buf, &val, 4);
+                vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_PSYBASS_DRIVE: {
+                float val = psybass_config.drive_db;
+                memcpy(resp_buf, &val, 4);
+                vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_PSYBASS_CHARACTER: {
+                float val = psybass_config.character_pct;
+                memcpy(resp_buf, &val, 4);
+                vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_PSYBASS_ORIGINAL: {
+                float val = psybass_config.original_db;
+                memcpy(resp_buf, &val, 4);
+                vendor_send_response(resp_buf, 4);
+                return true;
+            }
+
+            case REQ_GET_PSYBASS_MASK: {
+                uint16_t m = psybass_config.output_mask;
+                resp_buf[0] = (uint8_t)(m & 0xFF);
+                resp_buf[1] = (uint8_t)((m >> 8) & 0xFF);
+                vendor_send_response(resp_buf, 2);
                 return true;
             }
 

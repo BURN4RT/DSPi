@@ -89,6 +89,9 @@ extern volatile uint8_t effective_vol_index;
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool crossfeed_update_pending;
 
+// Psychoacoustic bass (config/state/coeffs live in psybass.c)
+#include "psybass.h"
+
 // Volume Leveller
 extern volatile LevellerConfig leveller_config;
 extern volatile bool leveller_update_pending;

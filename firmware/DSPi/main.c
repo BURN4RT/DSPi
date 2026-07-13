@@ -199,6 +199,7 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
     loudness_recompute_pending = true;
     crossfeed_update_pending = true;  // Recalculate crossfeed coefficients for new sample rate
     leveller_update_pending = true;   // Recalculate leveller coefficients for new sample rate
+    psybass_update_pending = true;    // Recalculate psybass coefficients for new sample rate
     pdm_update_clock(new_freq);
 
 #if PICO_RP2350
@@ -1556,6 +1557,9 @@ void core0_init() {
     leveller_reset_state(&leveller_state);
     leveller_bypassed = !leveller_config.enabled;
 
+    // Initial psychoacoustic bass setup (uses loaded or default params)
+    psybass_apply_config((const PsybassConfig *)&psybass_config, 48000.0f);
+
 #if ENABLE_SUB
     {
         extern uint8_t output_pins[];
@@ -2283,6 +2287,14 @@ int main(void) {
         if (crossfeed_update_pending) {
             crossfeed_update_pending = false;
             crossfeed_apply_config((const CrossfeedConfig *)&crossfeed_config, (float)audio_state.freq);
+        }
+
+        // Handle psychoacoustic bass coefficient updates: same double-buffer
+        // publish model as crossfeed (NULL = disabled); per-output states are
+        // reset by the pipeline whenever an output is skipped.
+        if (psybass_update_pending) {
+            psybass_update_pending = false;
+            psybass_apply_config((const PsybassConfig *)&psybass_config, (float)audio_state.freq);
         }
 
         // Handle volume leveller coefficient updates

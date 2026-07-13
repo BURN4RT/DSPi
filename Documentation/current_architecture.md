@@ -1057,6 +1057,65 @@ Double-buffered coeffs plus 4 (RP2350) / 2 (RP2040) pair states; net a few dozen
 
 ---
 
+## Psychoacoustic Bass
+*Last updated: 2026-07-13*
+
+### Purpose
+
+Missing-fundamental bass enhancement for small speakers. A speaker that cannot physically reproduce content below its low-frequency limit can still convey that bass psychoacoustically: the ear reconstructs a missing fundamental from a consecutive harmonic series (2f, 3f, 4f...). Psybass extracts the sub-cutoff low band per output, generates harmonics of it with a nonlinear device (NLD), band-limits those harmonics into the speaker's reproducible range, and mixes them back in. Status: **HW-untested**.
+
+### Signal Flow (per output channel, in place)
+
+```
+low  = LP2(x)                          // 2nd-order lowpass split at cutoff (Butterworth, Q=0.707)
+even = |low|                           // full-wave rectifier: even harmonics, level-proportional
+odd  = softclip(drive * low)           // cubic soft clipper (1.5d - 0.5d^3): odd harmonics
+h    = (1 - t)*even + t*odd            // character blend t (0 = even/warm, 1 = odd/aggressive)
+h    = OP4fc(HP2(h))                   // HP2 at cutoff kills DC + fundamental; one-pole LP at 4x cutoff caps brightness
+out  = x + (g_orig - 1)*low + g_harm*h // original low band already split out, so its level control is free
+```
+
+The full-wave rectified (even) path tracks program dynamics; the driven cubic (odd) path adds bite. Blending both yields the consecutive 2f/3f/4f series that pitches the missing fundamental. The harmonic highpass at the cutoff removes DC and the fundamental itself (leaving only the reproducible harmonics); the one-pole lowpass at `4 * cutoff` (`PSYBASS_HARM_LP_RATIO`) is a gentle 6 dB/oct rolloff mimicking natural harmonic decay. The original low band is split out separately, so `original_db` attenuates it independently (`orig_delta = 10^(orig/20) - 1`, range -1..0) without touching the rest of the signal.
+
+**Zero added latency.** The effect is pure IIR (no delay lines, identical `sample_count` on every output), so inter-output-slot sample alignment is untouched by construction (the CLAUDE.md inviolable guarantee).
+
+### Platform Implementation
+
+- **RP2350:** TPT SVF (topology-preserving transform) in single-precision float. The split lowpass and harmonic highpass share one Butterworth corner at the cutoff; the cutoff is always far below Fs/7.5, deep in SVF territory. The harmonic one-pole lowpass is a plain float one-pole. `PsybassCoeffs` holds SVF integrator coefficients (`lp_a1-3`, `hp_a1-3`, `hp_k`), one-pole coeffs, `drive`, NLD blend weights (`even_w`/`odd_w`), `harm_gain`, and `orig_delta`; per-output state is the SVF integrators plus the one-pole state (`PsybassOutputState`).
+- **RP2040:** RBJ biquads (TDF2) scaled to Q28, processed with `fast_mul_q28()`. Range clamps keep every Q28 coefficient inside the representable +/-8.0 range (harmonics capped at +12 dB, drive at +18 dB = 7.94). The kernel **pre-clamps the low band to +/-1.0 before the drive multiply**: drive can be up to 7.94 and `fast_mul_q28` wraps sign past +/-8.0, so `drive * low` on an over-full-scale low band would wrap; since drive >= 1.0 the result is identical to clamping only the product. A second clamp bounds `d` so `1.5d - 0.5d^3` (which peaks at exactly 1.0) stays in range.
+
+### Parameters
+
+One global config (`PsybassConfig`) applied to the output channels selected by `output_mask`:
+
+| Parameter | Type | Range | Default | Description |
+|-----------|------|-------|---------|-------------|
+| enabled | bool | 0/1 | false | Enable/disable the effect |
+| cutoff_hz | float | 30-300 Hz | 80 | Speaker LF limit; harmonics generated from below it |
+| harmonics_db | float | -24..+12 dB | 0 | Generated-harmonics mix level (`g_harm`); +12 cap holds Q28 headroom |
+| drive_db | float | 0..18 dB | 6 | Odd-path cubic-clipper drive (18 dB = 7.94 linear, below the Q28 ceiling) |
+| character_pct | float | 0..100 | 50 | Even<->odd harmonic blend (0 = even only/warm, 100 = odd only/aggressive) |
+| original_db | float | -60..0 dB | 0 | Original low-band level (0 = untouched) |
+| output_mask | uint16 | 0x0000-0xFFFF | 0xFFFF | Bit k: process output channel k |
+
+### Coefficient Publish & Per-Output State
+
+Follows the loudness/crossfeed module pattern:
+
+- **Double-buffered publish.** `psybass.c` computes one shared `PsybassCoeffs` into the inactive buffer (`pb_coeff_bufs[2]`) and atomically publishes the pointer via `volatile const PsybassCoeffs *current_psybass_coeffs` (**NULL = disabled**, replacing a bypass flag), never mutating the buffer the pipeline is reading. Vendor SET handlers write `psybass_config` and raise `psybass_update_pending`; the main loop consumes the flag and calls `psybass_apply_config()`. Coefficients are also recomputed on rate change (`perform_rate_change()` raises the flag). Initial setup runs once in `core0_init()`.
+- **Per-output state ownership.** `PsybassOutputState psybass_output_state[NUM_OUTPUT_CHANNELS]` lives in `psybass.c`; each output is only ever touched by the core that owns it in the current pipeline mode.
+- **Skip-and-reset predicate.** An output runs psybass when coeffs are published AND its mask bit is set AND it is matrix-enabled AND not muted AND not carrying a siggen RAW test signal; otherwise its state is reset each packet (`psybass_reset_output_state()`) so re-entry starts clean. This reset-on-skip is wired at all six pipeline call sites: the single-core and dual-core output loops on both the RP2350 and RP2040 branches of `audio_pipeline.c`, and the two Core 1 EQ-worker output loops in `pdm_generator.c`. Psybass runs **pre-crossover** (it must see the low band before any highpass crossover removes it) and the disabled PDM output's state is also kept cleared in EQ_WORKER mode.
+- **Two-core coherence.** Core 0 snapshots the coefficient pointer + `output_mask` once per packet and hands them to Core 1 through new `Core1EqWork` fields `psybass_coeffs`/`psybass_mask`, so both cores apply one consistent view for the whole packet (same single-view rationale as the loudness/crossfeed fields).
+- **RAM cost.** Double-buffered coeffs plus one `PsybassOutputState` per output; a few hundred bytes.
+
+### Persistence & Control
+
+- **Wire format V23:** `WirePsybassParams` (24 bytes) is tail-appended to `WireBulkParams` (`enabled` + `reserved0` + `output_mask` + five floats). Bulk collect/apply copy it straight to/from `psybass_config` and raise the pending flag.
+- **Preset slot V31:** the config is tail-appended to `PresetSlot` (struct grows 24 bytes; `SLOT_DATA_SIZE_V31`), gated on `slot->version >= 31` in `apply_slot_to_live()`. Older slots have no psybass data and load the disabled/all-outputs defaults; V21..V30 slots still validate via `slot_data_size_for_version()`. Factory defaults set it disabled with `PSYBASS_DEFAULT_*` values.
+- **Vendor commands:** `0x30-0x3D` (SET/GET enable, cutoff, harmonics, drive, character, original, mask). Each SET clamps to the parameter range, writes `psybass_config`, and emits a `notify_param_write`. All SET commands except the mask raise `psybass_update_pending`; the mask (0x3C) is read live each packet (skipped outputs reset themselves), so it needs no recompute. See the Vendor Command Reference table.
+
+---
+
 ## Volume Leveller
 *Last updated: 2026-07-10 (crossfeed no longer stereo-only; runs per output pair)*
 
@@ -1314,7 +1373,7 @@ the single 4 KB directory sector. See
 | cs_ir | Control Surfaces IR command table (V11+, 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
-*Last updated: 2026-07-10 (crossfeed output_pair_mask, slot V27)*
+*Last updated: 2026-07-13 (psychoacoustic bass, slot V31)*
 
 | Field | Description |
 |-------|-------------|
@@ -1330,6 +1389,7 @@ the single 4 KB directory sector. See
 | Legacy gain/mute | 3 channels (backward compatibility) |
 | Loudness | enabled, reference SPL, intensity |
 | Crossfeed | enabled, preset, ITD, custom fc/feed, output_pair_mask (V27+, tail-appended; older slots default 0x01) |
+| Psychoacoustic bass | enabled, output_mask, cutoff, harmonics, drive, character, original (V31+, tail-appended 24 bytes, `SLOT_DATA_VERSION` 31; older slots load disabled/all-outputs defaults) |
 | Matrix mixer | crosspoints + output channels |
 | Pin config | NUM_PIN_OUTPUTS pin assignments (always stored, conditionally loaded) |
 | Channel names | NUM_CHANNELS × 32-byte NUL-terminated names (V8, default names for V<8) |
@@ -1549,7 +1609,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-11 (I2S clock-pin mode: SPLIT slave-pair defaults 12/13 vs 26/27; wire/slot version row now V21 / V29)*
+*Last updated: 2026-07-13 (psychoacoustic bass row added; wire/slot version row now V23 / V31)*
 
 ### Hardware
 
@@ -1592,13 +1652,14 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | I2S input channels | 2 (stereo) | 2 / 4 / 6 / 8 (configurable) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V21 / V29 | V21 / V29 |
+| Wire / slot version | V23 / V31 | V23 / V31 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
 | Volume leveller | Q28 envelope + float gain; 2 channels, 2 lookahead rings; max boost clamped to 18 dB (Q28 gain range) | Float throughout; 2 to 8 active channels, mask-driven, 8 lookahead rings; full 35 dB max boost |
 | Loudness | Per output, post-gain: 2 Q28 shelf biquads; `loudness_output_mask` (5 outputs) | Per output, post-gain: 2 SVF shelves; `loudness_output_mask` (9 outputs). Both platforms: volume-keyed, works in stereo and multichannel input modes |
 | Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
+| Psychoacoustic bass | Per output, pre-crossover; RBJ Q28 biquads (with pre-drive low-band clamp) | Per output, pre-crossover; TPT SVF float. Both platforms: missing-fundamental NLD, `output_mask`, zero added latency |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
 ### Delay Lines
@@ -2307,7 +2368,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-12 (Linkwitz Transform qp sidecar on 0x42/0x43)*
+*Last updated: 2026-07-13 (psychoacoustic bass commands 0x30-0x3D)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2323,6 +2384,20 @@ op state ~400 B).
 
 | Command | Code | Direction | Description |
 |---------|------|-----------|-------------|
+| REQ_SET_PSYBASS | 0x30 | OUT | Enable/disable psychoacoustic bass (1 byte, 0/1) |
+| REQ_GET_PSYBASS | 0x31 | IN | Get psybass enabled state (1 byte) |
+| REQ_SET_PSYBASS_CUTOFF | 0x32 | OUT | Set cutoff (4-byte LE IEEE754 float, 30-300 Hz, clamped) |
+| REQ_GET_PSYBASS_CUTOFF | 0x33 | IN | Get cutoff (4-byte float) |
+| REQ_SET_PSYBASS_HARMONICS | 0x34 | OUT | Set harmonics mix level (4-byte float, -24..+12 dB, clamped) |
+| REQ_GET_PSYBASS_HARMONICS | 0x35 | IN | Get harmonics mix level (4-byte float) |
+| REQ_SET_PSYBASS_DRIVE | 0x36 | OUT | Set odd-path drive (4-byte float, 0..18 dB, clamped) |
+| REQ_GET_PSYBASS_DRIVE | 0x37 | IN | Get odd-path drive (4-byte float) |
+| REQ_SET_PSYBASS_CHARACTER | 0x38 | OUT | Set even/odd blend (4-byte float, 0..100, clamped) |
+| REQ_GET_PSYBASS_CHARACTER | 0x39 | IN | Get even/odd blend (4-byte float) |
+| REQ_SET_PSYBASS_ORIGINAL | 0x3A | OUT | Set original low-band level (4-byte float, -60..0 dB, clamped) |
+| REQ_GET_PSYBASS_ORIGINAL | 0x3B | IN | Get original low-band level (4-byte float) |
+| REQ_SET_PSYBASS_MASK | 0x3C | OUT | Set output mask (2-byte LE uint16; read live, no recompute) |
+| REQ_GET_PSYBASS_MASK | 0x3D | IN | Get output mask (2-byte LE uint16) |
 | REQ_SET_EQ_PARAM | 0x42 | OUT | Set EQ band parameters; optional 18-byte payload appends a `uint16` LE Linkwitz-Transform `qp` (`Q*512`) at offsets 16-17 (a 16-byte payload preserves the stored `qp`) |
 | REQ_GET_EQ_PARAM | 0x43 | IN | Get one EQ scalar; param codes 0-4 as before (type/freq/Q/gain_db/bypass), param code 5 returns `qp_x512` as a `u32` |
 | REQ_SET_PREAMP | 0x44 | OUT | Set preamp gain (legacy: sets all input channels) |
@@ -2483,7 +2558,7 @@ op state ~400 B).
 
 Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 12); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.)
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 23, total 5900 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes.
 
 **Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 

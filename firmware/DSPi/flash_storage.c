@@ -151,7 +151,12 @@
 //        tail-append like V22..V29: V21..V29 slots still load via
 //        slot_data_size_for_version; the missing bytes read as 0 (= 0.707
 //        default), the correct default for older presets.
-#define SLOT_DATA_VERSION       30
+//   V31: Psychoacoustic bass appended (psybass_enabled + reserved + output mask
+//        + five floats; struct grows by 24 bytes).  Backward-compatible
+//        tail-append like V22..V30: V21..V30 slots still load via
+//        slot_data_size_for_version; older slots have no psybass data and load
+//        the disabled/all-outputs defaults (see apply_slot_to_live).
+#define SLOT_DATA_VERSION       31
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -926,6 +931,16 @@ typedef struct __attribute__((packed)) {
     // default.  Gated on version >= 30 in apply_slot_to_live(); older slots
     // have no qp data and load all-zero (= 0.707 default) for every band.
     uint16_t peq_qp_x512[NUM_CHANNELS][MAX_BANDS];
+
+    // V31: psychoacoustic bass (one global config + output mask; see psybass.h)
+    uint8_t  psybass_enabled;
+    uint8_t  psybass_reserved;
+    uint16_t psybass_output_mask;
+    float    psybass_cutoff_hz;
+    float    psybass_harmonics_db;
+    float    psybass_drive_db;
+    float    psybass_character_pct;
+    float    psybass_original_db;
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -2365,6 +2380,16 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     // Linkwitz Transform per-band target Q (V30): Q*512, 0 = 0.707 default.
     memcpy(slot->peq_qp_x512, peq_qp_x512, sizeof(slot->peq_qp_x512));
 
+    // Psychoacoustic bass (V31): one global config, enabled + mask + 5 floats.
+    slot->psybass_enabled       = psybass_config.enabled ? 1 : 0;
+    slot->psybass_reserved      = 0;
+    slot->psybass_output_mask   = psybass_config.output_mask;
+    slot->psybass_cutoff_hz     = psybass_config.cutoff_hz;
+    slot->psybass_harmonics_db  = psybass_config.harmonics_db;
+    slot->psybass_drive_db      = psybass_config.drive_db;
+    slot->psybass_character_pct = psybass_config.character_pct;
+    slot->psybass_original_db   = psybass_config.original_db;
+
     // Channel names
     memcpy(slot->channel_names, channel_names, sizeof(slot->channel_names));
 
@@ -2567,6 +2592,28 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     crossfeed_config.custom_feed_db = slot->crossfeed_custom_feed_db;
     crossfeed_update_pending = true;
 
+    // Psychoacoustic bass (V31): older slots have no psybass data, so restore
+    // the disabled/all-outputs defaults for them.  The pending flag is raised in
+    // both branches so a load that turns psybass off unpublishes its coefficients.
+    if (slot->version >= 31) {
+        psybass_config.enabled       = (slot->psybass_enabled != 0);
+        psybass_config.output_mask   = slot->psybass_output_mask;
+        psybass_config.cutoff_hz     = slot->psybass_cutoff_hz;
+        psybass_config.harmonics_db  = slot->psybass_harmonics_db;
+        psybass_config.drive_db      = slot->psybass_drive_db;
+        psybass_config.character_pct = slot->psybass_character_pct;
+        psybass_config.original_db   = slot->psybass_original_db;
+    } else {
+        psybass_config.enabled       = false;
+        psybass_config.output_mask   = PSYBASS_DEFAULT_OUTPUT_MASK;
+        psybass_config.cutoff_hz     = PSYBASS_DEFAULT_CUTOFF;
+        psybass_config.harmonics_db  = PSYBASS_DEFAULT_HARMONICS;
+        psybass_config.drive_db      = PSYBASS_DEFAULT_DRIVE;
+        psybass_config.character_pct = PSYBASS_DEFAULT_CHARACTER;
+        psybass_config.original_db   = PSYBASS_DEFAULT_ORIGINAL;
+    }
+    psybass_update_pending = true;
+
     // Matrix mixer — all inputs, direct.
     for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
@@ -2748,19 +2795,23 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V29 \
     (offsetof(PresetSlot, peq_qp_x512) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V30 \
+    (offsetof(PresetSlot, psybass_enabled) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V31 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
-// (I2S clock master/slave mode), V29 (I2S clock-pin mode) and V30 (Linkwitz
-// Transform per-band target Q) are backward-compatible tail-appends.  V21..V30
-// slots are all accepted (an older slot loads with the newer fields defaulted
-// to unset) while older/unknown versions are invalidated and the slot loads
-// factory defaults.
+// (I2S clock master/slave mode), V29 (I2S clock-pin mode), V30 (Linkwitz
+// Transform per-band target Q) and V31 (psychoacoustic bass) are
+// backward-compatible tail-appends.  V21..V31 slots are all accepted (an older
+// slot loads with the newer fields defaulted to unset) while older/unknown
+// versions are invalidated and the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 30
+        case SLOT_DATA_VERSION:   // 31
+            return SLOT_DATA_SIZE_V31;
+        case 30:
             return SLOT_DATA_SIZE_V30;
         case 29:
             return SLOT_DATA_SIZE_V29;
@@ -3317,6 +3368,16 @@ static void apply_factory_defaults(void) {
     crossfeed_config.custom_fc = 700.0f;
     crossfeed_config.custom_feed_db = 4.5f;
     crossfeed_update_pending = true;
+
+    // Psychoacoustic bass
+    psybass_config.enabled       = false;
+    psybass_config.output_mask   = PSYBASS_DEFAULT_OUTPUT_MASK;
+    psybass_config.cutoff_hz     = PSYBASS_DEFAULT_CUTOFF;
+    psybass_config.harmonics_db  = PSYBASS_DEFAULT_HARMONICS;
+    psybass_config.drive_db      = PSYBASS_DEFAULT_DRIVE;
+    psybass_config.character_pct = PSYBASS_DEFAULT_CHARACTER;
+    psybass_config.original_db   = PSYBASS_DEFAULT_ORIGINAL;
+    psybass_update_pending = true;
 
     // Matrix mixer: stereo pass-through on first pair
     memset(&matrix_mixer, 0, sizeof(matrix_mixer));

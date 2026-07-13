@@ -128,6 +128,22 @@ extern volatile uint32_t nominal_feedback_10_14;
 // tud_vendor_control_xfer_cb in vendor_commands.c.
 #define MS_VENDOR_CODE      0x01
 
+// Psychoacoustic bass enhancement (missing-fundamental harmonics; psybass.h)
+#define REQ_SET_PSYBASS             0x30
+#define REQ_GET_PSYBASS             0x31
+#define REQ_SET_PSYBASS_CUTOFF      0x32
+#define REQ_GET_PSYBASS_CUTOFF      0x33
+#define REQ_SET_PSYBASS_HARMONICS   0x34
+#define REQ_GET_PSYBASS_HARMONICS   0x35
+#define REQ_SET_PSYBASS_DRIVE       0x36
+#define REQ_GET_PSYBASS_DRIVE       0x37
+#define REQ_SET_PSYBASS_CHARACTER   0x38
+#define REQ_GET_PSYBASS_CHARACTER   0x39
+#define REQ_SET_PSYBASS_ORIGINAL    0x3A
+#define REQ_GET_PSYBASS_ORIGINAL    0x3B
+#define REQ_SET_PSYBASS_MASK        0x3C
+#define REQ_GET_PSYBASS_MASK        0x3D
+
 // Vendor Request Commands (EP0 control transfers)
 #define REQ_SET_EQ_PARAM    0x42
 #define REQ_GET_EQ_PARAM    0x43
@@ -726,6 +742,9 @@ typedef struct {
     // Crossfeed snapshot for THIS packet; same single-view rationale.
     const void       *xfeed_coeffs;    // CrossfeedCoeffs or NULL = off
     uint8_t           xfeed_mask;      // Bit p = crossfeed output pair p
+    // Psychoacoustic bass snapshot for THIS packet; same single-view rationale.
+    const void       *psybass_coeffs;  // PsybassCoeffs or NULL = off
+    uint16_t          psybass_mask;    // Bit k = process output k
 } Core1EqWork;
 
 // ----------------------------------------------------------------------------
