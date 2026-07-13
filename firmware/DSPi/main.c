@@ -1231,6 +1231,11 @@ static void prepare_flash_write_operation(void) {
     } else if (active_input_source == INPUT_SOURCE_I2S) {
         i2s_input_poll();
     }
+#if PICO_RP2350
+    else if (active_input_source == INPUT_SOURCE_ADAT) {
+        adat_input_poll();
+    }
+#endif
 
     prepare_pipeline_reset(samples_for_duration_ms(audio_state.freq,
                                                    FLASH_WRITE_PREMUTE_MS));
@@ -1257,7 +1262,12 @@ static void prepare_flash_write_operation(void) {
                            (spdif_input_get_state() == SPDIF_INPUT_LOCKED);
     bool i2s_streaming   = (active_input_source == INPUT_SOURCE_I2S) &&
                            (i2s_input_get_state() == I2S_INPUT_RUNNING);
-    if (usb_streaming || spdif_streaming || i2s_streaming) {
+    bool adat_streaming  = false;
+#if PICO_RP2350
+    adat_streaming = (active_input_source == INPUT_SOURCE_ADAT) &&
+                     (adat_input_get_state() == ADAT_INPUT_LOCKED);
+#endif
+    if (usb_streaming || spdif_streaming || i2s_streaming || adat_streaming) {
         uint64_t start_us = time_us_64();
         while ((time_us_64() - start_us) < FLASH_WRITE_FADE_SETTLE_US
                || !dac_hw_mute_hold_elapsed()) {
@@ -1265,6 +1275,10 @@ static void prepare_flash_write_operation(void) {
                 usb_audio_drain_ring();
             } else if (input_source_is_spdif(active_input_source)) {
                 spdif_input_poll();
+#if PICO_RP2350
+            } else if (active_input_source == INPUT_SOURCE_ADAT) {
+                adat_input_poll();
+#endif
             } else {
                 i2s_input_poll();
             }
@@ -1300,6 +1314,13 @@ static void prepare_flash_write_operation(void) {
         i2s_input_stop();
         i2s_suspended_for_flash = true;
     }
+
+    // ADAT is deliberately NOT stopped for the blackout: its RX is an
+    // IRQ-less free-running DMA ring (no decode-timeout alarms to race the
+    // blackout edge, unlike SPDIF), and the software poll re-acquires frame
+    // sync after the ring laps.  preset_loading is still set from
+    // prepare_pipeline_reset() above, so the main-loop ADAT lock block
+    // re-runs the drain/prefill/enable handshake once LOCKED returns.
 }
 
 // Restart SPDIF RX if prepare_flash_write_operation() tore it down.  Must
