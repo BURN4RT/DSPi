@@ -78,6 +78,10 @@ static uint32_t adat_silence_exit[2];
 static uint32_t adat_line_level;   // line level after the last ring write
 
 static uint32_t adat_wr_frame;
+// Mutated only from Core 0 main-loop context (resync/stop paths).  The DSP
+// pipeline's per-packet finalize_s24 snapshot (audio_pipeline.c) relies on
+// this staying constant across one process_input_block() call; never flip it
+// from an ISR or Core 1.
 static bool     adat_running;
 static bool     adat_hw_init_done;
 static uint8_t  adat_hw_pin = 0xFF;       // GPIO currently routed to the PIO
@@ -331,6 +335,10 @@ void adat_output_set_config(bool enabled, uint8_t pin) {
 
 bool    adat_output_config_enabled(void) { return adat_cfg_enabled != 0; }
 uint8_t adat_output_pin(void)            { return adat_cfg_pin; }
+
+// Sampled per packet by the DSP pipeline to pick the slot finalization mode
+// (see output_s24.h); must stay RAM-resident like its caller.
+DSP_TIME_CRITICAL
 bool    adat_output_is_active(void)      { return adat_running; }
 
 void adat_output_get_status(AdatStatus *out) {

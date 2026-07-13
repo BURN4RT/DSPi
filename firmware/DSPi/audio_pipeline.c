@@ -394,11 +394,18 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         siggen_render(buf_out, sample_count, sample_rate_hz);
 
     // ========== PASS 5-7: Per-Output EQ + Gain + Delay + Output ==========
+    // Slot finalization mode for THIS packet (see output_s24.h): in-place S24
+    // staging while ADAT consumes it, fused convert+interleave otherwise.
+    // Sampled once so both cores and the ADAT push agree within the packet
+    // (resync runs on this same thread, so the value cannot change mid-call).
+    bool finalize_s24 = adat_output_is_active();
+
     if (core1_mode == CORE1_MODE_EQ_WORKER) {
         // --- Dual-core path: Core 1 handles EQ+delay+SPDIF for outputs 2-7 ---
 
         // Dispatch to Core 1 — both cores share the same vol ramp params so
         // outputs assigned to either core stay phase-aligned.
+        core1_eq_work.finalize_s24 = finalize_s24;
         core1_eq_work.sample_count = sample_count;
         core1_eq_work.vol_mul_start = vol_mul_master_start;
         core1_eq_work.vol_mul_step  = vol_mul_master_step;
@@ -509,23 +516,24 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         // PDM is inactive in EQ_WORKER mode
         global_status.peaks[CH_OUT_SUB] = 0;
 
-        // Core 0: finalize outputs 0-1 to S24 in place (single conversion
-        // point, shared with ADAT), then interleave S/PDIF pair 0.  Runs
-        // even with no slot buffer so ADAT always sees converted samples.
-        output_block_to_s24_inplace(buf_out[0], sample_count);
-        output_block_to_s24_inplace(buf_out[1], sample_count);
+        // Core 0: finalize outputs 0-1 (see output_s24.h).  ADAT active:
+        // convert to S24 in place, even with no slot buffer, so ADAT always
+        // sees converted samples; otherwise fuse convert+interleave and skip
+        // the staging pass.  Then S/PDIF pair 0.
+        if (finalize_s24) {
+            output_block_to_s24_inplace(buf_out[0], sample_count);
+            output_block_to_s24_inplace(buf_out[1], sample_count);
+        }
         if (audio_buf[0]) {
             int left_ch = 0, right_ch = 1;
             if (!matrix_mixer.outputs[left_ch].enabled && !matrix_mixer.outputs[right_ch].enabled) {
                 memset(audio_buf[0]->buffer->bytes, 0, sample_count * 8);
             } else {
                 int32_t *out_ptr = (int32_t *)audio_buf[0]->buffer->bytes;
-                const out_s24_t *sl = (const out_s24_t *)buf_out[0];
-                const out_s24_t *sr = (const out_s24_t *)buf_out[1];
-                for (uint32_t i = 0; i < sample_count; i++) {
-                    out_ptr[i*2]   = sl[i];
-                    out_ptr[i*2+1] = sr[i];
-                }
+                if (finalize_s24)
+                    output_pair_interleave_s24(out_ptr, buf_out[0], buf_out[1], sample_count);
+                else
+                    output_pair_convert_interleave(out_ptr, buf_out[0], buf_out[1], sample_count);
             }
         }
 
@@ -624,11 +632,14 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
         }
 
-        // Finalize outputs 0-7 to S24 in place (single conversion point,
-        // shared with ADAT; runs even with no slot buffer so ADAT always
-        // sees converted samples), then interleave the S/PDIF slots.
-        for (int out = 0; out < NUM_SPDIF_INSTANCES * 2; out++)
-            output_block_to_s24_inplace(buf_out[out], sample_count);
+        // Finalize outputs 0-7 (see output_s24.h).  ADAT active: convert to
+        // S24 in place, even with no slot buffer, so ADAT always sees
+        // converted samples; otherwise fuse convert+interleave per pair and
+        // skip the staging pass.
+        if (finalize_s24) {
+            for (int out = 0; out < NUM_SPDIF_INSTANCES * 2; out++)
+                output_block_to_s24_inplace(buf_out[out], sample_count);
+        }
         for (int pair = 0; pair < 4; pair++) {
             if (!audio_buf[pair]) continue;
             int left_ch = pair * 2;
@@ -638,12 +649,10 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                 continue;
             }
             int32_t *out_ptr = (int32_t *)audio_buf[pair]->buffer->bytes;
-            const out_s24_t *sl = (const out_s24_t *)buf_out[left_ch];
-            const out_s24_t *sr = (const out_s24_t *)buf_out[right_ch];
-            for (uint32_t i = 0; i < sample_count; i++) {
-                out_ptr[i*2]   = sl[i];
-                out_ptr[i*2+1] = sr[i];
-            }
+            if (finalize_s24)
+                output_pair_interleave_s24(out_ptr, buf_out[left_ch], buf_out[right_ch], sample_count);
+            else
+                output_pair_convert_interleave(out_ptr, buf_out[left_ch], buf_out[right_ch], sample_count);
         }
 
 #if ENABLE_SUB
@@ -1046,11 +1055,13 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         }
     }
 
-    // ADAT bulk output tap: buf_out[0..7] hold finalized in-place S24 for
-    // every pipeline variant here (see output_s24.h), and pushing AFTER the
-    // (blocking) gives keeps the ADAT ring lead bounded by the slot-0
-    // consumer fill; see adat_output.c.
-    adat_output_push_block((const out_s24_t (*)[192])buf_out, sample_count);
+    // ADAT bulk output tap: in finalize_s24 mode buf_out[0..7] hold in-place
+    // S24 for every pipeline variant here (see output_s24.h), and pushing
+    // AFTER the (blocking) gives keeps the ADAT ring lead bounded by the
+    // slot-0 consumer fill; see adat_output.c.  The snapshot gate keeps the
+    // push and the conversion mode consistent within the packet.
+    if (finalize_s24)
+        adat_output_push_block((const out_s24_t (*)[192])buf_out, sample_count);
 #else
     if (audio_buf[0]) give_audio_buffer(producer_pool_1, audio_buf[0]);
     if (audio_buf[1]) give_audio_buffer(producer_pool_2, audio_buf[1]);

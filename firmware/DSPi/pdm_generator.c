@@ -539,11 +539,16 @@ static void __not_in_flash_func(eq_worker_loop)() {
             if (peak > CLIP_THRESH_F) global_status.clip_flags |= (1u << (CH_OUT_1 + out));
         }
 
-        // Finalize Core 1's outputs to S24 in place (single conversion
-        // point, shared with ADAT; runs even with no slot buffer so ADAT
-        // always sees converted samples), then interleave pairs 1-3.
-        for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++)
-            output_block_to_s24_inplace(buf_out[out], sample_count);
+        // Finalize Core 1's outputs (see output_s24.h), using Core 0's
+        // per-packet mode snapshot so both cores agree.  ADAT active:
+        // convert rows 2-7 to S24 in place, even with no slot buffer, so
+        // ADAT always sees converted samples; otherwise fuse
+        // convert+interleave per pair.  Then interleave pairs 1-3.
+        bool finalize_s24 = core1_eq_work.finalize_s24 != 0;
+        if (finalize_s24) {
+            for (int out = CORE1_EQ_FIRST_OUTPUT; out <= CORE1_EQ_LAST_OUTPUT; out++)
+                output_block_to_s24_inplace(buf_out[out], sample_count);
+        }
         for (int p = 0; p < 3; p++) {
             int32_t *out_ptr = core1_eq_work.spdif_out[p];
             if (!out_ptr) continue;
@@ -554,12 +559,12 @@ static void __not_in_flash_func(eq_worker_loop)() {
                 memset(out_ptr, 0, sample_count * 8);
                 continue;
             }
-            const out_s24_t *sl = (const out_s24_t *)buf_out[left_out];
-            const out_s24_t *sr = (const out_s24_t *)buf_out[right_out];
-            for (uint32_t i = 0; i < sample_count; i++) {
-                out_ptr[i*2]   = sl[i];
-                out_ptr[i*2+1] = sr[i];
-            }
+            if (finalize_s24)
+                output_pair_interleave_s24(out_ptr, buf_out[left_out],
+                                           buf_out[right_out], sample_count);
+            else
+                output_pair_convert_interleave(out_ptr, buf_out[left_out],
+                                               buf_out[right_out], sample_count);
         }
 
         uint32_t work_end = time_us_32();

@@ -396,7 +396,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-07-13 (single in-place float->S24 finalization; slot interleave is now an integer copy)*
+*Last updated: 2026-07-13 (float->S24 finalization gated on ADAT activity: in-place staging while ADAT is active, fused convert+interleave otherwise)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -411,9 +411,9 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Output gain | Per-output gain × host volume × master volume |
 | Loudness | Per masked output, post-gain: 2 SVF shelf filters, volume-keyed; `loudness_output_mask` selects outputs; skipped-and-cleared when masked off / muted / RAW test signal |
 | Delay | Float circular buffers, 2048 samples max (42ms at 48kHz) |
-| S24 finalization | After the last float consumer, each output row of `buf_out` (rows 0-7) is converted to a clamped 24-bit sample **in place** via `output_block_to_s24_inplace()` (`output_s24.h`, `out_s24_t` = `may_alias` int32). This runs once per sample per channel; it runs even when a slot pool is starved so ADAT always sees converted data. Row 8 (PDM sub) stays float. |
-| SPDIF output | Pure integer copy of the finalized S24 rows into the 4 stereo slot pairs (no per-sample clamp/scale) |
-| ADAT output | Encodes the same finalized S24 rows 0-7 directly (see "ADAT Bulk Output") |
+| S24 finalization | Mode is snapshotted once per packet from `adat_output_is_active()` and shared with Core 1 via `core1_eq_work.finalize_s24`. ADAT active: after the last float consumer, each output row of `buf_out` (rows 0-7) is converted to a clamped 24-bit sample **in place** via `output_block_to_s24_inplace()` (`output_s24.h`, `out_s24_t` = `may_alias` int32), once per sample per channel, even when a slot pool is starved, so ADAT always sees converted data. ADAT inactive: the staging pass is skipped and each slot pair uses the fused `output_pair_convert_interleave()` (rows stay float; no second memory pass). Slot bytes are bit-identical in both modes. Row 8 (PDM sub) stays float always. |
+| SPDIF output | ADAT active: pure integer copy of the finalized S24 rows into the 4 stereo slot pairs (`output_pair_interleave_s24()`). ADAT inactive: fused float->int24 convert+interleave per pair |
+| ADAT output | Encodes the same finalized S24 rows 0-7 directly; the push is gated on the same per-packet snapshot (see "ADAT Bulk Output") |
 | PDM output | Float → Q28 for sigma-delta modulation |
 
 ### RP2040 Fixed-Point Pipeline
@@ -1484,16 +1484,21 @@ Determined at boot and runtime based on output enables:
 **Mutual exclusion:** PDM sub and EQ worker outputs cannot coexist on either platform, enforced in `REQ_SET_OUTPUT_ENABLE`. RP2040: outputs 2-3 conflict with PDM. RP2350: outputs 2-7 conflict with PDM.
 
 ### EQ Worker (Both Platforms)
-*Last updated: 2026-07-13 (RP2350 Core 1 now finalizes buf_out rows 2-7 to S24 in place before the integer pair interleave)*
+*Last updated: 2026-07-13 (RP2350 slot finalization mode selected per packet via core1_eq_work.finalize_s24)*
 
 Core 0 processes input pipeline + matrix mix, then dispatches per-output work to Core 1.
 Core 1 processes assigned SPDIF outputs in parallel: EQ, gain, delay, and S/PDIF conversion.
-On RP2350, `eq_worker_loop` (`pdm_generator.c`) now converts its `buf_out` rows
-2-7 to S24 in place via `output_block_to_s24_inplace()` (the single conversion
-point shared with ADAT; runs even when a slot pool is starved) and then
-interleaves pairs 1-3 as a pure integer copy. Core 0 symmetrically converts rows
-0-1 and interleaves pair 0; the single-core fallback converts rows 0-7 and
-interleaves pairs 0-3.
+On RP2350 the slot finalization mode is snapshotted once per packet by Core 0
+from `adat_output_is_active()` and passed to Core 1 as
+`core1_eq_work.finalize_s24`, so both cores always agree. ADAT active:
+`eq_worker_loop` (`pdm_generator.c`) converts its `buf_out` rows 2-7 to S24 in
+place via `output_block_to_s24_inplace()` (the single conversion point shared
+with ADAT; runs even when a slot pool is starved) and then interleaves pairs
+1-3 as a pure integer copy; Core 0 symmetrically converts rows 0-1 and
+interleaves pair 0, and the single-core fallback converts rows 0-7 and
+interleaves pairs 0-3. ADAT inactive: both cores skip the staging pass and use
+the fused `output_pair_convert_interleave()` per pair (rows stay float),
+avoiding the second memory pass; slot bytes are bit-identical in both modes.
 
 | Platform | Core 0 outputs | Core 1 outputs | spdif_out[] size |
 |----------|----------------|----------------|------------------|
@@ -1690,12 +1695,15 @@ masked, and PDM claims its channel once at init.
 > samples) so overwrite of unplayed frames is structurally impossible. The
 > LUT-driven encoder adds 528 bytes of BSS (`adat_token_lut[256]` uint16 = 512 B,
 > plus the per-entry-level header variants `adat_hdr_nrzi`/`adat_hdr_exit`),
-> built once in `adat_output_init()`. The new single float->S24 conversion point
-> costs zero extra RAM: it reuses `buf_out` rows 0-7 in place (the rows stay
-> declared `float` but are read as `out_s24_t` = `may_alias` int32 after
-> finalization). Only `adat_output_push_block()` is RAM-resident
-> (`DSP_TIME_CRITICAL`); all control paths stay cold in flash. RP2040 compiles
-> the engine out entirely (zero cost). See "ADAT Bulk Output".
+> built once in `adat_output_init()`. The single float->S24 conversion point
+> costs zero extra RAM: while ADAT is active it reuses `buf_out` rows 0-7 in
+> place (the rows stay declared `float` but are read as `out_s24_t` =
+> `may_alias` int32 after finalization); while ADAT is inactive the staging
+> pass is skipped (fused per-pair convert+interleave). Only
+> `adat_output_push_block()` and `adat_output_is_active()` (sampled per packet
+> for the mode snapshot) are RAM-resident (`DSP_TIME_CRITICAL`); all other
+> control paths stay cold in flash. RP2040 compiles the engine out entirely
+> (zero cost). See "ADAT Bulk Output".
 
 > **Test signal generator (2026-07-05).** The siggen subsystem adds a small amount
 > of BSS (well under 1 KB: applied + staged `SiggenConfig`, three 44.1/48/96 kHz
@@ -2642,9 +2650,15 @@ against the old encoder was proven by a 4-million-frame host differential test
 (chained levels, silence templates, all 256 tokens x 3 positions x 2 levels,
 float edge cases); codegen on Cortex-M33 -O3 dropped from 311 to 231
 instructions per frame. Samples arrive already converted to S24 in place in
-`buf_out` (see `output_s24.h`): the pipeline's single float->S24 pass feeds both
-the S/PDIF slots and this encoder, and `adat_output_push_block()` now takes
-`const out_s24_t (*)[192]` and encodes the integers directly. PIO-side NRZI was
+`buf_out` (see `output_s24.h`): while ADAT is active the pipeline's single
+float->S24 pass feeds both the S/PDIF slots and this encoder, and
+`adat_output_push_block()` takes `const out_s24_t (*)[192]` and encodes the
+integers directly. While ADAT is inactive the pipeline skips the staging pass
+(fused per-pair convert+interleave, rows stay float) and the push is gated off
+by the same per-packet snapshot (`adat_output_is_active()`, RAM-resident;
+shared with Core 1 via `core1_eq_work.finalize_s24`), so the ADAT-off steady
+state pays no extra memory pass and the encoder can never read unconverted
+rows. PIO-side NRZI was
 rejected (the servo dithers between adjacent possibly-odd dividers, and a
 two-mode encoder would need mid-stream resync); the encode LUT is intentionally
 not shared with the planned ADAT input, whose NRZI decode is `x ^ (x >> 1)` and

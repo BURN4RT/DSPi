@@ -706,6 +706,10 @@ typedef struct {
     float             vol_mul_step;    // Per-sample increment
     uint32_t          delay_write_idx;  // Snapshot for Core 1 delay processing
     int32_t          *spdif_out[3];     // Pairs 1-3 output buffers (NULL = skip)
+    // ADAT-active snapshot for THIS packet: both cores must pick the same
+    // slot finalization mode (in-place S24 staging vs fused convert+
+    // interleave) so ADAT never reads unconverted rows.  See output_s24.h.
+    uint8_t           finalize_s24;
 #else
     int32_t         (*buf_out)[192];   // Pointer to buf_out array (Q28), set once at init
     uint32_t          sample_count;

@@ -212,17 +212,27 @@ the float clamp/convert path including +/-1.0, denormals and infinities.
   instructions per frame, and the per-frame float clamp/convert is gone
   entirely (see next bullet). Silence templates are built at init through the
   same encoder.
-- Single S24 conversion point: the pipeline converts `buf_out[0..7]` float ->
-  clamped S24 **in place** once per block (`output_s24.h`,
-  `output_block_to_s24_inplace()`), after the last float consumer (EQ, gain,
-  loudness, delay, peak metering) and before the S/PDIF slot interleave. Both
-  the slot interleave and the ADAT encoder read the integer form
-  (`out_s24_t`, a may_alias int32), eliminating the previous duplicate
-  conversion (8 channels x Fs = 384,000 extra clamp/scale/convert per second
-  at 48 kHz) with zero additional RAM. In dual-core mode Core 0 converts
-  rows 0-1 and Core 1 converts rows 2-7; ADAT reads them only after the
-  `work_done` handshake. Conversion runs even when a slot pool is starved
-  (no buffer taken), so ADAT always sees converted samples.
+- Single S24 conversion point, gated on ADAT activity: while ADAT is active
+  the pipeline converts `buf_out[0..7]` float -> clamped S24 **in place**
+  once per block (`output_s24.h`, `output_block_to_s24_inplace()`), after
+  the last float consumer (EQ, gain, loudness, delay, peak metering) and
+  before the S/PDIF slot interleave. Both the slot interleave
+  (`output_pair_interleave_s24()`, pure integer) and the ADAT encoder read
+  the integer form (`out_s24_t`, a may_alias int32), eliminating the
+  previous duplicate conversion (8 channels x Fs = 384,000 extra
+  clamp/scale/convert per second at 48 kHz) with zero additional RAM. While
+  ADAT is inactive the staging pass is skipped entirely and each slot pair
+  runs the original fused convert+interleave
+  (`output_pair_convert_interleave()`, rows stay float), so the ADAT-off
+  steady state pays no extra memory pass. Both modes produce bit-identical
+  slot bytes. The mode is snapshotted once per packet on Core 0
+  (`adat_output_is_active()`, RAM-resident) and shared with Core 1 via
+  `core1_eq_work.finalize_s24`, and the same snapshot gates the ADAT push,
+  so the two cores and the encoder can never disagree within a packet
+  (ADAT resync runs on the same thread as the pipeline). In dual-core mode
+  Core 0 converts rows 0-1 and Core 1 converts rows 2-7; ADAT reads them
+  only after the `work_done` handshake. Conversion runs even when a slot
+  pool is starved (no buffer taken), so ADAT always sees converted samples.
 - The DSP pushes encoded frames from `process_input_block()` after the slot
   buffer gives; the blocking give bounds the ring lead, so overwrite of
   unplayed frames is structurally impossible while the DMA runs.
