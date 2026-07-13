@@ -396,6 +396,14 @@ void dac_hw_mute_release(void) {
     refresh_pin_assertion();
 }
 
+uint16_t dac_hw_mute_hold_ms(void) {
+    /* 0 when the feature is off or unclaimed — matches the conditions under
+     * which dac_hw_mute_hold_elapsed() reports "no hold to honor", so callers
+     * sizing work against the hold see a consistent zero-cost picture. */
+    if (s_cfg.enabled == 0 || !s_pin_claimed) return 0;
+    return s_cfg.hold_ms;
+}
+
 bool dac_hw_mute_hold_elapsed(void) {
     /* No hold to honor when the feature is off, no pin is claimed, or no
      * hold deadline is armed (hold_ms == 0 / not yet asserted).  Returning

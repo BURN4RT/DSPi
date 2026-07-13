@@ -154,4 +154,16 @@ extern volatile uint32_t preset_mute_counter;
 // Number of samples to mute during preset switch (~5ms at 48kHz)
 #define PRESET_MUTE_SAMPLES  256
 
+// Margin (ms) added on top of the configured DAC hardware-mute hold when
+// flooring preset_mute_counter against a still-pending hold: preset_loading
+// auto-clears when the counter expires (update_preset_mute_envelope), and if
+// that happens while a deferred consumer of the flag is still waiting on
+// dac_hw_mute_hold_elapsed(), the prefill handshake that owns the mute
+// release never fires.  Both arming points enforce the floor:
+// prepare_pipeline_reset() (main.c) and flash_mute_hold_samples()
+// (flash_storage.c).  The margin covers the poll iterations between the hold
+// elapsing and the consumer running, plus slop; samples only decrement while
+// input is actually processed, so IRQ-off flash blackouts cost nothing.
+#define PRESET_MUTE_HOLD_MARGIN_MS  120u
+
 #endif // FLASH_STORAGE_H

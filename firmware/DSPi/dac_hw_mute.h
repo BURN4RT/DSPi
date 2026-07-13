@@ -212,6 +212,13 @@ void dac_hw_mute_assert(void);
  * Cheap: one byte load + (when armed) one 64-bit compare. */
 bool dac_hw_mute_hold_elapsed(void);
 
+/* Configured pre-clock-stop hold dwell in ms; 0 when the feature is
+ * disabled or no pin is claimed (the same conditions under which
+ * dac_hw_mute_hold_elapsed() reports no hold to honor).  Lets callers
+ * size time-based work — e.g. the soft-mute sample counter — to outlast
+ * a pending hold. */
+uint16_t dac_hw_mute_hold_ms(void);
+
 /* Begin release of the pipeline-reset hardware mute.  Called from
  * complete_pipeline_reset() AFTER the synchronized PIO SM start, so
  * the DAC sees valid clocks before its mute pin deasserts.  If

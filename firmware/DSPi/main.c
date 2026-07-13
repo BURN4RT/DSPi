@@ -346,6 +346,7 @@ static void prepare_pipeline_reset(uint32_t mute_samples);
 static void complete_pipeline_reset(void);
 static void drain_and_disable_outputs(void);
 static void enable_outputs_in_sync(void);
+static uint32_t samples_for_duration_ms(uint32_t sample_rate_hz, uint32_t duration_ms);
 
 // SPDIF input prefill: outputs disabled while consumer buffers fill to 50%
 static bool spdif_prefilling = false;
@@ -829,6 +830,32 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
     adat_prefilling = false;
     __dmb();
     dac_hw_mute_assert();
+
+    // preset_loading must outlive any pending hardware-mute hold.  The soft
+    // envelope (update_preset_mute_envelope) auto-clears preset_loading after
+    // preset_mute_counter samples, and the SPDIF/ADAT/I2S-slave prefill
+    // blocks gate their drain on dac_hw_mute_hold_elapsed() while their poll
+    // keeps feeding the pipeline; after a fast re-lock (or a pin-swap input
+    // restart) with a long configured hold, a small counter expires before
+    // the drain is allowed to run, the prefill handshake never fires, and
+    // dac_hw_mute_release() is never called: stuck mute.  So when a hold is
+    // still pending here, floor the counter to outlast it (hold + margin for
+    // the post-hold poll iterations).  Reachable only with a fresh hold: the
+    // synchronous reset handlers pre-gate on pipeline_reset_ready(), so by
+    // the time their body runs prepare, the hold has elapsed and this is
+    // skipped — USB-path mute durations are unchanged.  The flash brackets
+    // are covered separately: their settle loop waits the hold out before
+    // the blackout when the source is streaming, and flash_write_sector()'s
+    // trailing re-arm (flash_mute_hold_samples) applies this same floor for
+    // the non-streaming case, where the hold is still pending at completion.
+    if (!dac_hw_mute_hold_elapsed()) {
+        uint32_t floor_samples = samples_for_duration_ms(
+            audio_state.freq,
+            (uint32_t)dac_hw_mute_hold_ms() + PRESET_MUTE_HOLD_MARGIN_MS);
+        if (preset_mute_counter < floor_samples) {
+            preset_mute_counter = floor_samples;
+        }
+    }
 }
 
 // Non-blocking pre-clock-stop barrier for the synchronous reset handlers.
@@ -1207,7 +1234,11 @@ static void enable_outputs_in_sync(void) {
 //     rendered to the outputs before interrupts are blacked out by flash ops.
 // Settle must exceed envelope ramp (~8ms) + consumer pipeline drain (~16ms @ 48kHz).
 // Premute must exceed settle + flash write (~45ms) + margin so the mute counter
-// never expires before the pipeline is reset.
+// never expires before the pipeline is reset.  A configured DAC hardware-mute
+// hold above ~75 ms burns through this while the settle loop services the
+// input, but flash_write_sector()'s trailing re-arm restores preset_loading
+// after every write (with the pending-hold floor from flash_mute_hold_samples),
+// so the completion path always sees the flag set regardless of hold length.
 #define FLASH_WRITE_PREMUTE_MS       120u
 #define FLASH_WRITE_FADE_SETTLE_US   30000u
 

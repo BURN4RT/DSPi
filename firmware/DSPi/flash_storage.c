@@ -46,6 +46,7 @@
 #include "uart_control.h"    // uart_ctrl_owns_pin (io_pin_valid guard)
 #include "i2c_control.h"     // i2c_ctrl_owns_pin (io_pin_valid guard)
 #include "bulk_params.h"     // WireBulkParams offsets for user_mute notify
+#include "dac_hw_mute.h"     // hold query for flash_mute_hold_samples floor
 
 #include "hardware/flash.h"
 #include "hardware/sync.h"
@@ -1109,8 +1110,25 @@ static bool dir_cache_valid = false;
 // which can be too short to cover post-flash pipeline refill and envelope
 // transitions.  Keep the hold at roughly 10 ms across rates with a floor
 // that preserves existing behavior at 48 kHz.
+//
+// When the DAC hardware-mute hold is still pending, size the counter to
+// outlast it (same floor as prepare_pipeline_reset in main.c).  This re-arm
+// runs after every flash write and is the last thing to touch
+// preset_mute_counter before the completion path, so it must uphold the
+// invariant on its own: on a non-streaming source the flash brackets skip
+// the settle loop (nothing to drain), leaving the hold un-elapsed at
+// completion; if the source then locks within the hold, its poll would burn
+// a ~10 ms counter and auto-clear preset_loading before the prefill block
+// (gated on dac_hw_mute_hold_elapsed) is allowed to run, and the mute
+// release that block owns would never happen.  When the source was
+// streaming, the settle loop already waited the hold out and this floor
+// stays disengaged.
 static inline uint32_t flash_mute_hold_samples(void) {
-    uint64_t samples = ((uint64_t)audio_state.freq * 10u + 999u) / 1000u;
+    uint32_t ms = 10u;
+    if (!dac_hw_mute_hold_elapsed()) {
+        ms += (uint32_t)dac_hw_mute_hold_ms() + PRESET_MUTE_HOLD_MARGIN_MS;
+    }
+    uint64_t samples = ((uint64_t)audio_state.freq * ms + 999u) / 1000u;
     if (samples < 512u) samples = 512u;
     return (uint32_t)samples;
 }
@@ -3209,7 +3227,10 @@ uint8_t preset_delete(uint8_t slot) {
 
     // If deleting the active slot, apply factory defaults to live state
     if (slot == dir_cache.last_active_slot) {
-        preset_mute_counter = PRESET_MUTE_SAMPLES;
+        // flash_mute_hold_samples (not PRESET_MUTE_SAMPLES): this write
+        // follows dir_flush()'s floored re-arm and must not lower the
+        // counter below a pending hardware-mute hold (see the helper).
+        preset_mute_counter = flash_mute_hold_samples();
         preset_loading = true;
         __dmb();
 
