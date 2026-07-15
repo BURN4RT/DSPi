@@ -13,7 +13,10 @@
  *           probing the exact 48/44.1 kHz decoder timings and requiring a
  *           valid frame-header run. Once locked, RX DMA word timing supplies
  *           the fine servo reference and all outputs track it via
- *           input_servo_apply(), exactly like SPDIF input.
+ *           input_servo_apply(), exactly like SPDIF input. Never parked:
+ *           rate_ok is always true (a >48 kHz device rate at switch-in is
+ *           resolved by the deferred rate change after lock, under the
+ *           switch-in mute).
  *
  * The receiver itself is identical in both modes: a PIO NRZI decoder
  * (adat_input.pio) streams decoded bits into a DMA ring; the main-loop poll
@@ -43,7 +46,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  clock_mode;     // live adat_clock_mode (0 master / 1 slave)
     uint8_t  enabled;        // configured enable
     uint8_t  pin;            // configured RX GPIO (0xFF = unset)
-    uint8_t  rate_ok;        // 0 while parked because device rate > 48 kHz
+    uint8_t  rate_ok;        // 0 = master mode parked (device rate > 48 kHz); always 1 in slave mode
     uint8_t  lock_count;     // locks since boot (saturates at 255)
     uint8_t  loss_count;     // lock losses since boot (saturates at 255)
     uint8_t  slip_count;     // losses caused by header verification failure

@@ -472,9 +472,17 @@ void adat_input_start(void) {
     // OSR = all-ones so `in osr, 1` emits a 1 (X and Y are both counters)
     pio_sm_exec(ADAT_RX_PIO, ADAT_RX_SM, pio_encode_mov_not(pio_osr, pio_null));
 
-    adat_rx_rate_ok = (audio_state.freq <= 48000u);
-    uint32_t fs = adat_rx_rate_ok ? audio_state.freq : 48000u;
-    adat_rx_set_cell((adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) ? 48000u : fs);
+    // rate_ok is a master-mode park flag only: false means the device rate
+    // (the rate authority in master mode) is above ADAT's 48 kHz ceiling.
+    // Slave mode always runs regardless of the current pipeline rate; the
+    // wire rate is detected and a >48k device rate at switch-in resolves
+    // itself through the deferred rate change after lock (the switch-in
+    // mute holds until then).
+    adat_rx_rate_ok = (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) ||
+                      (audio_state.freq <= 48000u);
+    adat_rx_set_cell((adat_clock_mode == ADAT_CLOCK_MODE_SLAVE)
+                         ? 48000u   // probe_arm below owns the candidate cell
+                         : (adat_rx_rate_ok ? audio_state.freq : 48000u));
 
     // Free-running ring: ENDLESS transfer count (never decrements) plus the
     // hardware write-address wrap. One channel, no IRQ, no reload channel.
@@ -559,7 +567,13 @@ uint32_t adat_input_poll(void) {
         else if (st == ADAT_INPUT_SYNCING || st == ADAT_INPUT_LOCKED)
             adat_rx_rate_machine(now, widx, stall);
     }
-    if (!adat_rx_rate_ok) return 0;
+    // Master-only park (rate_ok can only be false in master mode; the mode
+    // qualifier keeps that invariant locally visible). Slave mode proceeds
+    // to LOCKED even if the pipeline is still above 48k: the main loop's
+    // check_rate_change() then retunes the pipeline under the switch-in
+    // mute before any output is enabled.
+    if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER && !adat_rx_rate_ok)
+        return 0;
 
     // Master mode re-acquires by rescanning; there is no rate to re-detect.
     if (adat_rx_state == ADAT_INPUT_RELOCKING &&
@@ -652,6 +666,11 @@ void adat_input_update_clock_servo(void) {
     if (adat_clock_mode != ADAT_CLOCK_MODE_SLAVE ||
         adat_rx_state != ADAT_INPUT_LOCKED)
         return;
+    // Hold off while the pipeline has not yet followed the detected rate
+    // (the muted window between slave lock at a >48k device rate and the
+    // deferred rate change): slewing every output clock to the wire rate
+    // early would be muted and slot-aligned, but pointless churn.
+    if (adat_rx_detected_rate != audio_state.freq) return;
     if (++adat_rx_servo_skip < ADAT_RX_SERVO_INTERVAL) return;
     adat_rx_servo_skip = 0;
 
@@ -671,7 +690,10 @@ bool adat_input_check_rate_change(void) {
 }
 
 void adat_input_on_rate_change(uint32_t freq) {
-    adat_rx_rate_ok = (freq <= 48000u);
+    // Master-only park flag; see adat_input_start. Slave mode is never
+    // parked (a clock-mode flip recomputes this through stop/start).
+    adat_rx_rate_ok = (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) ||
+                      (freq <= 48000u);
     if (!adat_rx_running) return;
     if (adat_clock_mode == ADAT_CLOCK_MODE_MASTER) {
         if (!adat_rx_rate_ok) {

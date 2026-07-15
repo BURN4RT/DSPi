@@ -65,6 +65,15 @@ deferred rate-change path, and every output (SPDIF and I2S slot dividers, the
 ADAT output divider, and MCK) is servo rate-matched to it, exactly like SPDIF
 input. An 8-16 s dual-anchor long window gives the servo a ~0.1 ppm reference.
 
+Slave mode is never parked: `rate_ok` is always 1 (parking is a master-only
+concept). If the device rate is above 48 kHz when ADAT slave becomes the
+active source (the source switch keeps the previous rate), acquisition still
+runs to LOCKED; the deferred rate change then retunes the pipeline to the
+detected 44.1/48 kHz rate while the switch-in mute holds, and only afterwards
+does the synchronized prefill enable every output slot together. The output
+servo also holds off until the pipeline rate matches the detected rate, so no
+output clock is slewed during that muted window.
+
 Clock-slaving to ADAT is only in force while ADAT is the active input
 source; switching to any other source restores nominal output dividers.
 
@@ -147,7 +156,7 @@ Behavioral notes:
 | 1 | u8 | `clock_mode` | Live clock mode: 0 master, 1 slave |
 | 2 | u8 | `enabled` | Configured enable |
 | 3 | u8 | `pin` | Configured RX GPIO (0xFF = unset) |
-| 4 | u8 | `rate_ok` | 0 while parked because the device rate is above 48 kHz |
+| 4 | u8 | `rate_ok` | 0 = master mode parked because the device rate is above 48 kHz; always 1 in slave mode |
 | 5 | u8 | `lock_count` | Locks since input start (saturates at 255) |
 | 6 | u8 | `loss_count` | Lock losses since input start (saturates at 255) |
 | 7 | u8 | `slip_count` | Losses caused by header verification failure (bit slips / signal loss) |
