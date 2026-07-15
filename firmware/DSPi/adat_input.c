@@ -20,11 +20,12 @@
  * verification doubles as the loss detector: a dark or unplugged line
  * decodes as zeros, which never match the header.
  *
- * Clock modes: see adat_input.h. Slave mode measures the wire rate from the
- * DMA write pointer (i2s_input.c slave machine pattern: 32 ms fast windows
- * snapped to 44.1/48 kHz, dual-anchor long window for the ~0.1 ppm servo
- * reference) and servos all outputs via input_servo_apply(). Master mode
- * skips all of that; the stream is already in our clock domain.
+ * Clock modes: see adat_input.h. Slave mode acquires by trying the two
+ * supported cell timings (48 kHz, then 44.1 kHz) and accepting only a run of
+ * valid frame headers. Once locked it measures the wire rate from the DMA
+ * write pointer (32 ms fast windows plus a dual-anchor long window for the
+ * ~0.1 ppm servo reference) and servos all outputs via input_servo_apply().
+ * Master mode skips all of that; the stream is already in our clock domain.
  */
 
 #include "adat_input.h"
@@ -74,11 +75,11 @@ _Static_assert(ADAT_RX_RING_WORDS % ADAT_RX_FRAME_WORDS == 0,
 #define ADAT_SYNC_VERIFY_FRAMES 8u     // consecutive good headers before LOCKED
 #define ADAT_HDR_FAIL_LIMIT     2u     // consecutive bad headers = lock loss
 #define ADAT_SCAN_WORDS_PER_POLL 256u  // bounds sync-search CPU per poll
+#define ADAT_RX_PROBE_DWELL_US  10000u // per-rate header-search dwell
 
 // Slave-mode rate measurement (i2s_input.c slave machine pattern)
 #define ADAT_RX_WINDOW_US       32000u     // fast measurement window
 #define ADAT_RX_CLOCK_TIMEOUT_US 5000u     // safety net only; see rate machine
-#define ADAT_RX_LOCK_WINDOWS    2          // agreeing windows needed
 #define ADAT_RX_LONG_HALF_US    8000000ull // long-window anchor rotation
 #define ADAT_RX_POLL_GAP_US     4000u      // stall guard (under ring fill time)
 #define ADAT_RX_SERVO_INTERVAL  1000       // main-loop iterations (~20 ms)
@@ -124,13 +125,17 @@ static uint64_t meas_win_us;
 static uint64_t meas_win_words;
 static float    meas_hz_smooth;
 static uint32_t meas_measured_hz;
-static uint32_t lock_candidate;
-static uint8_t  lock_agree;
 static uint64_t long_us[2];
 static uint64_t long_words[2];
 static bool     long_valid;
 static float    meas_hz_long;
 static uint32_t adat_rx_servo_skip;
+
+// Slave acquisition probes one exact decoder timing at a time. The DMA word
+// rate is not trustworthy while the decoder cell is wrong: the emitted stream
+// is corrupt and its rate depends partly on the decoder timeout.
+static uint32_t probe_rate;
+static uint64_t probe_started_us;
 
 // ============================================================================
 // HELPERS
@@ -140,6 +145,10 @@ static inline uint32_t adat_rx_write_index(void) {
     return (uint32_t)((dma_hw->ch[ADAT_RX_DMA_CH].write_addr -
                        (uintptr_t)adat_rx_ring) >> 2) & ADAT_RX_RING_MASK;
 }
+
+static void adat_rx_probe_arm(uint64_t now, uint32_t widx,
+                              uint32_t preferred_rate);
+static void adat_rx_meas_arm(uint64_t now, uint32_t widx);
 
 static void adat_rx_set_state(AdatInputState st) {
     if (adat_rx_state == st) return;
@@ -180,9 +189,16 @@ static void adat_rx_resync_scan(uint32_t from) {
 static void adat_rx_drop_lock(void) {
     if (adat_rx_loss_count < 255) adat_rx_loss_count++;
     long_valid = false;
-    lock_candidate = 0;
-    lock_agree = 0;
-    adat_rx_resync_scan(adat_rx_write_index());
+    uint32_t widx = adat_rx_write_index();
+    if (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) {
+        // Retry the last valid family first. A brief optical glitch can
+        // recover immediately; a genuine family switch reaches the alternate
+        // after one short probe dwell.
+        uint32_t preferred = (adat_rx_detected_rate == 44100u) ? 44100u : 48000u;
+        adat_rx_probe_arm(time_us_64(), widx, preferred);
+    } else {
+        adat_rx_resync_scan(widx);
+    }
     adat_rx_set_state(ADAT_INPUT_RELOCKING);
 }
 
@@ -264,8 +280,60 @@ static void adat_rx_scan(uint32_t widx) {
         scan_word = (widx - 64u) & ADAT_RX_RING_MASK;
 }
 
+// Start (or switch) a slave-mode candidate. Bits already in the ring were
+// decoded with the previous timing, so search only from the current writer.
+// One partly assembled PIO word may straddle the retune; the scanner skips it
+// naturally before reaching clean candidate-rate words.
+static void adat_rx_probe_arm(uint64_t now, uint32_t widx,
+                              uint32_t preferred_rate) {
+    probe_rate = (preferred_rate == 44100u) ? 44100u : 48000u;
+    probe_started_us = now;
+    adat_rx_set_cell(probe_rate);
+    adat_rx_resync_scan(widx);
+}
+
+// Prove the current exact cell timing with a consecutive structural-header
+// run. A wrong candidate can contain an isolated accidental 0x801 pattern,
+// but cannot preserve it at the fixed eight-word frame stride for the full
+// verification run.
+static bool adat_rx_probe_poll(uint64_t now, uint32_t widx) {
+    if (!sync_found) adat_rx_scan(widx);
+
+    while (sync_found && verify_left) {
+        if (((widx - rd_word) & ADAT_RX_RING_MASK) < ADAT_RX_FRAME_WORDS + 1u)
+            break;
+        if (!adat_rx_header_ok(rd_word, frame_bit)) {
+            adat_rx_header_err++;
+            adat_rx_resync_scan(rd_word);
+            break;
+        }
+        rd_word = (rd_word + ADAT_RX_FRAME_WORDS) & ADAT_RX_RING_MASK;
+        verify_left--;
+    }
+
+    if (sync_found && verify_left == 0u) {
+        adat_rx_detected_rate = probe_rate;
+        // Begin fine-rate/servo measurement only after the decoder timing is
+        // known-correct. The previous wrong-cell DMA-rate bootstrap was the
+        // source of the real-hardware 44.1 kHz acquisition failure.
+        adat_rx_meas_arm(now, widx);
+        meas_hz_smooth = (float)probe_rate;
+        long_us[0] = long_us[1] = now;
+        long_words[0] = long_words[1] = 0;
+        long_valid = false;
+        adat_rx_set_state(ADAT_INPUT_SYNCING);
+        return true;
+    }
+
+    if (now - probe_started_us >= ADAT_RX_PROBE_DWELL_US) {
+        uint32_t alternate = (probe_rate == 48000u) ? 44100u : 48000u;
+        adat_rx_probe_arm(now, widx, alternate);
+    }
+    return false;
+}
+
 // ============================================================================
-// SLAVE-MODE RATE MACHINE
+// SLAVE-MODE LOCKED-RATE MEASUREMENT
 // ============================================================================
 
 // Re-anchor the measurement accumulators (start, stall, divider change).
@@ -277,8 +345,6 @@ static void adat_rx_meas_arm(uint64_t now, uint32_t widx) {
     meas_win_words = 0;
     meas_hz_smooth = 0.0f;
     meas_measured_hz = 0;
-    lock_candidate = 0;
-    lock_agree = 0;
     long_valid = false;
 }
 
@@ -339,42 +405,24 @@ static void adat_rx_rate_machine(uint64_t now, uint32_t widx, bool stall) {
 
     uint32_t snapped = adat_rx_snap_rate(hz);
 
-    if (adat_rx_state == ADAT_INPUT_LOCKED || adat_rx_state == ADAT_INPUT_SYNCING) {
-        if (snapped != adat_rx_detected_rate) {
-            // Wire rate changed (or a glitch burst disturbed the window)
-            adat_rx_drop_lock();
-            return;
+    if (snapped != adat_rx_detected_rate) {
+        // Wire rate changed (or a glitch burst disturbed the window). Header
+        // verification chooses the new exact family during re-lock.
+        adat_rx_drop_lock();
+        return;
+    }
+    if (adat_rx_state == ADAT_INPUT_LOCKED) {
+        meas_hz_smooth += 0.25f * (hz - meas_hz_smooth);
+        // Long dual-anchor window: rotate every 8 s, measure 8-16 s span
+        if (now - long_us[1] >= ADAT_RX_LONG_HALF_US) {
+            long_us[0] = long_us[1];     long_words[0] = long_words[1];
+            long_us[1] = now;            long_words[1] = meas_total_words;
         }
-        if (adat_rx_state == ADAT_INPUT_LOCKED) {
-            meas_hz_smooth += 0.25f * (hz - meas_hz_smooth);
-            // Long dual-anchor window: rotate every 8 s, measure 8-16 s span
-            if (now - long_us[1] >= ADAT_RX_LONG_HALF_US) {
-                long_us[0] = long_us[1];     long_words[0] = long_words[1];
-                long_us[1] = now;            long_words[1] = meas_total_words;
-            }
-            uint64_t long_span = now - long_us[0];
-            if (long_span >= ADAT_RX_LONG_HALF_US) {
-                meas_hz_long = (float)(meas_total_words - long_words[0]) *
-                               (1e6f / 8.0f) / (float)long_span;
-                long_valid = true;
-            }
-        }
-    } else {
-        // ACQUIRING / RELOCKING: consecutive agreeing windows before syncing
-        if (snapped && snapped == lock_candidate) {
-            if (++lock_agree >= ADAT_RX_LOCK_WINDOWS) {
-                adat_rx_detected_rate = snapped;
-                adat_rx_set_cell(snapped);
-                adat_rx_resync_scan(widx);   // bits before the retune are stale
-                meas_hz_smooth = hz;
-                long_us[0] = long_us[1] = now;
-                long_words[0] = long_words[1] = meas_total_words;
-                long_valid = false;
-                adat_rx_set_state(ADAT_INPUT_SYNCING);
-            }
-        } else {
-            lock_candidate = snapped;
-            lock_agree = snapped ? 1 : 0;
+        uint64_t long_span = now - long_us[0];
+        if (long_span >= ADAT_RX_LONG_HALF_US) {
+            meas_hz_long = (float)(meas_total_words - long_words[0]) *
+                           (1e6f / 8.0f) / (float)long_span;
+            long_valid = true;
         }
     }
 }
@@ -451,11 +499,13 @@ void adat_input_start(void) {
     adat_rx_servo_skip = 0;
     uint64_t now = time_us_64();
     meas_last_poll_us = now;
-    adat_rx_meas_arm(now, adat_rx_write_index());
-    adat_rx_resync_scan(adat_rx_write_index());
+    uint32_t widx = adat_rx_write_index();
+    adat_rx_meas_arm(now, widx);
+    adat_rx_resync_scan(widx);
 
     if (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) {
         adat_rx_detected_rate = 0;
+        adat_rx_probe_arm(now, widx, 48000u);
         adat_rx_set_state(ADAT_INPUT_ACQUIRING);
     } else if (!adat_rx_rate_ok) {
         adat_rx_detected_rate = 0;
@@ -502,8 +552,13 @@ uint32_t adat_input_poll(void) {
     meas_last_poll_us = now;
     bool stall = (gap > ADAT_RX_POLL_GAP_US);
 
-    if (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE)
-        adat_rx_rate_machine(now, widx, stall);
+    if (adat_clock_mode == ADAT_CLOCK_MODE_SLAVE) {
+        AdatInputState st = adat_rx_state;
+        if (st == ADAT_INPUT_ACQUIRING || st == ADAT_INPUT_RELOCKING)
+            adat_rx_probe_poll(now, widx);
+        else if (st == ADAT_INPUT_SYNCING || st == ADAT_INPUT_LOCKED)
+            adat_rx_rate_machine(now, widx, stall);
+    }
     if (!adat_rx_rate_ok) return 0;
 
     // Master mode re-acquires by rescanning; there is no rate to re-detect.

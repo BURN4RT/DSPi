@@ -1733,7 +1733,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-13 (ADAT input receiver: +8 KB RX ring BSS + ~3 KB RAM-pinned decode, RP2350; .data budget raised to 72K)*
+*Last updated: 2026-07-15 (ADAT slave acquisition replaces candidate-window counters with probe rate/start-time state; RX ring and buffer sizes unchanged)*
 
 > **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
 > fourth parameter (`Qp`) is stored out-of-band in a new BSS array
@@ -1768,12 +1768,15 @@ masked, and PDM claims its channel once at init.
 > control paths stay cold in flash. RP2040 compiles the engine out entirely
 > (zero cost). See "ADAT Bulk Output".
 
-> **ADAT bulk input (2026-07-13, RP2350 only).** The ADAT receiver adds a fixed
+> **ADAT bulk input (2026-07-13, acquisition state updated 2026-07-15; RP2350 only).** The ADAT receiver adds a fixed
 > **8 KB BSS ring** (`adat_rx_ring`, 2048 x uint32, aligned to its own size for the
-> DMA write-address wrap) plus a few dozen bytes of state, and roughly **3 KB of
+> DMA write-address wrap) plus a few dozen bytes of state (including the current
+> slave probe rate and its 64-bit start timestamp), and roughly **3 KB of
 > RAM-pinned decode code**: the `DSP_TIME_CRITICAL` poll body, header check, frame
 > decoder, slave-mode rate machine, and clock servo. The bounded sync-search scan
-> is `noinline` and stays cold in flash (it runs only while the pipeline is muted).
+> and exact-timing acquisition probe stay cold in flash (they run only while the
+> pipeline is muted). Ring and audio-buffer sizes are unchanged by the probe-based
+> acquisition update.
 > RP2040 compiles the receiver out entirely (config state only). This lifted the
 > RP2350 `.data` budget in `scripts/check_ram_placement.py` from 64K to 72K. See
 > "ADAT Input".
@@ -3114,11 +3117,11 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 
 **Frame sync and loss detection.** The sync header's 10-zero run cannot occur in channel data (ADAT forces a 1 every 5th bit, bounding data runs to 4), so `adat_rx_scan()` searches fresh decoded bits for the 12-bit structural pattern `[1][10x0][1]` (`0x801`) to find the frame boundary. Once found, frames sit at a fixed bit offset (edge resync in the PIO absorbs clock offset, so exactly 256 bits arrive per frame) and `adat_rx_decode_frame()` unstuffs the 8 channel fields (exact inverse of `adat_encode_frame` in adat_output.c) into int32 full-scale. Each frame's header is verified before its samples are trusted; header verification doubles as the loss detector, since a dark or unplugged line decodes as zeros and never matches the header. An isolated bad frame is skipped while the lock holds; `ADAT_HDR_FAIL_LIMIT` (2) consecutive bad headers drop the lock (`slip_count`++).
 
-**Lock machine** (`AdatInputState`): INACTIVE (hardware stopped) -> ACQUIRING (slave: measuring wire rate; master: waiting for a valid device rate) -> SYNCING (searching for / verifying the frame sync, `ADAT_SYNC_VERIFY_FRAMES` = 8 consecutive good headers) -> LOCKED (decoding audio) -> RELOCKING (signal or rate lost; outputs muted exactly like a SPDIF lock loss). The main loop reacts to RELOCKING with the same mute/drain/prefill flow as SPDIF.
+**Lock machine** (`AdatInputState`): INACTIVE (hardware stopped) -> ACQUIRING (slave: probing exact 48/44.1 kHz decoder timing; master: waiting for a valid device rate) -> SYNCING (candidate header-proven; completing the lock transition) -> LOCKED (decoding audio) -> RELOCKING (signal or rate lost; outputs muted exactly like a SPDIF lock loss). Slave acquisition starts with the 48 kHz cell timing, requires `ADAT_SYNC_VERIFY_FRAMES` = 8 consecutive valid headers at the fixed eight-word frame stride, and alternates to the 44.1 kHz timing after `ADAT_RX_PROBE_DWELL_US` = 10 ms without a valid run (continuing to alternate while absent/unsupported). Re-lock tries the last valid family first. This makes decoded frame structure—not the DMA rate of a deliberately corrupt wrong-cell stream—the family-rate authority. The main loop reacts to RELOCKING with the same mute/drain/prefill flow as SPDIF, so the output slots remain aligned through every probe/re-lock transition.
 
 **Clock modes** (`adat_clock_mode`, default MASTER):
 - **MASTER:** the far end locks to DSPi's ADAT output, so the return stream is already in our clock domain; no rate detection, no servo. The device is the rate authority via `REQ_SET_INPUT_RATE` (shared with I2S master mode). Above 48 kHz the input parks with `rate_ok = false` (outputs stay muted through a never-completing prefill), mirroring the ADAT output's suspension above 48k.
-- **SLAVE:** external gear owns the clock. The wire rate is auto-detected from the RX DMA write pointer (i2s_input.c slave-machine pattern: 32 ms fast windows snapped to 44.1/48 kHz with 2% tolerance, plus a dual-anchor 8-16 s long window for a ~0.1 ppm servo reference), and all outputs (SPDIF/I2S/ADAT TX dividers + MCK) are servoed to it via `input_servo_apply()`, exactly like SPDIF input. `adat_input_check_rate_change()` feeds the standard deferred `pending_rate` mechanism when the detected rate differs from `audio_state.freq`.
+- **SLAVE:** external gear owns the clock. Exact-timing header probes select the 44.1/48 kHz family as described above. Only after a candidate is proven does the receiver arm DMA-word measurement: 32 ms fast windows validate the family and supply the initial fine-rate estimate, while a dual-anchor 8-16 s long window supplies a ~0.1 ppm servo reference. All outputs (SPDIF/I2S/ADAT TX dividers + MCK) are servoed to it via `input_servo_apply()`, exactly like SPDIF input. `adat_input_check_rate_change()` feeds the standard deferred `pending_rate` mechanism when the detected rate differs from `audio_state.freq`.
 
 **Prefill flow.** On lock the poll batches whole frames (`ADAT_INPUT_MIN_BLOCK` = 48, ~1 ms at 48k, capped at 192/poll), decodes each into the pipeline input buffers (`buf_l`/`buf_r` + `buf_in_ext[0..5]`) with per-channel preamp, and calls `process_input_block()`. A lap guard skips whole frames (preserving frame phase, since the ring holds an exact number of frames) before the reader can be overwritten.
 
@@ -3130,7 +3133,7 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 
 **Flash-write bracket.** `prepare_flash_write_operation()` treats a LOCKED ADAT input as a live source: it appears in the pre-mute drain, the streaming test, and the fade-settle loop (which calls `adat_input_poll()` until both the settle interval and the DAC hardware-mute hold have elapsed), matching the guarantees given to USB/SPDIF/I2S (see "DAC Hardware Mute"). Unlike SPDIF and I2S, ADAT is deliberately NOT stopped for the ~45 ms blackout: its RX is an IRQ-less free-running DMA ring with no decode-timeout alarms to race the blackout edge, and the poll re-acquires frame sync after the ring laps; `preset_loading` (still set from `prepare_pipeline_reset()`) then re-runs the drain/prefill/enable handshake once LOCKED returns.
 
-**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` is fixed BSS; the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the sync-search scan stays cold in flash, since it runs only while muted). See "Memory Layout".
+**Resources.** PIO1 SM2 (PIO1 SM0 = PDM, SM1 = ADAT TX); DMA channel 15 (RX ring, ENDLESS mode, no IRQ). The 8 KB `adat_rx_ring` is fixed BSS; the decode hot path (`adat_input_poll`, `adat_rx_header_ok`, `adat_rx_decode_frame`, `adat_rx_rate_machine`, `adat_input_update_clock_servo`) is `DSP_TIME_CRITICAL` and RAM-resident (the acquisition probe/header scan stays cold in flash, since it runs only while muted). See "Memory Layout".
 
 **Persistence.** ADAT input config persists like the optional SPDIF inputs (disabled by default, pin `0xFF` = unset, GPIO claimed only while ADAT is the active source). `WireInputConfig` (V24) gains `adat_input_pin`, `adat_input_enabled_p1` (enable + 1; 0 absent), and `adat_clock_mode_p1` (mode + 1; 0 absent, 1 master, 2 slave). The fields also ride `PresetSlot` (`SLOT_DATA_VERSION` 32) and the device-global `FlashOutputConfig` (`DIR_VERSION` 15), honoring `output_config_mode` exactly like the other physical-IO config. Vendor commands: `REQ_SET/GET_ADAT_INPUT_ENABLE` (0x68/0x69), `REQ_SET/GET_ADAT_INPUT_PIN` (0x6A/0x6B), `REQ_SET/GET_ADAT_INPUT_CLOCK_MODE` (0x6C/0x6D), `REQ_GET_ADAT_INPUT_STATUS` (0x6E); 0x6F reserved.
 

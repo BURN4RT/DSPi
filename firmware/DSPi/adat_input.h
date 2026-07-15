@@ -9,8 +9,10 @@
  *           end syncs to DSPi's ADAT output). No rate detection, no servo;
  *           the device rate authority is REQ_SET_INPUT_RATE, as in I2S
  *           master mode. Above 48 kHz the input parks with rate_ok = false.
- *   SLAVE:  external gear owns the clock. The wire rate is auto-detected
- *           from the RX DMA word rate and all outputs are servoed to it via
+ *   SLAVE:  external gear owns the clock. The wire rate is acquired by
+ *           probing the exact 48/44.1 kHz decoder timings and requiring a
+ *           valid frame-header run. Once locked, RX DMA word timing supplies
+ *           the fine servo reference and all outputs track it via
  *           input_servo_apply(), exactly like SPDIF input.
  *
  * The receiver itself is identical in both modes: a PIO NRZI decoder
@@ -29,7 +31,7 @@
 // frame sync header. RELOCKING mutes outputs exactly like a SPDIF lock loss.
 typedef enum {
     ADAT_INPUT_INACTIVE  = 0,   // hardware stopped (not selected as input)
-    ADAT_INPUT_ACQUIRING = 1,   // slave: measuring wire rate; master: waiting for a valid device rate
+    ADAT_INPUT_ACQUIRING = 1,   // slave: probing 48/44.1 timing; master: waiting for a valid device rate
     ADAT_INPUT_SYNCING   = 2,   // searching for frame sync
     ADAT_INPUT_LOCKED    = 3,   // decoding audio
     ADAT_INPUT_RELOCKING = 4,   // signal or rate lost; output muted

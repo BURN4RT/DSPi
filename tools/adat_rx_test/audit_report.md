@@ -296,8 +296,14 @@ jitter at all) counting each cell with a 2-cycle poll loop (length per rate
 via the Y register: 27/25 sys cycles), with a post-edge window placed so
 edges re-anchor the grid within 2 sys cycles in both directions. The
 cycle-accurate model proves the new program bit-exact at 44.1 and 48 kHz
-across at least +-1000 ppm of source clock offset, that cross-rate
-acquisition (44.1 kHz stream on the 48 kHz cell) keeps rate-measurement
-error inside the 2 percent snap window, and that the original program's
-failures still reproduce (model fidelity check). The 150 MHz fallback sys
-clock is documented as unsupported for ADAT input.
+across at least +-1000 ppm of source clock offset and that the original
+program's failures still reproduce (model fidelity check). The 150 MHz
+fallback sys clock is documented as unsupported for ADAT input.
+
+Follow-up, 2026-07-15: real external hardware showed that using the corrupt
+cross-rate decoded stream's DMA fill rate as the family-rate bootstrap was
+not robust at 44.1 kHz. Slave acquisition now probes the exact 48 and 44.1
+kHz cell timings in turn and accepts only an eight-header valid run; DMA-rate
+measurement begins after that structural proof and is retained for fine servo
+tracking only. The regression now verifies wrong-candidate rejection followed
+by matching-candidate acceptance in both directions.

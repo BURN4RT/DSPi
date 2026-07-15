@@ -16,8 +16,9 @@
  * insufficient, and the CURRENT divider-1.0 counter-loop program (model 2,
  * matches adat_input.pio). The no-arg run is a regression matrix: model 0's
  * known failures must reproduce (simulator fidelity) and model 2 must be
- * bit-exact at both rates across +-1000 ppm, with cross-rate acquisition
- * inflation inside the 2 percent rate-snap window.
+ * bit-exact at both rates across +-1000 ppm. The acquisition regression also
+ * verifies the current exact-timing probe policy: the wrong family is dirty,
+ * then the matching 48/44.1 kHz candidate decodes cleanly.
  *
  * cc -O2 -o adat_rx_bitdiff adat_rx_bitdiff.c && ./adat_rx_bitdiff
  * Single case: ./adat_rx_bitdiff <fs> <src_ppm> <div_or_y> <model>
@@ -445,20 +446,15 @@ int main(int argc, char **argv) {
         if (!run_case(44100, ppms[p], 11)) fails++;
     for (int p = 0; p < 7; p++)
         if (!run_case(48000, ppms[p], 10)) fails++;
-    // Cross-rate acquisition: 44.1k stream decoded with the 48k cell (the
-    // slave ACQUIRING state). Decode is expected dirty; what matters is the
-    // emitted bit-rate inflation staying inside the 2% snap window.
-    printf("==== cross-rate (expected dirty; check bit-rate inflation) ====\n");
-    run_case(44100, 0, 10);
-    printf("  emitted/ideal bit ratio = %.5f (must be within 0.98..1.02 for rate snap)\n",
-           (double)n_emitted / (double)n_levels);
-    double ratio = (double)n_emitted / (double)n_levels;
-    if (ratio < 0.98 || ratio > 1.02) fails++;
-    run_case(48000, 0, 11);
-    printf("  emitted/ideal bit ratio = %.5f\n",
-           (double)n_emitted / (double)n_levels);
-    ratio = (double)n_emitted / (double)n_levels;
-    if (ratio < 0.98 || ratio > 1.02) fails++;
+    // Slave acquisition probes exact decoder timings and trusts only a clean
+    // header run. It must reject the initial wrong family and accept the
+    // matching candidate; DMA rate from a dirty wrong-cell stream is no
+    // longer part of the decision.
+    printf("==== exact-timing acquisition probes ====\n");
+    if (run_case(44100, 0, 10)) fails++;   // initial 48k candidate: reject
+    if (!run_case(44100, 0, 11)) fails++;  // alternate 44.1k: accept
+    if (run_case(48000, 0, 11)) fails++;   // stale 44.1k candidate: reject
+    if (!run_case(48000, 0, 10)) fails++;  // alternate 48k: accept
     printf(fails ? "FAIL: %d\n" : "PASS\n", fails);
     return fails ? 1 : 0;
 }

@@ -1,6 +1,6 @@
 # ADAT Input
 
-*Last updated: 2026-07-13*
+*Last updated: 2026-07-15*
 
 ## Overview
 
@@ -55,12 +55,15 @@ output's auto-suspend and needs no host recovery action.
 ### SLAVE (1)
 
 External gear owns the clock (for example DSPi hangs off an audio
-interface's ADAT output). The wire rate is auto-detected from the receiver's
-DMA word rate (32 ms windows snapped to 44.1/48 kHz, two agreeing windows),
-the pipeline rate follows it through the standard deferred rate-change path,
-and every output (SPDIF and I2S slot dividers, the ADAT output divider, and
-MCK) is servo rate-matched to the recovered clock, exactly like SPDIF input.
-An 8-16 s dual-anchor long window gives the servo a ~0.1 ppm rate reference.
+interface's ADAT output). Acquisition probes the exact 48 kHz and 44.1 kHz
+decoder cell timings in turn (10 ms dwell each) and accepts a candidate only
+after eight consecutive valid frame headers at the fixed frame stride. This
+avoids inferring the source rate from a corrupt wrong-cell decoded stream.
+Once locked, 32 ms DMA-word timing windows measure the fine source-clock
+offset; the pipeline follows the detected family through the standard
+deferred rate-change path, and every output (SPDIF and I2S slot dividers, the
+ADAT output divider, and MCK) is servo rate-matched to it, exactly like SPDIF
+input. An 8-16 s dual-anchor long window gives the servo a ~0.1 ppm reference.
 
 Clock-slaving to ADAT is only in force while ADAT is the active input
 source; switching to any other source restores nominal output dividers.
@@ -72,7 +75,7 @@ source; switching to any other source restores nominal output dividers.
 | Value | State | Meaning |
 |---|---|---|
 | 0 | INACTIVE | Hardware stopped (ADAT is not the active source) |
-| 1 | ACQUIRING | Slave: measuring the wire rate. Master: parked, waiting for a valid (<= 48 kHz) device rate |
+| 1 | ACQUIRING | Slave: probing 48/44.1 kHz cell timing and verifying headers. Master: parked, waiting for a valid (<= 48 kHz) device rate |
 | 2 | SYNCING | Rate known; searching for / verifying the frame sync header |
 | 3 | LOCKED | Decoding audio; outputs enabled after the prefill completes |
 | 4 | RELOCKING | Signal lost or rate changed; outputs muted, re-acquiring |
@@ -284,6 +287,11 @@ implements the exact inverse. Reception details:
   at least +-1000 ppm of source offset at both rates
   (tools/adat_rx_test/adat_rx_bitdiff.c). The cell length is set once per
   rate and never servoed.
+- Slave acquisition does not measure a wrong-cell decoded stream. It tries
+  the 48 kHz timing first, alternates to 44.1 kHz after 10 ms without a valid
+  eight-header run, and continues alternating while the signal is absent or
+  unsupported. On re-lock it tries the last valid family first. Fine DMA-rate
+  measurement and the output servo start only after header-proven lock.
 - DMA channel 15 streams decoded bits into an 8 KB ring using the RP2350
   ENDLESS transfer-count mode plus hardware address wrap: a free-running
   ring with no IRQ and no reload channel.
