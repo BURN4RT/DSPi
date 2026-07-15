@@ -404,6 +404,14 @@ void adat_input_start(void) {
     // ADAT TX pin itself (PIO reads the pad regardless of function): that is
     // the zero-hardware loopback self-test.
     gpio_set_input_enabled(pin, true);
+#if HAS_PADS_BANK0_ISOLATION
+    // RP2350 pads reset isolated (ISO=1) and gpio_set_input_enabled does not
+    // clear it, so an external signal never reaches the PIO input mux; only
+    // gpio_set_function clears ISO, which is why same-pin loopback worked (the
+    // TX pio_gpio_init unisolated the shared pad).  Clear ISO directly rather
+    // than via pio_gpio_init to keep funcsel untouched for the loopback case.
+    hw_clear_bits(&pads_bank0_hw->io[pin], PADS_BANK0_GPIO0_ISO_BITS);
+#endif
     adat_rx_active_pin = pin;
 
     pio_sm_config c = adat_rx_program_get_default_config(adat_rx_prog_offset);

@@ -3106,7 +3106,7 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 **Hardware notes.** The external master must run BCK = 64 x Fs with standard LRCLK polarity (no runtime format detection). Whenever the device is NOT in slave-clocked I2S operation it drives BCK/LRCLK itself if any I2S output or I2S input is active, so a hard-wired external master and the device can transiently both drive the pins across boots and mode/source transitions (documented user constraint; the firmware minimizes the windows). SPLIT clock-pin mode addresses this directly: because master (and every non-slave) role drives `i2s_bck_pin` while the external master feeds the separate `i2s_bck_pin_slave` pair, the two never contend on the same GPIOs; the dual-driver caveat applies only in UNIFIED mode where both share one pair.
 
 ### ADAT Input (RP2350 only)
-*Last updated: 2026-07-13*
+*Last updated: 2026-07-15*
 
 `INPUT_SOURCE_ADAT` (3) is an 8-channel, 24-bit ADAT lightpipe input from one TOSLINK receiver, 44.1/48 kHz only (no SMUX/96k). Disabled by default; selectable only when `adat_input_enabled != 0` AND `adat_input_pin != 0xFF`, and only on RP2350 (RP2040 keeps the config state for wire/preset round-trips but has no PIO/DMA budget for the receiver). Files: `adat_input.c/h`, `adat_input.pio`.
 
@@ -3123,6 +3123,8 @@ The helper `i2s_effective_bck_pin()` resolves the pair the active clock mode act
 **Prefill flow.** On lock the poll batches whole frames (`ADAT_INPUT_MIN_BLOCK` = 48, ~1 ms at 48k, capped at 192/poll), decodes each into the pipeline input buffers (`buf_l`/`buf_r` + `buf_in_ext[0..5]`) with per-channel preamp, and calls `process_input_block()`. A lap guard skips whole frames (preserving frame phase, since the ring holds an exact number of frames) before the reader can be overwritten.
 
 **Loopback self-test.** The RX pin may deliberately equal the ADAT output pin: `adat_input_start()` only sets the pad's input enable and never touches funcsel, so the PIO reads the pad the ADAT TX drives; this is a zero-hardware loopback self-test. `adat_input_stop()` clears input-enable only, safe on the shared pin.
+
+**RP2350 pad isolation.** RP2350 pads reset isolated (`ISO=1` in `PADS_BANK0`), and `gpio_set_input_enabled()` never clears the isolation latch; only `gpio_set_function()` does. A dedicated external RX pad would therefore stay electrically isolated and the PIO would see a static level (same-pin loopback worked only because the ADAT TX `pio_gpio_init()` unisolated the shared pad). `adat_input_start()` clears `ISO` directly with `hw_clear_bits()` under `#if HAS_PADS_BANK0_ISOLATION`, keeping funcsel untouched so the loopback self-test still works even if RX and TX ever sit on different PIO blocks. *Last updated: 2026-07-15*
 
 **Main-loop integration** (`main.c`): the poll + prefill block, the source-switch branches, the deferred clock-mode handler (`adat_clock_mode_change_pending`), boot-into-ADAT, the `adat_input_restart_pending` handler (enable/pin change while ADAT is the live source), and the `perform_rate_change` hook (`adat_input_on_rate_change`) mirror the SPDIF/I2S input plumbing. Status is surfaced by `REQ_GET_ADAT_INPUT_STATUS` (0x6E, 20-byte `AdatInputStatusPacket`) and `NOTIFY_EVT_ADAT_INPUT_STATE` (0x0B) on every state change.
 
