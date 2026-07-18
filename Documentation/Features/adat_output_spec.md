@@ -72,8 +72,11 @@ Behavioral notes:
   Disabling always succeeds.
 - `REQ_SET_ADAT_PIN` validates the GPIO (23..25 and out-of-range rejected,
   conflicts with any owned pin rejected) and may be issued while enabled; the
-  stream is re-routed under a muted restart. `wValue = 0` resets to the
-  platform default pin (matching the flash/bulk "0 = default" convention).
+  stream is re-routed under a muted restart. `wValue = 0xFF`
+  (`PIN_RESET_TO_DEFAULT`, the escape hatch shared by every single-pin SET
+  command) resets to the platform default pin; 0 means GPIO 0. (The
+  flash/bulk "0 = default" decoding is a persistence-layer migration
+  convention only and is unchanged.)
 - Config changes apply from the main loop inside the same muted
   pipeline-restart bracket used by output type/pin switches; expect the brief
   global mute-and-resync that any output reconfiguration produces.

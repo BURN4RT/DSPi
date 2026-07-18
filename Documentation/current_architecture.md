@@ -1509,11 +1509,13 @@ section.
 | 25 | LED | Heartbeat |
 
 ### Runtime Reconfiguration
-*Last updated: 2026-07-04*
+*Last updated: 2026-07-15 (universal PIN_RESET_TO_DEFAULT 0xFF escape hatch across every single-pin SET command)*
 
 Vendor commands `REQ_SET_OUTPUT_PIN` (0x7C) / `REQ_GET_OUTPUT_PIN` (0x7D).
 
 **Constraints:** Valid GPIO range, not reserved (23-25 power/LED; GPIO 16/17 are no longer reserved now that the debug UART is gone), and not in use by another output, the I2S BCK/LRCLK or MCK pin, the SPDIF RX pin, the DAC hardware-mute pin, or a live UART/I2C control-interface pin (`is_pin_in_use`).
+
+**Reset-to-default escape hatch (`PIN_RESET_TO_DEFAULT`, 0xFF):** every single-pin SET command — `REQ_SET_OUTPUT_PIN` (0x7C), `REQ_SET_I2S_BCK_PIN` (0xC2, per role), `REQ_SET_MCK_PIN` (0xC6), `REQ_SET_ADAT_PIN` (0xCC), `REQ_SET_SPDIF_RX_PIN` (0xE4, per index), `REQ_SET_ADAT_INPUT_PIN` (0x6A), `REQ_SET_I2S_RX_PIN` (0xF1, per pair) — maps a pin byte of 0xFF to the platform default for the addressed target before running its normal validation chain, so a reset can still fail (e.g. PIN_IN_USE if the default has been claimed). 0xFF is not a valid GPIO on either platform, so pin byte 0 always means GPIO 0; the previous `REQ_SET_ADAT_PIN` behavior of treating 0 as "reset to default 12" is gone (0 now addresses GPIO 0 like everywhere else). ADAT input has no free default GPIO, so its "default" is unset: 0xFF clears the pin (only while the input is disabled, since an enabled input with no pin would be unselectable). The persistence layers are unchanged: flash/bulk zero-fill "0 = default/absent" decoding is a migration artifact of zero-filled struct tails, not a wire semantic of the SET commands.
 
 **S/PDIF and I2S slots:** Deferred to the main loop, not applied in the USB ISR. `REQ_SET_OUTPUT_PIN` writes the target into `output_pins[out_idx]` (RAM-only, like `spdif_rx_pin`) and sets a bit in `output_pin_change_mask`; the main-loop gate (shared `pipeline_reset_ready()` hold) then runs `process_pin_changes(mask)`. That helper mirrors `process_type_switches`: `prepare_pipeline_reset()` (soft mute + Core 1 fence + DAC hardware-mute assert) → suspend SPDIF RX if running → `drain_and_disable_outputs()` → `audio_spdif_change_pin()` / `audio_i2s_change_data_pin()` on each flagged slot while disabled → `complete_pipeline_reset()` for the **synchronized** restart of all slots → restart RX. The synchronized restart is the point: a moved slot re-enters in phase with the others, preserving the inviolable inter-slot sample alignment. (The prior implementation restarted only the changed slot live in the ISR, which clicked and left that slot phase-misaligned until the next full reset.) `change_pin` masks the channel's DMA IRQ before aborting the DMA so the handler can't start a conflicting transfer during PIO SM reinit, and clears any stale completion flag before unmasking. Back-to-back requests accumulate in the mask and apply in one batch. Persistence follows `output_config_mode`: in with-preset mode the pin travels with the preset (`REQ_PRESET_SAVE` captures it, applied on load); in independent mode it is device-global (`REQ_SAVE_OUTPUT_CONFIG` persists it, applied at boot).
 
@@ -2385,7 +2387,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-13 (ADAT input commands 0x68-0x6E)*
+*Last updated: 2026-07-15 (pin byte 0xFF = reset to default on every single-pin SET; REQ_SET_ADAT_PIN no longer treats 0 as default)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2449,7 +2451,7 @@ op state ~400 B).
 | REQ_GET_CROSSFEED_ITD | 0x67 | IN | Get crossfeed ITD |
 | REQ_SET_ADAT_INPUT_ENABLE | 0x68 | OUT | Enable/disable ADAT input (1 byte, 0/1; RP2350 only). Selectable only when enabled AND a pin is set |
 | REQ_GET_ADAT_INPUT_ENABLE | 0x69 | IN | Get ADAT input enable state (1 byte) |
-| REQ_SET_ADAT_INPUT_PIN | 0x6A | OUT | Set ADAT RX GPIO (1 byte; 0xFF = unset). May equal the ADAT output pin for a zero-hardware loopback self-test |
+| REQ_SET_ADAT_INPUT_PIN | 0x6A | OUT | Set ADAT RX GPIO (1 byte; 0xFF = reset to default = clear to unset, only while disabled). May equal the ADAT output pin for a zero-hardware loopback self-test |
 | REQ_GET_ADAT_INPUT_PIN | 0x6B | IN | Get ADAT RX GPIO (1 byte) |
 | REQ_SET_ADAT_INPUT_CLOCK_MODE | 0x6C | OUT | Set ADAT clock mode (1 byte: 0 = master, 1 = slave); deferred apply |
 | REQ_GET_ADAT_INPUT_CLOCK_MODE | 0x6D | IN | Get ADAT clock mode (1 byte) |
@@ -2466,7 +2468,7 @@ op state ~400 B).
 | REQ_GET_OUTPUT_DELAY | 0x79 | IN | Get output delay |
 | REQ_GET_CORE1_MODE | 0x7A | IN | Get Core 1 operating mode |
 | REQ_GET_CORE1_CONFLICT | 0x7B | IN | Get Core 1 conflict state |
-| REQ_SET_OUTPUT_PIN | 0x7C | OUT | Set output GPIO pin |
+| REQ_SET_OUTPUT_PIN | 0x7C | OUT | Set output GPIO pin (pin byte 0xFF = reset that output to its platform default) |
 | REQ_GET_OUTPUT_PIN | 0x7D | IN | Get output GPIO pin |
 | REQ_GET_SERIAL | 0x7E | IN | Get unique board serial |
 | REQ_GET_PLATFORM | 0x7F | IN | Get platform ID (0=RP2040, 1=RP2350) |
@@ -2520,17 +2522,17 @@ op state ~400 B).
 | REQ_GET_LEVELLER_GATE | 0xBF | IN | Get leveller silence gate threshold |
 | SET_OUTPUT_TYPE | 0xC0 | OUT | Set output slot type (S/PDIF or I2S) |
 | GET_OUTPUT_TYPE | 0xC1 | IN | Get output slot type |
-| SET_I2S_BCK_PIN | 0xC2 | OUT | Set an I2S BCK pin (LRCLK = BCK + 1). `wValue = (role << 8) | GPIO`: role 0 = master/unified pair (legacy hosts send role 0 implicitly), role 1 = slave pair (`i2s_bck_pin_slave`, meaningful in SPLIT clock-pin mode; storable any time). Rejects with OUTPUT_ACTIVE while I2S output slots run on the pair being moved, PIN_IN_USE on overlap/collision, INVALID_OUTPUT for role > 1. The two pairs are kept mutually distinct. |
+| SET_I2S_BCK_PIN | 0xC2 | OUT | Set an I2S BCK pin (LRCLK = BCK + 1). `wValue = (role << 8) | GPIO`: role 0 = master/unified pair (legacy hosts send role 0 implicitly), role 1 = slave pair (`i2s_bck_pin_slave`, meaningful in SPLIT clock-pin mode; storable any time). Rejects with OUTPUT_ACTIVE while I2S output slots run on the pair being moved, PIN_IN_USE on overlap/collision, INVALID_OUTPUT for role > 1. The two pairs are kept mutually distinct. GPIO 0xFF = reset the addressed role's pair to its default. |
 | GET_I2S_BCK_PIN | 0xC3 | IN | Get an I2S BCK pin. `wValue = role` (0 = master/unified pair, 1 = slave pair; invalid role returns 0) |
 | SET_MCK_ENABLE | 0xC4 | OUT | Set MCK enable |
 | GET_MCK_ENABLE | 0xC5 | IN | Get MCK enable |
-| SET_MCK_PIN | 0xC6 | OUT | Set MCK pin |
+| SET_MCK_PIN | 0xC6 | OUT | Set MCK pin (0xFF = reset to platform default) |
 | GET_MCK_PIN | 0xC7 | IN | Get MCK pin |
 | SET_MCK_MULTIPLIER | 0xC8 | OUT | Set MCK multiplier (0=128x, 1=256x) |
 | GET_MCK_MULTIPLIER | 0xC9 | IN | Get MCK multiplier |
 | REQ_SET_ADAT_ENABLE | 0xCA | OUT | Enable/disable ADAT bulk output (wValue 0/1; RP2350 only, RP2040 returns INVALID_OUTPUT) |
 | REQ_GET_ADAT_ENABLE | 0xCB | IN | Get configured ADAT enable |
-| REQ_SET_ADAT_PIN | 0xCC | OUT | Set ADAT data GPIO (wValue = pin; 0 = reset to default 12) |
+| REQ_SET_ADAT_PIN | 0xCC | OUT | Set ADAT data GPIO (wValue = pin; 0xFF = reset to default 12; 0 = GPIO 0) |
 | REQ_GET_ADAT_PIN | 0xCD | IN | Get ADAT data GPIO |
 | REQ_GET_ADAT_STATUS | 0xCE | IN | Get 8-byte AdatStatus (enabled, active, pin, rate_ok, resync/slip counters) |
 | REQ_SET_PREAMP_CH | 0xD0 | OUT | Set per-channel preamp gain (wValue=channel) |
@@ -2554,7 +2556,7 @@ op state ~400 B).
 | REQ_GET_INPUT_SOURCE | 0xE1 | IN | Get active input source |
 | REQ_GET_SPDIF_RX_STATUS | 0xE2 | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | REQ_GET_SPDIF_RX_CH_STATUS | 0xE3 | IN | Get IEC 60958 channel status (24 bytes) |
-| REQ_SET_SPDIF_RX_PIN | 0xE4 | IN* | Set a SPDIF input's RX GPIO (wValue = (index<<8)\|pin, index 0..2; old hosts sending just a pin target index 0). Enabled inputs conflict-check the new pin; a disabled 2/3 stores it as a preference. Returns status byte |
+| REQ_SET_SPDIF_RX_PIN | 0xE4 | IN* | Set a SPDIF input's RX GPIO (wValue = (index<<8)\|pin, index 0..2; old hosts sending just a pin target index 0; pin 0xFF = reset that input to its default). Enabled inputs conflict-check the new pin; a disabled 2/3 stores it as a preference. Returns status byte |
 | REQ_GET_SPDIF_RX_PIN | 0xE5 | IN | Get a SPDIF input's RX GPIO (wValue = index 0..2) |
 | REQ_SET_LG_SOUND_SYNC_ENABLE | 0xE6 | OUT | Set LG Sound Sync enable flag (per-preset; live until REQ_SAVE_PRESET) |
 | REQ_GET_LG_SOUND_SYNC_ENABLE | 0xE7 | IN | Get LG Sound Sync enable flag |
@@ -2563,7 +2565,7 @@ op state ~400 B).
 | REQ_SET_INPUT_RATE | 0xED | OUT | Set I2S input sample rate (uint32_t Hz: 44100/48000/96000; applied live when I2S input active in master clock mode; stored only in slave mode, where the rate is auto-detected) |
 | REQ_GET_INPUT_RATE | 0xEE | IN | Returns 8 bytes: 2x uint32_t {current pipeline Hz, selected I2S input Hz} |
 | REQ_GET_SPDIF_INPUT_CONFIG | 0xEF | IN | Get 5 bytes: input count (3), enable mask over all inputs (bit 0 = input 1, always set), then GPIOs for inputs 1..3. Lets a host build its source list data-driven |
-| REQ_SET_I2S_RX_PIN | 0xF1 | IN* | Set I2S RX data GPIO pin (wValue=pin, returns status) |
+| REQ_SET_I2S_RX_PIN | 0xF1 | IN* | Set I2S RX data GPIO pin (wValue=(pair<<8)\|pin, returns status; pin 0xFF = reset that pair to its default) |
 | REQ_GET_I2S_RX_PIN | 0xF2 | IN | Get I2S RX data GPIO pin |
 | REQ_SET_UART_CONFIG | 0xF5 | OUT | Configure UART control interface (8-byte `UartCtrlConfig`; **USB only**, refused with BLOCKED over UART/I2C; deferred apply, persist on success; returns `PIN_CONFIG_*`) |
 | REQ_GET_UART_CONFIG | 0xF6 | IN | Get persisted `UartCtrlConfig` (8 bytes) |
@@ -2947,7 +2949,7 @@ The SPDIF→USB transition in the deferred input-source switch handler (`main.c:
 This matches the user's product-level decision; it differs from the industry-standard pattern (RME TotalMix / UA Apollo, where host volume continues to act as master output gain on external sources) on purpose.
 
 ### SPDIF RX Pin
-*Last updated: 2026-07-08 (per-input pins: `spdif_rx_pin` plus `spdif_rx_pin_ext[2]` for SPDIF 2/3)*
+*Last updated: 2026-07-15 (pin byte 0xFF on SET = reset that input to its default)*
 
 - Default: GPIO 5 (`PICO_SPDIF_RX_PIN_DEFAULT`) for input 1; GPIO 20/21 (`PICO_SPDIF_RX_PIN2_DEFAULT` / `PICO_SPDIF_RX_PIN3_DEFAULT`) for the optional inputs 2/3. Input 1's GPIO 5 moved off GPIO 11 to avoid colliding with `DAC_HW_MUTE_DEFAULT_PIN`; it is unclaimed by any default output, the UART, or the I²S pins, so the SPDIF RX defaults stop blocking a fresh-install enable of the DAC hardware-mute feature. A disabled input's pin is not reserved, so GPIO 20/21 stay free for other functions until the input is enabled.
 - **Persistence follows `output_config_mode` (matches `output_pins[]`).** `REQ_SET_SPDIF_RX_PIN` updates the live `spdif_rx_pin` / `spdif_rx_pin_ext[]` global in RAM only; no implicit flash write. In with-preset mode the user `REQ_PRESET_SAVE`s to capture the pins in a slot (restored on load); in independent mode `REQ_SAVE_OUTPUT_CONFIG` persists them to the device-global block (applied at boot). The RX pins are part of the physical-IO config block, applied by `apply_output_config_from_mode()`.
@@ -2992,7 +2994,7 @@ This matches the user's product-level decision; it differs from the industry-sta
 **Files**: `spdif_input.h` (API + status struct), `spdif_input.c` (lifecycle, audio extraction, clock servo, status queries)
 
 ### I2S Input
-*Last updated: 2026-07-11 (I2S clock-slave mode added: external master drives BCK/LRCLK; see the dedicated section below)*
+*Last updated: 2026-07-15 (pin byte 0xFF on the pin SETs = reset the addressed target to its default)*
 
 In the default MASTER clock mode (`i2s_clock_mode` = 0) I2S input keeps the device as the clock authority: the external source slaves to our BCK/LRCLK, the same shared clock pair the I2S outputs use (`i2s_bck_pin` / +1; master clocking always uses this pair regardless of clock-pin mode). Because the input is then synchronous to the device clock domain, there is **no clock servo, no rate detection and no lock state machine**; the subsystem is structurally a much simpler sibling of SPDIF RX. State is just INACTIVE / RUNNING. In SLAVE clock mode (`i2s_clock_mode` = 1) an EXTERNAL master drives BCK/LRCLK instead; that mode adds rate detection, a lock state machine and an output clock servo, described in the "I2S Clock-Slave Input Mode" section below. Everything in THIS section describes master mode unless noted.
 
@@ -3036,24 +3038,24 @@ How the pools get filled depends on the input's clock role, because the prefill 
 | 0xE1 | REQ_GET_INPUT_SOURCE | IN | Get active input source (returns uint8_t) |
 | 0xE2 | REQ_GET_SPDIF_RX_STATUS | IN | Get SPDIF RX status (16-byte SpdifRxStatusPacket) |
 | 0xE3 | REQ_GET_SPDIF_RX_CH_STATUS | IN | Get IEC 60958 channel status (24 bytes) |
-| 0xE4 | REQ_SET_SPDIF_RX_PIN | IN* | Set a SPDIF input's RX pin (wValue = (index<<8)\|pin, index 0..2; old hosts sending a bare pin target index 0). Returns status byte |
+| 0xE4 | REQ_SET_SPDIF_RX_PIN | IN* | Set a SPDIF input's RX pin (wValue = (index<<8)\|pin, index 0..2; old hosts sending a bare pin target index 0; pin 0xFF = reset that input to its default). Returns status byte |
 | 0xE5 | REQ_GET_SPDIF_RX_PIN | IN | Get a SPDIF input's RX pin (wValue = index 0..2, returns uint8_t) |
 | 0xE9 | REQ_SET_SPDIF_INPUT_ENABLE | IN* | Enable/disable optional SPDIF input 2/3 (wValue = (index<<8)\|enable, index 1..2). Returns PIN_CONFIG_* status byte |
 | 0x88 | REQ_SET_I2S_CLOCK_MODE | OUT | Set clock mode (0=master, 1=slave); deferred apply |
 | 0x89 | REQ_GET_I2S_CLOCK_MODE | IN | Get live clock mode (returns uint8_t) |
 | 0x8A | REQ_GET_I2S_SLAVE_STATUS | IN | Get 16-byte I2sSlaveStatusPacket |
-| 0xC2 | REQ_SET_I2S_BCK_PIN | IN* | Set a BCK pin; `wValue = (role<<8)|GPIO` (role 0 = master/unified pair, 1 = slave pair) |
+| 0xC2 | REQ_SET_I2S_BCK_PIN | IN* | Set a BCK pin; `wValue = (role<<8)|GPIO` (role 0 = master/unified pair, 1 = slave pair; GPIO 0xFF = reset that role's pair to its default) |
 | 0xC3 | REQ_GET_I2S_BCK_PIN | IN | Get a BCK pin; `wValue = role` (0 = master/unified, 1 = slave) |
 | 0xFE | REQ_SET_I2S_CLOCK_PIN_MODE | IN* | Set clock-pin mode (wValue = 0 unified / 1 split; returns `PIN_CONFIG_*`); SPLIT enable always validates the slave pair, live apply, deferred input restart when the effective pair moves |
 | 0xFF | REQ_GET_I2S_CLOCK_PIN_MODE | IN | Get live clock-pin mode (returns uint8_t: 0=unified, 1=split) |
 | 0xED | REQ_SET_INPUT_RATE | OUT | Set I2S input rate (uint32_t Hz: 44100/48000/96000; master mode only; stored-not-applied in slave mode) |
 | 0xEE | REQ_GET_INPUT_RATE | IN | Returns 2x uint32_t {current pipeline Hz, selected I2S Hz} |
 | 0xEF | REQ_GET_SPDIF_INPUT_CONFIG | IN | Returns 5 bytes: input count (3), enable mask (bit 0 = input 1, always set), GPIOs for inputs 1..3 |
-| 0xF1 | REQ_SET_I2S_RX_PIN | IN* | Set I2S RX data pin (wValue=pin, returns status byte) |
+| 0xF1 | REQ_SET_I2S_RX_PIN | IN* | Set I2S RX data pin (wValue=(pair<<8)\|pin, returns status byte; pin 0xFF = reset that pair to its default) |
 | 0xF2 | REQ_GET_I2S_RX_PIN | IN | Get I2S RX data pin (returns uint8_t) |
 | 0x68 | REQ_SET_ADAT_INPUT_ENABLE | OUT | Enable/disable ADAT input (1 byte 0/1; RP2350 only) |
 | 0x69 | REQ_GET_ADAT_INPUT_ENABLE | IN | Get ADAT input enable state (uint8_t) |
-| 0x6A | REQ_SET_ADAT_INPUT_PIN | OUT | Set ADAT RX GPIO (uint8_t; 0xFF = unset; may equal the ADAT output pin for loopback self-test) |
+| 0x6A | REQ_SET_ADAT_INPUT_PIN | OUT | Set ADAT RX GPIO (uint8_t; 0xFF = reset to default = clear to unset, only while disabled; may equal the ADAT output pin for loopback self-test) |
 | 0x6B | REQ_GET_ADAT_INPUT_PIN | IN | Get ADAT RX GPIO (uint8_t) |
 | 0x6C | REQ_SET_ADAT_INPUT_CLOCK_MODE | OUT | Set ADAT clock mode (uint8_t 0=master, 1=slave); deferred apply |
 | 0x6D | REQ_GET_ADAT_INPUT_CLOCK_MODE | IN | Get ADAT clock mode (uint8_t) |

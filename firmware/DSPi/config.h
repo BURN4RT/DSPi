@@ -191,8 +191,9 @@ extern volatile uint32_t nominal_feedback_10_14;
 // ADAT Input Commands (RP2350 only; state round-trips on RP2040). 0x6F reserved.
 #define REQ_SET_ADAT_INPUT_ENABLE      0x68
 #define REQ_GET_ADAT_INPUT_ENABLE      0x69
-#define REQ_SET_ADAT_INPUT_PIN         0x6A
-#define REQ_GET_ADAT_INPUT_PIN         0x6B
+#define REQ_SET_ADAT_INPUT_PIN         0x6A  // wValue = GPIO; PIN_RESET_TO_DEFAULT
+                                             // clears to unset (only while disabled)
+#define REQ_GET_ADAT_INPUT_PIN         0x6B  // returns uint8_t (0xFF = unset)
 #define REQ_SET_ADAT_INPUT_CLOCK_MODE  0x6C
 #define REQ_GET_ADAT_INPUT_CLOCK_MODE  0x6D
 #define REQ_GET_ADAT_INPUT_STATUS      0x6E
@@ -214,7 +215,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_CORE1_CONFLICT      0x7B
 
 // Pin Configuration Commands
-#define REQ_SET_OUTPUT_PIN          0x7C
+#define REQ_SET_OUTPUT_PIN          0x7C  // wValue = (GPIO<<8)|output_index;
+                                          // GPIO = PIN_RESET_TO_DEFAULT restores the default
 #define REQ_GET_OUTPUT_PIN          0x7D
 
 // Device Identification Commands
@@ -292,11 +294,13 @@ extern volatile uint32_t nominal_feedback_10_14;
 // I2S Output Configuration Commands
 #define REQ_SET_OUTPUT_TYPE         0xC0
 #define REQ_GET_OUTPUT_TYPE         0xC1
-#define REQ_SET_I2S_BCK_PIN         0xC2
+#define REQ_SET_I2S_BCK_PIN         0xC2  // wValue = (role<<8)|GPIO; GPIO =
+                                          // PIN_RESET_TO_DEFAULT restores the role's default
 #define REQ_GET_I2S_BCK_PIN         0xC3
 #define REQ_SET_MCK_ENABLE          0xC4
 #define REQ_GET_MCK_ENABLE          0xC5
-#define REQ_SET_MCK_PIN             0xC6
+#define REQ_SET_MCK_PIN             0xC6  // wValue = GPIO; PIN_RESET_TO_DEFAULT
+                                          // restores PICO_I2S_MCK_PIN
 #define REQ_GET_MCK_PIN             0xC7
 #define REQ_SET_MCK_MULTIPLIER      0xC8
 #define REQ_GET_MCK_MULTIPLIER      0xC9
@@ -307,7 +311,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 // at higher rates (see adat_output.h).
 #define REQ_SET_ADAT_ENABLE         0xCA  // wValue = 0/1, returns status byte
 #define REQ_GET_ADAT_ENABLE         0xCB  // returns uint8_t configured enable
-#define REQ_SET_ADAT_PIN            0xCC  // wValue = GPIO, returns status byte
+#define REQ_SET_ADAT_PIN            0xCC  // wValue = GPIO, returns status byte; GPIO =
+                                          // PIN_RESET_TO_DEFAULT restores PICO_ADAT_PIN
 #define REQ_GET_ADAT_PIN            0xCD  // returns uint8_t
 #define REQ_GET_ADAT_STATUS         0xCE  // returns AdatStatus (8 B)
 
@@ -406,7 +411,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_SPDIF_RX_CH_STATUS  0xE3  // returns 24-byte IEC 60958 channel status (Phase 2)
 #define REQ_SET_SPDIF_RX_PIN        0xE4  // wValue = (index<<8)|GPIO; index 0..2 selects the
                                           // SPDIF input (old hosts send wValue=pin => index 0).
-                                          // Returns status byte.
+                                          // GPIO = PIN_RESET_TO_DEFAULT restores that input's
+                                          // default. Returns status byte.
 #define REQ_GET_SPDIF_RX_PIN        0xE5  // wValue = index (0..2); returns that input's GPIO
 #define REQ_SET_SPDIF_INPUT_ENABLE  0xE9  // wValue = (index<<8)|enable; index 1..2, enable 0/1.
                                           // Enables/disables an optional SPDIF input. Returns status byte.
@@ -420,7 +426,8 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_INPUT_RATE          0xEE  // returns 2x uint32_t {current Hz, selected I2S Hz}
 #define REQ_SET_I2S_RX_PIN          0xF1  // wValue = (pair<<8)|GPIO; pair 0..3 selects the
                                           // stereo pair (old hosts send wValue=pin => pair 0).
-                                          // Returns status byte.
+                                          // GPIO = PIN_RESET_TO_DEFAULT restores that pair's
+                                          // default. Returns status byte.
 #define REQ_GET_I2S_RX_PIN          0xF2  // wValue = pair (0..3); returns that pair's GPIO
 // I2S input channel count (RP2350 multichannel input: 2/4/6/8 -> 1..4 stereo pairs).
 #define REQ_SET_I2S_INPUT_CHANNELS  0xF3  // wValue = channel count (2/4/6/8); returns status byte
@@ -547,6 +554,17 @@ typedef struct __attribute__((packed)) {
 #define FW_VERSION_MINOR            1
 #define FW_VERSION_PATCH            5
 #define FW_VERSION_BCD              ((FW_VERSION_MAJOR << 8) | (FW_VERSION_MINOR << 4) | FW_VERSION_PATCH)
+
+// Universal "reset to default" escape hatch for every single-pin SET command
+// (REQ_SET_OUTPUT_PIN, REQ_SET_I2S_BCK_PIN, REQ_SET_MCK_PIN, REQ_SET_ADAT_PIN,
+// REQ_SET_SPDIF_RX_PIN, REQ_SET_ADAT_INPUT_PIN, REQ_SET_I2S_RX_PIN).  Sending
+// this value as the pin byte restores the platform default for the addressed
+// target; the mapped default then passes through the command's normal
+// validation, so a reset can still fail with PIN_IN_USE etc.  0xFF is not a
+// valid GPIO on either platform, so GPIO 0 stays addressable as a real pin
+// (pin byte 0 always means GPIO 0, never "default").  For ADAT input the
+// default is "unset" (no free default GPIO exists), so reset clears the pin.
+#define PIN_RESET_TO_DEFAULT        0xFF
 
 // Pin config status codes (shared by S/PDIF, I2S, and MCK pin commands)
 #define PIN_CONFIG_SUCCESS          0x00

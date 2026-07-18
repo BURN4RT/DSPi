@@ -311,6 +311,18 @@ uint16_t mck_decode(uint8_t raw)  { return (raw == 1) ? 256 : 128; }
 // PIN VALIDATION HELPERS (moved from usb_audio.c)
 // ----------------------------------------------------------------------------
 
+// Platform defaults for each pin output, in output_pins[] order (same values
+// as the initializer in usb_audio.c).  REQ_SET_OUTPUT_PIN maps the
+// PIN_RESET_TO_DEFAULT sentinel through this table.
+static const uint8_t default_output_pins[NUM_PIN_OUTPUTS] = {
+#if PICO_RP2350
+    PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2,
+    PICO_SPDIF_PIN_3, PICO_SPDIF_PIN_4, PICO_PDM_PIN
+#else
+    PICO_AUDIO_SPDIF_PIN, PICO_SPDIF_PIN_2, PICO_PDM_PIN
+#endif
+};
+
 bool is_valid_gpio_pin(uint8_t pin) {
     // GPIO 16/17 are general-purpose again since the debug UART was removed;
     // when the UART control interface claims them, is_pin_in_use() covers it.
@@ -2011,6 +2023,9 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 uint8_t new_pin = (setup->wValue >> 8) & 0xFF;
                 uint8_t status;
 
+                if (out_idx < NUM_PIN_OUTPUTS && new_pin == PIN_RESET_TO_DEFAULT)
+                    new_pin = default_output_pins[out_idx];
+
                 if (out_idx >= NUM_PIN_OUTPUTS) {
                     status = PIN_CONFIG_INVALID_OUTPUT;
                 } else if (!is_valid_gpio_pin(new_pin)) {
@@ -2595,6 +2610,9 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 uint8_t role    = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
 
+                if (role <= 1 && new_pin == PIN_RESET_TO_DEFAULT)
+                    new_pin = role ? PICO_I2S_BCK_PIN_SLAVE : PICO_I2S_BCK_PIN;
+
                 if (role > 1) {
                     status = PIN_CONFIG_INVALID_OUTPUT;
                 } else if (!is_valid_gpio_pin(new_pin) || !is_valid_gpio_pin(new_pin + 1)) {
@@ -2767,6 +2785,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             case REQ_SET_MCK_PIN: {
                 uint8_t new_pin = (uint8_t)setup->wValue;
                 uint8_t status;
+                if (new_pin == PIN_RESET_TO_DEFAULT) new_pin = PICO_I2S_MCK_PIN;
                 if (!is_valid_gpio_pin(new_pin)) {
                     status = PIN_CONFIG_INVALID_PIN;
                 }
@@ -2892,7 +2911,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 #else
                 uint8_t pin = setup->wValue & 0xFF;
                 uint8_t status;
-                if (pin == 0) pin = PICO_ADAT_PIN;  // 0 = reset to default (matches flash/bulk)
+                // 0 means GPIO 0 (the flash/bulk zero-fill "0 = default"
+                // convention is a persistence-layer migration artifact, not a
+                // wire semantic here).
+                if (pin == PIN_RESET_TO_DEFAULT) pin = PICO_ADAT_PIN;
                 if (!is_valid_gpio_pin(pin)) {
                     status = PIN_CONFIG_INVALID_PIN;
                 } else if (pin == adat_output_pin()) {
@@ -2976,6 +2998,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 uint8_t new_pin = (uint8_t)(setup->wValue & 0xFF);
                 uint8_t index   = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
+                if (index < SPDIF_RX_NUM_INPUTS && new_pin == PIN_RESET_TO_DEFAULT)
+                    new_pin = (index == 0) ? PICO_SPDIF_RX_PIN_DEFAULT
+                            : (index == 1) ? PICO_SPDIF_RX_PIN2_DEFAULT
+                                           : PICO_SPDIF_RX_PIN3_DEFAULT;
                 if (index >= SPDIF_RX_NUM_INPUTS) {
                     status = PIN_CONFIG_INVALID_OUTPUT;   // no such SPDIF input
                 } else if (!is_valid_gpio_pin(new_pin)) {
@@ -3150,9 +3176,10 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
 #else
                 uint8_t pin = setup->wValue & 0xFF;
                 uint8_t status;
-                if (pin == 0xFF) {
-                    // Clearing is only allowed while disabled; a cleared pin
-                    // would make an enabled input unselectable.
+                if (pin == PIN_RESET_TO_DEFAULT) {
+                    // Reset to default = clear to unset (no free default GPIO
+                    // exists for ADAT input).  Only allowed while disabled; a
+                    // cleared pin would make an enabled input unselectable.
                     if (adat_input_enabled) {
                         status = PIN_CONFIG_PIN_IN_USE;
                     } else {
@@ -3246,6 +3273,11 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 uint8_t new_pin = (uint8_t)(setup->wValue & 0xFF);
                 uint8_t pair    = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
+                // Defaults are the contiguous block starting at pair 0's
+                // default GPIO (cf. the i2s_rx_pin[] initializer in
+                // audio_input.c).
+                if (pair < I2S_RX_MAX_PAIRS && new_pin == PIN_RESET_TO_DEFAULT)
+                    new_pin = (uint8_t)(PICO_I2S_RX_PIN_DEFAULT + pair);
                 if (pair >= I2S_RX_MAX_PAIRS) {
                     status = PIN_CONFIG_INVALID_OUTPUT;   // no such stereo pair
                 } else if (new_pin == i2s_rx_pin[pair]) {
