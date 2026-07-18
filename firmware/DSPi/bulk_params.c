@@ -20,6 +20,7 @@
 #include "lg_sound_sync.h"
 #include "dac_hw_mute.h"
 #include "adat_output.h"
+#include "upmix.h"     // upmix_config / upmix_update_pending (RP2350; header body #if-guarded)
 #include "notify.h"
 #include "uart_control.h"
 #include "i2c_control.h"
@@ -28,6 +29,7 @@
 #include <stdio.h>   // printf() for rejected-config diagnostics
 #include <math.h>    // powf() for master volume (db_to_linear() clamps at -60 dB, insufficient)
 #include <assert.h>  // _Static_assert
+#include <stddef.h>  // offsetof
 
 #include "hardware/sync.h"    // __dmb()
 #include "hardware/clocks.h"  // GPIO_TO_GPOUT_CLOCK_HANDLE() — MCK pin migration
@@ -45,6 +47,17 @@ _Static_assert(sizeof(WireLgSoundSync) == sizeof(LgSoundSyncStatus),
                "WireLgSoundSync and LgSoundSyncStatus must have identical layout");
 _Static_assert(sizeof(WireBulkParams) <= WIRE_BULK_BUF_SIZE,
                "WireBulkParams must fit in the bulk transfer buffer");
+_Static_assert(sizeof(WireUpmixParams) == 44, "V25 upmixer section must be 44 bytes");
+// Wire ABI pins: hosts hard-code these numbers (see upmixer_spec.md).  A
+// mid-struct edit that shifts them must bump WIRE_FORMAT_VERSION instead.
+_Static_assert(offsetof(WireBulkParams, upmix) == 5900,
+               "V25 upmixer section must sit at wire offset 5900");
+_Static_assert(sizeof(WireBulkParams) == 5944,
+               "V25 wire total must be 5944 bytes");
+#if PICO_RP2350
+_Static_assert(sizeof(WireUpmixParams) == sizeof(UpmixConfigPacket),
+               "WireUpmixParams and UpmixConfigPacket must have identical layout");
+#endif
 
 // External variables (defined in usb_audio.c)
 extern volatile float global_preamp_db[NUM_INPUT_CHANNELS];
@@ -306,6 +319,25 @@ void bulk_params_collect(WireBulkParams *out) {
     out->psybass.drive_db      = psybass_config.drive_db;
     out->psybass.character_pct = psybass_config.character_pct;
     out->psybass.original_db   = psybass_config.original_db;
+
+    // Stereo upmixer (V25+).  RP2350 only; the whole section (including reserved)
+    // stays zeroed on RP2040 from the memset above.
+#if PICO_RP2350
+    out->upmix.enabled            = upmix_config.enabled ? 1 : 0;
+    out->upmix.center_mode        = upmix_config.center_mode;
+    out->upmix.surround_mode      = upmix_config.surround_mode;
+    out->upmix.reserved           = 0;
+    out->upmix.strength_pct       = upmix_config.strength_pct;
+    out->upmix.center_width_pct   = upmix_config.center_width_pct;
+    out->upmix.corr_threshold_pct = upmix_config.corr_threshold_pct;
+    out->upmix.attack_ms          = upmix_config.attack_ms;
+    out->upmix.release_ms         = upmix_config.release_ms;
+    out->upmix.detector_hpf_hz    = upmix_config.detector_hpf_hz;
+    out->upmix.surround_delay_ms  = upmix_config.surround_delay_ms;
+    out->upmix.surround_hpf_hz    = upmix_config.surround_hpf_hz;
+    out->upmix.surround_lpf_hz    = upmix_config.surround_lpf_hz;
+    out->upmix.decorr_pct         = upmix_config.decorr_pct;
+#endif
 }
 
 // ============================================================================
@@ -876,6 +908,31 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     psybass_config.character_pct = in->psybass.character_pct;
     psybass_config.original_db   = in->psybass.original_db;
     psybass_update_pending = true;
+
+    // Stereo upmixer (V25+).  RP2350 only; RP2040 ignores the section.  Config
+    // copied straight in (mode fields clamped; floats are clamped downstream in
+    // upmix_compute_coefficients); the main loop recomputes coefficients from
+    // the raised pending flag, mirroring psybass above.
+#if PICO_RP2350
+    {
+        uint8_t cm = in->upmix.center_mode;
+        uint8_t sm = in->upmix.surround_mode;
+        upmix_config.enabled            = (in->upmix.enabled != 0);
+        upmix_config.center_mode        = (cm > 1) ? 1 : cm;
+        upmix_config.surround_mode      = (sm > 2) ? 2 : sm;
+        upmix_config.strength_pct       = in->upmix.strength_pct;
+        upmix_config.center_width_pct   = in->upmix.center_width_pct;
+        upmix_config.corr_threshold_pct = in->upmix.corr_threshold_pct;
+        upmix_config.attack_ms          = in->upmix.attack_ms;
+        upmix_config.release_ms         = in->upmix.release_ms;
+        upmix_config.detector_hpf_hz    = in->upmix.detector_hpf_hz;
+        upmix_config.surround_delay_ms  = in->upmix.surround_delay_ms;
+        upmix_config.surround_hpf_hz    = in->upmix.surround_hpf_hz;
+        upmix_config.surround_lpf_hz    = in->upmix.surround_lpf_hz;
+        upmix_config.decorr_pct         = in->upmix.decorr_pct;
+        upmix_update_pending = true;
+    }
+#endif
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).
     notify_end_bulk();

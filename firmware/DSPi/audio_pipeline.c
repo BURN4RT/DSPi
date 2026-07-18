@@ -22,6 +22,7 @@
 #include "flash_storage.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "upmix.h"
 #include "adat_output.h"
 #include "output_s24.h"
 #include "loopback.h"   // DSPI_LOOPBACK slot-0 capture tap (self-guarded; empty otherwise)
@@ -349,12 +350,50 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
                                sample_count);
     }
 
+    // ========== PASS 3: Stereo Upmixer ==========
+    // Derives Centre/Ls/Rs from the stereo bus into the otherwise-idle
+    // multichannel input rows (buf_in_ext[0..2] = source rows 2..4) and raises
+    // the matrix source count so they become ordinary routable sources.  Runs
+    // only when the active input is the plain stereo pair; in multichannel
+    // modes those rows carry real inputs and the upmixer parks (state reset,
+    // source count unchanged).  Steering is pure gain on C/L/R (zero latency);
+    // the surround Haas delay is identical for every slot fed from the same
+    // source row, so inter-output-slot alignment is preserved.
+    int n_matrix_sources = n_active_inputs;
+    const UpmixCoeffs *um_coeffs = (const UpmixCoeffs *)current_upmix_coeffs;
+    if (um_coeffs && n_active_inputs == NUM_STEREO_INPUTS) {
+        upmix_process_block(um_coeffs, buf_l, buf_r,
+                            buf_in_ext[UPMIX_ROW_C - NUM_STEREO_INPUTS],
+                            buf_in_ext[UPMIX_ROW_LS - NUM_STEREO_INPUTS],
+                            buf_in_ext[UPMIX_ROW_RS - NUM_STEREO_INPUTS],
+                            sample_count);
+        n_matrix_sources = NUM_STEREO_INPUTS + um_coeffs->n_derived;
+
+        // Derived-row metering: rows 2..4 carry C/Ls/Rs while upmixing (the
+        // PASS 2 zeroing loop above cleared them).  The extracted centre can
+        // legitimately reach +3 dBFS on hot correlated content, so the host
+        // must be able to see it; clip flags share the channel bit space.
+        for (int k = 0; k < um_coeffs->n_derived; k++) {
+            int row = NUM_STEREO_INPUTS + k;
+            const float *dbuf = input_bufs[row];
+            float pk = 0.0f;
+            for (uint32_t i = 0; i < sample_count; i++) {
+                float a = fabsf(dbuf[i]); if (a > pk) pk = a;
+            }
+            global_status.peaks[row] = (uint16_t)(fminf(1.0f, pk) * 32767.0f);
+            if (pk > CLIP_THRESH_F) global_status.clip_flags |= (1u << row);
+        }
+    } else {
+        upmix_park();
+    }
+
     // ========== PASS 4: Matrix Mixing (block-based, output-major) ==========
-    // Generalized over n_active_inputs (2 for stereo / S/PDIF / I2S, 4/6/8 for
-    // multichannel USB).  For each output, snapshot the active (input buffer,
-    // signed gain) pairs ONCE — then run the sample loop.  Inputs are gated by
-    // n_active_inputs, not by crosspoint enables, so buf_in_ext (inputs 2..7) is
-    // read only when those inputs are active.  Every output uses the same
+    // Generalized over n_matrix_sources (2 for stereo / S/PDIF / I2S, 4/6/8
+    // for multichannel USB, 3 or 5 with the upmixer active).  For each output,
+    // snapshot the active (source buffer, signed gain) pairs ONCE, then run
+    // the sample loop.  Sources are gated by n_matrix_sources, not by
+    // crosspoint enables, so buf_in_ext rows are read only when they carry
+    // real input or upmix-derived audio.  Every output uses the same
     // sample_count and per-sample index, so inter-output sample alignment is
     // preserved exactly (CLAUDE.md hard rule).
     for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
@@ -368,7 +407,7 @@ void __not_in_flash_func(process_input_block)(uint32_t sample_count) {
         const float *src[NUM_INPUT_CHANNELS];
         float        gain[NUM_INPUT_CHANNELS];
         int n = 0;
-        for (int in = 0; in < n_active_inputs; in++) {
+        for (int in = 0; in < n_matrix_sources; in++) {
             MatrixCrosspoint *xp = &matrix_mixer.crosspoints[in][out];
             if (!xp->enabled) continue;
             float g = xp->phase_invert ? -xp->gain_linear : xp->gain_linear;

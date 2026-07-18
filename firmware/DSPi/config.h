@@ -153,6 +153,16 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_BYPASS      0x47
 #define REQ_SET_DELAY       0x48
 #define REQ_GET_DELAY       0x49
+
+// Stereo upmixer (RP2350 only; see upmix.h and
+// Documentation/Features/upmixer_spec.md).  RP2040 SETs STALL (unsupported),
+// GETs return zeros.
+#define REQ_UPMIX_SET_CONFIG        0x4A  // payload = UpmixConfigPacket (44 B)
+#define REQ_UPMIX_GET_CONFIG        0x4B  // returns UpmixConfigPacket
+#define REQ_UPMIX_SET_PARAM         0x4C  // wValue = UPMIX_PARAM_*, payload = float (4 B)
+#define REQ_UPMIX_GET_PARAM         0x4D  // wValue = UPMIX_PARAM_*, returns float
+#define REQ_UPMIX_GET_STATUS        0x4E  // returns UpmixStatus (16 B)
+// 0x4F reserved for future upmixer extensions
 #define REQ_GET_STATUS      0x50
 #define REQ_SAVE_PARAMS     0x51
 // REQ_SAVE_OUTPUT_CONFIG (0x52): persist the live physical IO/output configuration

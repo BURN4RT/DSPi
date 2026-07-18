@@ -33,6 +33,7 @@
 #include "adat_input.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "upmix.h"
 #include "usb_audio.h"
 #include "notify.h"
 #include "uart_control.h"
@@ -201,6 +202,9 @@ static void perform_rate_change(uint32_t new_freq, bool defer_output_to_input_pr
     crossfeed_update_pending = true;  // Recalculate crossfeed coefficients for new sample rate
     leveller_update_pending = true;   // Recalculate leveller coefficients for new sample rate
     psybass_update_pending = true;    // Recalculate psybass coefficients for new sample rate
+#if PICO_RP2350
+    upmix_update_pending = true;      // Recalculate upmixer coefficients for new sample rate
+#endif
     pdm_update_clock(new_freq);
 
 #if PICO_RP2350
@@ -1630,6 +1634,11 @@ void core0_init() {
     // Initial psychoacoustic bass setup (uses loaded or default params)
     psybass_apply_config((const PsybassConfig *)&psybass_config, 48000.0f);
 
+#if PICO_RP2350
+    // Initial upmixer setup (uses loaded or default params)
+    upmix_apply_config((const UpmixConfig *)&upmix_config, 48000.0f);
+#endif
+
 #if ENABLE_SUB
     {
         extern uint8_t output_pins[];
@@ -2433,6 +2442,16 @@ int main(void) {
             psybass_update_pending = false;
             psybass_apply_config((const PsybassConfig *)&psybass_config, (float)audio_state.freq);
         }
+
+#if PICO_RP2350
+        // Handle upmixer coefficient updates: same double-buffer publish
+        // model (NULL = disabled); processing state resets via upmix_park()
+        // whenever the pipeline pass is not running.
+        if (upmix_update_pending) {
+            upmix_update_pending = false;
+            upmix_apply_config((const UpmixConfig *)&upmix_config, (float)audio_state.freq);
+        }
+#endif
 
         // Handle volume leveller coefficient updates
         if (leveller_update_pending) {

@@ -33,6 +33,7 @@
 #include "control_surfaces.h"
 #include "pdm_generator.h"
 #include "siggen.h"
+#include "upmix.h"
 #include "adat_output.h"
 #include "adat_input.h"
 #include "usb_descriptors.h"
@@ -1436,6 +1437,78 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             if (!siggen_stage_config(vendor_rx_buf, buffer->data_len)) {
                 handled = false;
             }
+            break;
+
+        // ---- Stereo upmixer (RP2350 only) ----
+        case REQ_UPMIX_SET_CONFIG:
+#if !PICO_RP2350
+            handled = false;   // RP2350-only feature; STALL on RP2040
+#else
+            // Expect exactly one wire packet; STALL wrong lengths like siggen.
+            if (buffer->data_len != sizeof(UpmixConfigPacket)) {
+                handled = false;
+            } else {
+                UpmixConfigPacket pkt;
+                memcpy(&pkt, vendor_rx_buf, sizeof(pkt));
+                upmix_config.enabled       = (pkt.enabled != 0);
+                // Clamp mode fields so garbage cannot persist; ranges of the
+                // float params are clamped inside upmix_compute_coefficients.
+                upmix_config.center_mode   = (pkt.center_mode   <= 1) ? pkt.center_mode   : 1;
+                upmix_config.surround_mode = (pkt.surround_mode <= 2) ? pkt.surround_mode : 2;
+                upmix_config.strength_pct       = pkt.strength_pct;
+                upmix_config.center_width_pct   = pkt.center_width_pct;
+                upmix_config.corr_threshold_pct = pkt.corr_threshold_pct;
+                upmix_config.attack_ms          = pkt.attack_ms;
+                upmix_config.release_ms         = pkt.release_ms;
+                upmix_config.detector_hpf_hz    = pkt.detector_hpf_hz;
+                upmix_config.surround_delay_ms  = pkt.surround_delay_ms;
+                upmix_config.surround_hpf_hz    = pkt.surround_hpf_hz;
+                upmix_config.surround_lpf_hz    = pkt.surround_lpf_hz;
+                upmix_config.decorr_pct         = pkt.decorr_pct;
+                upmix_update_pending = true;
+            }
+#endif
+            break;
+
+        case REQ_UPMIX_SET_PARAM:
+#if !PICO_RP2350
+            handled = false;   // RP2350-only feature; STALL on RP2040
+#else
+            // wValue = param id; payload = one 4-byte float.
+            if (vendor_last_wValue >= UPMIX_PARAM_COUNT || buffer->data_len < 4) {
+                handled = false;   // unknown param or short payload; STALL
+            } else {
+                float v;
+                memcpy(&v, vendor_rx_buf, 4);
+                switch (vendor_last_wValue) {
+                    case UPMIX_PARAM_ENABLED:
+                        // Plain nonzero test, matching SET_CONFIG/bulk/flash
+                        upmix_config.enabled = (v != 0.0f);
+                        break;
+                    case UPMIX_PARAM_CENTER_MODE: {
+                        long m = lrintf(v);
+                        upmix_config.center_mode = (m < 0) ? 0 : (m > 1) ? 1 : (uint8_t)m;
+                        break;
+                    }
+                    case UPMIX_PARAM_SURROUND_MODE: {
+                        long m = lrintf(v);
+                        upmix_config.surround_mode = (m < 0) ? 0 : (m > 2) ? 2 : (uint8_t)m;
+                        break;
+                    }
+                    case UPMIX_PARAM_STRENGTH:      upmix_config.strength_pct = v; break;
+                    case UPMIX_PARAM_CENTER_WIDTH:  upmix_config.center_width_pct = v; break;
+                    case UPMIX_PARAM_THRESHOLD:     upmix_config.corr_threshold_pct = v; break;
+                    case UPMIX_PARAM_ATTACK:        upmix_config.attack_ms = v; break;
+                    case UPMIX_PARAM_RELEASE:       upmix_config.release_ms = v; break;
+                    case UPMIX_PARAM_DET_HPF:       upmix_config.detector_hpf_hz = v; break;
+                    case UPMIX_PARAM_SUR_DELAY:     upmix_config.surround_delay_ms = v; break;
+                    case UPMIX_PARAM_SUR_HPF:       upmix_config.surround_hpf_hz = v; break;
+                    case UPMIX_PARAM_SUR_LPF:       upmix_config.surround_lpf_hz = v; break;
+                    case UPMIX_PARAM_DECORR:        upmix_config.decorr_pct = v; break;
+                }
+                upmix_update_pending = true;
+            }
+#endif
             break;
 
         default:
@@ -3456,6 +3529,75 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 siggen_get_status(&tmp);
                 memcpy(resp_buf, &tmp, sizeof(SiggenStatus));
                 vendor_send_response(resp_buf, sizeof(SiggenStatus));
+                return true;
+            }
+
+            // ---- Stereo upmixer (RP2350 only) ----
+            case REQ_UPMIX_GET_CONFIG: {
+#if !PICO_RP2350
+                memset(resp_buf, 0, 44);   // upmix unavailable: 44 zero bytes
+                vendor_send_response(resp_buf, 44);
+#else
+                UpmixConfigPacket pkt;
+                pkt.enabled       = upmix_config.enabled ? 1 : 0;
+                pkt.center_mode   = upmix_config.center_mode;
+                pkt.surround_mode = upmix_config.surround_mode;
+                pkt.reserved      = 0;
+                pkt.strength_pct       = upmix_config.strength_pct;
+                pkt.center_width_pct   = upmix_config.center_width_pct;
+                pkt.corr_threshold_pct = upmix_config.corr_threshold_pct;
+                pkt.attack_ms          = upmix_config.attack_ms;
+                pkt.release_ms         = upmix_config.release_ms;
+                pkt.detector_hpf_hz    = upmix_config.detector_hpf_hz;
+                pkt.surround_delay_ms  = upmix_config.surround_delay_ms;
+                pkt.surround_hpf_hz    = upmix_config.surround_hpf_hz;
+                pkt.surround_lpf_hz    = upmix_config.surround_lpf_hz;
+                pkt.decorr_pct         = upmix_config.decorr_pct;
+                memcpy(resp_buf, &pkt, sizeof(pkt));
+                vendor_send_response(resp_buf, sizeof(pkt));
+#endif
+                return true;
+            }
+
+            case REQ_UPMIX_GET_PARAM: {
+#if !PICO_RP2350
+                float v = 0.0f;   // upmix unavailable: zero
+                memcpy(resp_buf, &v, 4);
+                vendor_send_response(resp_buf, 4);
+#else
+                if (setup->wValue >= UPMIX_PARAM_COUNT) return false;  // STALL: unknown param
+                float v = 0.0f;
+                switch (setup->wValue) {
+                    case UPMIX_PARAM_ENABLED:       v = upmix_config.enabled ? 1.0f : 0.0f; break;
+                    case UPMIX_PARAM_CENTER_MODE:   v = (float)upmix_config.center_mode; break;
+                    case UPMIX_PARAM_SURROUND_MODE: v = (float)upmix_config.surround_mode; break;
+                    case UPMIX_PARAM_STRENGTH:      v = upmix_config.strength_pct; break;
+                    case UPMIX_PARAM_CENTER_WIDTH:  v = upmix_config.center_width_pct; break;
+                    case UPMIX_PARAM_THRESHOLD:     v = upmix_config.corr_threshold_pct; break;
+                    case UPMIX_PARAM_ATTACK:        v = upmix_config.attack_ms; break;
+                    case UPMIX_PARAM_RELEASE:       v = upmix_config.release_ms; break;
+                    case UPMIX_PARAM_DET_HPF:       v = upmix_config.detector_hpf_hz; break;
+                    case UPMIX_PARAM_SUR_DELAY:     v = upmix_config.surround_delay_ms; break;
+                    case UPMIX_PARAM_SUR_HPF:       v = upmix_config.surround_hpf_hz; break;
+                    case UPMIX_PARAM_SUR_LPF:       v = upmix_config.surround_lpf_hz; break;
+                    case UPMIX_PARAM_DECORR:        v = upmix_config.decorr_pct; break;
+                }
+                memcpy(resp_buf, &v, 4);
+                vendor_send_response(resp_buf, 4);
+#endif
+                return true;
+            }
+
+            case REQ_UPMIX_GET_STATUS: {
+#if !PICO_RP2350
+                memset(resp_buf, 0, 16);   // upmix unavailable: 16 zero bytes
+                vendor_send_response(resp_buf, 16);
+#else
+                UpmixStatus st;
+                upmix_get_status(&st);
+                memcpy(resp_buf, &st, sizeof(st));
+                vendor_send_response(resp_buf, sizeof(st));
+#endif
                 return true;
             }
 

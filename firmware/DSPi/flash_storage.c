@@ -42,6 +42,7 @@
 #include "loudness.h"     // LOUDNESS_DEFAULT_OUTPUT_MASK
 #include "lg_sound_sync.h"
 #include "adat_output.h"     // adat_output_config_enabled/_pin/_set_config (RP2350)
+#include "upmix.h"           // upmix_config + UPMIX_DEFAULT_* (RP2350 only)
 #include "notify.h"
 #include "uart_control.h"    // uart_ctrl_owns_pin (io_pin_valid guard)
 #include "i2c_control.h"     // i2c_ctrl_owns_pin (io_pin_valid guard)
@@ -162,7 +163,12 @@
 //        tail-append like V22..V31: V21..V31 slots still load via
 //        slot_data_size_for_version; older slots decode as disabled / pin unset
 //        (0xFF) / master since io_config_from_slot gates the read on version >= 32.
-#define SLOT_DATA_VERSION       32
+//   V33: Stereo upmixer appended (upmix_enabled + center/surround modes +
+//        reserved + ten floats; struct grows by 44 bytes; RP2350-only feature).
+//        Backward-compatible tail-append like V22..V32: V21..V32 slots still load
+//        via slot_data_size_for_version; older slots have no upmix data and load
+//        the disabled defaults (apply is gated on version >= 33, RP2350 only).
+#define SLOT_DATA_VERSION       33
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -1025,6 +1031,26 @@ typedef struct __attribute__((packed)) {
     uint8_t adat_input_pin;          // 0xFF = unset
     uint8_t adat_input_enabled;      // 0/1
     uint8_t adat_input_clock_mode;   // 0=master, 1=slave
+
+    // Stereo upmixer (V33+, struct grows by 44 bytes; RP2350-only feature; see
+    // upmix.h).  Layout mirrors UpmixConfigPacket: 4 bytes of flags/modes then
+    // ten floats.  Fields are always stored (both platforms) for layout
+    // uniformity; RP2040 writes zeros and never applies them.  Gated on version
+    // >= 33 in apply_slot_to_live() so older slots load the disabled defaults.
+    uint8_t upmix_enabled;           // 0/1
+    uint8_t upmix_center_mode;       // UPMIX_CENTER_* (0..1)
+    uint8_t upmix_surround_mode;     // UPMIX_SURROUND_* (0..2)
+    uint8_t upmix_reserved;
+    float   upmix_strength_pct;
+    float   upmix_center_width_pct;
+    float   upmix_corr_threshold_pct;
+    float   upmix_attack_ms;
+    float   upmix_release_ms;
+    float   upmix_detector_hpf_hz;
+    float   upmix_surround_delay_ms;
+    float   upmix_surround_hpf_hz;
+    float   upmix_surround_lpf_hz;
+    float   upmix_decorr_pct;
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -2616,6 +2642,40 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->adat_input_enabled    = adat_input_enabled ? 1 : 0;
     slot->adat_input_clock_mode = adat_clock_mode;
 
+    // Stereo upmixer (V33): RP2350 stores the live config; RP2040 has no upmix
+    // config, so it zero-fills (fields are round-tripped but never applied).
+#if PICO_RP2350
+    slot->upmix_enabled            = upmix_config.enabled ? 1 : 0;
+    slot->upmix_center_mode        = upmix_config.center_mode;
+    slot->upmix_surround_mode      = upmix_config.surround_mode;
+    slot->upmix_reserved           = 0;
+    slot->upmix_strength_pct       = upmix_config.strength_pct;
+    slot->upmix_center_width_pct   = upmix_config.center_width_pct;
+    slot->upmix_corr_threshold_pct = upmix_config.corr_threshold_pct;
+    slot->upmix_attack_ms          = upmix_config.attack_ms;
+    slot->upmix_release_ms         = upmix_config.release_ms;
+    slot->upmix_detector_hpf_hz    = upmix_config.detector_hpf_hz;
+    slot->upmix_surround_delay_ms  = upmix_config.surround_delay_ms;
+    slot->upmix_surround_hpf_hz    = upmix_config.surround_hpf_hz;
+    slot->upmix_surround_lpf_hz    = upmix_config.surround_lpf_hz;
+    slot->upmix_decorr_pct         = upmix_config.decorr_pct;
+#else
+    slot->upmix_enabled            = 0;
+    slot->upmix_center_mode        = 0;
+    slot->upmix_surround_mode      = 0;
+    slot->upmix_reserved           = 0;
+    slot->upmix_strength_pct       = 0.0f;
+    slot->upmix_center_width_pct   = 0.0f;
+    slot->upmix_corr_threshold_pct = 0.0f;
+    slot->upmix_attack_ms          = 0.0f;
+    slot->upmix_release_ms         = 0.0f;
+    slot->upmix_detector_hpf_hz    = 0.0f;
+    slot->upmix_surround_delay_ms  = 0.0f;
+    slot->upmix_surround_hpf_hz    = 0.0f;
+    slot->upmix_surround_lpf_hz    = 0.0f;
+    slot->upmix_decorr_pct         = 0.0f;
+#endif
+
     // Channel names
     memcpy(slot->channel_names, channel_names, sizeof(slot->channel_names));
 
@@ -2840,6 +2900,48 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     }
     psybass_update_pending = true;
 
+    // Stereo upmixer (V33): RP2350-only.  V33+ slots restore the stored config
+    // (modes clamped; enabled = nonzero); older slots load the disabled
+    // defaults.  Range clamping of the floats happens downstream in
+    // upmix_compute_coefficients (matching the psybass/leveller precedent of a
+    // raw copy plus downstream clamp), so no NaN/range sanitization here.  The
+    // pending flag is raised in both branches so a load that turns the upmixer
+    // off unpublishes its coefficients.
+#if PICO_RP2350
+    if (slot->version >= 33) {
+        upmix_config.enabled            = (slot->upmix_enabled != 0);
+        upmix_config.center_mode        = (slot->upmix_center_mode <= 1)
+                                          ? slot->upmix_center_mode : UPMIX_DEFAULT_CENTER_MODE;
+        upmix_config.surround_mode      = (slot->upmix_surround_mode <= 2)
+                                          ? slot->upmix_surround_mode : UPMIX_DEFAULT_SURROUND_MODE;
+        upmix_config.strength_pct       = slot->upmix_strength_pct;
+        upmix_config.center_width_pct   = slot->upmix_center_width_pct;
+        upmix_config.corr_threshold_pct = slot->upmix_corr_threshold_pct;
+        upmix_config.attack_ms          = slot->upmix_attack_ms;
+        upmix_config.release_ms         = slot->upmix_release_ms;
+        upmix_config.detector_hpf_hz    = slot->upmix_detector_hpf_hz;
+        upmix_config.surround_delay_ms  = slot->upmix_surround_delay_ms;
+        upmix_config.surround_hpf_hz    = slot->upmix_surround_hpf_hz;
+        upmix_config.surround_lpf_hz    = slot->upmix_surround_lpf_hz;
+        upmix_config.decorr_pct         = slot->upmix_decorr_pct;
+    } else {
+        upmix_config.enabled            = false;
+        upmix_config.center_mode        = UPMIX_DEFAULT_CENTER_MODE;
+        upmix_config.surround_mode      = UPMIX_DEFAULT_SURROUND_MODE;
+        upmix_config.strength_pct       = UPMIX_DEFAULT_STRENGTH;
+        upmix_config.center_width_pct   = UPMIX_DEFAULT_WIDTH;
+        upmix_config.corr_threshold_pct = UPMIX_DEFAULT_THRESH;
+        upmix_config.attack_ms          = UPMIX_DEFAULT_ATTACK;
+        upmix_config.release_ms         = UPMIX_DEFAULT_RELEASE;
+        upmix_config.detector_hpf_hz    = UPMIX_DEFAULT_DET_HPF;
+        upmix_config.surround_delay_ms  = UPMIX_DEFAULT_SUR_DELAY;
+        upmix_config.surround_hpf_hz    = UPMIX_DEFAULT_SUR_HPF;
+        upmix_config.surround_lpf_hz    = UPMIX_DEFAULT_SUR_LPF;
+        upmix_config.decorr_pct         = UPMIX_DEFAULT_DECORR;
+    }
+    upmix_update_pending = true;
+#endif
+
     // Matrix mixer — all inputs, direct.
     for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
         for (int out = 0; out < NUM_OUTPUT_CHANNELS; out++) {
@@ -3001,8 +3103,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // loudness output mask; V27 appended the crossfeed output pair mask; V28
 // appended i2s_clock_mode; V29 appended i2s_clock_pin_mode + i2s_bck_pin_slave;
 // V30 appended peq_qp_x512; V31 appended psybass; V32 appended the ADAT input
-// fields, so V31's range stops where those begin (a stored slot's CRC was
-// computed without the fields its version predates).
+// fields; V33 appended the stereo upmixer config, so each version's range stops
+// where the next version's fields begin (a stored slot's CRC was computed
+// without the fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -3026,19 +3129,24 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V31 \
     (offsetof(PresetSlot, adat_input_pin) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V32 \
+    (offsetof(PresetSlot, upmix_enabled) - offsetof(PresetSlot, filter_recipes))
+#define SLOT_DATA_SIZE_V33 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
 // (I2S clock master/slave mode), V29 (I2S clock-pin mode), V30 (Linkwitz
-// Transform per-band target Q), V31 (psychoacoustic bass) and V32 (ADAT input)
-// are backward-compatible tail-appends.  V21..V32 slots are all accepted (an
-// older slot loads with the newer fields defaulted to unset) while older/unknown
-// versions are invalidated and the slot loads factory defaults.
+// Transform per-band target Q), V31 (psychoacoustic bass), V32 (ADAT input) and
+// V33 (stereo upmixer) are backward-compatible tail-appends.  V21..V33 slots are
+// all accepted (an older slot loads with the newer fields defaulted to unset)
+// while older/unknown versions are invalidated and the slot loads factory
+// defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 32
+        case SLOT_DATA_VERSION:   // 33
+            return SLOT_DATA_SIZE_V33;
+        case 32:
             return SLOT_DATA_SIZE_V32;
         case 31:
             return SLOT_DATA_SIZE_V31;
@@ -3612,6 +3720,24 @@ static void apply_factory_defaults(void) {
     psybass_config.character_pct = PSYBASS_DEFAULT_CHARACTER;
     psybass_config.original_db   = PSYBASS_DEFAULT_ORIGINAL;
     psybass_update_pending = true;
+
+    // Stereo upmixer (RP2350-only): disabled, default engine params.
+#if PICO_RP2350
+    upmix_config.enabled            = false;
+    upmix_config.center_mode        = UPMIX_DEFAULT_CENTER_MODE;
+    upmix_config.surround_mode      = UPMIX_DEFAULT_SURROUND_MODE;
+    upmix_config.strength_pct       = UPMIX_DEFAULT_STRENGTH;
+    upmix_config.center_width_pct   = UPMIX_DEFAULT_WIDTH;
+    upmix_config.corr_threshold_pct = UPMIX_DEFAULT_THRESH;
+    upmix_config.attack_ms          = UPMIX_DEFAULT_ATTACK;
+    upmix_config.release_ms         = UPMIX_DEFAULT_RELEASE;
+    upmix_config.detector_hpf_hz    = UPMIX_DEFAULT_DET_HPF;
+    upmix_config.surround_delay_ms  = UPMIX_DEFAULT_SUR_DELAY;
+    upmix_config.surround_hpf_hz    = UPMIX_DEFAULT_SUR_HPF;
+    upmix_config.surround_lpf_hz    = UPMIX_DEFAULT_SUR_LPF;
+    upmix_config.decorr_pct         = UPMIX_DEFAULT_DECORR;
+    upmix_update_pending = true;
+#endif
 
     // Matrix mixer: stereo pass-through on first pair
     memset(&matrix_mixer, 0, sizeof(matrix_mixer));

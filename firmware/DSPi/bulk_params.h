@@ -31,7 +31,7 @@
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      24   // V24: ADAT input config (pin/enable/clock mode) claimed from the input-config reserved bytes (struct size unchanged). V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
+#define WIRE_FORMAT_VERSION      25   // V25: append upmixer section (44 bytes; RP2350 stereo upmixer, zeroed/ignored on RP2040). V24: ADAT input config (pin/enable/clock mode) claimed from the input-config reserved bytes (struct size unchanged). V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -349,6 +349,31 @@ typedef struct __attribute__((packed)) {
 } WirePsybassParams;                 // 24 bytes
 
 // ============================================================================
+// Section 22: Stereo Upmixer (44 bytes); V25+
+// ============================================================================
+//
+// RP2350-only stereo upmixer (see upmix.h).  One global config; layout mirrors
+// UpmixConfigPacket in upmix.h.  Zeroed on collect and ignored on apply on
+// RP2040.  Float ranges are clamped downstream in upmix_compute_coefficients,
+// so only enabled/mode fields need validation on apply.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  center_mode;            // UPMIX_CENTER_* (0-1)
+    uint8_t  surround_mode;          // UPMIX_SURROUND_* (0-2)
+    uint8_t  reserved;               // Zero
+    float    strength_pct;
+    float    center_width_pct;
+    float    corr_threshold_pct;
+    float    attack_ms;
+    float    release_ms;
+    float    detector_hpf_hz;
+    float    surround_delay_ms;
+    float    surround_hpf_hz;
+    float    surround_lpf_hz;
+    float    decorr_pct;
+} WireUpmixParams;                   // 44 bytes
+
+// ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
@@ -373,7 +398,8 @@ typedef struct __attribute__((packed)) {
     WireCrossoverConfig crossovers;      // 1088 (17×4; input rows unused)
     WireAdatConfig      adat_config;     //    8
     WirePsybassParams   psybass;         //   24  (V23+)
-} WireBulkParams;                        // Total: 5900 bytes (V23 appends the 24-byte psybass section)
+    WireUpmixParams     upmix;           //   44  (V25+)
+} WireBulkParams;                        // Total: 5944 bytes (V25 appends the 44-byte upmixer section)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
@@ -385,7 +411,7 @@ typedef struct __attribute__((packed)) {
 #define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
 // Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
-// V23 is 5900 bytes (17-channel EQ/names/crossover + ADAT + leveller masks + psybass); 8192 is the next power of 2.
+// V25 is 5944 bytes (17-channel EQ/names/crossover + ADAT + leveller masks + psybass + upmixer); 8192 is the next power of 2.
 // Shared by both platforms (the wire format is platform-independent).
 #define WIRE_BULK_BUF_SIZE     8192
 

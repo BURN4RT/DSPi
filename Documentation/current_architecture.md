@@ -396,7 +396,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-07-13 (float->S24 finalization gated on ADAT activity: in-place staging while ADAT is active, fused convert+interleave otherwise)*
+*Last updated: 2026-07-18 (stereo upmixer pass added between the leveller and the matrix, stereo input only)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -405,7 +405,8 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Input conversion | USB int16/24-bit or SPDIF RX 24-bit → float full-scale, per-channel preamp gain (`global_preamp_linear[ch]`) |
 | Per-Input EQ + metering | Per active input: block-based `dsp_process_channel_block()`, 10 bands, hybrid SVF/biquad; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor over active inputs (2 to 8), mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (float throughout) |
-| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode) with gain/phase (loudness now per-output post-gain; leveller still runs) |
+| Stereo Upmixer | Stereo input only: derives Centre/Ls/Rs into matrix source rows 2..4 and removes centre from L/R; raises the matrix source count to 3 or 5. Parks in multichannel modes. Zero-latency steering; deliberate identical-per-row surround Haas delay (see "Stereo Upmixer") |
+| Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode, or 3/5 sources with the upmixer active) with gain/phase (loudness now per-output post-gain; leveller still runs) |
 | Crossfeed | BS2B lowpass + allpass (ILD + ITD) per output pair, post-matrix (PASS 4.5), pre-output-EQ; `output_pair_mask`-selected (up to 4 pairs); works in every input mode |
 | Output EQ | Block-based, 10 bands per output (Core 0: outputs 0-1, Core 1: outputs 2-7) |
 | Output gain | Per-output gain × host volume × master volume |
@@ -784,7 +785,7 @@ Spec: `Documentation/Features/crossover_filters_spec.md`.
 ---
 
 ## Matrix Mixer
-*Last updated: 2026-06-24*
+*Last updated: 2026-07-18 (loop bound generalized to n_matrix_sources; rows 2..4 shared by multichannel inputs 3..5 and the stereo upmixer's C/Ls/Rs)*
 
 ### Architecture
 
@@ -797,7 +798,9 @@ typedef struct {
 } MatrixMixer;
 ```
 
-The matrix loop iterates the *active* input count (2 for stereo / S/PDIF / I2S, 8 only for the 8-channel USB alt), snapshotting the enabled `(input, signed gain)` pairs per output once per block. Matrix-route vendor commands accept input indices 0-7 on RP2350.
+The matrix loop iterates `n_matrix_sources`, snapshotting the enabled `(source, signed gain)` pairs per output once per block. This is `n_active_inputs` (2 for stereo / S/PDIF / I2S, 4/6/8 for multichannel USB) plus, on RP2350 with the stereo upmixer active on a stereo input, 1 or 3 derived rows (2 + 1 centre-only, 2 + 3 with surround). Matrix-route vendor commands accept input indices 0-7 on RP2350.
+
+**Row sharing (RP2350).** Source rows 2..4 are dual-purpose: they carry multichannel inputs 3..5 in multichannel input modes, and the stereo upmixer's Upmix C / Ls / Rs derived channels in stereo upmix mode. The crosspoint storage is the same in both cases, so a host must present those rows contextually by the active input mode (see "Stereo Upmixer").
 
 **Crosspoint:** enabled, phase_invert, gain_db, gain_linear (pre-computed)
 
@@ -1116,6 +1119,72 @@ Follows the loudness/crossfeed module pattern:
 
 ---
 
+## Stereo Upmixer
+*Last updated: 2026-07-18*
+
+### Purpose
+
+Derives Centre / Left-Surround / Right-Surround virtual source channels from a stereo program so a two-channel input can drive a multi-speaker layout. It runs **only on RP2350** (the feature is compiled out on RP2040), **only when the active input is the plain stereo pair** (`active_input_channel_count() == 2`), and **only at sample rates of 48 kHz or below** (the delay rings are sized for 48 kHz; above that the upmixer parks, ADAT-style, and `upmix_apply_config` publishes NULL). In multichannel input modes those matrix rows carry real inputs and the upmixer parks the same way. Module: `firmware/DSPi/upmix.c/h`. Status: **HW-untested**.
+
+### Signal Flow
+
+The pass sits between the leveller and the matrix (PASS 3 in the RP2350 pipeline). It reads the post-EQ/leveller stereo bus (`buf_l`/`buf_r`), writes the derived channels into the otherwise-idle multichannel input rows (`buf_in_ext[0..2]` = matrix source rows 2..4 = `UPMIX_ROW_C`/`_LS`/`_RS`), and applies centre removal to L/R in place. The matrix then treats the derived channels as ordinary sources: routing, crosspoint gains, and the whole per-output chain (PEQ, crossover, delay, gain, loudness) are reused unchanged. The matrix loop bound is generalized from `n_active_inputs` to `n_matrix_sources` (2 + 1 for centre-only, 2 + 3 with surround), so only the rows actually carrying derived audio are summed. The derived rows have **no input PEQ** (they are synthesized after the per-input stage) but DO get peak/clip metering into `global_status.peaks[2..4]` while the upmixer runs; the extracted centre can legitimately reach +3 dBFS on hot correlated content, so hosts must watch these meters. Steering telemetry (correlation, balance, live gains) is exposed through `REQ_UPMIX_GET_STATUS`.
+
+Two independent engines feed the derived rows.
+
+**Centre engine** (always produces row 2 when enabled):
+- `PASSIVE`: `C = 0.7071 * (L + R)`, fixed constant-power sum.
+- `ADAPTIVE`: a running normalized cross-correlation and L/R balance (one-pole estimators on a bass-cut, one-pole-HP detector path) drive the centre gain through a threshold gate with renormalization above the knee, then attack/release ballistics applied per block (packet-size independent) and per-sample gain ramps. Only genuinely centre-panned correlated content is extracted, so the image does not pump; long-wavelength content is excluded by the detector HP (industry-standard bass-steering mitigation).
+
+Extracted centre energy is subtracted from L/R scaled by strength and by centre-width (`0.5 * (1 - width)` removal), so a physical centre speaker and the L/R phantom do not comb-filter. Constant-power conventions: `0.7071` centre extraction, `0.5` removal.
+
+**Surround engine** (rows 3..4 when `surround_mode != OFF`):
+- `OFF`: no surround rows (`n_derived = 1`).
+- `PASSIVE`: `Ls = Rs = 0.7071 * (L - R)` difference feed, mirrored polarity.
+- `ADAPTIVE`: Dolby low-complexity matrix decoder steering (WO2007067320A2): rectified level differences per axis, gain 1024 + hard clip, 40 ms one-pole dominance smoothers, polynomial pan law (`1 - x^2`) with front/back bias mapped into `[-1, 0]`, and Pro Logic II surround decode feed coefficients (`0.8710` / `-0.4898`). The patent's front L/R gain riding is deliberately omitted; the centre engine owns all modification of the mains.
+
+Both surround modes then run a built-in conditioning chain per surround channel: a 2nd-order Butterworth TPT-SVF high-pass (default 300 Hz) and low-pass (default 7 kHz) band-limit, a Haas delay (default 12 ms, per-channel ring of 1024 samples; the 20 ms ceiling holds at 48 kHz), and a mirrored-gain Schroeder allpass decorrelator (10 ms, `G = 0.5 * decorr_pct / 100`, ring of 512 samples). Routing "Upmix Ls/Rs" to output slots is then the entire user setup.
+
+**Zero added latency, alignment preserved.** Steering is pure gain (zero latency) on C/L/R. The surround Haas delay is a deliberate feature and is identical for every output slot fed from the same source row, so inter-output-slot sample alignment is preserved by construction (the CLAUDE.md inviolable guarantee).
+
+### Coefficient Publish & State
+
+Follows the psybass module pattern:
+
+- **Double-buffered publish.** `upmix_apply_config()` computes one shared `UpmixCoeffs` into the inactive buffer (`um_coeff_bufs[2]`) and atomically publishes `volatile const UpmixCoeffs *current_upmix_coeffs` (**NULL = disabled**), never mutating the buffer the pipeline reads. Vendor SET handlers write `upmix_config` and raise `upmix_update_pending`; the main loop consumes the flag and recomputes. Coefficients are also recomputed on rate change (`perform_rate_change()` raises the flag). Initial setup runs once in `core0_init()`.
+- **Processing state.** All state is Core 0 only (the pass runs before the matrix). `upmix_process_block()` is `DSP_TIME_CRITICAL` (RAM-resident). Whenever the pass does not run (multichannel input, or disabled), the pipeline calls the inline `upmix_park()`, a dirty-flag check that runs the cold `upmix_reset_state()` once on the running -> parked transition so re-entry starts clean.
+- **Telemetry.** `upmix_get_status()` fills a 16-byte `UpmixStatus` (active flag, `parked_reason` 0 active / 1 disabled / 2 input-not-stereo / 3 rate-above-48kHz, smoothed correlation and balance in Q14, and centre/Ls/Rs gains in Q15).
+
+### Parameters
+
+One global config (`UpmixConfig`); ranges are clamped downstream in `upmix_compute_coefficients()` (SET handlers only validate the enable/mode fields).
+
+| Parameter | Range | Default | Description |
+|-----------|-------|---------|-------------|
+| enabled | 0/1 | false | Enable/disable the upmixer |
+| center_mode | 0/1 | ADAPTIVE (1) | Centre engine: 0 PASSIVE, 1 ADAPTIVE |
+| surround_mode | 0..2 | ADAPTIVE (2) | Surround engine: 0 OFF, 1 PASSIVE, 2 ADAPTIVE |
+| strength_pct | 0..100 | 100 | Centre extraction strength |
+| center_width_pct | 0..100 | 25 | Residual L/R retention (0 = full removal, 100 = phantom kept) |
+| corr_threshold_pct | 0..95 | 30 | Correlation gate for adaptive centre |
+| attack_ms | 1..500 | 10 | Centre gain attack ballistics |
+| release_ms | 5..2000 | 100 | Centre gain release ballistics |
+| detector_hpf_hz | 20..1000 | 200 | Detector bass-cut corner (anti bass-steering) |
+| surround_delay_ms | 0..20 | 12 | Surround Haas delay |
+| surround_hpf_hz | 20..2000 | 300 | Surround band-limit high-pass |
+| surround_lpf_hz | 1000..20000 | 7000 | Surround band-limit low-pass |
+| decorr_pct | 0..100 | 90 | Decorrelator amount (`G = 0.5 * pct/100`) |
+
+### Persistence & Control
+
+- **Wire format V25:** `WireUpmixParams` (44 bytes, layout-identical to `UpmixConfigPacket`) is tail-appended to `WireBulkParams` (total 5944 bytes). Bulk collect/apply copy it straight to/from `upmix_config` and raise the pending flag; the section is zeroed on collect and ignored on apply on RP2040.
+- **Preset slot V33:** the config is tail-appended to `PresetSlot` (struct grows 44 bytes; `SLOT_DATA_SIZE_V33`), gated on `slot->version >= 33` in `apply_slot_to_live()` (RP2350). Older slots have no upmix data and load the disabled defaults; V21..V32 slots still validate via `slot_data_size_for_version()`. Factory reset sets it disabled with `UPMIX_DEFAULT_*` values. RP2040 round-trips the fields as zeros and never applies them.
+- **Vendor commands:** `0x4A-0x4E`; RP2350 only (SETs STALL on RP2040, GETs return zeros). `0x4A` SET_CONFIG takes the 44-byte `UpmixConfigPacket`; `0x4B` GET_CONFIG returns it; `0x4C`/`0x4D` SET/GET_PARAM address a single field by `wValue` (`UPMIX_PARAM_*` 0..12) as a 4-byte float; `0x4E` GET_STATUS returns the 16-byte `UpmixStatus`. `0x4F` is reserved. See the Vendor Command Reference table.
+
+**Matrix row-sharing consequence.** Source rows 2..4 are dual-purpose: they carry multichannel inputs 3..5 in multichannel input modes and the Upmix C / Ls / Rs derived channels in stereo upmix mode. The matrix crosspoints for those rows are the same storage in both cases, so a host application must present them contextually (real input vs upmix-derived) based on the active input mode.
+
+---
+
 ## Volume Leveller
 *Last updated: 2026-07-10 (crossfeed no longer stereo-only; runs per output pair)*
 
@@ -1373,7 +1442,7 @@ the single 4 KB directory sector. See
 | cs_ir | Control Surfaces IR command table (V11+, 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
-*Last updated: 2026-07-13 (psychoacoustic bass, slot V31)*
+*Last updated: 2026-07-18 (stereo upmixer, slot V33; `SLOT_DATA_VERSION` now 33)*
 
 | Field | Description |
 |-------|-------------|
@@ -1390,6 +1459,7 @@ the single 4 KB directory sector. See
 | Loudness | enabled, reference SPL, intensity |
 | Crossfeed | enabled, preset, ITD, custom fc/feed, output_pair_mask (V27+, tail-appended; older slots default 0x01) |
 | Psychoacoustic bass | enabled, output_mask, cutoff, harmonics, drive, character, original (V31+, tail-appended 24 bytes, `SLOT_DATA_VERSION` 31; older slots load disabled/all-outputs defaults) |
+| Stereo upmixer | enabled, centre/surround modes, reserved, ten floats (V33+, tail-appended 44 bytes, `SLOT_DATA_VERSION` 33; RP2350 only, gated on version >= 33; older slots load disabled defaults; RP2040 stores zeros and never applies them) |
 | Matrix mixer | crosspoints + output channels |
 | Pin config | NUM_PIN_OUTPUTS pin assignments (always stored, conditionally loaded) |
 | Channel names | NUM_CHANNELS × 32-byte NUL-terminated names (V8, default names for V<8) |
@@ -1611,7 +1681,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-13 (ADAT input row added, RP2350 only; wire/slot version row now V24 / V32)*
+*Last updated: 2026-07-18 (stereo upmixer row added, RP2350 only; wire/slot version row now V25 / V33)*
 
 ### Hardware
 
@@ -1655,7 +1725,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | ADAT input | Config state only (never selectable) | Yes (8 ch, 24-bit, 44.1/48 kHz; master/slave clock; PIO1 SM2 + DMA CH15) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V24 / V32 | V24 / V32 |
+| Wire / slot version | V25 / V33 | V25 / V33 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
@@ -1663,6 +1733,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Loudness | Per output, post-gain: 2 Q28 shelf biquads; `loudness_output_mask` (5 outputs) | Per output, post-gain: 2 SVF shelves; `loudness_output_mask` (9 outputs). Both platforms: volume-keyed, works in stereo and multichannel input modes |
 | Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
 | Psychoacoustic bass | Per output, pre-crossover; RBJ Q28 biquads (with pre-drive low-band clamp) | Per output, pre-crossover; TPT SVF float. Both platforms: missing-fundamental NLD, `output_mask`, zero added latency |
+| Stereo upmixer | Not available (compiled out; matrix untouched) | Stereo input only: derives C/Ls/Rs into matrix rows 2..4 (passive or adaptive centre; OFF/passive/adaptive surround). Zero-latency steering; deliberate per-row surround Haas delay |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
 ### Delay Lines
@@ -1735,7 +1806,7 @@ masked, and PDM claims its channel once at init.
 ---
 
 ## Memory Layout
-*Last updated: 2026-07-15 (ADAT slave acquisition replaces candidate-window counters with probe rate/start-time state; RX ring and buffer sizes unchanged)*
+*Last updated: 2026-07-19 (RP2350 stereo upmixer adds ~12.3 KB BSS: Haas + allpass rings sized for 48 kHz, estimators, double-buffered coeffs; RP2040 unchanged, feature compiled out)*
 
 > **Linkwitz Transform target-Q sidecar (2026-07-12).** The Linkwitz Transform's
 > fourth parameter (`Qp`) is stored out-of-band in a new BSS array
@@ -1941,11 +2012,12 @@ and warns on flash reached through linker long-call veneers (cold paths); Check
 | Consumer pools + silence (static, 4 slots × 16 × 48 × 16, shared SPDIF/I2S) | ~55 KB |
 | I2S RX DMA ring (2048 × 4, 8 KB aligned) | 8 KB |
 | ADAT RX ring (`adat_rx_ring`, 2048 × 4, 8 KB aligned) | 8 KB |
-| Other BSS | ~24 KB |
-| **Total BSS** | **~284 KB** (measured: 291,052 B; unchanged by the XIP migration) |
-| RAM code+rodata+data (.data section, hot set only) | 48,688 B (was 147,332 under copy_to_ram) |
+| Stereo upmixer state (Haas 2 × 1024 + allpass 2 × 512 floats + estimators + double-buffered coeffs) | ~12.3 KB |
+| Other BSS | ~35 KB |
+| **Total BSS** | **~346 KB** (measured 353,884 B after the stereo upmixer, + ~12.3 KB over the prior build. RP2040 unchanged: the feature is compiled out and the matrix is untouched) |
+| RAM code+rodata+data (.data section, hot set only) | 70,520 B (was 147,332 under copy_to_ram) |
 | Flash-resident code (.text + .rodata + boot2, XIP) | ~98 KB |
-| Free RAM | ~182,228 B (was ~75,540 under copy_to_ram) |
+| Free RAM | ~99,460 B (per scripts/check_ram_placement.py, includes vector table + 2 KB heap reserve accounting) |
 | SPDIF producer pools (heap, 4 × 8 × 192 × 8) | ~48 KB |
 | Stack + remaining heap | drawn from the free-RAM pool above |
 
@@ -2387,7 +2459,7 @@ op state ~400 B).
 ---
 
 ## Vendor Command Reference
-*Last updated: 2026-07-15 (pin byte 0xFF = reset to default on every single-pin SET; REQ_SET_ADAT_PIN no longer treats 0 as default)*
+*Last updated: 2026-07-18 (stereo upmixer commands 0x4A-0x4E added, RP2350 only)*
 
 **Band-index map (PEQ and crossover share one address space):**
 
@@ -2425,6 +2497,11 @@ op state ~400 B).
 | REQ_GET_BYPASS | 0x47 | IN | Get master EQ bypass state |
 | REQ_SET_DELAY | 0x48 | OUT | Set channel delay |
 | REQ_GET_DELAY | 0x49 | IN | Get channel delay |
+| REQ_UPMIX_SET_CONFIG | 0x4A | OUT | Set the whole stereo upmixer config (44-byte `UpmixConfigPacket`; RP2350 only, wrong length STALLs; RP2040 STALLs). Mode fields clamped; floats clamped downstream |
+| REQ_UPMIX_GET_CONFIG | 0x4B | IN | Get the stereo upmixer config (44-byte `UpmixConfigPacket`; RP2040 returns 44 zero bytes) |
+| REQ_UPMIX_SET_PARAM | 0x4C | OUT | Set one upmixer field: `wValue` = `UPMIX_PARAM_*` (0..12), payload = 4-byte LE float (mode/enable rounded to int; RP2350 only, RP2040 STALLs) |
+| REQ_UPMIX_GET_PARAM | 0x4D | IN | Get one upmixer field (`wValue` = `UPMIX_PARAM_*`, returns 4-byte float; RP2040 returns 0.0). Unknown param STALLs |
+| REQ_UPMIX_GET_STATUS | 0x4E | IN | Get 16-byte `UpmixStatus` (active, parked_reason, corr_q14, balance_q14, center/ls/rs gains; RP2040 returns 16 zero bytes). 0x4F reserved |
 | REQ_GET_STATUS | 0x50 | IN | Get all channel peaks + CPU load (see Channel Metering) |
 | REQ_SAVE_PARAMS | 0x51 | OUT | Save all params to flash |
 | REQ_SAVE_OUTPUT_CONFIG | 0x52 | IN | Persist live physical IO config to the directory's device-global block (independent mode; was the deprecated REQ_LOAD_PARAMS) |
@@ -2580,11 +2657,11 @@ op state ~400 B).
 | REQ_GET_I2S_CLOCK_PIN_MODE | 0xFF | IN | Get live I2S clock-pin mode (returns uint8_t: 0 = unified, 1 = split) |
 
 ### Bulk Parameter Transfer
-*Last updated: 2026-07-12 (wire V22: Linkwitz Transform qp in EQ reserved bytes)*
+*Last updated: 2026-07-18 (wire V25: 44-byte stereo upmixer section appended; total 5944 bytes)*
 
 Transfers the complete DSP state in a single USB control transfer (3664 bytes at V11/V12), replacing dozens of individual vendor requests.
 
-**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 24, total 5900 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes. **V24** claims three `WireInputConfig` reserved bytes for the ADAT input (`adat_input_pin`, `adat_input_enabled_p1`, `adat_clock_mode_p1`, each 0 = absent/keep-live); struct sizes and the 5900-byte total are unchanged.
+**Wire format:** `WireBulkParams` (`bulk_params.h`, `WIRE_FORMAT_VERSION` 25, total 5944 bytes); packed struct with header, global params, crossfeed, legacy channel gains, delays, matrix crosspoints, matrix outputs, pin config, EQ bands, channel names, I2S config, leveller config, preamp config (`WirePreampConfig`, 16 bytes), master volume config (`WireMasterVolume`, 16 bytes), input source config (`WireInputConfig`, 16 bytes), LG Sound Sync (`WireLgSoundSync`, 16 bytes), user volume/mute (`WireUserVolume`, 16 bytes), DAC hardware mute (`WireDacHwMute`, 16 bytes, V10+), and **crossover bands** (`WireCrossoverConfig`, 704 bytes = 11 × 4 × `WireBandParams`, V11+). V12 claims two reserved bytes inside `WireInputConfig` for `i2s_rx_pin` and `i2s_input_rate` (enum 0=44100, 1=48000, 2=96000); V12 payloads are byte-identical in size to V11. All arrays sized at platform maximums (RP2350: 11 channels, 9 outputs, 5 pins, 12 PEQ bands, 4 crossover bands per channel). Unused entries zero-padded; for crossover, master rows (channel < `CH_OUT_1`) are zeroed on collect and skipped on apply. **V20** repurposes the `WireCrossfeedParams` reserved byte (offset 3) as `output_pair_mask` (bit p = crossfeed on output pair p); struct sizes are unchanged. **V22** carries the Linkwitz-Transform target `Q` in the EQ `WireBandParams.reserved[2]` bytes (`uint16` LE, `Q*512`; zero for non-LT types), so struct sizes stay unchanged. (V21 claimed one `WireInputConfig` reserved byte for the I2S clock master/slave mode, also size-neutral.) **V23** tail-appends the 24-byte `WirePsybassParams` (psychoacoustic bass: `enabled` + `output_mask` + five floats), bringing the total to 5900 bytes. **V24** claims three `WireInputConfig` reserved bytes for the ADAT input (`adat_input_pin`, `adat_input_enabled_p1`, `adat_clock_mode_p1`, each 0 = absent/keep-live); struct sizes and the 5900-byte total are unchanged. **V25** tail-appends the 44-byte `WireUpmixParams` (RP2350 stereo upmixer: enabled + centre/surround modes + reserved + ten floats; layout-identical to `UpmixConfigPacket`), bringing the total to 5944 bytes; the section is zeroed on collect and ignored on apply on RP2040.
 
 **Per-version size anchors** live in `bulk_params.h` (`WIRE_BULK_PARAMS_V{N}_SIZE`, N=2..12). Each legacy-section apply gate inside `bulk_params_apply()` compares `payload_length` against its own version's anchor, NOT against `sizeof(WireBulkParams)`. Without this discipline, growing the struct would silently lock older payloads out of the very tail sections they own (e.g. a V10 payload would stop applying its DAC-mute section the moment V11 was added). V<11 payloads leave crossover state untouched on apply; V<12 payloads leave the I2S input pin/rate untouched.
 
