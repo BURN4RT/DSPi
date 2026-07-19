@@ -168,7 +168,10 @@
 //        Backward-compatible tail-append like V22..V32: V21..V32 slots still load
 //        via slot_data_size_for_version; older slots have no upmix data and load
 //        the disabled defaults (apply is gated on version >= 33, RP2350 only).
-#define SLOT_DATA_VERSION       33
+//   V34: Upmixer presence bell claims the upmix reserved byte (int8, dB * 2;
+//        struct size unchanged).  V33 slots always wrote 0 there, which decodes
+//        as the 0 dB default, so V33 loads need no special handling.
+#define SLOT_DATA_VERSION       34
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -1040,7 +1043,8 @@ typedef struct __attribute__((packed)) {
     uint8_t upmix_enabled;           // 0/1
     uint8_t upmix_center_mode;       // UPMIX_CENTER_* (0..1)
     uint8_t upmix_surround_mode;     // UPMIX_SURROUND_* (0..2)
-    uint8_t upmix_reserved;
+    int8_t  upmix_presence_q1;       // V34+: presence bell dB * 2 (was reserved,
+                                     // always 0 in V33 slots = 0 dB default)
     float   upmix_strength_pct;
     float   upmix_center_width_pct;
     float   upmix_corr_threshold_pct;
@@ -2642,13 +2646,14 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->adat_input_enabled    = adat_input_enabled ? 1 : 0;
     slot->adat_input_clock_mode = adat_clock_mode;
 
-    // Stereo upmixer (V33): RP2350 stores the live config; RP2040 has no upmix
-    // config, so it zero-fills (fields are round-tripped but never applied).
+    // Stereo upmixer (V33; presence byte V34): RP2350 stores the live config;
+    // RP2040 has no upmix config, so it zero-fills (fields are round-tripped
+    // but never applied).
 #if PICO_RP2350
     slot->upmix_enabled            = upmix_config.enabled ? 1 : 0;
     slot->upmix_center_mode        = upmix_config.center_mode;
     slot->upmix_surround_mode      = upmix_config.surround_mode;
-    slot->upmix_reserved           = 0;
+    slot->upmix_presence_q1        = upmix_presence_encode(upmix_config.presence_db);
     slot->upmix_strength_pct       = upmix_config.strength_pct;
     slot->upmix_center_width_pct   = upmix_config.center_width_pct;
     slot->upmix_corr_threshold_pct = upmix_config.corr_threshold_pct;
@@ -2663,7 +2668,7 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     slot->upmix_enabled            = 0;
     slot->upmix_center_mode        = 0;
     slot->upmix_surround_mode      = 0;
-    slot->upmix_reserved           = 0;
+    slot->upmix_presence_q1        = 0;
     slot->upmix_strength_pct       = 0.0f;
     slot->upmix_center_width_pct   = 0.0f;
     slot->upmix_corr_threshold_pct = 0.0f;
@@ -2924,6 +2929,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         upmix_config.surround_hpf_hz    = slot->upmix_surround_hpf_hz;
         upmix_config.surround_lpf_hz    = slot->upmix_surround_lpf_hz;
         upmix_config.decorr_pct         = slot->upmix_decorr_pct;
+        // V34 presence byte; V33 slots wrote 0 here, which decodes to the
+        // 0 dB default, so no version gate is needed.
+        upmix_config.presence_db        = upmix_presence_decode(slot->upmix_presence_q1);
     } else {
         upmix_config.enabled            = false;
         upmix_config.center_mode        = UPMIX_DEFAULT_CENTER_MODE;
@@ -2938,6 +2946,7 @@ static void apply_slot_to_live(const PresetSlot *slot) {
         upmix_config.surround_hpf_hz    = UPMIX_DEFAULT_SUR_HPF;
         upmix_config.surround_lpf_hz    = UPMIX_DEFAULT_SUR_LPF;
         upmix_config.decorr_pct         = UPMIX_DEFAULT_DECORR;
+        upmix_config.presence_db        = UPMIX_DEFAULT_PRESENCE;
     }
     upmix_update_pending = true;
 #endif
@@ -3132,19 +3141,24 @@ static void apply_slot_to_live(const PresetSlot *slot) {
     (offsetof(PresetSlot, upmix_enabled) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V33 \
     (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
+// V34 claims the upmix reserved byte (presence); no size change.
+#define SLOT_DATA_SIZE_V34 SLOT_DATA_SIZE_V33
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
 // (I2S clock master/slave mode), V29 (I2S clock-pin mode), V30 (Linkwitz
 // Transform per-band target Q), V31 (psychoacoustic bass), V32 (ADAT input) and
-// V33 (stereo upmixer) are backward-compatible tail-appends.  V21..V33 slots are
+// V33 (stereo upmixer) are backward-compatible tail-appends; V34 (upmix
+// presence) claims a reserved byte with no size change.  V21..V34 slots are
 // all accepted (an older slot loads with the newer fields defaulted to unset)
 // while older/unknown versions are invalidated and the slot loads factory
 // defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 33
+        case SLOT_DATA_VERSION:   // 34
+            return SLOT_DATA_SIZE_V34;
+        case 33:
             return SLOT_DATA_SIZE_V33;
         case 32:
             return SLOT_DATA_SIZE_V32;
@@ -3736,6 +3750,7 @@ static void apply_factory_defaults(void) {
     upmix_config.surround_hpf_hz    = UPMIX_DEFAULT_SUR_HPF;
     upmix_config.surround_lpf_hz    = UPMIX_DEFAULT_SUR_LPF;
     upmix_config.decorr_pct         = UPMIX_DEFAULT_DECORR;
+    upmix_config.presence_db        = UPMIX_DEFAULT_PRESENCE;
     upmix_update_pending = true;
 #endif
 

@@ -326,7 +326,7 @@ void bulk_params_collect(WireBulkParams *out) {
     out->upmix.enabled            = upmix_config.enabled ? 1 : 0;
     out->upmix.center_mode        = upmix_config.center_mode;
     out->upmix.surround_mode      = upmix_config.surround_mode;
-    out->upmix.reserved           = 0;
+    out->upmix.presence_q1        = upmix_presence_encode(upmix_config.presence_db);
     out->upmix.strength_pct       = upmix_config.strength_pct;
     out->upmix.center_width_pct   = upmix_config.center_width_pct;
     out->upmix.corr_threshold_pct = upmix_config.corr_threshold_pct;
@@ -930,6 +930,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         upmix_config.surround_hpf_hz    = in->upmix.surround_hpf_hz;
         upmix_config.surround_lpf_hz    = in->upmix.surround_lpf_hz;
         upmix_config.decorr_pct         = in->upmix.decorr_pct;
+        upmix_config.presence_db        = upmix_presence_decode(in->upmix.presence_q1);
         upmix_update_pending = true;
     }
 #endif

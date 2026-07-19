@@ -1465,6 +1465,7 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                 upmix_config.surround_hpf_hz    = pkt.surround_hpf_hz;
                 upmix_config.surround_lpf_hz    = pkt.surround_lpf_hz;
                 upmix_config.decorr_pct         = pkt.decorr_pct;
+                upmix_config.presence_db        = upmix_presence_decode(pkt.presence_q1);
                 upmix_update_pending = true;
             }
 #endif
@@ -1505,6 +1506,7 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                     case UPMIX_PARAM_SUR_HPF:       upmix_config.surround_hpf_hz = v; break;
                     case UPMIX_PARAM_SUR_LPF:       upmix_config.surround_lpf_hz = v; break;
                     case UPMIX_PARAM_DECORR:        upmix_config.decorr_pct = v; break;
+                    case UPMIX_PARAM_PRESENCE:      upmix_config.presence_db = v; break;
                 }
                 upmix_update_pending = true;
             }
@@ -3542,7 +3544,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 pkt.enabled       = upmix_config.enabled ? 1 : 0;
                 pkt.center_mode   = upmix_config.center_mode;
                 pkt.surround_mode = upmix_config.surround_mode;
-                pkt.reserved      = 0;
+                pkt.presence_q1   = upmix_presence_encode(upmix_config.presence_db);
                 pkt.strength_pct       = upmix_config.strength_pct;
                 pkt.center_width_pct   = upmix_config.center_width_pct;
                 pkt.corr_threshold_pct = upmix_config.corr_threshold_pct;
@@ -3581,6 +3583,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     case UPMIX_PARAM_SUR_HPF:       v = upmix_config.surround_hpf_hz; break;
                     case UPMIX_PARAM_SUR_LPF:       v = upmix_config.surround_lpf_hz; break;
                     case UPMIX_PARAM_DECORR:        v = upmix_config.decorr_pct; break;
+                    case UPMIX_PARAM_PRESENCE:      v = upmix_config.presence_db; break;
                 }
                 memcpy(resp_buf, &v, 4);
                 vendor_send_response(resp_buf, 4);

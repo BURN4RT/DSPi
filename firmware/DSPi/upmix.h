@@ -33,6 +33,8 @@
 //               image does not pump.
 //     Extracted centre energy is subtracted from L/R (scaled by width) so a
 //     physical centre speaker and the L/R phantom don't comb-filter.
+//     Both modes: a broad presence bell (TPT SVF, 3 kHz, Q 0.6, +-12 dB) on
+//     the extracted C moves voices forward/back (Syn-style presence control).
 //
 //   Surround engine (rows 3..4 when mode != OFF):
 //     PASSIVE : difference feed, Ls = 0.7071*(L-R) and Rs mirrored (-S).
@@ -93,6 +95,8 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 #define UPMIX_SUR_LPF_MAX     20000.0f
 #define UPMIX_DECORR_MIN          0.0f   // decorrelator amount (%); G = 0.5 * pct/100
 #define UPMIX_DECORR_MAX        100.0f
+#define UPMIX_PRESENCE_MIN      -12.0f   // centre presence bell gain (dB); Syn-style
+#define UPMIX_PRESENCE_MAX       12.0f   // "presence" knob, both centre modes
 
 #define UPMIX_DEFAULT_CENTER_MODE    UPMIX_CENTER_ADAPTIVE
 #define UPMIX_DEFAULT_SURROUND_MODE  UPMIX_SURROUND_ADAPTIVE
@@ -106,12 +110,15 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 #define UPMIX_DEFAULT_SUR_HPF      300.0f
 #define UPMIX_DEFAULT_SUR_LPF     7000.0f
 #define UPMIX_DEFAULT_DECORR        90.0f
+#define UPMIX_DEFAULT_PRESENCE       0.0f
 
 // Fixed internals
 #define UPMIX_CORR_TAU_MS       100.0f   // correlation/balance estimator time constant
 #define UPMIX_DOM_TAU_MS         40.0f   // dominance smoother (patent value)
 #define UPMIX_DOM_CLIP_GAIN    1024.0f   // pre-clip gain (patent value)
 #define UPMIX_DECORR_DELAY_MS    10.0f   // Schroeder allpass delay (patent value)
+#define UPMIX_PRESENCE_HZ      3000.0f   // presence bell centre (vocal presence region)
+#define UPMIX_PRESENCE_Q          0.6f   // broad bell, roughly 1.5-6 kHz
 #define UPMIX_FADE_MS            10.0f   // activation fade-in
 #define UPMIX_RATE_MAX        48000.0f   // parks above this (rings sized for 48 kHz)
 #define UPMIX_HAAS_RING        1024      // samples; holds the 20 ms delay ceiling at 48 kHz
@@ -132,14 +139,18 @@ typedef struct {
     float surround_hpf_hz;
     float surround_lpf_hz;
     float decorr_pct;
+    float presence_db;         // centre presence bell (Syn-style), both centre modes
 } UpmixConfig;
 
-// Wire image of UpmixConfig for REQ_UPMIX_SET/GET_CONFIG (44 bytes)
+// Wire image of UpmixConfig for REQ_UPMIX_SET/GET_CONFIG (44 bytes).
+// presence_q1 (V26+, was reserved) carries presence_db in 0.5 dB steps
+// (int8, dB * 2, -24..+24); older V25 hosts wrote 0 = 0 dB, so the byte is
+// backward-compatible in both directions and no struct size changes.
 typedef struct __attribute__((packed)) {
     uint8_t enabled;
     uint8_t center_mode;
     uint8_t surround_mode;
-    uint8_t reserved;
+    int8_t presence_q1;
     float strength_pct;
     float center_width_pct;
     float corr_threshold_pct;
@@ -169,8 +180,19 @@ enum {
     UPMIX_PARAM_SUR_HPF       = 10,
     UPMIX_PARAM_SUR_LPF       = 11,
     UPMIX_PARAM_DECORR        = 12,
+    UPMIX_PARAM_PRESENCE      = 13,
     UPMIX_PARAM_COUNT
 };
+
+// Wire encoding for the presence byte (0.5 dB steps; see UpmixConfigPacket)
+static inline int8_t upmix_presence_encode(float db) {
+    db = db < UPMIX_PRESENCE_MIN ? UPMIX_PRESENCE_MIN
+       : (db > UPMIX_PRESENCE_MAX ? UPMIX_PRESENCE_MAX : db);
+    return (int8_t)lrintf(db * 2.0f);
+}
+static inline float upmix_presence_decode(int8_t q1) {
+    return 0.5f * (float)q1;
+}
 
 // Live telemetry for REQ_UPMIX_GET_STATUS (16 bytes)
 typedef struct __attribute__((packed)) {
@@ -199,6 +221,8 @@ typedef struct {
     float alpha_att, alpha_rel;// per-sample gain smoothing retentions
     float alpha_corr;          // per-sample estimator retention
     float det_hp_a;            // detector one-pole HP coefficient
+    float pres_a1, pres_a2, pres_a3, pres_m1;  // centre presence bell, TPT SVF
+                                               // (m1 = 0 at 0 dB: exact passthrough)
     // Dominance (adaptive surround)
     float alpha_dom;           // per-sample 40 ms smoother retention
     // Surround engine

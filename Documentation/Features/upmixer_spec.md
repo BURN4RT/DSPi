@@ -1,6 +1,6 @@
 # DSPi Stereo Upmixer Specification
 
-*Version 1.0, 2026-07-19. Firmware: wire format V25, preset slot V33, vendor commands 0x4A-0x4E. RP2350 only. Hardware-untested at time of writing (implemented and audited on the bench build only).*
+*Version 1.2, 2026-07-19. Firmware: wire format V26, preset slot V34, vendor commands 0x4A-0x4E. RP2350 only. Hardware-untested at time of writing (implemented and audited on the bench build only).*
 
 This document contains everything an application developer needs to integrate the DSPi stereo upmixer: the concept, the routing model, every command byte layout, parameter semantics with ranges and defaults, status telemetry, persistence behavior, and recommended UX patterns.
 
@@ -80,25 +80,28 @@ Everything downstream applies unchanged per output slot: crosspoint gain/phase, 
 
 ## 4. Parameters
 
-All persisted in presets (slot V33) and carried in bulk params (wire V25). Floats are IEEE 754 single precision little-endian. Out-of-range floats are clamped by the firmware when coefficients are computed (the stored config keeps the written value).
+All persisted in presets (slot V34) and carried in bulk params (wire V26). Floats are IEEE 754 single precision little-endian. Out-of-range floats are clamped by the firmware when coefficients are computed (the stored config keeps the written value).
 
 | # | Param id | Field | Range | Default | Meaning |
 |---|---|---|---|---|---|
 | 0 | `UPMIX_PARAM_ENABLED` | enabled | 0/1 | 0 | Master enable |
 | 1 | `UPMIX_PARAM_CENTER_MODE` | center_mode | 0-1 | 1 (ADAPTIVE) | Centre engine mode |
 | 2 | `UPMIX_PARAM_SURROUND_MODE` | surround_mode | 0-2 | 2 (ADAPTIVE) | Surround engine mode |
-| 3 | `UPMIX_PARAM_STRENGTH` | strength_pct | 0-100 | 100 | Centre extraction strength; scales both the C output and the removal from L/R |
-| 4 | `UPMIX_PARAM_CENTER_WIDTH` | center_width_pct | 0-100 | 25 | How much extracted centre stays in L/R. 0 = full removal (discrete centre), 100 = L/R untouched (C is additive; expect combing if a real centre speaker plays) |
-| 5 | `UPMIX_PARAM_THRESHOLD` | corr_threshold_pct | 0-95 | 30 | Correlation gate. Centre presence below this extracts nothing; above it, extraction scales smoothly to full. Raise to extract only strongly-correlated content |
-| 6 | `UPMIX_PARAM_ATTACK` | attack_ms | 1-500 | 10 | Centre gain rise time (adaptive mode) |
-| 7 | `UPMIX_PARAM_RELEASE` | release_ms | 5-2000 | 100 | Centre gain fall time (adaptive mode) |
-| 8 | `UPMIX_PARAM_DET_HPF` | detector_hpf_hz | 20-1000 | 200 | Detector bass-cut corner. Bass correlates by coincidence and would pump the steering; content below this corner is ignored by the detector (the audio itself is not filtered) |
+| 3 | `UPMIX_PARAM_STRENGTH` | strength_pct | 0-100 | 100 | Centre extraction strength; scales both the C output and the removal from L/R. **Both centre modes**; in passive mode it is the fixed centre gain (the primary passive control) |
+| 4 | `UPMIX_PARAM_CENTER_WIDTH` | center_width_pct | 0-100 | 25 | How much extracted centre stays in L/R. 0 = full removal (discrete centre), 100 = L/R untouched (C is additive; expect combing if a real centre speaker plays). **Both centre modes** |
+| 5 | `UPMIX_PARAM_THRESHOLD` | corr_threshold_pct | 0-95 | 30 | Correlation gate. Centre presence below this extracts nothing; above it, extraction scales smoothly to full. Raise to extract only strongly-correlated content. **Adaptive centre mode only**; no effect in passive |
+| 6 | `UPMIX_PARAM_ATTACK` | attack_ms | 1-500 | 10 | Centre gain rise time. **Adaptive centre mode only** (in passive mode it still smooths strength/mode changes, but has no steady-state effect) |
+| 7 | `UPMIX_PARAM_RELEASE` | release_ms | 5-2000 | 100 | Centre gain fall time. **Adaptive centre mode only** (same passive-mode caveat as attack) |
+| 8 | `UPMIX_PARAM_DET_HPF` | detector_hpf_hz | 20-1000 | 200 | Detector bass-cut corner. Bass correlates by coincidence and would pump the steering; content below this corner is ignored by the detector (the audio itself is not filtered). **Adaptive centre mode only**; no effect in passive |
 | 9 | `UPMIX_PARAM_SUR_DELAY` | surround_delay_ms | 0-20 | 12 | Haas delay on Ls/Rs. Rule of thumb ~1 ms per foot of listener distance |
 | 10 | `UPMIX_PARAM_SUR_HPF` | surround_hpf_hz | 20-2000 | 300 | Surround band-limit high-pass (keeps rumble out of the rears) |
 | 11 | `UPMIX_PARAM_SUR_LPF` | surround_lpf_hz | 1000-20000 | 7000 | Surround band-limit low-pass (classic 7 kHz surround voicing; raise for full-band rears) |
 | 12 | `UPMIX_PARAM_DECORR` | decorr_pct | 0-100 | 90 | Decorrelator amount; allpass gain G = 0.5 x pct/100. 0 disables decorrelation |
+| 13 | `UPMIX_PARAM_PRESENCE` | presence_db | -12..+12 | 0 | Centre presence bell gain (dB) at a fixed 3 kHz, Q 0.6. Negative moves voices back, positive brings them forward (Syn-style presence). **Both centre modes.** Via SET/GET_PARAM the value is a plain float dB; in the config packet and presets it is carried in 0.5 dB steps |
 
-Fixed internals (not configurable): correlation estimator time constant 100 ms, dominance smoothers 40 ms, decorrelator delay 10 ms, activation fade 10 ms.
+**Per-mode applicability (UI guidance):** when the centre mode is `PASSIVE`, keep **Strength** (3) and **Width** (4) accessible; they are the passive mode's working controls. Keep **Presence** (13) accessible in both centre modes as well. Grey out only **Threshold** (5), **Attack** (6), **Release** (7), and **Detector HPF** (8); those drive the adaptive steering and are inert in passive mode. Do not disable the whole centre group on mode. The surround conditioning params (9-12) apply in both `PASSIVE` and `ADAPTIVE` surround modes and should be greyed only when the surround mode is `OFF`.
+
+Fixed internals (not configurable): correlation estimator time constant 100 ms, dominance smoothers 40 ms, decorrelator delay 10 ms, activation fade 10 ms, presence bell corner 3 kHz / Q 0.6 (TPT SVF bell, boost/cut symmetric).
 
 Parameter changes take effect within a few ms (main-loop coefficient recompute, double-buffered publish, no audio interruption). Mode and parameter changes while running are click-safe: gains ramp per sample, and a live surround OFF to ON transition clears the rear conditioning state and fades the rears in.
 
@@ -125,8 +128,8 @@ On **RP2040** the feature does not exist: both SET commands STALL (error status 
 |---|---|---|---|---|
 | 0x4A | `REQ_UPMIX_SET_CONFIG` | OUT | 0 | `UpmixConfigPacket`, exactly 44 bytes |
 | 0x4B | `REQ_UPMIX_GET_CONFIG` | IN | 0 | `UpmixConfigPacket`, 44 bytes |
-| 0x4C | `REQ_UPMIX_SET_PARAM` | OUT | param id (0-12) | one float, 4 bytes |
-| 0x4D | `REQ_UPMIX_GET_PARAM` | IN | param id (0-12) | one float, 4 bytes |
+| 0x4C | `REQ_UPMIX_SET_PARAM` | OUT | param id (0-13) | one float, 4 bytes |
+| 0x4D | `REQ_UPMIX_GET_PARAM` | IN | param id (0-13) | one float, 4 bytes |
 | 0x4E | `REQ_UPMIX_GET_STATUS` | IN | 0 | `UpmixStatus`, 16 bytes |
 | 0x4F | reserved | | | |
 
@@ -137,7 +140,7 @@ On **RP2040** the feature does not exist: both SET commands STALL (error status 
 | 0 | u8 | enabled (0/1) |
 | 1 | u8 | center_mode (0 = PASSIVE, 1 = ADAPTIVE) |
 | 2 | u8 | surround_mode (0 = OFF, 1 = PASSIVE, 2 = ADAPTIVE) |
-| 3 | u8 | reserved (write 0) |
+| 3 | i8 | presence_q1: presence bell gain in 0.5 dB steps (dB x 2, -24..+24; V26+, was reserved; 0 = flat) |
 | 4 | f32 | strength_pct |
 | 8 | f32 | center_width_pct |
 | 12 | f32 | corr_threshold_pct |
@@ -177,14 +180,14 @@ Poll at 5-20 Hz for a responsive "what is the upmixer doing" display (correlatio
 
 ---
 
-## 7. Bulk parameters (wire V25)
+## 7. Bulk parameters (wire V26)
 
 `REQ_GET/SET_ALL_PARAMS` (0xA0/0xA1, chunked 0xA2/0xA3) now carry the upmixer as the final section of `WireBulkParams`:
 
 - `WIRE_FORMAT_VERSION` = 25. Total struct size = **5944 bytes** (was 5900 at V24).
 - The upmix section is a `WireUpmixParams` at **byte offset 5900**, byte-identical to `UpmixConfigPacket` (section 6.1).
 - On RP2040 the section is present but zero on GET and ignored on SET (platform-independent wire format).
-- Version discipline is strict: a V24 client's SET (5900 bytes) is rejected against V25 firmware. Update clients to send the full V25 image.
+- Version discipline is strict: the header's format_version must match exactly, so a V25 client's SET is rejected against V26 firmware even though the layout only differs in the presence byte. Update clients to send format_version 26 with presence_q1 populated (0 = flat).
 
 A bulk SET applies the upmix section exactly like SET_CONFIG (deferred coefficient recompute, no audio glitch).
 
@@ -192,7 +195,7 @@ A bulk SET applies the upmix section exactly like SET_CONFIG (deferred coefficie
 
 ## 8. Persistence
 
-- **Preset slots:** `SLOT_DATA_VERSION` = 33. The upmix config is a 44-byte tail-append to the slot; presets saved by older firmware (V21-V32) load with the upmixer **disabled at defaults**. Preset save/load round-trips all 13 fields. Loading a preset that disables the upmixer unpublishes it within one main-loop pass.
+- **Preset slots:** `SLOT_DATA_VERSION` = 34. The upmix config is a 44-byte tail-append to the slot (V33); V34 claims the reserved byte for presence_q1 with no size change. Presets saved by older firmware (V21-V32) load with the upmixer **disabled at defaults**; V33 presets load with presence 0 dB (the byte was always written 0). Preset save/load round-trips all 14 fields. Loading a preset that disables the upmixer unpublishes it within one main-loop pass.
 - **Factory reset:** upmixer disabled, all params to defaults.
 - **RP2040 slots:** fields are stored (zeros) for layout uniformity but never applied.
 - After any preset load or bulk SET, re-read the upmix config (0x4B) rather than assuming your cached copy; the standard bulk-invalidation notification (notify endpoint) fires as usual and is your refresh trigger.
@@ -237,7 +240,7 @@ if st.parked_reason == 2: banner("Upmixer idle: input is not stereo")
 if st.parked_reason == 3: banner("Upmixer idle: sample rate above 48 kHz")
 
 // Save with the rest of the preset
-SET 0x90-series preset save as usual; upmix config rides along (slot V33)
+SET 0x90-series preset save as usual; upmix config rides along (slot V34)
 ```
 
 ---
@@ -247,8 +250,8 @@ SET 0x90-series preset save as usual; upmix config rides along (slot V33)
 | Item | Value |
 |---|---|
 | Vendor commands | 0x4A-0x4E (0x4F reserved) |
-| Wire format | V25 (`WireUpmixParams` at offset 5900; total 5944 B) |
-| Preset slot | V33 (44-byte tail-append) |
+| Wire format | V26 (`WireUpmixParams` at offset 5900; total 5944 B; presence byte claimed from reserved) |
+| Preset slot | V34 (44-byte tail-append; presence byte claimed from reserved, size unchanged) |
 | Platforms | RP2350 only (RP2040: SETs STALL, GETs zero) |
 | Matrix rows | 2 = C, 3 = Ls, 4 = Rs (shared with multichannel inputs 3-5) |
 | Status telemetry | `REQ_UPMIX_GET_STATUS`, 16 B, poll 5-20 Hz |

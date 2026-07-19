@@ -17,6 +17,8 @@
  *     coefficients.  The patent's front/back bias maps FB into [-1, 0] so
  *     neutral material keeps ~0.75 surround pan-law gain.
  *   - Surround band-limit filters are TPT SVF Butterworth (psybass form).
+ *   - Centre presence bell is a Cytomic TPT SVF bell at fixed 3 kHz / Q 0.6,
+ *     boost/cut symmetric (k = 1/(Q*A)); the knob is the gain only.
  */
 
 #include <math.h>
@@ -41,6 +43,7 @@ volatile UpmixConfig upmix_config = {
     .surround_hpf_hz = UPMIX_DEFAULT_SUR_HPF,
     .surround_lpf_hz = UPMIX_DEFAULT_SUR_LPF,
     .decorr_pct = UPMIX_DEFAULT_DECORR,
+    .presence_db = UPMIX_DEFAULT_PRESENCE,
 };
 volatile bool upmix_update_pending = false;
 
@@ -65,6 +68,8 @@ typedef struct {
     float env;
     // Telemetry snapshots
     float t_corr, t_bal;
+    // Centre presence bell
+    float pres_ic1, pres_ic2;      // TPT SVF integrators
     // Surround conditioning
     float shp_ic1[2], shp_ic2[2];  // HP SVF integrators
     float slp_ic1[2], slp_ic2[2];  // LP SVF integrators
@@ -114,6 +119,19 @@ void upmix_compute_coefficients(UpmixCoeffs *c, const UpmixConfig *cfg, float sa
 
     float det_hp = clampf(cfg->detector_hpf_hz, UPMIX_DET_HPF_MIN, UPMIX_DET_HPF_MAX);
     c->det_hp_a = 1.0f - expf(-2.0f * pi * det_hp / fs);
+
+    // Centre presence bell: Cytomic TPT SVF (Simper), fixed corner/Q.
+    // m1 = k*(A^2-1) is exactly 0 at 0 dB, so neutral is a true passthrough.
+    {
+        float pres = clampf(cfg->presence_db, UPMIX_PRESENCE_MIN, UPMIX_PRESENCE_MAX);
+        float A = powf(10.0f, pres * (1.0f / 40.0f));
+        float g = tanf(pi * UPMIX_PRESENCE_HZ / fs);
+        float k = 1.0f / (UPMIX_PRESENCE_Q * A);
+        c->pres_a1 = 1.0f / (1.0f + g * (g + k));
+        c->pres_a2 = g * c->pres_a1;
+        c->pres_a3 = g * c->pres_a2;
+        c->pres_m1 = k * (A * A - 1.0f);
+    }
 
     if (c->surround_mode == UPMIX_SURROUND_ADAPTIVE) {
         c->ls_cl = 0.8710f;   // PLII surround decode (WO2007067320A2)
@@ -304,7 +322,19 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
 
         // Centre extraction + constant-power removal from the mains
         float mid = l0 + r0;
-        cbuf[i] = gc_i * mid;
+        float c0 = gc_i * mid;
+        // Presence bell on the extracted centre (both centre modes).  Runs
+        // unconditionally so gain sweeps through 0 dB stay continuous; at
+        // 0 dB pres_m1 = 0 and the output is bit-exact c0.
+        {
+            float pv3 = c0 - um.pres_ic2;
+            float pv1 = c->pres_a1 * um.pres_ic1 + c->pres_a2 * pv3;
+            float pv2 = um.pres_ic2 + c->pres_a2 * um.pres_ic1 + c->pres_a3 * pv3;
+            um.pres_ic1 = 2.0f * pv1 - um.pres_ic1;
+            um.pres_ic2 = 2.0f * pv2 - um.pres_ic2;
+            c0 += c->pres_m1 * pv1;
+        }
+        cbuf[i] = c0;
         float rem = rem_i * mid;
         float l1 = l0 - rem, r1 = r0 - rem;
         l[i] = l1;

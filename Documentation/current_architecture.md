@@ -396,7 +396,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-07-18 (stereo upmixer pass added between the leveller and the matrix, stereo input only)*
+*Last updated: 2026-07-19 (upmixer presence bell added to the centre engine)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -1120,7 +1120,7 @@ Follows the loudness/crossfeed module pattern:
 ---
 
 ## Stereo Upmixer
-*Last updated: 2026-07-18*
+*Last updated: 2026-07-19*
 
 ### Purpose
 
@@ -1137,6 +1137,8 @@ Two independent engines feed the derived rows.
 - `ADAPTIVE`: a running normalized cross-correlation and L/R balance (one-pole estimators on a bass-cut, one-pole-HP detector path) drive the centre gain through a threshold gate with renormalization above the knee, then attack/release ballistics applied per block (packet-size independent) and per-sample gain ramps. Only genuinely centre-panned correlated content is extracted, so the image does not pump; long-wavelength content is excluded by the detector HP (industry-standard bass-steering mitigation).
 
 Extracted centre energy is subtracted from L/R scaled by strength and by centre-width (`0.5 * (1 - width)` removal), so a physical centre speaker and the L/R phantom do not comb-filter. Constant-power conventions: `0.7071` centre extraction, `0.5` removal.
+
+Both centre modes then run a **presence bell** on the extracted C (added 2026-07-19, Syn-style presence control): a Cytomic TPT-SVF bell at fixed 3 kHz / Q 0.6, `presence_db` in [-12, +12] dB, boost/cut symmetric (`k = 1/(Q*A)`), `m1 = k*(A^2 - 1)` so 0 dB is an exact passthrough. Negative moves voices back, positive brings them forward. The filter runs unconditionally while the pass is active so gain sweeps through 0 dB stay continuous.
 
 **Surround engine** (rows 3..4 when `surround_mode != OFF`):
 - `OFF`: no surround rows (`n_derived = 1`).
@@ -1174,12 +1176,13 @@ One global config (`UpmixConfig`); ranges are clamped downstream in `upmix_compu
 | surround_hpf_hz | 20..2000 | 300 | Surround band-limit high-pass |
 | surround_lpf_hz | 1000..20000 | 7000 | Surround band-limit low-pass |
 | decorr_pct | 0..100 | 90 | Decorrelator amount (`G = 0.5 * pct/100`) |
+| presence_db | -12..+12 | 0 | Centre presence bell gain (dB), fixed 3 kHz / Q 0.6; both centre modes |
 
 ### Persistence & Control
 
-- **Wire format V25:** `WireUpmixParams` (44 bytes, layout-identical to `UpmixConfigPacket`) is tail-appended to `WireBulkParams` (total 5944 bytes). Bulk collect/apply copy it straight to/from `upmix_config` and raise the pending flag; the section is zeroed on collect and ignored on apply on RP2040.
-- **Preset slot V33:** the config is tail-appended to `PresetSlot` (struct grows 44 bytes; `SLOT_DATA_SIZE_V33`), gated on `slot->version >= 33` in `apply_slot_to_live()` (RP2350). Older slots have no upmix data and load the disabled defaults; V21..V32 slots still validate via `slot_data_size_for_version()`. Factory reset sets it disabled with `UPMIX_DEFAULT_*` values. RP2040 round-trips the fields as zeros and never applies them.
-- **Vendor commands:** `0x4A-0x4E`; RP2350 only (SETs STALL on RP2040, GETs return zeros). `0x4A` SET_CONFIG takes the 44-byte `UpmixConfigPacket`; `0x4B` GET_CONFIG returns it; `0x4C`/`0x4D` SET/GET_PARAM address a single field by `wValue` (`UPMIX_PARAM_*` 0..12) as a 4-byte float; `0x4E` GET_STATUS returns the 16-byte `UpmixStatus`. `0x4F` is reserved. See the Vendor Command Reference table.
+- **Wire format V25 (presence byte V26):** `WireUpmixParams` (44 bytes, layout-identical to `UpmixConfigPacket`) is tail-appended to `WireBulkParams` (total 5944 bytes). V26 claims the section's reserved byte for `presence_q1` (int8, dB * 2, 0.5 dB steps; no size change). Bulk collect/apply copy it straight to/from `upmix_config` and raise the pending flag; the section is zeroed on collect and ignored on apply on RP2040.
+- **Preset slot V33 (presence byte V34):** the config is tail-appended to `PresetSlot` (struct grows 44 bytes; `SLOT_DATA_SIZE_V33`), gated on `slot->version >= 33` in `apply_slot_to_live()` (RP2350). V34 claims the upmix reserved byte for `upmix_presence_q1` (no size change; `SLOT_DATA_SIZE_V34` = `SLOT_DATA_SIZE_V33`); V33 slots always wrote 0 there, which decodes to the 0 dB default, so no version gate is needed for the byte. Older slots have no upmix data and load the disabled defaults; V21..V33 slots still validate via `slot_data_size_for_version()`. Factory reset sets it disabled with `UPMIX_DEFAULT_*` values. RP2040 round-trips the fields as zeros and never applies them.
+- **Vendor commands:** `0x4A-0x4E`; RP2350 only (SETs STALL on RP2040, GETs return zeros). `0x4A` SET_CONFIG takes the 44-byte `UpmixConfigPacket` (byte 3 = `presence_q1`, int8 dB * 2); `0x4B` GET_CONFIG returns it; `0x4C`/`0x4D` SET/GET_PARAM address a single field by `wValue` (`UPMIX_PARAM_*` 0..13; 13 = `UPMIX_PARAM_PRESENCE`, plain float dB) as a 4-byte float; `0x4E` GET_STATUS returns the 16-byte `UpmixStatus`. `0x4F` is reserved. See the Vendor Command Reference table.
 
 **Matrix row-sharing consequence.** Source rows 2..4 are dual-purpose: they carry multichannel inputs 3..5 in multichannel input modes and the Upmix C / Ls / Rs derived channels in stereo upmix mode. The matrix crosspoints for those rows are the same storage in both cases, so a host application must present them contextually (real input vs upmix-derived) based on the active input mode.
 
@@ -1442,7 +1445,7 @@ the single 4 KB directory sector. See
 | cs_ir | Control Surfaces IR command table (V11+, 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
-*Last updated: 2026-07-18 (stereo upmixer, slot V33; `SLOT_DATA_VERSION` now 33)*
+*Last updated: 2026-07-19 (upmixer presence byte, slot V34; `SLOT_DATA_VERSION` now 34)*
 
 | Field | Description |
 |-------|-------------|
@@ -1459,7 +1462,7 @@ the single 4 KB directory sector. See
 | Loudness | enabled, reference SPL, intensity |
 | Crossfeed | enabled, preset, ITD, custom fc/feed, output_pair_mask (V27+, tail-appended; older slots default 0x01) |
 | Psychoacoustic bass | enabled, output_mask, cutoff, harmonics, drive, character, original (V31+, tail-appended 24 bytes, `SLOT_DATA_VERSION` 31; older slots load disabled/all-outputs defaults) |
-| Stereo upmixer | enabled, centre/surround modes, reserved, ten floats (V33+, tail-appended 44 bytes, `SLOT_DATA_VERSION` 33; RP2350 only, gated on version >= 33; older slots load disabled defaults; RP2040 stores zeros and never applies them) |
+| Stereo upmixer | enabled, centre/surround modes, presence_q1 (V34+, int8 dB * 2, was reserved), ten floats (V33+, tail-appended 44 bytes; `SLOT_DATA_VERSION` now 34, size unchanged from V33; RP2350 only, gated on version >= 33; older slots load disabled defaults; RP2040 stores zeros and never applies them) |
 | Matrix mixer | crosspoints + output channels |
 | Pin config | NUM_PIN_OUTPUTS pin assignments (always stored, conditionally loaded) |
 | Channel names | NUM_CHANNELS × 32-byte NUL-terminated names (V8, default names for V<8) |
@@ -1681,7 +1684,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-18 (stereo upmixer row added, RP2350 only; wire/slot version row now V25 / V33)*
+*Last updated: 2026-07-19 (upmixer presence bell; wire/slot version row now V26 / V34)*
 
 ### Hardware
 
@@ -1725,7 +1728,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | ADAT input | Config state only (never selectable) | Yes (8 ch, 24-bit, 44.1/48 kHz; master/slave clock; PIO1 SM2 + DMA CH15) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V25 / V33 | V25 / V33 |
+| Wire / slot version | V26 / V34 | V26 / V34 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
@@ -2499,7 +2502,7 @@ op state ~400 B).
 | REQ_GET_DELAY | 0x49 | IN | Get channel delay |
 | REQ_UPMIX_SET_CONFIG | 0x4A | OUT | Set the whole stereo upmixer config (44-byte `UpmixConfigPacket`; RP2350 only, wrong length STALLs; RP2040 STALLs). Mode fields clamped; floats clamped downstream |
 | REQ_UPMIX_GET_CONFIG | 0x4B | IN | Get the stereo upmixer config (44-byte `UpmixConfigPacket`; RP2040 returns 44 zero bytes) |
-| REQ_UPMIX_SET_PARAM | 0x4C | OUT | Set one upmixer field: `wValue` = `UPMIX_PARAM_*` (0..12), payload = 4-byte LE float (mode/enable rounded to int; RP2350 only, RP2040 STALLs) |
+| REQ_UPMIX_SET_PARAM | 0x4C | OUT | Set one upmixer field: `wValue` = `UPMIX_PARAM_*` (0..13; 13 = presence dB), payload = 4-byte LE float (mode/enable rounded to int; RP2350 only, RP2040 STALLs) |
 | REQ_UPMIX_GET_PARAM | 0x4D | IN | Get one upmixer field (`wValue` = `UPMIX_PARAM_*`, returns 4-byte float; RP2040 returns 0.0). Unknown param STALLs |
 | REQ_UPMIX_GET_STATUS | 0x4E | IN | Get 16-byte `UpmixStatus` (active, parked_reason, corr_q14, balance_q14, center/ls/rs gains; RP2040 returns 16 zero bytes). 0x4F reserved |
 | REQ_GET_STATUS | 0x50 | IN | Get all channel peaks + CPU load (see Channel Metering) |
