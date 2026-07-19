@@ -37,6 +37,11 @@
  * and slot-name SETs are apply-live-only previews; REQ_CS_SAVE persists the
  * whole live config and REQ_CS_REVERT reloads the stored one.
  *
+ * Caps v4 adds the stereo upmixer, psychoacoustic bass, output delay, and
+ * preset-reload nouns, plus the CS_UNIT_MS unit (8.8 milliseconds) the
+ * delay noun uses.  No structure sizes change; the bump only signals the
+ * new unit value to hosts.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -103,6 +108,22 @@ typedef enum {
     CS_NOUN_ADAT_ACTIVE    = 32, // bool, read-only (ADAT out streaming, rate ok; RP2350)
     CS_NOUN_LG_PRESENT     = 33, // bool, read-only (LG Sound Sync source detected)
     CS_NOUN_LG_MUTED       = 34, // bool, read-only (LG source present and muted)
+    // --- caps v4 additions ---
+    CS_NOUN_UPMIX          = 35, // bool (stereo upmixer enable; RP2350)
+    CS_NOUN_UPMIX_CENTER_MODE   = 36, // enum 0..1 (Passive / Logic; RP2350)
+    CS_NOUN_UPMIX_SURROUND_MODE = 37, // enum 0..2 (Off / Passive / Logic; RP2350)
+    CS_NOUN_UPMIX_STRENGTH = 38, // continuous percent 0..100 (RP2350)
+    CS_NOUN_UPMIX_WIDTH    = 39, // continuous percent 0..100 (centre width; RP2350)
+    CS_NOUN_UPMIX_PRESENCE = 40, // continuous dB -12..+12 (centre presence bell; RP2350)
+    CS_NOUN_PSYBASS        = 41, // bool (psychoacoustic bass enable)
+    CS_NOUN_PSYBASS_CUTOFF = 42, // continuous Hz 30..300
+    CS_NOUN_PSYBASS_HARMONICS = 43, // continuous dB -24..+12 (harmonics mix level)
+    CS_NOUN_PSYBASS_DRIVE  = 44, // continuous dB 0..18
+    CS_NOUN_PSYBASS_CHARACTER = 45, // continuous percent 0..100 (even<->odd blend)
+    CS_NOUN_PSYBASS_ORIGINAL = 46, // continuous dB -60..0 (original low-band level)
+    CS_NOUN_OUTPUT_DELAY   = 47, // continuous ms; target = output channel
+    CS_NOUN_PRESET_RELOAD  = 48, // trigger (reload the active preset from flash,
+                                 // discarding unsaved live edits)
     CS_NOUN_COUNT
 } CsNoun;
 
@@ -118,6 +139,8 @@ typedef enum {
 #define CS_UNIT_HZ       2   // plain integer Hz; log stepping (step = 8.8 octaves)
 #define CS_UNIT_Q        3   // 8.8 fixed point Q; log stepping (step = 8.8 octaves)
 #define CS_UNIT_PERCENT  4   // 8.8 fixed point percent; linear stepping
+#define CS_UNIT_MS       5   // 8.8 fixed point milliseconds; linear stepping,
+                             // default step 0.1 ms (caps v4+)
 
 // Target kinds (CsNounDesc.target_kind); what CsBinding.target addresses.
 #define CS_TARGET_NONE      0   // target/index ignored
@@ -284,7 +307,7 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (3)
+    uint8_t  caps_version; // capability format version (4)
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
     uint8_t  noun_count;   // CS_NOUN_COUNT

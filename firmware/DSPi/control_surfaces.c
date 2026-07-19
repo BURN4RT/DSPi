@@ -115,7 +115,7 @@ volatile bool    cs_revert_pending = false;
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 3,
+    .caps_version = 4,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -241,9 +241,9 @@ static const int8_t s_enc_table[16] = {
 };
 
 // ---------------------------------------------------------------------------
-// Unit math.  Natural units are float (dB, Hz, Q, percent); wire fields are
-// int16 (8.8 for dB/Q/percent, plain integer for Hz).  HZ and Q step and
-// quantize logarithmically (in octaves), the rest linearly.
+// Unit math.  Natural units are float (dB, Hz, Q, percent, ms); wire fields
+// are int16 (8.8 for dB/Q/percent/ms, plain integer for Hz).  HZ and Q step
+// and quantize logarithmically (in octaves), the rest linearly.
 // ---------------------------------------------------------------------------
 
 static bool cs_unit_is_log(uint8_t unit) {
@@ -255,9 +255,10 @@ static float cs_decode(uint8_t unit, int16_t raw) {
 }
 
 // Step size in natural units (linear) or octaves (log units).  step == 0
-// selects the default: 1 dB, 1 percent, or 1/12 octave.
+// selects the default: 1 dB, 1 percent, 0.1 ms, or 1/12 octave.
 static float cs_step_size(const CsBinding *b, uint8_t unit) {
     if (b->step > 0) return (float)b->step * (1.0f / 256.0f);
+    if (unit == CS_UNIT_MS) return 0.1f;
     return cs_unit_is_log(unit) ? (1.0f / 12.0f) : 1.0f;
 }
 

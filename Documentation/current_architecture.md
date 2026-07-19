@@ -1696,7 +1696,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
 | UART + I2C external control | Yes (identical) | Yes (identical) |
-| Control Surfaces nouns (v2) | 35 in table, `ADAT_ACTIVE` unusable (empty action mask) | 35, all usable |
+| Control Surfaces nouns (caps v4) | 49 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 49, all usable |
 | Binary type | `default` (XIP) | `default` (XIP) |
 | Cold code location (control paths, storage, coeff design, init) | Flash XIP | Flash XIP |
 | RAM code+rodata+data (.data) | 44,376 B (was 108,692 under copy_to_ram) | 48,688 B (was 147,332 under copy_to_ram) |
@@ -2252,7 +2252,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-07-08 (slot names join the Apply/Save/Revert preview: 0x8B live-only, persist via 0x9D)*
+*Last updated: 2026-07-19 (caps v4: upmixer/psybass/output-delay/preset-reload nouns 35-48, CS_UNIT_MS)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
@@ -2272,18 +2272,32 @@ hold-to-repeat (`CS_FLAG_REPEAT`) and momentary hold-to-engage (`CS_ACT_MOMENTAR
 restore on release). Encoders support acceleration (`CS_FLAG_ACCEL`). The
 `CS_TYPE_LED_PWM` type drives a hardware-PWM LED whose brightness follows a noun
 (`CS_ACT_IND_LEVEL`), and `CS_ACT_IND_ABOVE` lights an LED while a noun is at or
-above a threshold. Nouns carry a `unit` (`CS_UNIT_DB/HZ/Q/PERCENT`) so frequency
-and Q step logarithmically while dB/percent step linearly, and a `target_kind`
-so a binding can address a specific input/output channel or a specific
-channel+filter-band.
+above a threshold. Nouns carry a `unit` (`CS_UNIT_DB/HZ/Q/PERCENT/MS`) so
+frequency and Q step logarithmically while dB/percent/ms step linearly, and a
+`target_kind` so a binding can address a specific input/output channel or a
+specific channel+filter-band.
 
-The noun catalog expanded from 9 to 35 entries: per-input preamp; per-output
+The v2 noun catalog expanded from 9 to 35 entries (35-48 arrived later with
+caps v4, below): per-input preamp; per-output
 gain/mute/enable; per-filter freq/gain/Q/type/bypass with channel + band
 targeting; siggen run; a DAC hardware-mute test trigger; and read-only indicator
 nouns (per-channel clip latch and peak level, SPDIF lock, sample rate, USB
 streaming, ADAT active, LG Sound Sync present/muted). `CS_NOUN_ADAT_ACTIVE` is
 RP2350-only; its descriptor carries an empty action mask on RP2040 so no host UI
 offers it and no binding to it validates there.
+
+**Caps v4** (2026-07-19) appends 14 nouns (35-48) and one unit with no
+structure or stored-config changes (directory stays V11): the stereo upmixer
+(enable, centre mode Passive/Logic, surround mode Off/Passive/Logic,
+strength, centre width, presence; all six RP2350-only via the empty-mask
+convention, dispatched through `REQ_UPMIX_SET_PARAM`), psychoacoustic bass
+(enable plus cutoff/harmonics/drive/character/original through the per-param
+`0x30`-`0x3A` SETs), per-output delay (`CS_NOUN_OUTPUT_DELAY`, target =
+output channel, `REQ_SET_OUTPUT_DELAY`; new `CS_UNIT_MS` = 8.8 ms, linear,
+default step 0.1 ms, range = the full delay ring at 48 kHz: 21 ms RP2040 /
+42 ms RP2350), and `CS_NOUN_PRESET_RELOAD` (a `TRIGGER` that reloads the
+active preset from flash via the deferred `REQ_PRESET_LOAD` path, discarding
+unsaved live edits).
 
 ### File layout
 
@@ -2454,8 +2468,10 @@ lifetime. On RP2040
 (see Memory Layout); only the IR edge ISR is RAM-pinned
 (`__not_in_flash_func`). Behavior is identical on both platforms (same 16
 bindings, 8 IR sub-slots,
-same ADC pins 26-28) except that `CS_NOUN_ADAT_ACTIVE` is RP2350-only (empty
-action mask on RP2040). New BSS for the IR feature is roughly 0.9 KB on both
+same ADC pins 26-28) except that `CS_NOUN_ADAT_ACTIVE` and the six upmixer
+nouns (35-40) are RP2350-only (empty
+action mask on RP2040), and the `OUTPUT_DELAY` range follows the platform's
+delay ring (21 ms RP2040 / 42 ms RP2350 at 48 kHz). New BSS for the IR feature is roughly 0.9 KB on both
 platforms (capture ring 256 B, frame buffer 224 B, command table plus per-command
 op state ~400 B).
 
@@ -2555,7 +2571,7 @@ op state ~400 B).
 | REQ_CLEAR_CLIPS | 0x83 | IN | Read-then-clear clip flags (see Clip Detection) |
 | REQ_SET_CS_BINDING | 0x84 | OUT | Set a Control Surfaces binding (wValue=slot 0-15, payload=24-byte CsBinding, required; short payload = INVALID_VALUE); apply-live-only preview, deferred, poll 0x87; persist via REQ_CS_SAVE (see Control Surfaces) |
 | REQ_GET_CS_BINDING | 0x85 | IN | Get the live 24-byte CsBinding for a slot (wValue=slot) |
-| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v3; wValue=noun: 12-byte CsNounDesc) |
+| REQ_GET_CS_CAPS | 0x86 | IN | Get capability tables (wValue=0xFFFF: 40-byte header+type table+max_ir_commands, caps v4; wValue=noun: 12-byte CsNounDesc) |
 | REQ_GET_CS_STATUS | 0x87 | IN | Get 32-byte CsStatusPacket (last SET result, dirty flag, active_mask, per-slot status, ir_active_mask, learn state, per-sub-slot IR status) |
 | REQ_SET_CS_NAME | 0x8B | OUT | Set a Control Surfaces slot name (wValue=slot 0-15, payload=1-32 bytes; one NUL byte clears); apply-live-only preview (persist via 0x9D), poll 0x87 for result |
 | REQ_GET_CS_NAME | 0x8C | IN | Get a Control Surfaces slot name (wValue=slot, returns 32 bytes NUL-terminated, live) |

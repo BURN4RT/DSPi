@@ -25,6 +25,8 @@
 #include "siggen.h"
 #include "crossover.h"
 #include "dsp_pipeline.h"
+#include "psybass.h"
+#include "upmix.h"
 #if PICO_RP2350
 #include "adat_output.h"
 #endif
@@ -66,6 +68,29 @@ extern volatile bool sync_started;
 #else
 #define CS_ADAT_ACTS  0
 #endif
+
+// The stereo upmixer is RP2350-only; same greyed-out pattern as ADAT.  The
+// range/enum literals in the RP2040 rows mirror upmix.h (whose limits are
+// compiled out there) so both platforms publish identical descriptors.
+#if PICO_RP2350
+#define CS_UPMIX_ACTS(group)     group
+#define CS_UPMIX_CENTER_MODES    (UPMIX_CENTER_ADAPTIVE + 1)
+#define CS_UPMIX_SURROUND_MODES  (UPMIX_SURROUND_ADAPTIVE + 1)
+#define CS_UPMIX_PRES_MIN        UPMIX_PRESENCE_MIN
+#define CS_UPMIX_PRES_MAX        UPMIX_PRESENCE_MAX
+#else
+#define CS_UPMIX_ACTS(group)     0
+#define CS_UPMIX_CENTER_MODES    2       // Passive / Logic
+#define CS_UPMIX_SURROUND_MODES  3       // Off / Passive / Logic
+#define CS_UPMIX_PRES_MIN        -12.0f  // mirror UPMIX_PRESENCE_MIN/MAX
+#define CS_UPMIX_PRES_MAX         12.0f
+#endif
+
+// Output-delay front-panel ceiling: the full delay ring at 48 kHz, floored
+// to whole ms (21 ms on RP2040, 42 ms on RP2350), pre-encoded as 8.8.  At
+// 96 kHz the pipeline clamps in samples, same as a host-set delay; the
+// stored ms value round-trips unclamped.
+#define CS_DELAY_MAX_MS_Q8  ((int16_t)((MAX_DELAY_SAMPLES / 48) * 256))
 
 // Q(8.8) helper for table literals; rounds to nearest (a plain cast would
 // truncate, encoding Q 0.1 as 25 instead of the documented 26).  Must stay a
@@ -156,6 +181,43 @@ const CsNounDesc cs_noun_table[CS_NOUN_COUNT] = {
     [CS_NOUN_LG_PRESENT]      = { CS_KIND_BOOL, 0, CS_BOOL_RO, 0, 0,
                                   CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
     [CS_NOUN_LG_MUTED]        = { CS_KIND_BOOL, 0, CS_BOOL_RO, 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_UPMIX]           = { CS_KIND_BOOL, 0, CS_UPMIX_ACTS(CS_BOOL_RW), 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_UPMIX_CENTER_MODE] = { CS_KIND_ENUM, CS_UPMIX_CENTER_MODES,
+                                  CS_UPMIX_ACTS(CS_ENUM_RW), 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_UPMIX_SURROUND_MODE] = { CS_KIND_ENUM, CS_UPMIX_SURROUND_MODES,
+                                  CS_UPMIX_ACTS(CS_ENUM_RW), 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_UPMIX_STRENGTH]  = { CS_KIND_CONTINUOUS, 0, CS_UPMIX_ACTS(CS_CONT_RW),
+                                  0, Q8(100), CS_UNIT_PERCENT, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_UPMIX_WIDTH]     = { CS_KIND_CONTINUOUS, 0, CS_UPMIX_ACTS(CS_CONT_RW),
+                                  0, Q8(100), CS_UNIT_PERCENT, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_UPMIX_PRESENCE]  = { CS_KIND_CONTINUOUS, 0, CS_UPMIX_ACTS(CS_CONT_RW),
+                                  Q8(CS_UPMIX_PRES_MIN), Q8(CS_UPMIX_PRES_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_PSYBASS]         = { CS_KIND_BOOL, 0, CS_BOOL_RW, 0, 0,
+                                  CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_PSYBASS_CUTOFF]  = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  (int16_t)PSYBASS_CUTOFF_MIN, (int16_t)PSYBASS_CUTOFF_MAX,
+                                  CS_UNIT_HZ, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_PSYBASS_HARMONICS] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(PSYBASS_HARMONICS_MIN), Q8(PSYBASS_HARMONICS_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_PSYBASS_DRIVE]   = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(PSYBASS_DRIVE_MIN), Q8(PSYBASS_DRIVE_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_PSYBASS_CHARACTER] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(PSYBASS_CHARACTER_MIN), Q8(PSYBASS_CHARACTER_MAX),
+                                  CS_UNIT_PERCENT, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_PSYBASS_ORIGINAL] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(PSYBASS_ORIGINAL_MIN), Q8(PSYBASS_ORIGINAL_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_OUTPUT_DELAY]    = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  0, CS_DELAY_MAX_MS_Q8, CS_UNIT_MS,
+                                  CS_TARGET_OUTPUT_CH, NUM_OUTPUT_CHANNELS, 0 },
+    [CS_NOUN_PRESET_RELOAD]   = { CS_KIND_BOOL, 0, CS_ACT_BIT(CS_ACT_TRIGGER), 0, 0,
                                   CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
 };
 
@@ -280,6 +342,29 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
             if (noun == CS_NOUN_LG_PRESENT) return st.present ? 1.0f : 0.0f;
             return (st.present && st.muted) ? 1.0f : 0.0f;
         }
+#if PICO_RP2350
+        case CS_NOUN_UPMIX:               return upmix_config.enabled ? 1.0f : 0.0f;
+        case CS_NOUN_UPMIX_CENTER_MODE:   return (float)upmix_config.center_mode;
+        case CS_NOUN_UPMIX_SURROUND_MODE: return (float)upmix_config.surround_mode;
+        case CS_NOUN_UPMIX_STRENGTH:      return upmix_config.strength_pct;
+        case CS_NOUN_UPMIX_WIDTH:         return upmix_config.center_width_pct;
+        case CS_NOUN_UPMIX_PRESENCE:      return upmix_config.presence_db;
+#else
+        case CS_NOUN_UPMIX:
+        case CS_NOUN_UPMIX_CENTER_MODE:
+        case CS_NOUN_UPMIX_SURROUND_MODE:
+        case CS_NOUN_UPMIX_STRENGTH:
+        case CS_NOUN_UPMIX_WIDTH:
+        case CS_NOUN_UPMIX_PRESENCE:      return 0.0f;
+#endif
+        case CS_NOUN_PSYBASS:           return psybass_config.enabled ? 1.0f : 0.0f;
+        case CS_NOUN_PSYBASS_CUTOFF:    return psybass_config.cutoff_hz;
+        case CS_NOUN_PSYBASS_HARMONICS: return psybass_config.harmonics_db;
+        case CS_NOUN_PSYBASS_DRIVE:     return psybass_config.drive_db;
+        case CS_NOUN_PSYBASS_CHARACTER: return psybass_config.character_pct;
+        case CS_NOUN_PSYBASS_ORIGINAL:  return psybass_config.original_db;
+        case CS_NOUN_OUTPUT_DELAY:      return matrix_mixer.outputs[target].delay_ms;
+        case CS_NOUN_PRESET_RELOAD:     return 0.0f;
         default: return 0.0f;
     }
 }
@@ -304,14 +389,63 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
             break;
         }
         case CS_NOUN_PREAMP:
-        case CS_NOUN_OUTPUT_GAIN: {
+        case CS_NOUN_OUTPUT_GAIN:
+        case CS_NOUN_OUTPUT_DELAY: {
             float f = value;
-            uint8_t req = (noun == CS_NOUN_PREAMP) ? REQ_SET_PREAMP_CH
-                                                   : REQ_SET_OUTPUT_GAIN;
+            uint8_t req = (noun == CS_NOUN_PREAMP)      ? REQ_SET_PREAMP_CH
+                        : (noun == CS_NOUN_OUTPUT_GAIN) ? REQ_SET_OUTPUT_GAIN
+                                                        : REQ_SET_OUTPUT_DELAY;
             r = vendor_dispatch_set(CTRL_SOURCE_GPIO, req, target, 0,
                                     (const uint8_t *)&f, sizeof(f));
             break;
         }
+        case CS_NOUN_PSYBASS_CUTOFF:
+        case CS_NOUN_PSYBASS_HARMONICS:
+        case CS_NOUN_PSYBASS_DRIVE:
+        case CS_NOUN_PSYBASS_CHARACTER:
+        case CS_NOUN_PSYBASS_ORIGINAL: {
+            // Per-parameter float SETs; nouns are contiguous from CUTOFF.
+            static const uint8_t psybass_req[] = {
+                REQ_SET_PSYBASS_CUTOFF, REQ_SET_PSYBASS_HARMONICS,
+                REQ_SET_PSYBASS_DRIVE, REQ_SET_PSYBASS_CHARACTER,
+                REQ_SET_PSYBASS_ORIGINAL,
+            };
+            float f = value;
+            r = vendor_dispatch_set(CTRL_SOURCE_GPIO,
+                                    psybass_req[noun - CS_NOUN_PSYBASS_CUTOFF],
+                                    0, 0, (const uint8_t *)&f, sizeof(f));
+            break;
+        }
+#if PICO_RP2350
+        case CS_NOUN_UPMIX:
+        case CS_NOUN_UPMIX_CENTER_MODE:
+        case CS_NOUN_UPMIX_SURROUND_MODE:
+        case CS_NOUN_UPMIX_STRENGTH:
+        case CS_NOUN_UPMIX_WIDTH:
+        case CS_NOUN_UPMIX_PRESENCE: {
+            // One float-per-parameter command; wValue selects the parameter.
+            // Nouns are contiguous from UPMIX; enable/mode floats are rounded
+            // and clamped by the handler.
+            static const uint8_t upmix_param[] = {
+                UPMIX_PARAM_ENABLED, UPMIX_PARAM_CENTER_MODE,
+                UPMIX_PARAM_SURROUND_MODE, UPMIX_PARAM_STRENGTH,
+                UPMIX_PARAM_CENTER_WIDTH, UPMIX_PARAM_PRESENCE,
+            };
+            float f = value;
+            r = vendor_dispatch_set(CTRL_SOURCE_GPIO, REQ_UPMIX_SET_PARAM,
+                                    upmix_param[noun - CS_NOUN_UPMIX], 0,
+                                    (const uint8_t *)&f, sizeof(f));
+            break;
+        }
+#endif
+        case CS_NOUN_PRESET_RELOAD:
+            // Reload the active preset from flash, discarding unsaved live
+            // edits; the same deferred, pipeline-safe path the PRESET noun
+            // takes.  Device-global state (master volume in independent
+            // mode, output config, CS bindings) is untouched.
+            r = vendor_dispatch_get(CTRL_SOURCE_GPIO, REQ_PRESET_LOAD,
+                                    (uint16_t)preset_get_active(), 0, 1, &rd, &rl);
+            break;
         case CS_NOUN_PRESET:
             // Same deferred, pipeline-safe path a host load takes.
             r = vendor_dispatch_get(CTRL_SOURCE_GPIO, REQ_PRESET_LOAD,
@@ -368,6 +502,7 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
                 case CS_NOUN_CROSSFEED_ITD:    req = REQ_SET_CROSSFEED_ITD;      break;
                 case CS_NOUN_LEVELLER_SPEED:   req = REQ_SET_LEVELLER_SPEED;     break;
                 case CS_NOUN_LEVELLER_LOOKAHEAD: req = REQ_SET_LEVELLER_LOOKAHEAD; break;
+                case CS_NOUN_PSYBASS:          req = REQ_SET_PSYBASS;            break;
                 default:                       return true;   // read-only noun
             }
             r = vendor_dispatch_set(CTRL_SOURCE_GPIO, req, 0, 0, &v, 1);

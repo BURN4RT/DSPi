@@ -1,6 +1,6 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 3*
+*Firmware capability format version: 4*
 *Config (flash) version: 2; IR config version: 1*
 *Directory version: 11*
 
@@ -29,6 +29,11 @@ Caps v3 adds two things on top of v2 (section 11.1):
 - **The Apply / Save / Revert preview model**: binding and IR command SETs
   now apply live only; `REQ_CS_SAVE` persists the whole live config in one
   flash write and `REQ_CS_REVERT` reloads the stored one. Section 3.5.
+
+Caps v4 adds 14 nouns and one unit on top of v3, with no structure or
+stored-config changes (section 11.1): the stereo upmixer (35-40, RP2350
+only), psychoacoustic bass (41-46), per-output delay (47, using the new
+`CS_UNIT_MS`), and a preset-reload trigger (48).
 
 Writing style note: this doc avoids em-dashes per project convention.
 
@@ -66,8 +71,8 @@ v2 adds four orthogonal concepts to this model:
   gain/mute/enable, per-channel clip/level) or a channel plus a filter band
   (per-filter frequency/gain/Q/type/bypass) carry the address in the binding's
   `target` / `index` bytes. Section 4.4.
-- **Units**: continuous nouns declare a unit (dB, Hz, Q, percent). Frequency
-  and Q step and map logarithmically; dB and percent linearly. Section 2.1.
+- **Units**: continuous nouns declare a unit (dB, Hz, Q, percent, ms). Frequency
+  and Q step and map logarithmically; dB, percent, and ms linearly. Section 2.1.
 - **Acceleration and repeat**: encoders can accelerate on fast rotation;
   INC/DEC buttons can auto-repeat while held. Sections 6.3, 6.1.
 
@@ -162,6 +167,11 @@ the stepping law:
 | `CS_UNIT_HZ` | 2 | plain integer Hz | logarithmic | 8.8 octaves | 1/12 octave | logarithmic |
 | `CS_UNIT_Q` | 3 | 8.8 Q (Q 0.707 = 181) | logarithmic | 8.8 octaves | 1/12 octave | logarithmic |
 | `CS_UNIT_PERCENT` | 4 | 8.8 percent (1 % = 256) | linear | 8.8 percent | 1 % | linear |
+| `CS_UNIT_MS` | 5 | 8.8 ms (1 ms = 256) | linear | 8.8 ms | 0.1 ms | linear |
+
+`CS_UNIT_MS` is a caps-v4 addition (currently only `OUTPUT_DELAY`); its
+default step is 0.1 ms rather than the one-unit default of the other linear
+units, because whole-ms detents are too coarse for delay alignment.
 
 Logarithmic stepping multiplies: one detent scales the value by
 `2^(step_octaves)`, so a frequency knob moves in musically even ratios and a
@@ -169,8 +179,8 @@ Q knob sweeps 0.1 to 10 in even multiplicative steps. `step = 256` is one
 octave per detent; `step = 0` selects the default 1/12 octave.
 
 Pots and dispatch quantization: linear units quantize to **half a unit**
-(half-dB, half-percent); log units quantize to **1/24 octave** above the
-noun's minimum. A pot only re-dispatches when the quantized value changes,
+(half-dB, half-percent, half-ms); log units quantize to **1/24 octave** above
+the noun's minimum. A pot only re-dispatches when the quantized value changes,
 giving smooth, jitter-free knob behavior without flooding the dispatcher.
 
 ### 2.2 `CsBinding` (24 bytes)
@@ -178,7 +188,7 @@ giving smooth, jitter-free knob behavior without flooding the dispatcher.
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
 | 0 | 1 | `type` | `CsType` (0-6); `0` = slot cleared |
-| 1 | 1 | `noun` | `CsNoun` (0-34) |
+| 1 | 1 | `noun` | `CsNoun` (0-48) |
 | 2 | 1 | `action` | `CsAction` (0-11) |
 | 3 | 1 | `flags` | `CS_FLAG_*` bitfield (see 2.2.1); unknown bits are rejected with `CS_STATUS_INVALID_VALUE` |
 | 4 | 1 | `gpio[0]` | primary GPIO |
@@ -232,10 +242,10 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (3) |
+| 0 | 1 | `caps_version` | capability format version (4) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (8); the type table has this many entries, indexed by `CsType` |
-| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (35) |
+| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (49) |
 | 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
 | 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (8) |
 | 37 | 3 | `reserved[3]` | 0 |
@@ -251,7 +261,7 @@ carries `noun = action = 0` (section 2.7).
 
 ### 2.5 `CsNounDesc` (12 bytes)
 
-Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-34).
+Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-48).
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
@@ -291,7 +301,7 @@ learned `code` instead of a GPIO edge.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `noun` | `CsNoun` (0-34) |
+| 0 | 1 | `noun` | `CsNoun` (0-48) |
 | 1 | 1 | `action` | `CsAction`; button subset only: `INC`, `DEC`, `TOGGLE`, `SET`, `TRIGGER`, `MOMENTARY` |
 | 2 | 1 | `flags` | `CS_FLAG_WRAP` and `CS_FLAG_REPEAT` only (REPEAT: INC/DEC only); any other bit is `CS_STATUS_INVALID_VALUE` |
 | 3 | 1 | `target` | channel address for targeted nouns (section 4.4); 0 otherwise |
@@ -639,6 +649,20 @@ Action-mask groups used below:
 | `ADAT_ACTIVE` | 32 | BOOL | - | read-only; **RP2350 only** (mask 0 on RP2040) | - | BOOL-RO |
 | `LG_PRESENT` | 33 | BOOL | - | read-only | - | BOOL-RO |
 | `LG_MUTED` | 34 | BOOL | - | read-only | - | BOOL-RO |
+| `UPMIX` | 35 | BOOL | - | **RP2350 only** (mask 0 on RP2040) | - | BOOL-RW |
+| `UPMIX_CENTER_MODE` | 36 | ENUM | - | 2 (Passive/Logic); **RP2350 only** | - | ENUM-RW |
+| `UPMIX_SURROUND_MODE` | 37 | ENUM | - | 3 (Off/Passive/Logic); **RP2350 only** | - | ENUM-RW |
+| `UPMIX_STRENGTH` | 38 | CONT | PERCENT | 0..100 %; **RP2350 only** | - | CONT-RW |
+| `UPMIX_WIDTH` | 39 | CONT | PERCENT | 0..100 %; **RP2350 only** | - | CONT-RW |
+| `UPMIX_PRESENCE` | 40 | CONT | DB | -12..+12 dB; **RP2350 only** | - | CONT-RW |
+| `PSYBASS` | 41 | BOOL | - | - | - | BOOL-RW |
+| `PSYBASS_CUTOFF` | 42 | CONT | HZ | 30..300 Hz | - | CONT-RW |
+| `PSYBASS_HARMONICS` | 43 | CONT | DB | -24..+12 dB | - | CONT-RW |
+| `PSYBASS_DRIVE` | 44 | CONT | DB | 0..+18 dB | - | CONT-RW |
+| `PSYBASS_CHARACTER` | 45 | CONT | PERCENT | 0..100 % | - | CONT-RW |
+| `PSYBASS_ORIGINAL` | 46 | CONT | DB | -60..0 dB | - | CONT-RW |
+| `OUTPUT_DELAY` | 47 | CONT | MS | 0..21 ms (RP2040) / 0..42 ms (RP2350) | OUTPUT_CH | CONT-RW |
+| `PRESET_RELOAD` | 48 | BOOL | - | - | - | `TRIGGER` (`0x0080`) |
 
 The *effective* legal action set for a (type, noun) pair is the bitwise AND of
 its two masks. Example: an encoder (`STEP` only) on `USER_MUTE` (bool, no
@@ -709,6 +733,20 @@ target and dispatches it.
 | `ADAT_ACTIVE` | (read-only, RP2350) | 1 while the ADAT output is streaming at a supported rate. |
 | `LG_PRESENT` | (read-only) | 1 while an LG Sound Sync source is detected. |
 | `LG_MUTED` | (read-only) | 1 while an LG source is present and reports muted. |
+| `UPMIX` | `REQ_UPMIX_SET_PARAM` (`0x4C`, wValue = 0, float) | Stereo upmixer enable (RP2350 only, mask 0 on RP2040; likewise the five nouns below). |
+| `UPMIX_CENTER_MODE` | `REQ_UPMIX_SET_PARAM` (wValue = 1) | Centre engine: 0 = Passive (fixed 0.7071 sum), 1 = Logic (adaptive correlation-steered extraction). INC+WRAP cycles. |
+| `UPMIX_SURROUND_MODE` | `REQ_UPMIX_SET_PARAM` (wValue = 2) | Surround engine: 0 = Off, 1 = Passive (difference feed), 2 = Logic (Dolby low-complexity steering). INC+WRAP cycles. |
+| `UPMIX_STRENGTH` | `REQ_UPMIX_SET_PARAM` (wValue = 3) | Centre extraction strength 0..100 %. |
+| `UPMIX_WIDTH` | `REQ_UPMIX_SET_PARAM` (wValue = 4) | Centre width 0..100 % (0 = full removal from L/R, 100 = phantom kept). |
+| `UPMIX_PRESENCE` | `REQ_UPMIX_SET_PARAM` (wValue = 13) | Centre presence bell -12..+12 dB (both centre modes). |
+| `PSYBASS` | `REQ_SET_PSYBASS` (`0x30`, uint8 0/1) | Psychoacoustic bass enable. |
+| `PSYBASS_CUTOFF` | `REQ_SET_PSYBASS_CUTOFF` (`0x32`, float Hz) | Speaker LF limit 30..300 Hz, log stepping. |
+| `PSYBASS_HARMONICS` | `REQ_SET_PSYBASS_HARMONICS` (`0x34`, float dB) | Generated-harmonics mix level -24..+12 dB. |
+| `PSYBASS_DRIVE` | `REQ_SET_PSYBASS_DRIVE` (`0x36`, float dB) | Odd-path clipper drive 0..18 dB. |
+| `PSYBASS_CHARACTER` | `REQ_SET_PSYBASS_CHARACTER` (`0x38`, float %) | Even<->odd harmonic blend 0..100 % (warm to aggressive). |
+| `PSYBASS_ORIGINAL` | `REQ_SET_PSYBASS_ORIGINAL` (`0x3A`, float dB) | Original low-band level -60..0 dB. |
+| `OUTPUT_DELAY` | `REQ_SET_OUTPUT_DELAY` (`0x78`, wValue = `target`, float ms) | Per-output delay; bindable span is the full delay ring at 48 kHz (21 ms RP2040 / 42 ms RP2350). At 96 kHz the pipeline clamps in samples, exactly as for a host-set delay; the ms value round-trips unclamped. |
+| `PRESET_RELOAD` | `REQ_PRESET_LOAD` (`0x91`, GET, wValue = active slot) | `TRIGGER` reloads the currently active preset from flash via the deferred pipeline-safe path, discarding unsaved live edits. Device-global state (master volume in independent mode, output config, CS bindings) is untouched. |
 
 ### 5.1 Enum stepping detail
 
@@ -1252,7 +1290,21 @@ are flash-persistent) and try the decoder before the hash fallback.
 
 ## 11. Compatibility
 
-### 11.1 v2 -> v3 (caps version 3, directory V11)
+### 11.1 v3 -> v4 (caps version 4, directory unchanged)
+
+- **No stored-config change.** The directory stays V11; bindings, IR commands,
+  and names are byte-identical, so no migration runs and firmware
+  up/downgrades across this boundary keep the stored CS config.
+- **No structure size change.** `REQ_GET_CS_CAPS` still returns 40 bytes and
+  `REQ_GET_CS_STATUS` 32 bytes. The `caps_version` bump to 4 signals the 14
+  new nouns (35-48: stereo upmixer, psychoacoustic bass, per-output delay,
+  preset reload) and the new `CS_UNIT_MS` unit (5) that `OUTPUT_DELAY` uses.
+- A v3 host keeps working unchanged for nouns 0-34; before offering the new
+  nouns it must learn `CS_UNIT_MS` (8.8 ms, linear, default step 0.1 ms).
+- The six upmixer nouns are RP2350-only: on RP2040 their action masks read 0
+  (unavailable), the same convention as `ADAT_ACTIVE`.
+
+### 11.2 v2 -> v3 (caps version 3, directory V11)
 
 - **Stored configs migrate automatically.** A V10 directory migrates to V11
   on first boot by appending the (empty) IR command table; bindings and
@@ -1271,7 +1323,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   version check and rebuilds a fresh directory (presets and CS config are
   lost); it does not misparse.
 
-### 11.2 v1 -> v2
+### 11.3 v1 -> v2
 
 - **Stored configs migrate automatically.** A device with a V8 directory (v1
   16-byte bindings, 8 slots) migrates on first boot: the 8 bindings carry

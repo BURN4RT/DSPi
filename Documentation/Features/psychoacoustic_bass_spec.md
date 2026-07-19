@@ -165,6 +165,8 @@ Mask changes take effect on the next audio packet without a coefficient recomput
 
 Psybass uses the standard DSPi vendor command surface, so it is reachable over every control transport (USB EP0, UART, I2C target, control surfaces engine) with the same command bytes.
 
+**Control Surfaces** (caps v4+): six front-panel nouns map onto these commands, so physical knobs/buttons/IR commands can drive the effect: `PSYBASS` (41, enable), `PSYBASS_CUTOFF` (42, log stepping), `PSYBASS_HARMONICS` (43), `PSYBASS_DRIVE` (44), `PSYBASS_CHARACTER` (45), `PSYBASS_ORIGINAL` (46). The output mask stays host-only. See `control_surfaces_spec.md` sections 4.3 and 5.
+
 ### USB (primary transport)
 
 - **SET**: control transfer, `bmRequestType = 0x40` (vendor, host-to-device), `bRequest = <command>`, `wValue = 0`, `wIndex = 0`, data stage = payload as documented per parameter.

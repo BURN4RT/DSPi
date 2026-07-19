@@ -133,6 +133,14 @@ On **RP2040** the feature does not exist: both SET commands STALL (error status 
 | 0x4E | `REQ_UPMIX_GET_STATUS` | IN | 0 | `UpmixStatus`, 16 bytes |
 | 0x4F | reserved | | | |
 
+**Control Surfaces** (caps v4+): six front-panel nouns dispatch through
+`REQ_UPMIX_SET_PARAM`, so physical knobs/buttons/IR commands can drive the
+upmixer: `UPMIX` (35, enable), `UPMIX_CENTER_MODE` (36), `UPMIX_SURROUND_MODE`
+(37), `UPMIX_STRENGTH` (38), `UPMIX_WIDTH` (39), `UPMIX_PRESENCE` (40). All
+six are RP2350-only (empty action mask on RP2040). The front-panel mode
+labels call the ADAPTIVE engine modes "Logic"; the wire values are
+identical. See `control_surfaces_spec.md` sections 4.3 and 5.
+
 ### 6.1 UpmixConfigPacket (44 bytes)
 
 | Offset | Type | Field |
