@@ -258,7 +258,7 @@ void dac_hw_mute_init(const DacHwMuteConfig *cfg) {
      * mute is currently held, preserve it: bring the (possibly new) pin up
      * MUTED and keep s_lifecycle_asserted set, leaving the release to the
      * completion path (complete_pipeline_reset / complete_flash_write_
-     * operation_*).  Same-source re-apply funnels through here for both the
+     * operation_full).  Same-source re-apply funnels through here for both the
      * REQ_SET_DAC_HW_MUTE_CONFIG handler and the bulk REQ_SET_ALL_PARAMS
      * apply, so both are covered. */
     bool carry_assert = s_lifecycle_asserted && s_pin_claimed;

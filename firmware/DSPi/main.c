@@ -1254,7 +1254,7 @@ static uint32_t samples_for_duration_ms(uint32_t sample_rate_hz, uint32_t durati
 }
 
 // Tracks whether prepare_flash_write_operation() tore down SPDIF RX and
-// therefore owes the complete_flash_write_operation_* helpers a restart.
+// therefore owes complete_flash_write_operation_full() a restart.
 // Static file-scope; flash operations are serialized via the main loop.
 static bool spdif_suspended_for_flash = false;
 
@@ -1289,7 +1289,7 @@ static void prepare_flash_write_operation(void) {
     // The loop also absorbs the DAC hardware-mute hold armed by
     // prepare_pipeline_reset() above: it runs until BOTH the settle window
     // and dac_hw_mute_hold_elapsed() are satisfied, so the DAC has its full
-    // ramp time before complete_flash_write_operation_*() stops the clocks.
+    // ramp time before complete_flash_write_operation_full() stops the clocks.
     // Flash writes are inherently blocking (≈45 ms IRQ-off), so unlike the
     // deferred main-loop reset handlers there is nothing to yield to here —
     // folding the hold into the existing settle wait adds no blocking beyond
@@ -1363,9 +1363,8 @@ static void prepare_flash_write_operation(void) {
     // re-runs the drain/prefill/enable handshake once LOCKED returns.
 }
 
-// Restart SPDIF RX if prepare_flash_write_operation() tore it down.  Must
-// be called from both full and light completion paths so every flash op
-// symmetrically restarts what it suspended.
+// Restart SPDIF RX if prepare_flash_write_operation() tore it down, so
+// every flash op symmetrically restarts what it suspended.
 static void resume_spdif_after_flash(void) {
     if (!spdif_suspended_for_flash) return;
     spdif_suspended_for_flash = false;
@@ -1394,45 +1393,34 @@ static void resume_i2s_after_flash(void) {
     i2s_input_start(i2s_input_should_be_master());
 }
 
-// Source-split release of the hardware mute that prepare_pipeline_reset()
-// asserted: the single canonical home of the rule deciding whether a completion
-// path may deassert the DAC mute itself, or must leave it for the SPDIF
-// lock-acquisition prefill block to release.
+// Completion path for EVERY runtime flash write: drain/restart all output
+// consumer pipelines and reset feedback state via complete_pipeline_reset(),
+// or hand the equivalent synchronized restart to the active input's own
+// prefill/re-lock handshake (SPDIF/I2S/ADAT).
 //
-//   - USB input: the output PIO clocks are live when this runs (the light/
-//     metadata path never stopped them; complete_pipeline_reset() on the full
-//     path just restarted them in sync), so the pin can deassert now.  The soft
-//     envelope is still settling, so the DAC un-mutes into silence/ramp, not a
-//     step.
-//   - SPDIF input: output must stay muted until valid SPDIF audio flows again.
-//     The lock-acquisition prefill block (main loop) re-enables outputs after
-//     re-lock and owns the matching dac_hw_mute_release(); deasserting here
-//     would un-mute the DAC into pre-lock silence.
-//   - I2S input: same conclusion as SPDIF, but for a subtler reason.
-//     prepare_flash_write_operation() stops the I2S input and leaves
-//     preset_loading set, so the main-loop I2S prefill block (gated on
-//     preset_loading) DRAINS and disables the outputs AFTER this completion
-//     returns, then re-enables them in sync and owns the matching
-//     dac_hw_mute_release() (right after enable_outputs_in_sync()).  Deasserting
-//     here would un-mute BEFORE that drain stops the output clocks — exposing
-//     the exact clock-stop click the hardware mute exists to suppress.
-//
-// So only USB releases here (its outputs genuinely stay live through the light
-// path).  Completion paths that run a full pipeline reset
-// (complete_flash_write_operation_full()) release implicitly inside
-// complete_pipeline_reset() and need not call this.  It exists for completion
-// paths that keep outputs running through the operation — today the
-// light/metadata flash path on USB — where the release is otherwise easy to
-// forget (its omission once left the DAC silent indefinitely; see git 833a51a).
-static inline void release_hw_mute_if_outputs_live(void) {
-    if (active_input_source == INPUT_SOURCE_USB) {
-        dac_hw_mute_release();
-    }
-}
-
-// Full completion path: drain/restart all output consumer pipelines and reset
-// feedback state. Use this for operations that materially affect runtime audio
-// continuity (preset save/delete and legacy save command compatibility path).
+// This used to be split into this "full" path (preset save/delete, legacy
+// save) and a "light" path for metadata-only writes (names, startup flags,
+// config modes, control surfaces, control interfaces, DAC mute config) that
+// skipped the output rebuild because DSP/output topology was unchanged.  The
+// light path is gone; here is why.  During the ~45 ms flash IRQ blackout the
+// output DMA handlers cannot re-arm, the PIO TX FIFOs drain within tens of
+// microseconds of the in-flight buffer completing, and every output SM stalls
+// with BCK/LRCLK/DATA frozen mid-frame.  The light path then resumed those
+// clocks mid-frame with no DAC mute cycle and no restart.  External DACs that
+// derive their system clock from BCK (e.g. PCM5102 with SCK grounded, BCK PLL
+// mode) can come out of that halt mis-locked and render every subsequent,
+// perfectly correct sample as full-scale distortion until the clocks are
+// stopped and restarted cleanly.  Field-reported as persistent "full scale
+// noise resembling the music" after a preset rename and after a Control
+// Surface save, fixed only by pressing preset save (which took this path).
+// Interim mitigation until the silent-state-changes design (outputs keep
+// clocking through the flash window) is implemented: every flash write ends
+// in a synchronized output restart.  The restart preserves the inviolable
+// inter-slot alignment (synchronized SM start) and complete_pipeline_reset()
+// releases the DAC hardware mute on the USB path; for SPDIF/I2S/ADAT inputs
+// the lingering preset_loading hands both the output restart and the mute
+// release to the source's prefill/lock handshake, exactly as preset save
+// always has.
 static void complete_flash_write_operation_full(void) {
     // Restart SPDIF RX if prepare_flash_write_operation() suspended it.
     // The lock-acquisition block in the main loop will drain outputs and
@@ -1452,9 +1440,9 @@ static void complete_flash_write_operation_full(void) {
         // intact to play out silence as DMA resumes.  We skip
         // complete_pipeline_reset() — draining the pools here would force
         // outputs to restart against an empty pool, causing pops and
-        // uneven inter-slot fill.  The hardware mute is likewise left asserted
-        // (the lock-acquisition prefill path releases it after re-lock — the
-        // SPDIF half of release_hw_mute_if_outputs_live()'s rule).
+        // uneven inter-slot fill.  The hardware mute is likewise left asserted;
+        // the lock-acquisition prefill path re-enables outputs in sync after
+        // re-lock and owns the matching dac_hw_mute_release().
         reset_usb_feedback_loop();
         return;
     }
@@ -1462,23 +1450,6 @@ static void complete_flash_write_operation_full(void) {
     // USB input: feedback loop and USB ring handle blackout recovery; a full
     // pipeline reset is safe and keeps inter-slot phase synchronized.
     complete_pipeline_reset();
-}
-
-// Light completion path: keep the mute envelope active, but skip a full output
-// pipeline rebuild. Suitable for metadata-only flash writes (names/startup flags)
-// where DSP/output topology is unchanged.
-static inline void complete_flash_write_operation_light(void) {
-    // Symmetry with prepare_flash_write_operation(): restart SPDIF RX and
-    // I2S input if they were suspended for the blackout.
-    resume_spdif_after_flash();
-    resume_i2s_after_flash();
-
-    // Release the DAC hardware mute that prepare_flash_write_operation()
-    // asserted (USB input only; for SPDIF the lock-acquisition prefill path
-    // owns it).  See release_hw_mute_if_outputs_live() for the full rule —
-    // omitting this once left the DAC silent indefinitely after a metadata-only
-    // write while EMC was enabled on USB input.
-    release_hw_mute_if_outputs_live();
 }
 
 void core0_init() {
@@ -2055,6 +2026,10 @@ int main(void) {
         // Handle deferred flash SET commands (fire-and-forget, no result).
         // Atomic snapshot: briefly disable IRQs to copy payload + clear flag,
         // preventing the USB ISR from overwriting payload mid-read.
+        // Every one of these completes via complete_flash_write_operation_full()
+        // even though only metadata changed: the flash blackout froze the output
+        // clocks mid-frame, and external DACs clocked from BCK need the clean
+        // synchronized restart (see the completion helper's comment).
         {
             extern volatile bool flash_set_name_pending;
             if (flash_set_name_pending) {
@@ -2069,7 +2044,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 uint8_t status = preset_set_name(slot, name);
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
                 if (status != PRESET_OK) {
                     printf("preset_set_name failed: slot=%u err=%u\n",
                            (unsigned)slot, (unsigned)status);
@@ -2088,7 +2063,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 uint8_t status = preset_set_startup(mode, slot);
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
                 if (status != PRESET_OK) {
                     printf("preset_set_startup failed: mode=%u slot=%u err=%u\n",
                            (unsigned)mode, (unsigned)slot, (unsigned)status);
@@ -2105,7 +2080,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 preset_set_output_config_mode(val);
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
             }
 
             extern volatile bool flash_save_output_config_pending;
@@ -2115,7 +2090,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 preset_save_output_config();
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
             }
 
             extern volatile bool flash_set_master_volume_mode_pending;
@@ -2128,7 +2103,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 preset_set_master_volume_mode(val);
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
             }
 
             extern volatile bool flash_save_master_volume_pending;
@@ -2138,7 +2113,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 preset_save_master_volume();
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
             }
 
             // UART / I2C control-interface config (USB-only SETs, deferred).
@@ -2156,7 +2131,7 @@ int main(void) {
                 if (status == PIN_CONFIG_SUCCESS) {
                     prepare_flash_write_operation();
                     preset_set_ctrl_iface(&cfg, NULL);
-                    complete_flash_write_operation_light();
+                    complete_flash_write_operation_full();
                 }
             }
 
@@ -2171,7 +2146,7 @@ int main(void) {
                 if (status == PIN_CONFIG_SUCCESS) {
                     prepare_flash_write_operation();
                     preset_set_ctrl_iface(NULL, &cfg);
-                    complete_flash_write_operation_light();
+                    complete_flash_write_operation_full();
                 }
             }
 
@@ -2244,7 +2219,7 @@ int main(void) {
                 uint8_t rc = preset_set_cs_all(control_surfaces_config(),
                                                control_surfaces_ir_config(),
                                                control_surfaces_names());
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
                 cs_last_status = (rc == PRESET_OK) ? PIN_CONFIG_SUCCESS
                                                    : CS_STATUS_FLASH_ERROR;
                 cs_last_slot = 0xFF;
@@ -2282,7 +2257,7 @@ int main(void) {
                 restore_interrupts(f);
                 prepare_flash_write_operation();
                 (void)dac_hw_mute_set_config(&hw);
-                complete_flash_write_operation_light();
+                complete_flash_write_operation_full();
             }
 
             // DAC hardware mute test pulse — starts asynchronously and
