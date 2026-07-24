@@ -2254,7 +2254,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-07-19 (caps v4: upmixer/psybass/output-delay/preset-reload nouns 35-48, CS_UNIT_MS)*
+*Last updated: 2026-07-25 (IR hold vs re-press: RC5/RC6 toggle bit + repeat-frame handset detection lift the 250 ms tap-rate cap)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
@@ -2326,9 +2326,10 @@ unsaved live edits).
   mark/space durations into a 128-entry SPSC ring; `cs_ir_poll()` (called
   from the CS tick) assembles frames (a >10 ms space terminates one) and
   decodes NEC/NECext including the dedicated repeat frame, RC5 and RC6 mode 0
-  with the toggle bit masked, and a stable FNV-1a timing-signature hash for
-  everything else, surfacing press / repeat / release events plus the learn
-  state machine (arm, 10 s window, capture-first-press).
+  with the toggle bit masked out of the code (its value is kept for hold
+  tracking), and a stable FNV-1a timing-signature hash for everything else,
+  surfacing press / repeat / release events plus the learn state machine
+  (arm, 10 s window, capture-first-press).
 - `vendor_commands.c`: the `0x84`-`0x87`, `0x8B`-`0x8F`, `0x9D`/`0x9E`
   handlers; `REQ_SET_CS_BINDING`, `REQ_SET_CS_NAME`, and `REQ_SET_CS_IR_CMD`
   latch deferred SETs, `REQ_CS_SAVE`/`REQ_CS_REVERT` latch deferred flags,
@@ -2426,10 +2427,37 @@ fired by a learned `{protocol, code}` pair instead of a GPIO edge, validated
 against the same caps masks and dispatched through the same `cs_noun_dispatch`
 path with per-command `CsOpState` (BUSY retry, deferred-noun shadow,
 momentary restore). Multiple commands may share one code (one button, several
-actions). Hold semantics mirror physical buttons: a NEC repeat frame or a
-re-transmission of the same code within 250 ms extends the hold (REPEAT
-events, gated to the button feel of 400 ms delay then 12.5 Hz); 250 ms of
-silence releases (restoring MOMENTARY). Learn (`REQ_CS_IR_LEARN`: wValue 1
+actions). Hold semantics mirror physical buttons: a NEC repeat frame always
+extends the hold, and 250 ms of silence releases it (restoring MOMENTARY);
+REPEAT events are gated to the button feel of 400 ms delay then 12.5 Hz.
+
+**Hold vs re-press (2026-07-25).** When a frame carries the code already held,
+the strongest available evidence decides whether it is the same press
+continuing or a fresh one, because no consumer IR protocol has a release
+message:
+
+1. *RC5/RC6* carry a toggle bit that flips once per new press and holds for
+   the life of a hold. It is compared directly, so re-presses are exact and
+   timing-independent. The bit stays masked out of `IrCommand.code` so one
+   learned code still matches every press.
+2. *Handsets observed marking holds with NEC repeat frames* cannot emit a data
+   frame mid-hold, so an arriving data frame can only be a new press. The
+   observation is made at runtime the first time a repeat frame extends a hold
+   (an ordinary press longer than ~110 ms is enough) and remembered in an
+   8-entry RAM table, keyed by NEC address so one hold teaches every button on
+   that handset; other protocols have no address field and key on the full
+   code. The table is not persisted and is kept across attach/detach.
+3. *Otherwise* the repeat is a bit-identical re-transmission and only the gap
+   separates the two, so the same code inside 250 ms is taken as a REPEAT.
+   This caps such remotes at roughly 4 taps/second, which is unavoidable
+   without protocol-level information.
+
+Cases 1 and 2 lift the tap-rate cap entirely for the remotes they cover. The
+250 ms window survives only as the release timeout (case 3's discriminator),
+sized to outlast a dropped frame at the longest repeat period in use
+(Kaseikyo ~130 ms).
+
+Learn (`REQ_CS_IR_LEARN`: wValue 1
 arm / 0 cancel / 2 read result) captures the next decoded press within 10 s,
 suppressing dispatch while armed, and completion is pushed as notify event
 `NOTIFY_EVT_CS_IR_LEARN` (0x0A: state, protocol, code) as well as being

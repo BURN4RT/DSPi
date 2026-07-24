@@ -7,10 +7,16 @@
  * A GPIO edge interrupt timestamps mark/space durations into a small ring;
  * cs_ir_poll() (main loop, called from the CS tick) assembles frames and
  * decodes them: NEC/NECext (including repeat frames), RC5 and RC6 mode 0
- * (toggle bit masked), and a timing-signature hash fallback for every other
- * protocol.  Decoded remote buttons surface as press / repeat / release
- * events keyed by {protocol, code}, mirroring a physical button's press,
- * auto-repeat and release.
+ * (toggle bit masked out of the code), and a timing-signature hash fallback
+ * for every other protocol.  Decoded remote buttons surface as press /
+ * repeat / release events keyed by {protocol, code}, mirroring a physical
+ * button's press, auto-repeat and release.
+ *
+ * Telling a hold apart from a fast re-press of the same button uses the
+ * RC5/RC6 toggle bit where there is one, and otherwise the fact that a
+ * handset known to mark holds with NEC repeat frames cannot emit a data
+ * frame mid-hold; only remotes that repeat by bit-identical re-transmission
+ * still fall back to a timing window, which caps their tap rate.
  */
 
 #ifndef CONTROL_SURFACES_IR_H

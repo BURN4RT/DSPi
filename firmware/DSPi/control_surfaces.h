@@ -207,9 +207,10 @@ typedef enum {
 
 // IR code protocols (IrCommand.protocol).  Wire/flash-persistent values.
 // NONE marks an empty sub-slot.  NEC and RC5/RC6 are decoded properly (NEC
-// repeat frames drive hold-to-repeat; the RC5/RC6 toggle bit is masked so a
-// learned button matches every press); everything else falls back to a
-// timing-signature hash, matched by exact re-transmission.
+// repeat frames drive hold-to-repeat; the RC5/RC6 toggle bit is masked out of
+// the code so a learned button matches every press, and its value separates a
+// hold from a re-press); everything else falls back to a timing-signature
+// hash, matched by exact re-transmission.
 #define CS_IR_PROTO_NONE   0
 #define CS_IR_PROTO_NEC    1
 #define CS_IR_PROTO_RC5    2

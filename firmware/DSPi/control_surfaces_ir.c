@@ -10,14 +10,27 @@
  * Decode (main loop, from the CS tick): a space longer than IR_FRAME_GAP_US
  * terminates a frame of alternating mark/space durations.  Frames are tried
  * against NEC (dedicated repeat frame drives hold-to-repeat), RC5 and RC6
- * mode 0 (Manchester; the toggle bit is masked so a learned button matches
- * every press), then fall back to an FNV-1a hash over the timing signature,
- * which matches any remote that repeats by re-transmission.
+ * mode 0 (Manchester; the toggle bit is masked out of the code so a learned
+ * button matches every press, but its value is kept for hold tracking), then
+ * fall back to an FNV-1a hash over the timing signature, which matches any
+ * remote that repeats by re-transmission.
  *
- * Hold model: one button at a time.  A frame carrying the held code (or a
- * NEC repeat frame) within IR_HOLD_GAP_US extends the hold as a REPEAT;
- * silence past the gap emits RELEASE.  A different code releases the old
- * button and presses the new one.
+ * Hold model: one button at a time.  A NEC repeat frame always extends the
+ * hold.  A frame carrying the held code is a REPEAT or a fresh re-press, and
+ * which one is decided by the strongest evidence available:
+ *
+ *   RC5 / RC6  the toggle bit; it flips once per new press and holds for the
+ *              life of a hold.  Exact, and independent of timing.
+ *   handsets known to mark holds with NEC repeat frames (observed at least
+ *              once, remembered per remote): a data frame cannot occur
+ *              mid-hold, so it is unambiguously a new press.
+ *   otherwise  the repeat is a bit-identical re-transmission and nothing but
+ *              the gap separates the two; same code inside IR_HOLD_GAP_US is
+ *              taken as a REPEAT.
+ *
+ * Silence past IR_HOLD_GAP_US emits RELEASE regardless (no consumer IR
+ * protocol has a release message).  A different code releases the old button
+ * and presses the new one.
  */
 
 #include "control_surfaces.h"     // CS_IR_PROTO_* / CS_IR_LEARN_*
@@ -39,6 +52,16 @@
 #define IR_MAX_DURS        112       // frame buffer (mark/space periods)
 #define IR_HOLD_GAP_US     250000u   // no frame for this long = released
 #define IR_LEARN_WINDOW_US 10000000u // learn listens for 10 s
+
+// Handsets remembered as marking holds with NEC repeat frames.  Keyed per
+// remote, not per button (NEC carries the address in the low half of the
+// code), so one observed hold teaches the whole handset; other protocols have
+// no address field and are keyed by the full code, hence the table is sized to
+// CS_MAX_IR_COMMANDS so a full set of learned buttons cannot evict each other.
+// RAM only, and kept across attach/detach: it describes the user's remote, not
+// the pin config.
+#define IR_RPT_KNOWN_N     CS_MAX_IR_COMMANDS
+#define IR_NEC_ADDR_MASK   0xFFFFu
 
 // NEC timings (µs)
 #define NEC_HDR_MARK    9000
@@ -71,7 +94,14 @@ static bool     s_frame_overflow;
 static bool     s_held;
 static uint8_t  s_held_proto;
 static uint32_t s_held_code;
+static uint8_t  s_held_toggle;               // RC5/RC6 only; 0 otherwise
 static uint32_t s_last_frame_us;
+
+// Repeat-frame handsets (see IR_RPT_KNOWN_N).  proto CS_IR_PROTO_NONE = empty;
+// decoded protocols are all non-zero, so the zero-init state matches nothing.
+static uint8_t  s_rpt_proto[IR_RPT_KNOWN_N];
+static uint32_t s_rpt_key[IR_RPT_KNOWN_N];
+static uint8_t  s_rpt_w;
 
 // Event queue, drained every tick.  Sized so it cannot overflow in practice:
 // a frame yields at most 2 events (RELEASE + PRESS) and frames are >= 20 ms
@@ -206,8 +236,9 @@ static int ir_expand_units(uint8_t first, uint16_t unit, int max_units,
 }
 
 // RC5 (14 bits, 889 µs half-bits, bit = second-half level).  The toggle bit
-// (wire bit 11) is masked.  RC5X's inverted S2 rides along in bit 12.
-static bool ir_decode_rc5(uint32_t *code) {
+// (wire bit 11) is masked out of the code and returned separately.  RC5X's
+// inverted S2 rides along in bit 12.
+static bool ir_decode_rc5(uint32_t *code, uint8_t *toggle) {
     if (s_frame_n < 11 || s_frame_n > 28) return false;
     uint8_t h[27];
     int n = ir_expand_units(0, RC5_UNIT, 2, h, 27);
@@ -220,16 +251,19 @@ static bool ir_decode_rc5(uint32_t *code) {
         if (first == second) return false;    // Manchester violation
         if (second) c |= 1u << (13 - k);
     }
+    // h[] opens at S1's second half (the leading space is swallowed by the
+    // inter-frame gap), so wire bit 11's second half sits at h[4].
+    *toggle = h[4];
     *code = c & ~(1u << 11);                  // mask toggle
     return true;
 }
 
 // RC6 mode 0 (leader + start bit + 3 mode bits + double-width toggle +
 // 16 data bits, 444 µs units, bit = FIRST-half level).  Toggle is checked
-// for shape and dropped from the code: code = (mode+1)<<16 | control<<8 |
-// info.  mode+1 keeps address 0 / command 0 away from 0 (the unlearned
-// sentinel in IrCommand.code).
-static bool ir_decode_rc6(uint32_t *code) {
+// for shape, returned separately and dropped from the code: code =
+// (mode+1)<<16 | control<<8 | info.  mode+1 keeps address 0 / command 0 away
+// from 0 (the unlearned sentinel in IrCommand.code).
+static bool ir_decode_rc6(uint32_t *code, uint8_t *toggle) {
     if (s_frame_n < 12 || s_frame_n > 44) return false;
     if (!ir_match(s_frame[0], 6 * RC6_UNIT) || !ir_match(s_frame[1], 2 * RC6_UNIT))
         return false;
@@ -247,8 +281,9 @@ static bool ir_decode_rc6(uint32_t *code) {
         if (first == second) return false;
         mode = (mode << 1) | first;
     }
-    // Toggle: two double-width halves
+    // Toggle: two double-width halves; the bit is the first half's level.
     if (u[8] != u[9] || u[10] != u[11] || u[8] == u[10]) return false;
+    uint8_t tog = u[8];
     uint32_t data = 0;
     for (int k = 0; k < 16; k++) {
         uint8_t first = u[12 + 2 * k], second = u[13 + 2 * k];
@@ -256,6 +291,7 @@ static bool ir_decode_rc6(uint32_t *code) {
         data = (data << 1) | first;
     }
     *code = ((mode + 1) << 16) | data;
+    *toggle = tog;               // outputs written only once the frame is good
     return true;
 }
 
@@ -280,6 +316,29 @@ static uint32_t ir_hash_frame(void) {
 // Frame -> events
 // ---------------------------------------------------------------------------
 
+// A handset that marks holds with NEC repeat frames never emits a data frame
+// mid-hold, so for it "same code again" can only mean a fresh press.  That is
+// a property of the remote, so NEC keys on its address half and one observed
+// hold covers every button; other protocols key on the whole code.
+static uint32_t ir_remote_key(uint8_t proto, uint32_t code) {
+    return proto == CS_IR_PROTO_NEC ? (code & IR_NEC_ADDR_MASK) : code;
+}
+
+static bool ir_remote_repeats_by_frame(uint8_t proto, uint32_t code) {
+    uint32_t key = ir_remote_key(proto, code);
+    for (int i = 0; i < IR_RPT_KNOWN_N; i++)
+        if (s_rpt_proto[i] == proto && s_rpt_key[i] == key) return true;
+    return false;
+}
+
+static void ir_note_repeats_by_frame(uint8_t proto, uint32_t code) {
+    if (proto == CS_IR_PROTO_NONE || ir_remote_repeats_by_frame(proto, code))
+        return;
+    s_rpt_proto[s_rpt_w] = proto;
+    s_rpt_key[s_rpt_w]   = ir_remote_key(proto, code);
+    s_rpt_w = (uint8_t)((s_rpt_w + 1) % IR_RPT_KNOWN_N);
+}
+
 static void ir_emit(uint8_t kind, uint8_t proto, uint32_t code) {
     if (s_evq_n < (uint8_t)(sizeof(s_evq) / sizeof(s_evq[0]))) {
         s_evq[s_evq_n].kind = kind;
@@ -292,6 +351,8 @@ static void ir_emit(uint8_t kind, uint8_t proto, uint32_t code) {
 static void ir_frame_complete(uint32_t now) {
     uint8_t proto;
     uint32_t code;
+    uint8_t toggle = 0;
+    bool has_toggle = false;
 
     if (s_frame_overflow || s_frame_n < 3) return;
 
@@ -302,16 +363,21 @@ static void ir_frame_complete(uint32_t now) {
         // back to the hash decoder send this exact repeat frame too.
         if (s_learn_state == CS_IR_LEARN_ARMED) return;
         if (s_held) {
+            // Proof that this handset signals a hold out of band, which is
+            // what lets its data frames be read as re-presses from now on.
+            ir_note_repeats_by_frame(s_held_proto, s_held_code);
             s_last_frame_us = now;
             ir_emit(CS_IR_EVT_REPEAT, s_held_proto, s_held_code);
         }
         return;
     } else if (nec == 1) {
         proto = CS_IR_PROTO_NEC;
-    } else if (ir_decode_rc5(&code)) {
+    } else if (ir_decode_rc5(&code, &toggle)) {
         proto = CS_IR_PROTO_RC5;
-    } else if (ir_decode_rc6(&code)) {
+        has_toggle = true;
+    } else if (ir_decode_rc6(&code, &toggle)) {
         proto = CS_IR_PROTO_RC6;
+        has_toggle = true;
     } else if (s_frame_n >= 8) {
         proto = CS_IR_PROTO_HASH;
         code = ir_hash_frame();
@@ -327,17 +393,27 @@ static void ir_frame_complete(uint32_t now) {
         return;                    // learning consumes the press
     }
 
-    if (s_held && s_held_proto == proto && s_held_code == code &&
-        (uint32_t)(now - s_last_frame_us) < IR_HOLD_GAP_US) {
-        s_last_frame_us = now;
-        ir_emit(CS_IR_EVT_REPEAT, proto, code);
-        return;
+    if (s_held && s_held_proto == proto && s_held_code == code) {
+        // Same button: still down, or pressed again?  Strongest evidence wins.
+        bool still_down;
+        if (has_toggle)
+            still_down = (toggle == s_held_toggle);
+        else if (ir_remote_repeats_by_frame(proto, code))
+            still_down = false;
+        else
+            still_down = (uint32_t)(now - s_last_frame_us) < IR_HOLD_GAP_US;
+        if (still_down) {
+            s_last_frame_us = now;
+            ir_emit(CS_IR_EVT_REPEAT, proto, code);
+            return;
+        }
     }
     if (s_held)
         ir_emit(CS_IR_EVT_RELEASE, s_held_proto, s_held_code);
     s_held = true;
     s_held_proto = proto;
     s_held_code = code;
+    s_held_toggle = toggle;
     s_last_frame_us = now;
     ir_emit(CS_IR_EVT_PRESS, proto, code);
 }
