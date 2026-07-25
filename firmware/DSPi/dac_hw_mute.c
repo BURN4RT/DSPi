@@ -404,6 +404,15 @@ uint16_t dac_hw_mute_hold_ms(void) {
     return s_cfg.hold_ms;
 }
 
+uint16_t dac_hw_mute_release_ms(void) {
+    /* 0 when the feature is off or unclaimed, matching dac_hw_mute_release()'s
+     * no-op behaviour in those cases.  complete_pipeline_reset() sizes its
+     * post-restart mute dwell against this so the digital fade back up starts
+     * after the pin has actually deasserted, not under an analog mute. */
+    if (s_cfg.enabled == 0 || !s_pin_claimed) return 0;
+    return s_cfg.release_ms;
+}
+
 bool dac_hw_mute_hold_elapsed(void) {
     /* No hold to honor when the feature is off, no pin is claimed, or no
      * hold deadline is armed (hold_ms == 0 / not yet asserted).  Returning

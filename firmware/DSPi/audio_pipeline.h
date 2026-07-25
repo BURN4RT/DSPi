@@ -28,6 +28,42 @@ uint8_t active_input_channel_count(void);
 // Reset CPU load metering state — called on audio gap detection
 void pipeline_reset_cpu_metering(void);
 
+// ---------------------------------------------------------------------------
+// Preset/reset mute envelope: observation and control
+//
+// The envelope is the final output gain applied to every slot (see
+// update_preset_mute_envelope in audio_pipeline.c).  These entry points let
+// the pipeline-reset bracket in main.c fade the wire to silence BEFORE it
+// stops any clock, and prove it got there, instead of arming a mute and
+// tearing down in the same breath.  All are main-thread only.
+// ---------------------------------------------------------------------------
+
+// Drive the envelope to zero for the next `samples` samples of audio without
+// touching `preset_loading` (which doubles as the input prefill-handshake
+// signal).  Refreshable: each call restarts the countdown, so a waiter calls
+// it every iteration; if the waiter disappears the request expires on its own
+// and audio fades back up.
+void pipeline_request_soft_mute(uint32_t samples);
+
+// Drop the request from pipeline_request_soft_mute() immediately.  Used once
+// `preset_loading` has taken ownership of the mute.
+void pipeline_clear_soft_mute_request(void);
+
+// True once a processed packet has actually rendered the envelope down to
+// zero, i.e. the fade-out is complete in the audio that has been produced,
+// not merely armed.
+bool pipeline_mute_is_silent(void);
+
+// Force the envelope (and the per-packet ramp's starting value) to zero.  For
+// the case where no producer is running: the envelope only advances when a
+// packet is processed, so elapsed time alone can never complete a fade.
+void pipeline_latch_mute_silence(void);
+
+// Longest configured per-output delay, in samples.  The mute gain is applied
+// ahead of the delay lines, so a fade-out is only truly on the wire once this
+// many samples have been pushed through behind it.
+uint32_t pipeline_max_active_delay_samples(void);
+
 // Shared input sample buffers (filled by active input source)
 #if PICO_RP2350
 extern float buf_l[192], buf_r[192];

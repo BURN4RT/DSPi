@@ -36,8 +36,15 @@ void dspi_flash_apply_clkdiv(void) { dspi_set_clkdiv(); }
 //      default ~102 MHz),
 //   3) restores the saved RCMD/RFMT so XIP reads stay in quad continuous
 //      mode, with our CLKDIV=6 overlaid on the preserved TIMING.
-// Caller is responsible for interrupts-off + Core 1 parked, same contract as
-// the SDK's flash_range_erase/program.
+// Caller is responsible for the interrupt blackout + Core 1 parked, same
+// contract as the SDK's flash_range_erase/program.  Note the blackout is
+// deliberately NOT total: flash_irq_blackout_begin() (flash_storage.c) masks
+// at the NVIC and leaves the two output DMA IRQ lines enabled so the audio
+// slots keep clocking through the window.  Those handlers and everything they
+// call are RAM-resident and touch no flash (enforced by
+// scripts/check_ram_placement.py), which is the only thing that matters here:
+// nothing below assumes exclusivity, it just requires that no interrupted
+// code path performs an XIP access.
 void __no_inline_not_in_flash_func(dspi_flash_range_erase)(uint32_t flash_offs, size_t count) {
     rom_connect_internal_flash_fn connect     = (rom_connect_internal_flash_fn) rom_func_lookup_inline(ROM_FUNC_CONNECT_INTERNAL_FLASH);
     rom_flash_exit_xip_fn         exit_xip    = (rom_flash_exit_xip_fn)         rom_func_lookup_inline(ROM_FUNC_FLASH_EXIT_XIP);

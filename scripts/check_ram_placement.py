@@ -183,6 +183,18 @@ LOOPBACK_EXTRA = [
 # Core-1 roots for the literal-pool scan (Check B2).
 CORE1_ROOTS = ["pdm_core1_entry", "pdm_processing_loop", "eq_worker_loop"]
 
+# Flash-window roots for the literal-pool scan (Check B2).
+#
+# These two output DMA completion handlers are the only interrupts left
+# unmasked across a flash erase/program (flash_irq_blackout_begin/end in
+# flash_storage.c), which is what keeps every output slot clocking framed
+# silence instead of freezing mid-frame.  XIP is unavailable while they run, so
+# neither they nor anything they call may touch flash — not via a branch (Check
+# B covers that) and not via a literal-pool pointer into flash-range data,
+# which is what this scan catches.  A missing root is a hard failure: it means
+# the handler is no longer RAM-resident and the blackout would fault.
+FLASH_WINDOW_ROOTS = ["audio_spdif_dma_irq_handler", "audio_i2s_dma_irq_handler"]
+
 BRANCH_MNEMONICS = {"bl", "blx", "b", "b.w", "b.n"}
 
 # Check B2: flash literals in core-1 code that are provably init-time only.
@@ -449,8 +461,8 @@ def check_elf(elf, baseline):
     fails += b_fail
     warns += len(veneer_edges)
 
-    # --- Check B2: core-1 literal-pool flash scan --------------------------
-    lines.append("[Check B2] core-1 function bodies must hold no flash-range literals")
+    # --- Check B2: core-1 + flash-window literal-pool flash scan -----------
+    lines.append("[Check B2] core-1 and flash-window function bodies must hold no flash-range literals")
     c1_seed = []
     for name in CORE1_ROOTS:
         for s in match_symbols(syms, name):
@@ -458,8 +470,23 @@ def check_elf(elf, baseline):
                 fs = enclosing_func(starts, funcs, s["addr"])
                 if fs is not None:
                     c1_seed.append(fs)
-    c1_visited, _, _, _ = bfs(c1_seed)
     b2_fail = 0
+    # Flash-window roots: same scan, but a root that is missing or not in RAM
+    # is itself a failure — the handler must run with XIP unavailable.
+    for name in FLASH_WINDOW_ROOTS:
+        matches = match_symbols(syms, name)
+        ram_matches = [s for s in matches if in_ram(s["addr"])]
+        if not ram_matches:
+            where = "not found" if not matches else "not in RAM"
+            lines.append("  FAIL  flash-window root %s %s (must be RAM-resident: "
+                         "it services output DMA while flash is unavailable)" % (name, where))
+            b2_fail += 1
+            continue
+        for s in ram_matches:
+            fs = enclosing_func(starts, funcs, s["addr"])
+            if fs is not None:
+                c1_seed.append(fs)
+    c1_visited, _, _, _ = bfs(c1_seed)
     for fs in sorted(c1_visited):
         f = funcs[fs]
         for (waddr, val) in f["words"]:
@@ -470,7 +497,8 @@ def check_elf(elf, baseline):
                 else:
                     lines.append("  FAIL  %s @0x%08x -> .word 0x%08x (FLASH pointer, near %s)" % (f["name"], waddr, val, wname))
                     b2_fail += 1
-    lines.append("  B2 summary: %d core-1 function(s) scanned, %d FAIL" % (len(c1_visited), b2_fail))
+    lines.append("  B2 summary: %d core-1 / flash-window function(s) scanned, %d FAIL"
+                 % (len(c1_visited), b2_fail))
     fails += b2_fail
 
     # --- Check C: size accounting ------------------------------------------

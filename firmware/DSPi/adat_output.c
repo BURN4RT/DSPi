@@ -429,6 +429,10 @@ void adat_output_set_stream_active(bool active) {
     adat_stream_active_mode = active;
 }
 
+void adat_output_rebaseline_starvations(void) {
+    adat_slot0_starv_seen = adat_slot0_starvations();
+}
+
 void adat_output_task(void) {
     if (adat_need_local_resync) {
         adat_slip_count++;

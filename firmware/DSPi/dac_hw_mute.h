@@ -22,11 +22,13 @@
  * INTEGRATION SEAMS (main.c):
  *   - core0_init() → dac_hw_mute_init(&dir_cache.dac_hw_mute) once
  *     after preset_boot_load() so the loaded config applies at boot.
- *   - prepare_pipeline_reset() → dac_hw_mute_assert() AFTER engaging
- *     the existing soft-mute envelope.  The software envelope handles
- *     the data path; the hardware mute hold gives the DAC's analog
- *     stage time to ramp down before clocks stop.  assert() is
- *     non-blocking — it drives the pin and arms a hold deadline only.
+ *   - prepare_pipeline_reset() → dac_hw_mute_assert() AFTER the
+ *     software fade has actually reached silence on the wire (and
+ *     likewise in the pipeline_reset_ready() gate, which fades first
+ *     and asserts second).  Asserting at full level would truncate the
+ *     fade this mute exists to cover and re-expose the step on release.
+ *     assert() is non-blocking; it drives the pin and arms a hold
+ *     deadline only.
  *   - The hold is enforced by the caller, non-blockingly: the main loop
  *     defers the clock-stopping work (complete_pipeline_reset() teardown,
  *     process_type_switches(), or drain_and_disable_outputs()) until
@@ -218,6 +220,13 @@ bool dac_hw_mute_hold_elapsed(void);
  * size time-based work — e.g. the soft-mute sample counter — to outlast
  * a pending hold. */
 uint16_t dac_hw_mute_hold_ms(void);
+
+/* Configured post-clock-restart release dwell in ms; 0 when the feature
+ * is disabled or no pin is claimed.  complete_pipeline_reset() adds this
+ * to the mute dwell it holds after the synchronized restart, so the
+ * digital fade back up begins once the pin has actually deasserted
+ * rather than into a still-muted analog stage. */
+uint16_t dac_hw_mute_release_ms(void);
 
 /* Begin release of the pipeline-reset hardware mute.  Called from
  * complete_pipeline_reset() AFTER the synchronized PIO SM start, so

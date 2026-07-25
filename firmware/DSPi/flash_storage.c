@@ -51,6 +51,8 @@
 
 #include "hardware/flash.h"
 #include "hardware/sync.h"
+#include "hardware/irq.h"            // DMA_IRQ_0 (selective flash blackout keep mask)
+#include "hardware/structs/nvic.h"   // nvic_hw (selective flash blackout)
 #include "hardware/clocks.h"  // GPIO_TO_GPOUT_CLOCK_HANDLE() — MCK pin migration
 #include "pico/stdlib.h"
 #include "pico/multicore.h"
@@ -1164,6 +1166,78 @@ static inline uint32_t flash_mute_hold_samples(void) {
 }
 
 // ============================================================================
+// SELECTIVE FLASH IRQ BLACKOUT
+// ============================================================================
+//
+// Masks at the NVIC instead of PRIMASK across the ~45 ms erase/program window,
+// keeping exactly the two output DMA IRQ lines alive so every slot keeps
+// clocking framed silence while XIP is unavailable.  Full rationale (why the
+// clocks must not halt, what the wire carries, what stays masked and why):
+// Documentation/current_architecture.md "Selective NVIC blackout" and
+// Documentation/Features/silent_state_changes_spec.md section 4.
+//
+// Constraints a future edit must not break:
+//   - Everything reachable from the two kept handlers must stay RAM-resident
+//     and read no flash data; scripts/check_ram_placement.py enforces this
+//     (FLASH_WINDOW_ROOTS in Check B2 is a hard failure).
+//   - ICER/ISER are written directly, never via irq_set_mask_n_enabled():
+//     the SDK helper clears pending bits on re-enable, and IRQs latched
+//     during the window must survive to be serviced after it.
+//   - In IRQ context NVIC masking cannot guarantee the DMA handlers preempt
+//     the current exception frame, so the PRIMASK fallback stays (defensive;
+//     every runtime flash write is deferred to the main loop).
+_Static_assert((DMA_IRQ_0 + PICO_AUDIO_SPDIF_DMA_IRQ) < 32 &&
+               (DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ) < 32,
+               "output DMA IRQs must live in NVIC word 0");
+
+#define FLASH_BLACKOUT_KEEP_MASK                              \
+    ((1u << (DMA_IRQ_0 + PICO_AUDIO_SPDIF_DMA_IRQ)) |         \
+     (1u << (DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ)))
+
+// The register shape differs per core: RP2040 (M0+) has scalar iser/icer,
+// RP2350 (M33) has iser[2]/icer[2].  Both output DMA IRQ numbers are below 32
+// on both platforms (asserted above), so only word 0 is ever touched.
+#if PICO_RP2350
+#define FLASH_BLACKOUT_ISER  (nvic_hw->iser[0])
+#define FLASH_BLACKOUT_ICER  (nvic_hw->icer[0])
+#else
+#define FLASH_BLACKOUT_ISER  (nvic_hw->iser)
+#define FLASH_BLACKOUT_ICER  (nvic_hw->icer)
+#endif
+
+static uint32_t flash_blackout_saved_iser = 0;
+static uint32_t flash_blackout_primask = 0;
+static bool     flash_blackout_used_primask = false;
+
+// RAM-resident: they bracket calls that quiesce XIP, and keeping them out of
+// flash removes any question about the return path.
+static void __no_inline_not_in_flash_func(flash_irq_blackout_begin)(void) {
+    if (__get_current_exception() != 0) {
+        flash_blackout_used_primask = true;
+        flash_blackout_primask = save_and_disable_interrupts();
+        return;
+    }
+    flash_blackout_used_primask = false;
+    flash_blackout_saved_iser = FLASH_BLACKOUT_ISER;
+    FLASH_BLACKOUT_ICER = flash_blackout_saved_iser & ~FLASH_BLACKOUT_KEEP_MASK;
+    __dsb();
+    __isb();
+}
+
+static void __no_inline_not_in_flash_func(flash_irq_blackout_end)(void) {
+    if (flash_blackout_used_primask) {
+        flash_blackout_used_primask = false;
+        restore_interrupts(flash_blackout_primask);
+        return;
+    }
+    // Writing 1s re-enables exactly what was enabled; pending bits latched
+    // during the window are preserved.
+    FLASH_BLACKOUT_ISER = flash_blackout_saved_iser;
+    __dsb();
+    __isb();
+}
+
+// ============================================================================
 // CRC32 (polynomial 0xEDB88320, same as legacy implementation)
 // ============================================================================
 
@@ -1235,10 +1309,21 @@ static int flash_write_sector(uint32_t offset, const void *data, size_t len) {
                       && (__get_current_exception() == 0);
     if (do_lockout) multicore_lockout_start_blocking();
 
-    uint32_t flags = save_and_disable_interrupts();
+    // PDM's ring DMA free-runs through the window; with Core 1 parked nothing
+    // refills it, so it would loop whatever modulator output is left in the
+    // ring.  Fill it with true silence and force a lead re-anchor on resume
+    // (see pdm_generator.c).  Only when we actually parked Core 1: if it keeps
+    // running (its whole execution set is RAM-resident) it goes on filling the
+    // ring itself, and a forced re-anchor would then be a gratuitous PDM phase
+    // jump against the other slots.
+    if (do_lockout) pdm_flash_silence();
+
+    // Selective blackout: the output DMA IRQ lines stay live so every slot
+    // keeps clocking framed silence for the whole erase/program window.
+    flash_irq_blackout_begin();
     dspi_flash_range_erase(offset, erase_size);
     dspi_flash_range_program(offset, write_buf, write_size);
-    restore_interrupts(flags);
+    flash_irq_blackout_end();
 
     if (do_lockout) multicore_lockout_end_blocking();
 
@@ -3330,9 +3415,14 @@ uint8_t preset_delete(uint8_t slot) {
                       && (__get_current_exception() == 0);
     if (do_lockout) multicore_lockout_start_blocking();
 
-    uint32_t flags = save_and_disable_interrupts();
+    // Same treatment as flash_write_sector(): PDM ring to true silence (only
+    // when Core 1 is parked), then a blackout that leaves the output DMA IRQ
+    // lines alive so the slots keep clocking through the erase.
+    if (do_lockout) pdm_flash_silence();
+
+    flash_irq_blackout_begin();
     dspi_flash_range_erase(SLOT_SECTOR_OFFSET(slot), SLOT_BYTES);
-    restore_interrupts(flags);
+    flash_irq_blackout_end();
 
     if (do_lockout) multicore_lockout_end_blocking();
 

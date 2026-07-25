@@ -15,6 +15,14 @@ void pdm_update_clock(uint32_t freq);
 void pdm_push_sample(int32_t sample, bool reset);
 void pdm_change_pin(uint8_t new_pin);
 
+// Fill the free-running PDM DMA ring with true silence and arm a write-lead
+// re-anchor for the Core 1 processing loop.  Called from Core 0 immediately
+// before a flash blackout, with Core 1 parked (no concurrent writer): the ring
+// DMA keeps clocking through the window, so without this it would loop the
+// last ~45 ms of modulator output.  Touches content only; DMA, PIO, and
+// pointers are untouched, so PDM stays phase-continuous with the other slots.
+void pdm_flash_silence(void);
+
 // Buffer fill level accessors (called from Core 0 for stats)
 uint8_t pdm_get_dma_fill_pct(void);
 uint8_t pdm_get_ring_fill_pct(void);

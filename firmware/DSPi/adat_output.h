@@ -65,6 +65,16 @@ void adat_output_resync(void);
 // while false (host stream stopped) the cushion free-runs on silence.
 void adat_output_set_stream_active(bool active);
 
+// Drop any accumulated slot-0 starvation backlog without inserting silence
+// for it.  Called at the end of a flash bracket: during the erase/program
+// window the slots keep clocking (selective NVIC blackout) and count
+// starvations, but ADAT is not behind by that amount; its own ring lapped
+// and it emitted a frame per sample clock the whole time.  Mirroring the
+// backlog would therefore shift the ADAT-to-slot offset in the wrong
+// direction; the synchronized restart (or the input prefill's) re-canonical-
+// izes the offset instead.
+void adat_output_rebaseline_starvations(void);
+
 // SPDIF-input clock servo hook: apply the same 16.8 divider the S/PDIF TX SMs
 // run (ADAT's PIO clock is likewise 256*Fs).  0 clears the override.
 void adat_output_servo_divider(uint32_t div_16_8);

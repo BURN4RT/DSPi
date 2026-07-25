@@ -47,6 +47,11 @@ Core1EqWork core1_eq_work = {0};
 // DMA write index snapshot for buffer stats (written by Core 1, read by Core 0)
 static volatile uint32_t pdm_stats_write_idx = 0;
 
+// Set by pdm_flash_silence() (Core 0, with Core 1 parked) before a flash
+// blackout; consumed by the processing loop on resume.  See the function
+// definition for why the loop's own underrun recovery is not enough.
+static volatile bool pdm_force_reanchor = false;
+
 // Budget-based CPU load metering (Core 1 EQ worker)
 static uint32_t c1eq_load_q8 = 0;
 static uint32_t pdm_load_q8 = 0;
@@ -115,6 +120,24 @@ static inline int32_t noise_shaped_dither(noise_shaper_t *ns, int32_t raw_dither
 void pdm_set_enabled(bool enabled) {
     pdm_enabled = enabled;
     __sev();  // Wake Core 1 if sleeping
+}
+
+// Fill the PDM DMA ring with the modulator's 50% duty silence pattern and arm
+// a lead re-anchor for the processing loop.
+//
+// Called from Core 0 immediately before a flash blackout, with Core 1 already
+// parked by multicore_lockout, so there is no concurrent writer.  Content only:
+// the DMA, the PIO SM, and every pointer are untouched, so PDM phase is
+// continuous across the window; the ring simply free-runs over silence
+// instead of looping the last modulator output for ~45 ms.  No-op when PDM
+// hardware was never set up.
+void pdm_flash_silence(void) {
+    if (pdm_dma_chan < 0) return;
+    for (int i = 0; i < PDM_DMA_BUFFER_SIZE; i++) {
+        pdm_dma_buffer[i] = 0xAAAAAAAA;
+    }
+    pdm_force_reanchor = true;
+    __dmb();
 }
 
 void pdm_update_clock(uint32_t freq) {
@@ -275,6 +298,19 @@ static void __not_in_flash_func(pdm_processing_loop)() {
         // Check buffer position relative to DMA read pointer
         uint32_t read_addr = dma_hw->ch[pdm_dma_chan].read_addr;
         uint32_t current_read_idx = (read_addr - (uint32_t)pdm_dma_buffer) / 4;
+
+        // Post-flash-window re-anchor: the ring lapped an unknown number of
+        // times while this core was parked, so the modulo write-read delta
+        // below cannot tell a multi-lap underrun from a valid lead (the
+        // delta > half-ring test misses roughly half the outcomes).  Re-seat
+        // the write lead unconditionally instead; without it PDM can resume
+        // with an arbitrary wrong lead, shifting PDM output by up to a full
+        // ring relative to the SPDIF/I2S slots.
+        if (pdm_force_reanchor) {
+            pdm_force_reanchor = false;
+            local_pdm_write = (current_read_idx + TARGET_LEAD) & (PDM_DMA_BUFFER_SIZE - 1);
+        }
+
         int32_t delta = (local_pdm_write - current_read_idx) & (PDM_DMA_BUFFER_SIZE - 1);
 
         // Underrun recovery - write pointer fell behind read pointer

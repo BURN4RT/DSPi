@@ -346,6 +346,7 @@ static void i2s_reset_consumer_pipeline(audio_i2s_instance_t *inst) {
 }
 
 // Forward declarations (defined later in this file)
+static void pipeline_settle_to_silence(void);
 static void prepare_pipeline_reset(uint32_t mute_samples);
 static void complete_pipeline_reset(void);
 static void drain_and_disable_outputs(void);
@@ -453,6 +454,14 @@ static void process_type_switches(uint8_t change_mask, const uint8_t new_types[]
         }
     }
     if (!any_change) return;
+
+    // Fade the outputs to silence BEFORE masking the USB IRQ below.  The fade
+    // needs the producer to keep delivering packets; once the IRQ is off the
+    // USB ring can no longer refill, so prepare_pipeline_reset()'s own settle
+    // would sit out its defensive cap instead of completing.  Immediate for
+    // every real caller: the vendor path pre-gates on pipeline_reset_ready(),
+    // preset load has already settled, and boot has no producer.
+    pipeline_settle_to_silence();
 
     output_type_switch_in_progress = true;
     __dmb();
@@ -808,21 +817,205 @@ static void reset_usb_feedback_loop(void) {
 // prepare_pipeline_reset() alone.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Fade-to-silence before disruptive work
+//
+// Arming the mute envelope does not make the wire silent: it advances only
+// when a packet is processed, and its gain applies ahead of the per-output
+// delay lines and consumer queues.  Disruptive brackets therefore wait on
+// pipeline_fade_to_silence_poll(), which reports true only once rendered
+// zeros have had time to reach the wire; when no producer is running (no
+// packet will ever advance the envelope) it latches the envelope at zero
+// instead.  Call paths, ordering against the DAC hardware mute, and the full
+// design: Documentation/current_architecture.md "Preset-Switch Mute &
+// Pipeline Reset" and Documentation/Features/silent_state_changes_spec.md.
+// ---------------------------------------------------------------------------
+
+// Soft-mute request refresh window, in rendered audio.  The waiter refreshes
+// it every iteration; this only has to outlast the gap between the last
+// refresh and prepare_pipeline_reset() taking ownership.  Kept short so a
+// fade that is armed and then abandoned unmutes promptly.
+#define PIPELINE_FADE_REQUEST_MS    40u
+// Post-fade dwell, in samples of output: a full consumer pool
+// (PICO_AUDIO_SPDIF_DMA_SAMPLE_COUNT per buffer) plus a couple of producer
+// blocks still in the connection.  The longest active output delay line is
+// added on top at runtime, and the whole thing is converted to a wall-clock
+// deadline at the live sample rate, so 44.1 / 48 / 96 kHz all wait the same
+// amount of AUDIO rather than the same amount of time.
+#define PIPELINE_FADE_DRAIN_SAMPLES \
+    ((uint32_t)(SPDIF_CONSUMER_BUFFER_COUNT * PICO_AUDIO_SPDIF_DMA_SAMPLE_COUNT) + 2u * 192u)
+// Fixed margin on top, covering scheduling slack in the settle loop.
+#define PIPELINE_FADE_DRAIN_MARGIN_MS 4u
+// Defensive cap on the whole settle (fade + drain), for a producer that
+// stalls after being declared live.  Comfortably above the worst real case
+// (8 ms fade + ~30 ms of queue + 42 ms of delay line).
+#define PIPELINE_FADE_CAP_US    200000u
+// A fade that has not been polled for this long belongs to an abandoned
+// operation; the next poll starts a fresh one rather than inheriting its
+// "already silent" verdict.
+#define PIPELINE_FADE_STALE_US   50000u
+// Dwell held at zero after the synchronized restart, before the envelope
+// ramps back up: long enough for the consumer pools to refill from empty
+// (~16 ms of audio per slot) with margin.  Any configured DAC hardware-mute
+// release dwell is added on top at runtime.
+#define PIPELINE_POST_RESET_MUTE_MS 24u
+
+static uint64_t fade_last_poll_us = 0;
+static uint64_t fade_start_us = 0;
+static uint64_t fade_drain_deadline_us = 0;
+static bool fade_drain_armed = false;
+// Set when a settle has run to completion and cleared as soon as the envelope
+// is seen above zero again.  Lets a nested or back-to-back prepare (a handler
+// that runs process_type_switches() and then another bracket, say) skip a
+// second fade+drain instead of paying the dwell again for a wire that is
+// already silent.  Deliberately NOT inferred from the envelope alone: an
+// envelope pinned at zero by a freshly armed mute (usb_audio.c's stream-restart
+// re-arm) has not necessarily flushed the delay lines yet.
+static bool pipeline_wire_silent = false;
+
+// Discard the in-flight settle's progress (not the wire-silent latch, which
+// tracks the state of the outputs rather than of any one operation).
+static void pipeline_fade_reset(void) {
+    fade_drain_armed = false;
+    fade_drain_deadline_us = 0;
+    fade_last_poll_us = 0;
+    fade_start_us = 0;
+}
+
+// True while something is actually feeding process_input_block(); mirrors the
+// producer set the main loop services (and the generator's idle pump, which
+// is what fills the pools when no source is streaming).
+static bool pipeline_producer_is_streaming(void) {
+    extern volatile bool sync_started;
+    if (active_input_source == INPUT_SOURCE_USB && sync_started) return true;
+    if (input_source_is_spdif(active_input_source) &&
+        spdif_input_get_state() == SPDIF_INPUT_LOCKED) return true;
+    if (active_input_source == INPUT_SOURCE_I2S &&
+        i2s_input_get_state() == I2S_INPUT_RUNNING) return true;
+#if PICO_RP2350
+    if (active_input_source == INPUT_SOURCE_ADAT &&
+        adat_input_get_state() == ADAT_INPUT_LOCKED) return true;
+#endif
+    // The generator's idle pump counts only when it would actually run:
+    // siggen_pump() refuses while a source change or type switch is in
+    // flight, and (for non-USB sources) while preset_loading is set, since
+    // that flag is those sources' prefill handshake.  Claiming it as a live
+    // producer in those cases would leave the settle waiting for packets
+    // that never come.
+    if (siggen_running && !input_source_change_pending &&
+        !output_type_switch_in_progress &&
+        !(preset_loading && active_input_source != INPUT_SOURCE_USB)) return true;
+    return false;
+}
+
+// One service pass over whatever is producing blocks.  Used by the blocking
+// spin in prepare_pipeline_reset(); the non-blocking gate relies on the main
+// loop's own calls instead.
+static void pipeline_service_producer(void) {
+    if (active_input_source == INPUT_SOURCE_USB) {
+        usb_audio_drain_ring();
+    } else if (input_source_is_spdif(active_input_source)) {
+        spdif_input_poll();
+#if PICO_RP2350
+    } else if (active_input_source == INPUT_SOURCE_ADAT) {
+        adat_input_poll();
+#endif
+    } else if (active_input_source == INPUT_SOURCE_I2S) {
+        i2s_input_poll();
+    }
+    // Generator audio has to fade out like any other source, and the pump is
+    // the only block source when no input is streaming.  No-op when idle.
+    siggen_pump();
+}
+
+static bool pipeline_fade_to_silence_poll(void) {
+    const uint64_t now = time_us_64();
+    if (fade_last_poll_us != 0 && (now - fade_last_poll_us) > PIPELINE_FADE_STALE_US) {
+        pipeline_fade_reset();
+    }
+    if (fade_start_us == 0) fade_start_us = now;
+    fade_last_poll_us = now;
+
+    // Audio came back since the last completed settle: this fade starts over.
+    if (!pipeline_mute_is_silent()) pipeline_wire_silent = false;
+
+    uint32_t fs = audio_state.freq ? audio_state.freq : 48000u;
+    pipeline_request_soft_mute(samples_for_duration_ms(fs, PIPELINE_FADE_REQUEST_MS));
+
+    // Already silent all the way to the wire from an earlier settle.
+    if (pipeline_wire_silent) return true;
+
+    if (!pipeline_producer_is_streaming()) {
+        // Nothing to fade, and no packet will arrive to advance the envelope.
+        pipeline_latch_mute_silence();
+        pipeline_wire_silent = true;
+        return true;
+    }
+
+    // Defensive: a producer that was declared live but stopped delivering.
+    if ((now - fade_start_us) > PIPELINE_FADE_CAP_US) {
+        pipeline_latch_mute_silence();
+        pipeline_wire_silent = true;
+        return true;
+    }
+
+    if (!fade_drain_armed) {
+        if (!pipeline_mute_is_silent()) return false;
+        // The envelope reached zero; now let those zeros reach the wire.
+        uint64_t drain_samples =
+            (uint64_t)PIPELINE_FADE_DRAIN_SAMPLES + pipeline_max_active_delay_samples();
+        uint32_t drain_ms = PIPELINE_FADE_DRAIN_MARGIN_MS +
+            (uint32_t)((drain_samples * 1000u + fs - 1u) / fs);
+        fade_drain_deadline_us = now + (uint64_t)drain_ms * 1000u;
+        fade_drain_armed = true;
+    }
+
+    if ((int64_t)(now - fade_drain_deadline_us) < 0) return false;
+
+    pipeline_latch_mute_silence();
+    pipeline_wire_silent = true;
+    return true;
+}
+
+// Blocking form of the fade: spin on the state machine while servicing the
+// producer, so the packets the fade needs keep coming even though the main
+// loop is not running.  Returns as soon as the wire is silent; immediate for
+// callers that already settled and when no producer is running.  Bounded by
+// PIPELINE_FADE_CAP_US.
+static void pipeline_settle_to_silence(void) {
+    while (!pipeline_fade_to_silence_poll()) {
+        pipeline_service_producer();
+        tight_loop_contents();
+    }
+}
+
 // Phase 1: prepare for disruptive pipeline work.
-// Waits for Core 1 EQ worker to finish, arms the audio soft-mute
-// envelope, then asserts the DAC hardware mute (if configured) and
-// holds for the user-configured hold_ms.  The order is intentional:
-// the software mute state is visible before disruptive work begins,
-// and the hardware mute gives the DAC chip's analog output time to
-// ramp down before the caller stops BCK/LRCLK.  Together they cover
-// both failure modes — data-path discontinuity and analog DC-step on
-// clock cessation.  Hardware mute is a no-op when disabled (zero-cost
-// when not configured).
+// Order is load-bearing: fade the wire to observed silence first, fence the
+// Core 1 EQ worker after the fade (the settle keeps dispatching EQ work),
+// arm the operation's own mute, and only then assert the DAC hardware mute;
+// an analog mute engaged before the digital fade completes truncates the
+// ramp it exists to cover.  The matching fade back up is armed by
+// complete_pipeline_reset() Phase 3.5; prefill-handshake paths fade up
+// through the audio they prefill.  Full ordering rationale:
+// Documentation/current_architecture.md "DAC Hardware Mute".
 static void prepare_pipeline_reset(uint32_t mute_samples) {
+    pipeline_settle_to_silence();
+
     if (core1_mode == CORE1_MODE_EQ_WORKER) {
         while (core1_eq_work.work_ready && !core1_eq_work.work_done)
             tight_loop_contents();
         __dmb();
+    }
+    // Floor the operation's mute at the post-restart dwell.  The default
+    // PRESET_MUTE_SAMPLES is ~5 ms of audio; if anything produces packets
+    // between here and complete_pipeline_reset() (the flash bracket's settle
+    // loop does), a counter that short expires mid-operation and the envelope
+    // starts fading back up into the disruptive window.
+    {
+        uint32_t min_samples = samples_for_duration_ms(
+            audio_state.freq ? audio_state.freq : 48000u,
+            PIPELINE_POST_RESET_MUTE_MS);
+        if (mute_samples < min_samples) mute_samples = min_samples;
     }
     preset_mute_counter = mute_samples;
     preset_loading = true;
@@ -833,6 +1026,17 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
     i2s_prefilling = false;
     adat_prefilling = false;
     __dmb();
+
+    // preset_loading now owns the mute, so drop the fade request (it would
+    // otherwise keep the envelope down for its full refresh window after the
+    // operation) and clear the state machine for the next operation.  The
+    // envelope itself stays latched at zero; the hand-off is seamless.
+    pipeline_clear_soft_mute_request();
+    pipeline_fade_reset();
+
+    // Hardware mute after the digital fade, never before it: an analog mute
+    // engaged while the signal is still at full level cuts the very ramp it
+    // exists to cover, and the step reappears when the pin deasserts.
     dac_hw_mute_assert();
 
     // preset_loading must outlive any pending hardware-mute hold.  The soft
@@ -901,7 +1105,16 @@ static void prepare_pipeline_reset(uint32_t mute_samples) {
 // until the body runs.  The body's prepare also fences Core 1 after the body's
 // final usb_audio_drain_ring().  The body's complete_pipeline_reset() (or the
 // SPDIF lock-block release) owns the matching dac_hw_mute_release().
+//
+// The gate runs in two stages.  Stage 1 fades the outputs to silence via
+// pipeline_fade_to_silence_poll(), which uses its own mute request and so
+// leaves preset_loading alone (the prefill-ordering argument above is
+// unaffected); the handler body stays skipped, so the main loop keeps
+// producing the packets the fade needs.  Stage 2 then asserts the DAC
+// hardware mute and waits out its hold, so the analog ramp starts from
+// silence.
 static bool pipeline_reset_ready(void) {
+    if (!pipeline_fade_to_silence_poll()) return false;
     dac_hw_mute_assert();
     return dac_hw_mute_hold_elapsed();
 }
@@ -1110,6 +1323,26 @@ static void complete_pipeline_reset(void) {
     // for the (bounded) race with the SOF ISR.
     reset_usb_feedback_loop();
 
+    // Phase 3.5: arm the fade back up.  Hold the envelope at zero until the
+    // just-restarted pools refill and the DAC mute pin deasserts; a ramp that
+    // starts earlier runs into a starved pool or completes under the analog
+    // mute (see current_architecture.md "Preset-Switch Mute", fade back up).
+    // Floor only, never a shortening: the prefill handshakes own their own
+    // unmute, and the flash bracket's longer window is left intact.  Without
+    // preset_loading set (a completion with no matching prepare) the dwell
+    // goes through the fade request, which cannot be mistaken for a
+    // prefill-handshake signal.
+    {
+        uint32_t fs = audio_state.freq ? audio_state.freq : 48000u;
+        uint32_t dwell = samples_for_duration_ms(
+            fs, PIPELINE_POST_RESET_MUTE_MS + (uint32_t)dac_hw_mute_release_ms());
+        if (preset_loading) {
+            if (preset_mute_counter < dwell) preset_mute_counter = dwell;
+        } else {
+            pipeline_request_soft_mute(dwell);
+        }
+    }
+
     // Phase 4: begin hardware-mute release.  Order is critical: clocks
     // must be running (Phase 2 completed) BEFORE the mute pin deasserts.
     // If release_ms > 0, dac_hw_mute_release() leaves the pin asserted
@@ -1280,48 +1513,17 @@ static void prepare_flash_write_operation(void) {
     prepare_pipeline_reset(samples_for_duration_ms(audio_state.freq,
                                                    FLASH_WRITE_PREMUTE_MS));
 
-    // During the fade-out settle window, keep servicing the active input
-    // source so the output consumer pools stay fed (with muted samples)
-    // until the envelope reaches zero.  Prior to this fix, the settle loop
-    // only drained the USB ring — for SPDIF input the RX FIFO filled and
-    // overflowed and the output pools drained, producing post-save pops.
-    //
-    // The loop also absorbs the DAC hardware-mute hold armed by
-    // prepare_pipeline_reset() above: it runs until BOTH the settle window
-    // and dac_hw_mute_hold_elapsed() are satisfied, so the DAC has its full
-    // ramp time before complete_flash_write_operation_full() stops the clocks.
-    // Flash writes are inherently blocking (≈45 ms IRQ-off), so unlike the
-    // deferred main-loop reset handlers there is nothing to yield to here —
-    // folding the hold into the existing settle wait adds no blocking beyond
-    // max(settle, hold), and keeps the pipeline fed throughout.  When not
-    // streaming the loop is skipped: there is no audio, so no clock-stop
-    // thump and no hold to honor.
-    extern volatile bool sync_started;
-    bool usb_streaming   = (active_input_source == INPUT_SOURCE_USB) && sync_started;
-    bool spdif_streaming = (input_source_is_spdif(active_input_source)) &&
-                           (spdif_input_get_state() == SPDIF_INPUT_LOCKED);
-    bool i2s_streaming   = (active_input_source == INPUT_SOURCE_I2S) &&
-                           (i2s_input_get_state() == I2S_INPUT_RUNNING);
-    bool adat_streaming  = false;
-#if PICO_RP2350
-    adat_streaming = (active_input_source == INPUT_SOURCE_ADAT) &&
-                     (adat_input_get_state() == ADAT_INPUT_LOCKED);
-#endif
-    if (usb_streaming || spdif_streaming || i2s_streaming || adat_streaming) {
+    // The fade already ran inside prepare_pipeline_reset(); this loop does
+    // not own it.  It keeps the consumer pools topped up with muted samples
+    // right up to the blackout (the SPDIF completion path relies on that
+    // pre-fill) and absorbs the DAC hardware-mute hold so the DAC has its
+    // full ramp time before the clocks stop.  Skipped when nothing streams:
+    // no audio, so no hold to honor.
+    if (pipeline_producer_is_streaming()) {
         uint64_t start_us = time_us_64();
         while ((time_us_64() - start_us) < FLASH_WRITE_FADE_SETTLE_US
                || !dac_hw_mute_hold_elapsed()) {
-            if (active_input_source == INPUT_SOURCE_USB) {
-                usb_audio_drain_ring();
-            } else if (input_source_is_spdif(active_input_source)) {
-                spdif_input_poll();
-#if PICO_RP2350
-            } else if (active_input_source == INPUT_SOURCE_ADAT) {
-                adat_input_poll();
-#endif
-            } else {
-                i2s_input_poll();
-            }
+            pipeline_service_producer();
             tight_loop_contents();
         }
     }
@@ -1398,30 +1600,25 @@ static void resume_i2s_after_flash(void) {
 // or hand the equivalent synchronized restart to the active input's own
 // prefill/re-lock handshake (SPDIF/I2S/ADAT).
 //
-// This used to be split into this "full" path (preset save/delete, legacy
-// save) and a "light" path for metadata-only writes (names, startup flags,
-// config modes, control surfaces, control interfaces, DAC mute config) that
-// skipped the output rebuild because DSP/output topology was unchanged.  The
-// light path is gone; here is why.  During the ~45 ms flash IRQ blackout the
-// output DMA handlers cannot re-arm, the PIO TX FIFOs drain within tens of
-// microseconds of the in-flight buffer completing, and every output SM stalls
-// with BCK/LRCLK/DATA frozen mid-frame.  The light path then resumed those
-// clocks mid-frame with no DAC mute cycle and no restart.  External DACs that
-// derive their system clock from BCK (e.g. PCM5102 with SCK grounded, BCK PLL
-// mode) can come out of that halt mis-locked and render every subsequent,
-// perfectly correct sample as full-scale distortion until the clocks are
-// stopped and restarted cleanly.  Field-reported as persistent "full scale
-// noise resembling the music" after a preset rename and after a Control
-// Surface save, fixed only by pressing preset save (which took this path).
-// Interim mitigation until the silent-state-changes design (outputs keep
-// clocking through the flash window) is implemented: every flash write ends
-// in a synchronized output restart.  The restart preserves the inviolable
-// inter-slot alignment (synchronized SM start) and complete_pipeline_reset()
-// releases the DAC hardware mute on the USB path; for SPDIF/I2S/ADAT inputs
-// the lingering preset_loading hands both the output restart and the mute
-// release to the source's prefill/lock handshake, exactly as preset save
-// always has.
+// Do not reintroduce a lighter completion that skips the restart: a
+// metadata-only "light" path once resumed halted clocks mid-frame and left
+// BCK-PLL DACs (PCM5102 with SCK grounded) persistently mis-locked in the
+// field.  The clocks no longer halt (selective blackout), but this unified
+// completion is still what refills the drained pools from a deterministic
+// synchronized state and is the shared owner of the feedback reset and the
+// DAC mute release; dropping the restart for topology-unchanged writes is
+// the separate no-teardown-completions work.  Full history and rationale:
+// Documentation/current_architecture.md "Flash Operation Safety".
 static void complete_flash_write_operation_full(void) {
+#if PICO_RP2350
+    // The slots counted a starvation per silence buffer through the window,
+    // but ADAT's own IRQ-less ring free-ran for the same span and is not
+    // behind; mirroring the backlog would push the ADAT-to-slot offset the
+    // wrong way.  Drop it; the synchronized restart below (or the SPDIF
+    // prefill's enable_outputs_in_sync()) re-canonicalizes via a resync.
+    adat_output_rebaseline_starvations();
+#endif
+
     // Restart SPDIF RX if prepare_flash_write_operation() suspended it.
     // The lock-acquisition block in the main loop will drain outputs and
     // run the prefill handshake once RX re-locks.
@@ -1434,11 +1631,9 @@ static void complete_flash_write_operation_full(void) {
     resume_i2s_after_flash();
 
     if (input_source_is_spdif(active_input_source)) {
-        // For SPDIF input: the pre-flash settle loop pre-filled the output
-        // consumer pools with muted samples.  The blackout stopped DMA
-        // chaining after ~one buffer, leaving the remaining pool buffers
-        // intact to play out silence as DMA resumes.  We skip
-        // complete_pipeline_reset() — draining the pools here would force
+        // For SPDIF input: the slots played continuous silence across the
+        // window (pre-filled pools, then the framed silence buffers).  Skip
+        // complete_pipeline_reset(); draining the pools here would force
         // outputs to restart against an empty pool, causing pops and
         // uneven inter-slot fill.  The hardware mute is likewise left asserted;
         // the lock-acquisition prefill path re-enables outputs in sync after
@@ -3446,6 +3641,10 @@ int main(void) {
             spdif_rx_pin_change_pending = false;
             if (input_source_is_spdif(active_input_source) &&
                 spdif_input_get_state() != SPDIF_INPUT_INACTIVE) {
+                // Fade before stopping the receiver: once RX is down the
+                // producer is gone and prepare_pipeline_reset()'s settle has
+                // nothing left to fade with, so the swap would cut live audio.
+                pipeline_settle_to_silence();
                 spdif_input_stop();
                 spdif_prefilling = false;
                 // Restart on the new pin; outputs stay muted until lock
@@ -3463,6 +3662,9 @@ int main(void) {
 #if PICO_RP2350
             if (active_input_source == INPUT_SOURCE_ADAT &&
                 adat_input_get_state() != ADAT_INPUT_INACTIVE) {
+                // Fade first, for the same reason as the SPDIF pin swap
+                // above: stopping the receiver removes the producer.
+                pipeline_settle_to_silence();
                 adat_input_stop();
                 adat_prefilling = false;
                 prepare_pipeline_reset(PRESET_MUTE_SAMPLES);

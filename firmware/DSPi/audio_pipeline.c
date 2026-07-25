@@ -130,6 +130,19 @@ static int32_t vol_mul_master_prev_q15 = 0;
 #define PRESET_MUTE_TRANSITION_MS 8u
 static float preset_mute_smooth_gain = 1.0f;  // 1.0 = full level, 0.0 = muted
 
+// Second, independent mute request used by the pipeline-reset fade-out
+// (main.c: pipeline_fade_to_silence_poll).  It drives the SAME envelope to
+// zero but deliberately does NOT touch `preset_loading`, because that flag
+// doubles as the SPDIF/I2S/ADAT prefill-handshake signal: setting it before
+// the reset body runs would make the main-loop lock blocks tear the outputs
+// down at the wrong moment (see pipeline_reset_ready() in main.c).
+//
+// It is a sample countdown rather than a plain flag so an abandoned fade
+// (a pending handler that is cleared without ever running the reset) always
+// self-heals: the request expires and the envelope fades back up.  The
+// requester refreshes it every main-loop iteration while it waits.
+static volatile uint32_t preset_mute_request_counter = 0;
+
 static inline uint32_t preset_mute_transition_samples(uint32_t sample_rate_hz) {
     uint64_t samples = ((uint64_t)sample_rate_hz * PRESET_MUTE_TRANSITION_MS + 999u) / 1000u;
     if (samples < 1u) samples = 1u;
@@ -137,12 +150,50 @@ static inline uint32_t preset_mute_transition_samples(uint32_t sample_rate_hz) {
     return (uint32_t)samples;
 }
 
+void pipeline_request_soft_mute(uint32_t samples) {
+    if (samples == 0) samples = 1;
+    preset_mute_request_counter = samples;   // refresh, never accumulate
+    __dmb();
+}
+
+void pipeline_clear_soft_mute_request(void) {
+    preset_mute_request_counter = 0;
+    __dmb();
+}
+
+bool pipeline_mute_is_silent(void) {
+    return preset_mute_smooth_gain <= 0.0f;
+}
+
+void pipeline_latch_mute_silence(void) {
+    // Pin both the envelope and the per-packet ramp's starting value at zero.
+    // Wall-clock time cannot advance the envelope (it only moves when a packet
+    // is processed), so without this a reset performed while no producer is
+    // running would let the first packet after the operation start its ramp
+    // from the pre-fade gain.
+    preset_mute_smooth_gain = 0.0f;
+#if PICO_RP2350
+    vol_mul_master_prev = 0.0f;
+#else
+    vol_mul_master_prev_q15 = 0;
+#endif
+}
+
+uint32_t pipeline_max_active_delay_samples(void) {
+    int32_t max_delay = 0;
+    for (int i = 0; i < NUM_DELAY_CHANNELS; i++) {
+        if (channel_delay_samples[i] > max_delay) max_delay = channel_delay_samples[i];
+    }
+    return (uint32_t)max_delay;
+}
+
 static inline float update_preset_mute_envelope(uint32_t sample_count, uint32_t sample_rate_hz) {
     // Latch current mute state for THIS packet so the final muted packet
     // remains fully in the fade-out direction even when the counter expires.
-    bool mute_active_for_packet = preset_loading;
+    bool request_active = (preset_mute_request_counter > 0);
+    bool mute_active_for_packet = preset_loading || request_active;
 
-    if (mute_active_for_packet) {
+    if (preset_loading) {
         if (preset_mute_counter > sample_count) {
             preset_mute_counter -= sample_count;
         } else {
@@ -150,10 +201,20 @@ static inline float update_preset_mute_envelope(uint32_t sample_count, uint32_t 
             preset_loading = false;
         }
     }
+    if (request_active) {
+        if (preset_mute_request_counter > sample_count) {
+            preset_mute_request_counter -= sample_count;
+        } else {
+            preset_mute_request_counter = 0;
+        }
+    }
 
     float target = mute_active_for_packet ? 0.0f : 1.0f;
     if (sample_count == 0) {
-        preset_mute_smooth_gain = target;
+        // Nothing is rendered by a zero-length packet, so the envelope must
+        // not move: snapping it to the target here used to let an empty
+        // packet skip the fade back up, so the next real packet ramped to
+        // full level within its own length instead of over the 8 ms window.
         return preset_mute_smooth_gain;
     }
 
