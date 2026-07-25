@@ -1183,6 +1183,8 @@ static inline uint32_t flash_mute_hold_samples(void) {
 //   - ICER/ISER are written directly, never via irq_set_mask_n_enabled():
 //     the SDK helper clears pending bits on re-enable, and IRQs latched
 //     during the window must survive to be serviced after it.
+//   - (RP2350) NVIC word 1 must be masked too: UART/I2C control ISRs live
+//     there and are flash-resident, so one firing mid-window faults.
 //   - In IRQ context NVIC masking cannot guarantee the DMA handlers preempt
 //     the current exception frame, so the PRIMASK fallback stays (defensive;
 //     every runtime flash write is deferred to the main loop).
@@ -1195,17 +1197,22 @@ _Static_assert((DMA_IRQ_0 + PICO_AUDIO_SPDIF_DMA_IRQ) < 32 &&
      (1u << (DMA_IRQ_0 + PICO_AUDIO_I2S_DMA_IRQ)))
 
 // The register shape differs per core: RP2040 (M0+) has scalar iser/icer,
-// RP2350 (M33) has iser[2]/icer[2].  Both output DMA IRQ numbers are below 32
-// on both platforms (asserted above), so only word 0 is ever touched.
+// RP2350 (M33) has iser[2]/icer[2].  The keep mask lives entirely in word 0
+// (asserted above); on RP2350 word 1 is masked wholesale.
 #if PICO_RP2350
-#define FLASH_BLACKOUT_ISER  (nvic_hw->iser[0])
-#define FLASH_BLACKOUT_ICER  (nvic_hw->icer[0])
+#define FLASH_BLACKOUT_ISER   (nvic_hw->iser[0])
+#define FLASH_BLACKOUT_ICER   (nvic_hw->icer[0])
+#define FLASH_BLACKOUT_ISER1  (nvic_hw->iser[1])
+#define FLASH_BLACKOUT_ICER1  (nvic_hw->icer[1])
 #else
 #define FLASH_BLACKOUT_ISER  (nvic_hw->iser)
 #define FLASH_BLACKOUT_ICER  (nvic_hw->icer)
 #endif
 
 static uint32_t flash_blackout_saved_iser = 0;
+#if PICO_RP2350
+static uint32_t flash_blackout_saved_iser1 = 0;
+#endif
 static uint32_t flash_blackout_primask = 0;
 static bool     flash_blackout_used_primask = false;
 
@@ -1218,6 +1225,11 @@ static void __no_inline_not_in_flash_func(flash_irq_blackout_begin)(void) {
         return;
     }
     flash_blackout_used_primask = false;
+#if PICO_RP2350
+    // Word 1 first, reverse of the restore order below.
+    flash_blackout_saved_iser1 = FLASH_BLACKOUT_ISER1;
+    FLASH_BLACKOUT_ICER1 = flash_blackout_saved_iser1;
+#endif
     flash_blackout_saved_iser = FLASH_BLACKOUT_ISER;
     FLASH_BLACKOUT_ICER = flash_blackout_saved_iser & ~FLASH_BLACKOUT_KEEP_MASK;
     __dsb();
@@ -1231,8 +1243,14 @@ static void __no_inline_not_in_flash_func(flash_irq_blackout_end)(void) {
         return;
     }
     // Writing 1s re-enables exactly what was enabled; pending bits latched
-    // during the window are preserved.
+    // during the window are preserved.  Word 0 first: an IRQ enabled by the
+    // first write can preempt before the second lands (the barriers do not
+    // gate preemption), and a pending word-1 UART/I2C handler must find the
+    // core IRQs already restored.
     FLASH_BLACKOUT_ISER = flash_blackout_saved_iser;
+#if PICO_RP2350
+    FLASH_BLACKOUT_ISER1 = flash_blackout_saved_iser1;
+#endif
     __dsb();
     __isb();
 }
