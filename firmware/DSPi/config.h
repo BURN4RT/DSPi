@@ -833,6 +833,7 @@ typedef struct {
     float sva1, sva2, sva3;                    // integrator coefficients
     float svm0, svm1, svm2;                    // output mix coefficients
     float svic1eq, svic2eq;                    // integrator state
+    float g;                                   // frequency warped cutoff frequency
     uint32_t svf_type;                         // FilterType enum for inner loop specialization
 
     bool use_svf;                              // true = SVF path, false = biquad path
