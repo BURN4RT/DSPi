@@ -32,6 +32,8 @@
 #include "crossover.h"
 #include "config.h"
 #include "dsp_pipeline.h"   // Biquad layout, FILTER_SHIFT, FILTER_LOWPASS/HIGHPASS
+#include "dsp_svf.h"
+#include "dsp_biquad.h"
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846f
@@ -265,6 +267,7 @@ static void biquad_assign_2nd_order_rp2350(Biquad *bq,
         bq->sva1 = sva1;
         bq->sva2 = sva2;
         bq->sva3 = sva3;
+        bq->g = g;
         if (is_hp) {
             bq->svm0 = 1.0f; bq->svm1 = -k; bq->svm2 = -1.0f;
             bq->svf_type = FILTER_HIGHPASS;
@@ -319,6 +322,8 @@ static void biquad_assign_1st_order_rp2350(Biquad *bq,
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
 
+    bq->svf_first_order = true;
+
     if (bq->use_svf) {
         // One-pole TPT SVF.  g = sigma_real/(2*Fs) is the prewarped one-pole
         // gain (same direct form as the 2nd-order section; avoids an atan->tan
@@ -336,13 +341,11 @@ static void biquad_assign_1st_order_rp2350(Biquad *bq,
             bq->svm0 = 0.0f; bq->svm1 = 1.0f; bq->svm2 = 0.0f;   // out = lp
             bq->svf_type = FILTER_LOWPASS1;
         }
-        bq->svf_first_order = true;
         bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;
         bq->bypass = false;
         return;
     }
 
-    bq->svf_first_order = false;
     float K  = 2.0f * Fs;
     float A0 = K + sigma_real;
     float A1 = sigma_real - K;
@@ -747,74 +750,18 @@ static inline void apply_section_block(Biquad * __restrict bq,
         float *sp = samples;
 
         if (bq->svf_first_order) {
-            // One-pole TPT SVF (1st-order crossover section): multiply-only.
-            for (uint32_t i = 0; i < count; i++) {
-                float in = *sp;
-                float v1 = a2 * in + a1 * ic1eq;
-                ic1eq = 2.0f * v1 - ic1eq;
-                *sp++ = m0 * in + m1 * v1 + m2 * (in - v1);
-            }
-            bq->svic1eq = ic1eq;
+            dsp_svf_first_order(bq, samples, count);
             return;
         }
-
-        switch (bq->svf_type) {
-            case FILTER_LOWPASS:
-                for (uint32_t i = 0; i < count; i++) {
-                    float in = *sp;
-                    float v3 = in - ic2eq;
-                    float v1 = a1 * ic1eq + a2 * v3;
-                    float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                    ic1eq = 2.0f * v1 - ic1eq;
-                    ic2eq = 2.0f * v2 - ic2eq;
-                    *sp++ = v2;
-                }
-                break;
-            case FILTER_HIGHPASS:
-                for (uint32_t i = 0; i < count; i++) {
-                    float in = *sp;
-                    float v3 = in - ic2eq;
-                    float v1 = a1 * ic1eq + a2 * v3;
-                    float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                    ic1eq = 2.0f * v1 - ic1eq;
-                    ic2eq = 2.0f * v2 - ic2eq;
-                    *sp++ = in + m1 * v1 - v2;
-                }
-                break;
-            default:
-                // Crossover sections only emit LP or HP types — fall back to
-                // the general SVF output mix for robustness if something
-                // upstream sets an unexpected svf_type.
-                for (uint32_t i = 0; i < count; i++) {
-                    float in = *sp;
-                    float v3 = in - ic2eq;
-                    float v1 = a1 * ic1eq + a2 * v3;
-                    float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                    ic1eq = 2.0f * v1 - ic1eq;
-                    ic2eq = 2.0f * v2 - ic2eq;
-                    *sp++ = m0 * in + m1 * v1 + m2 * v2;
-                }
-                break;
-        }
-        bq->svic1eq = ic1eq;
-        bq->svic2eq = ic2eq;
+        dsp_svf_second_order(bq, samples, count);
         return;
     }
 
-    // TDF2 biquad
-    float b0 = bq->b0, b1 = bq->b1, b2 = bq->b2;
-    float a1 = bq->a1, a2 = bq->a2;
-    float s1 = bq->s1, s2 = bq->s2;
-    float *sp = samples;
-    for (uint32_t i = 0; i < count; i++) {
-        float in = *sp;
-        float out = b0 * in + s1;
-        s1 = b1 * in - a1 * out + s2;
-        s2 = b2 * in - a2 * out;
-        *sp++ = out;
+    if(bq->svf_first_order) {
+        dsp_biquad_first_order(bq, samples, count);
+        return;
     }
-    bq->s1 = s1;
-    bq->s2 = s2;
+    dsp_biquad_second_order(bq, samples, count);
 }
 
 DSP_TIME_CRITICAL
