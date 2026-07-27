@@ -52,6 +52,48 @@ static inline void dsp_biquad_first_order(Biquad * __restrict bq, float * __rest
             }
             break;
 
+        case FILTER_LOWPASS1:
+            //optimise b0=b1
+            while(blk_count > 0) {
+                x = sp[0];
+                t = b0 * x;
+                y = t + s1;
+                s1 = t - a1 * y;
+                sp[0] = y;
+
+                x = sp[1];
+                t = b0 * x;
+                y = t + s1;
+                s1 = t - a1 * y;
+                sp[1] = y;
+
+                x = sp[2];
+                t = b0 * x;
+                y = t + s1;
+                s1 = t - a1 * y;
+                sp[2] = y;
+
+                x = sp[3];
+                t = b0 * x;
+                y = t + s1;
+                s1 = t - a1 * y;
+                sp[3] = y;
+
+                sp += 4;
+                blk_count--;
+            }
+
+            blk_count = count & 0x3;
+            while(blk_count > 0) {
+                x = *sp;
+                t = b0 * x;
+                y = t + s1;
+                s1 = t - a1 * y;
+                *sp++ = y;
+                blk_count--;
+            }
+            break;
+
         default:
             while(blk_count > 0) {
                 x = sp[0];

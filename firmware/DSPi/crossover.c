@@ -331,10 +331,10 @@ static void biquad_assign_1st_order_rp2350(Biquad *bq,
         bq->sva3 = 0.0f;
         if (is_hp) {
             bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 1.0f;   // out = in - lp
-            bq->svf_type = FILTER_HIGHPASS;
+            bq->svf_type = FILTER_HIGHPASS1;
         } else {
             bq->svm0 = 0.0f; bq->svm1 = 1.0f; bq->svm2 = 0.0f;   // out = lp
-            bq->svf_type = FILTER_LOWPASS;
+            bq->svf_type = FILTER_LOWPASS1;
         }
         bq->svf_first_order = true;
         bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;

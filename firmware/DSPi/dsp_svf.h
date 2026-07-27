@@ -17,6 +17,77 @@ static inline void dsp_svf_first_order(Biquad * __restrict bq, float * __restric
     switch (bq->svf_type)
     {
         // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
+        // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
+        case FILTER_LOWPASS1:
+            while(blk_count > 0) {
+                v0 = sp[0];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[0] = v1;
+
+                v0 = sp[1];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[1] = v1;
+
+                v0 = sp[2];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[2] = v1;
+
+                v0 = sp[3];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[3] = v1;
+
+                sp += 4;
+                blk_count--;
+            }
+            blk_count = count & 0x3;
+            while(blk_count > 0) {
+                v0 = *sp;
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                *sp++ = v1;
+                blk_count--;
+            }
+        break;
+
+        case FILTER_HIGHPASS1:
+            while(blk_count > 0) {
+                v0 = sp[0];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[0] = v0 - v1;
+
+                v0 = sp[1];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[1] = v0 - v1;
+
+                v0 = sp[2];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[2] = v0 - v1;
+
+                v0 = sp[3];
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                sp[3] = v0 - v1;
+
+                sp += 4;
+                blk_count--;
+            }
+            blk_count = count & 0x3;
+            while(blk_count > 0) {
+                v0 = *sp;
+                v1 = a2 * v0 + a1 * ic1eq;
+                ic1eq = v1 + v1 - ic1eq;
+                *sp++ = v0 - v1;
+                blk_count--;
+            }
+        break;
+
         case FILTER_ALLPASS1:
             while(blk_count > 0) {
 

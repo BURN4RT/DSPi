@@ -889,7 +889,11 @@ enum FilterType {
     // see peq_qp_x512[] and Documentation/Features/peq_filters.md.
     FILTER_LINKWITZ_TRANSFORM = 11,
 
-    // 12..31 reserved for future PEQ types.
+    // First order low/highpass
+    FILTER_LOWPASS1 = 12,
+    FILTER_HIGHPASS1 = 13,
+
+    // 14..31 reserved for future PEQ types.
 
     // Crossover filter types — indices 32..63. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.

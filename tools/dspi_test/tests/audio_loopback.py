@@ -46,7 +46,9 @@ FS = audio.DEFAULT_FS       # 48 kHz; DSPi follows the host USB rate
 
 # FilterType enum (firmware) by RBJ-reference name.
 TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5,
-        "notch": 6, "allpass": 7, "allpass1": 8, "lowshelf1": 9, "highshelf1": 10}
+        "notch": 6, "allpass": 7, "allpass1": 8, "lowshelf1": 9, "highshelf1": 10,
+        "lowpass1":12, "highpass1":13}
+
 FLAT = 0
 INPUT_USB = 0
 TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
@@ -60,6 +62,10 @@ TYPE_SWITCH_SETTLE_S = 2.0
 # straddle the RP2350 SVF/biquad boundary (Fs/7.5 ~= 6400 Hz @ 48 kHz).
 
 PEQ_CONFIGS = [
+    ("lowpass1_lo",   "lowpass1",      300.0, 0.707, 0.0),
+    ("lowpass1_hi",   "lowpass1",     9000.0, 0.707, 0.0),
+    ("highpass1_lo",  "highpass1",     300.0, 0.707, 0.0),
+    ("highpass1_hi",  "highpass1",    9000.0, 0.707, 0.0),
     ("peaking_lo",    "peaking",       300.0, 2.0,   6.0),
     ("peaking_hi",    "peaking",      9000.0, 2.0,   6.0),
     ("peaking_cut",   "peaking",      1000.0, 1.0,  -6.0),

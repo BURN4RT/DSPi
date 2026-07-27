@@ -143,7 +143,9 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
     // sections.  They can't use the 2nd-order SVF, but they DO follow the same
     // hybrid rule: a one-pole SVF below Fs/7.5 (svf_first_order) and a
     // degenerate TDF2 biquad above.
-    const bool is_first_order = (p->type == FILTER_ALLPASS1 ||
+    const bool is_first_order = (p->type == FILTER_LOWPASS1 ||
+                                 p->type == FILTER_HIGHPASS1 ||
+                                 p->type == FILTER_ALLPASS1 ||
                                  p->type == FILTER_LOWSHELF1 ||
                                  p->type == FILTER_HIGHSHELF1);
     bq->svf_first_order = bq->use_svf && is_first_order;
@@ -160,6 +162,10 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
             float g = tanf(3.1415926535f * p->freq / sample_rate);
             float svm0_f = 0.0f, svm1_f = 0.0f, svm2_f = 0.0f;
             switch (p->type) {
+                case FILTER_HIGHPASS1:  // out = in - v1
+                    svm0_f = 0.0f; svm1_f = 0.0f; svm2_f = 1.0f; break;
+                case FILTER_LOWPASS1:   // out = v1
+                    svm0_f = 0.0f; svm1_f = 1.0f; svm2_f = 0.0f; break;
                 case FILTER_ALLPASS1:   // out = 2*lp - in
                     svm0_f = 0.0f; svm1_f = 1.0f; svm2_f = -1.0f; break;
                 case FILTER_LOWSHELF1:  // 1st-order shelf prewarps by A, not sqrt(A)
@@ -297,6 +303,16 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
             a0_f = 1.0f + gp / lt_qp + gp * gp;
             a1_f = 2.0f * (gp * gp - 1.0f);
             a2_f = 1.0f - gp / lt_qp + gp * gp;
+            break;
+        }
+        case FILTER_LOWPASS1: {
+            b0_f = sn; b1_f = sn; b2_f = 0.0f;
+            a0_f = sn + 1.0f + cs; a1_f = sn - 1.0f - cs; a2_f = 0.0f;
+            break;
+        }
+        case FILTER_HIGHPASS1: {
+            b0_f = 1.0f + cs; b1_f = -1.0f - cs; b2_f = 0.0f;
+            a0_f = sn + 1.0f + cs; a1_f = sn - 1.0f - cs; a2_f = 0.0f;
             break;
         }
         default: break;
