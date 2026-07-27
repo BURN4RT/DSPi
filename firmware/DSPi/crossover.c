@@ -243,7 +243,7 @@ static void biquad_assign_2nd_order_rp2350(Biquad *bq,
         bq->s1 = 0.0f; bq->s2 = 0.0f;
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
-    bq->svf_first_order = false;   // 2nd-order section uses the 2-pole SVF path
+    bq->first_order = false;   // 2nd-order section uses the 2-pole SVF path
 
     if (bq->use_svf) {
         // Cytomic SVF (TPT). For a 2nd-order section with prewarped pole
@@ -322,7 +322,7 @@ static void biquad_assign_1st_order_rp2350(Biquad *bq,
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
 
-    bq->svf_first_order = true;
+    bq->first_order = true;
 
     if (bq->use_svf) {
         // One-pole TPT SVF.  g = sigma_real/(2*Fs) is the prewarped one-pole
@@ -610,7 +610,7 @@ void xover_design_filter(const EqParamPacket *recipe,
         old_ic1[i] = band->sections[i].svic1eq;
         old_ic2[i] = band->sections[i].svic2eq;
         old_svf[i] = band->sections[i].use_svf;
-        old_first_order[i] = band->sections[i].svf_first_order;
+        old_first_order[i] = band->sections[i].first_order;
 #endif
     }
 
@@ -657,13 +657,13 @@ void xover_design_filter(const EqParamPacket *recipe,
         // Restore surviving sections' state (the passthrough reset above
         // zeroed it). A section that was bypassed, dropped out of the new
         // cascade, or changed topology (SVF/TDF2 path, or 1st/2nd-order via
-        // svf_first_order) stays zeroed, matching the PEQ path-change convention.
+        // first_order) stays zeroed, matching the PEQ path-change convention.
         uint8_t keep = (band->num_sections < old_active)
                        ? band->num_sections : old_active;
         for (uint8_t i = 0; i < keep; i++) {
 #if PICO_RP2350
             if (band->sections[i].use_svf != old_svf[i] ||
-                band->sections[i].svf_first_order != old_first_order[i]) continue;
+                band->sections[i].first_order != old_first_order[i]) continue;
             band->sections[i].svic1eq = old_ic1[i];
             band->sections[i].svic2eq = old_ic2[i];
 #endif
@@ -749,7 +749,7 @@ static inline void apply_section_block(Biquad * __restrict bq,
         float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
         float *sp = samples;
 
-        if (bq->svf_first_order) {
+        if (bq->first_order) {
             dsp_svf_first_order(bq, samples, count);
             return;
         }
@@ -757,7 +757,7 @@ static inline void apply_section_block(Biquad * __restrict bq,
         return;
     }
 
-    if(bq->svf_first_order) {
+    if(bq->first_order) {
         dsp_biquad_first_order(bq, samples, count);
         return;
     }

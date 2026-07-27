@@ -90,7 +90,7 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
         bq->sva1 = 0.0f; bq->sva2 = 0.0f; bq->sva3 = 0.0f;
         bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 0.0f;
         bq->use_svf = false;
-        bq->svf_first_order = false;
+        bq->first_order = false;
 #else
         bq->b0 = 1 << FILTER_SHIFT; bq->b1 = 0; bq->b2 = 0; bq->a1 = 0; bq->a2 = 0;
 #endif
@@ -134,7 +134,7 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
 #if PICO_RP2350
     // SVF/biquad crossover decision + state reset on path change
     bool was_svf = bq->use_svf;
-    bool was_first_order = bq->svf_first_order;
+    bool was_first_order = bq->first_order;
     bq->use_svf = (p->freq < (sample_rate / 7.5f));
     // LT has two corner frequencies; both must sit below the SVF threshold,
     // otherwise fall back to the exact-bilinear biquad.
@@ -148,14 +148,14 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
                                  p->type == FILTER_ALLPASS1 ||
                                  p->type == FILTER_LOWSHELF1 ||
                                  p->type == FILTER_HIGHSHELF1);
-    bq->svf_first_order = bq->use_svf && is_first_order;
-    if (was_svf != bq->use_svf || was_first_order != bq->svf_first_order) {
+    bq->first_order = is_first_order;
+    if (was_svf != bq->use_svf || was_first_order != bq->first_order) {
         bq->s1 = 0.0f; bq->s2 = 0.0f;
         bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
     }
 
     if (bq->use_svf) {
-        if (bq->svf_first_order) {
+        if (bq->first_order) {
             // One-pole TPT SVF (1st-order types).  The 1/(1+g) reciprocal is
             // folded into sva1 so the inner loop is multiply-only; svic2eq is
             // unused (kept 0).  lp = v1, hp = in - v1.
@@ -422,7 +422,7 @@ float dsp_process_channel(Biquad * __restrict biquads, float input, uint8_t chan
         if (bq->bypass) continue;
 
         if (bq->use_svf) {
-            if (bq->svf_first_order) {
+            if (bq->first_order) {
                 // One-pole TPT SVF (1st-order). lp = v1, hp = sample - v1.
                 float v1 = bq->sva2 * sample + bq->sva1 * bq->svic1eq;
                 bq->svic1eq = 2.0f * v1 - bq->svic1eq;
@@ -455,12 +455,12 @@ void dsp_process_channel_block(Biquad * __restrict biquads, float * __restrict s
         if (bq->bypass) continue;
 
         if (bq->use_svf) {
-            if (bq->svf_first_order)
+            if (bq->first_order)
                 dsp_svf_first_order(bq, samples, count);
             else
                 dsp_svf_second_order(bq, samples, count);
         } else {
-            if (bq->svf_first_order)
+            if (bq->first_order)
                 dsp_biquad_first_order(bq, samples, count);
             else
                 dsp_biquad_second_order(bq, samples, count);

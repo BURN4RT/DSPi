@@ -837,7 +837,7 @@ typedef struct {
     uint32_t svf_type;                         // FilterType enum for inner loop specialization
 
     bool use_svf;                              // true = SVF path, false = biquad path
-    bool svf_first_order;                      // true = one-pole SVF inner loop (1st-order types)
+    bool first_order;                          // true = filter type is first order
     bool bypass;
 } Biquad;
 #else
