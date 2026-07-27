@@ -78,7 +78,7 @@ def svf_coefficients(filter_type, fc, Q, gain_db, Fs):
     else:
         raise ValueError(f"Unknown filter type: {filter_type}")
 
-    return a1, a2, a3, m0, m1, m2
+    return a1, a2, a3, m0, m1, m2, g
 
 
 # ---------------------------------------------------------------------------
@@ -164,7 +164,7 @@ def user_process(filter_type, fc, Q, gain_db, Fs, x):
     if filter_type.lower() in FIRST_ORDER_TYPES:
         return first_order_process(filter_type, fc, gain_db, Fs, x)
 
-    a1, a2, a3, m0, m1, m2 = svf_coefficients(filter_type, fc, Q, gain_db, Fs)
+    a1, a2, a3, m0, m1, m2, g = svf_coefficients(filter_type, fc, Q, gain_db, Fs)
 
     y = np.empty_like(x)
     ic1 = 0.0
@@ -173,7 +173,7 @@ def user_process(filter_type, fc, Q, gain_db, Fs, x):
         v0 = x[n]
         v3 = v0 - ic2
         v1_new = a1 * ic1 + a2 * v3
-        v2_new = ic2 + a2 * ic1 + a3 * v3
+        v2_new = ic2 + g * v1_new;
         ic1 = 2.0 * v1_new - ic1
         ic2 = 2.0 * v2_new - ic2
         y[n] = m0 * v0 + m1 * v1_new + m2 * v2_new
