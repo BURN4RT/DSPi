@@ -217,7 +217,7 @@ static void filter_set_passthrough(Filter *f) {
 #if PICO_RP2350
     f->b0 = 1.0f;
     f->use_svf = false;
-    f->svf_type = FILTER_FLAT;
+    f->filter_type = FILTER_FLAT;
     f->bypass = true;
 #else
     f->b0 = 1 << FILTER_SHIFT;
@@ -245,6 +245,11 @@ static void filter_assign_2nd_order_rp2350(Filter *f,
     }
     f->first_order = false;   // 2nd-order section uses the 2-pole SVF path
 
+    if(is_hp)
+        f->filter_type = FILTER_HIGHPASS;
+    else
+        f->filter_type = FILTER_LOWPASS;
+
     if (f->use_svf) {
         // Cytomic SVF (TPT). For a 2nd-order section with prewarped pole
         // (σ, ω), the equivalent (f₀, Q) parameters are:
@@ -270,10 +275,8 @@ static void filter_assign_2nd_order_rp2350(Filter *f,
         f->g = g;
         if (is_hp) {
             f->svm0 = 1.0f; f->svm1 = -k; f->svm2 = -1.0f;
-            f->svf_type = FILTER_HIGHPASS;
         } else {
             f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 1.0f;
-            f->svf_type = FILTER_LOWPASS;
         }
         // Fallback biquad coeffs (unused in SVF path, keep sane)
         f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f;
@@ -304,7 +307,6 @@ static void filter_assign_2nd_order_rp2350(Filter *f,
     f->a2 = A2 * inv;
     f->sva1 = 0.0f; f->sva2 = 0.0f; f->sva3 = 0.0f;
     f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 0.0f;
-    f->svf_type = FILTER_FLAT;
     f->bypass = false;
 }
 
@@ -324,6 +326,11 @@ static void filter_assign_1st_order_rp2350(Filter *f,
 
     f->first_order = true;
 
+    if(is_hp)
+        f->filter_type = FILTER_HIGHPASS1;
+    else
+        f->filter_type = FILTER_LOWPASS1;
+
     if (f->use_svf) {
         // One-pole TPT SVF.  g = sigma_real/(2*Fs) is the prewarped one-pole
         // gain (same direct form as the 2nd-order section; avoids an atan->tan
@@ -336,10 +343,8 @@ static void filter_assign_1st_order_rp2350(Filter *f,
         f->sva3 = 0.0f;
         if (is_hp) {
             f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 1.0f;   // out = in - lp
-            f->svf_type = FILTER_HIGHPASS1;
         } else {
             f->svm0 = 0.0f; f->svm1 = 1.0f; f->svm2 = 0.0f;   // out = lp
-            f->svf_type = FILTER_LOWPASS1;
         }
         f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f; f->a1 = 0.0f; f->a2 = 0.0f;
         f->bypass = false;
@@ -363,7 +368,6 @@ static void filter_assign_1st_order_rp2350(Filter *f,
     f->a2 = 0.0f;
     f->sva1 = 0.0f; f->sva2 = 0.0f; f->sva3 = 0.0f;
     f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 0.0f;
-    f->svf_type = FILTER_FLAT;
     f->bypass = false;
 }
 #else

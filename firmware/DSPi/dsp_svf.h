@@ -13,7 +13,7 @@ static inline void dsp_svf_first_order(Filter * __restrict f, float * __restrict
     float v0, v1;
     uint32_t blk_count = count >> 2; // unroll loops by 4
     // Per-type specialization: eliminates zero-multiplies in inner loop
-    switch (f->svf_type)
+    switch (f->filter_type)
     {
         // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
         case FILTER_LOWPASS1:
@@ -244,7 +244,7 @@ static inline void dsp_svf_second_order(Filter * __restrict f, float * __restric
     uint32_t blk_count = count >> 2; // unroll loops by 4
 
     // Per-type specialization: eliminates zero-multiplies in inner loop
-    switch (f->svf_type) {
+    switch (f->filter_type) {
         case FILTER_LOWPASS:
             while(blk_count > 0) {
                 v0 = sp[0];

@@ -14,7 +14,7 @@ static inline void dsp_biquad_first_order(Filter * __restrict f, float * __restr
     float x, y, t;
     uint32_t blk_count = count >> 2; // unroll loops by 4
 
-    switch(f->svf_type) {
+    switch(f->filter_type) {
         case FILTER_ALLPASS1:
             //optimise b1=1.0f, (b0=a1)
             while(blk_count > 0) {
@@ -144,7 +144,7 @@ static inline void dsp_biquad_second_order(Filter * __restrict f, float * __rest
     float x, y;
     uint32_t blk_count = count >> 2; // unroll loops by 4
 
-    switch(f->svf_type) {
+    switch(f->filter_type) {
         case FILTER_LOWPASS:
         case FILTER_HIGHPASS:
             //optimise b0 = b2

@@ -136,6 +136,7 @@ void dsp_compute_coefficients(EqParamPacket *p, Filter *f, float sample_rate) {
     bool was_svf = f->use_svf;
     bool was_first_order = f->first_order;
     f->use_svf = (p->freq < (sample_rate / 7.5f));
+    f->filter_type = p->type;
     // LT has two corner frequencies; both must sit below the SVF threshold,
     // otherwise fall back to the exact-bilinear biquad.
     if (is_lt && lt_fp >= (sample_rate / 7.5f)) f->use_svf = false;
@@ -180,7 +181,6 @@ void dsp_compute_coefficients(EqParamPacket *p, Filter *f, float sample_rate) {
             float sva2_f = g * sva1_f;
             f->sva1 = sva1_f; f->sva2 = sva2_f; f->sva3 = 0.0f;
             f->svm0 = svm0_f; f->svm1 = svm1_f; f->svm2 = svm2_f;
-            f->svf_type = p->type;
             f->g = g;
             // Fallback biquad coeffs (unused in SVF path, keep sane)
             f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f; f->a1 = 0.0f; f->a2 = 0.0f;
@@ -242,7 +242,6 @@ void dsp_compute_coefficients(EqParamPacket *p, Filter *f, float sample_rate) {
 
         f->sva1 = sva1_f; f->sva2 = sva2_f; f->sva3 = sva3_f;
         f->svm0 = svm0_f; f->svm1 = svm1_f; f->svm2 = svm2_f;
-        f->svf_type = p->type;
         f->g = g;
 
         // Also compute biquad coefficients as fallback (not used in SVF path)
@@ -349,7 +348,7 @@ void dsp_init_default_filters() {
 #if PICO_RP2350
             filters[ch][b].b0 = 1.0f;
             filters[ch][b].use_svf = false;
-            filters[ch][b].svf_type = FILTER_FLAT;
+            filters[ch][b].filter_type = FILTER_FLAT;
             filters[ch][b].svic1eq = 0.0f;
             filters[ch][b].svic2eq = 0.0f;
 #else
