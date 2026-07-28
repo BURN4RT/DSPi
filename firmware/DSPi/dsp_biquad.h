@@ -4,17 +4,17 @@
 #include "config.h"
 
 #if PICO_RP2350
-static inline void dsp_biquad_first_order(Biquad * __restrict bq, float * __restrict samples, uint32_t count) {
+static inline void dsp_biquad_first_order(Filter * __restrict f, float * __restrict samples, uint32_t count) {
     // Load biquad coefficients
     // Assumption is that b2 and a2 are 0.0f
-    float b0 = bq->b0, b1 = bq->b1;
-    float a1 = bq->a1;
-    float s1 = bq->s1, s2 = bq->s2;
+    float b0 = f->b0, b1 = f->b1;
+    float a1 = f->a1;
+    float s1 = f->s1, s2 = f->s2;
     float *sp = samples;
     float x, y, t;
     uint32_t blk_count = count >> 2; // unroll loops by 4
 
-    switch(bq->svf_type) {
+    switch(f->svf_type) {
         case FILTER_ALLPASS1:
             //optimise b1=1.0f, (b0=a1)
             while(blk_count > 0) {
@@ -131,20 +131,20 @@ static inline void dsp_biquad_first_order(Biquad * __restrict bq, float * __rest
             break;
     }
 
-    bq->s1 = s1;
-    bq->s2 - 0.0f
+    f->s1 = s1;
+    f->s2 = 0.0f;
 }
 
-static inline void dsp_biquad_second_order(Biquad * __restrict bq, float * __restrict samples, uint32_t count) {
+static inline void dsp_biquad_second_order(Filter * __restrict f, float * __restrict samples, uint32_t count) {
     // Load biquad coefficients
-    float b0 = bq->b0, b1 = bq->b1, b2 = bq->b2;
-    float a1 = bq->a1, a2 = bq->a2;
-    float s1 = bq->s1, s2 = bq->s2;
+    float b0 = f->b0, b1 = f->b1, b2 = f->b2;
+    float a1 = f->a1, a2 = f->a2;
+    float s1 = f->s1, s2 = f->s2;
     float *sp = samples;
     float x, y;
     uint32_t blk_count = count >> 2; // unroll loops by 4
 
-    switch(bq->svf_type) {
+    switch(f->svf_type) {
         case FILTER_LOWPASS:
         case FILTER_HIGHPASS:
             //optimise b0 = b2
@@ -357,8 +357,8 @@ static inline void dsp_biquad_second_order(Biquad * __restrict bq, float * __res
             break;
     }
 
-    bq->s1 = s1;
-    bq->s2 = s2;
+    f->s1 = s1;
+    f->s2 = s2;
 }
 
 #endif // PICO_RP2350

@@ -839,13 +839,13 @@ typedef struct {
     bool use_svf;                              // true = SVF path, false = biquad path
     bool first_order;                          // true = filter type is first order
     bool bypass;
-} Biquad;
+} Filter;
 #else
 typedef struct {
     int32_t b0, b1, b2, a1, a2;
     int32_t s1, s2;
     bool bypass;
-} Biquad;
+} Filter;
 #endif
 
 // FilterType value-space contract.  These values are persisted in flash

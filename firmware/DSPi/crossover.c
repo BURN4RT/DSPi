@@ -14,7 +14,7 @@
  *   Bessel_N: N/2 biquads (only even N supported: 2, 4, 6, 8)
  *
  * Each section is built from an analog 2nd-order (or 1st-order) prototype via
- * the bilinear transform with frequency prewarping. The output Biquad coeffs
+ * the bilinear transform with frequency prewarping. The output filter coeffs
  * feed straight into the existing per-platform kernel (TDF2 on RP2040, hybrid
  * SVF/TDF2 on RP2350). First-order sections always use TDF2 — the Cytomic SVF
  * is fundamentally 2nd-order topology.
@@ -31,7 +31,7 @@
 
 #include "crossover.h"
 #include "config.h"
-#include "dsp_pipeline.h"   // Biquad layout, FILTER_SHIFT, FILTER_LOWPASS/HIGHPASS
+#include "dsp_pipeline.h"   // Filter layout, FILTER_SHIFT, FILTER_LOWPASS/HIGHPASS
 #include "dsp_svf.h"
 #include "dsp_biquad.h"
 
@@ -205,23 +205,23 @@ static const AnalogPolePair *bessel_table(uint8_t order, uint8_t *count) {
 // Per-section design (bilinear transform with frequency prewarping)
 //
 // Given a normalized analog pole pair (σ_n, ω_n) and a target digital cutoff
-// fc Hz at sample rate Fs Hz, build a Biquad section. Frequency prewarping is
+// fc Hz at sample rate Fs Hz, build a filter section. Frequency prewarping is
 // applied at the FILTER level: ω_a = 2·Fs·tan(π·fc/Fs). Per-section poles are
 // then σ = σ_n · ω_a, ω = ω_n · ω_a. The bilinear transform with K = 2·Fs
 // produces the z-domain coefficients.
 // =============================================================================
 
 // Zero state + set bq as unity-passthrough (used for bypassed sections).
-static void biquad_set_passthrough(Biquad *bq) {
-    memset(bq, 0, sizeof(*bq));
+static void filter_set_passthrough(Filter *f) {
+    memset(f, 0, sizeof(*f));
 #if PICO_RP2350
-    bq->b0 = 1.0f;
-    bq->use_svf = false;
-    bq->svf_type = FILTER_FLAT;
-    bq->bypass = true;
+    f->b0 = 1.0f;
+    f->use_svf = false;
+    f->svf_type = FILTER_FLAT;
+    f->bypass = true;
 #else
-    bq->b0 = 1 << FILTER_SHIFT;
-    bq->bypass = true;
+    f->b0 = 1 << FILTER_SHIFT;
+    f->bypass = true;
 #endif
 }
 
@@ -229,23 +229,23 @@ static void biquad_set_passthrough(Biquad *bq) {
 // RP2350: choose between SVF (low fc) and TDF2 biquad per section. Section
 // state (s1/s2 or svic1eq/svic2eq) is cleared whenever use_svf changes,
 // matching the existing PEQ convention.
-static void biquad_assign_2nd_order_rp2350(Biquad *bq,
+static void filter_assign_2nd_order_rp2350(Filter *f,
                                            float sigma, float omega,
                                            bool is_hp, float Fs, float fc) {
-    bool was_svf = bq->use_svf;
+    bool was_svf = f->use_svf;
 
     // Per-section SVF/TDF2 decision. For our scope the section radius (and
     // therefore the section's effective frequency relative to fc) is always
     // close to 1, so we apply the same filter-level fc/Fs gate the PEQ uses.
-    bq->use_svf = (fc < (Fs / 7.5f));
+    f->use_svf = (fc < (Fs / 7.5f));
 
-    if (was_svf != bq->use_svf) {
-        bq->s1 = 0.0f; bq->s2 = 0.0f;
-        bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
+    if (was_svf != f->use_svf) {
+        f->s1 = 0.0f; f->s2 = 0.0f;
+        f->svic1eq = 0.0f; f->svic2eq = 0.0f;
     }
-    bq->first_order = false;   // 2nd-order section uses the 2-pole SVF path
+    f->first_order = false;   // 2nd-order section uses the 2-pole SVF path
 
-    if (bq->use_svf) {
+    if (f->use_svf) {
         // Cytomic SVF (TPT). For a 2nd-order section with prewarped pole
         // (σ, ω), the equivalent (f₀, Q) parameters are:
         //   ω₀ = √(σ² + ω²)        (analog rad/s)
@@ -264,21 +264,21 @@ static void biquad_assign_2nd_order_rp2350(Biquad *bq,
         float sva2 = g * sva1;
         float sva3 = g * sva2;
 
-        bq->sva1 = sva1;
-        bq->sva2 = sva2;
-        bq->sva3 = sva3;
-        bq->g = g;
+        f->sva1 = sva1;
+        f->sva2 = sva2;
+        f->sva3 = sva3;
+        f->g = g;
         if (is_hp) {
-            bq->svm0 = 1.0f; bq->svm1 = -k; bq->svm2 = -1.0f;
-            bq->svf_type = FILTER_HIGHPASS;
+            f->svm0 = 1.0f; f->svm1 = -k; f->svm2 = -1.0f;
+            f->svf_type = FILTER_HIGHPASS;
         } else {
-            bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 1.0f;
-            bq->svf_type = FILTER_LOWPASS;
+            f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 1.0f;
+            f->svf_type = FILTER_LOWPASS;
         }
         // Fallback biquad coeffs (unused in SVF path, keep sane)
-        bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f;
-        bq->a1 = 0.0f; bq->a2 = 0.0f;
-        bq->bypass = false;
+        f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f;
+        f->a1 = 0.0f; f->a2 = 0.0f;
+        f->bypass = false;
         return;
     }
 
@@ -292,57 +292,57 @@ static void biquad_assign_2nd_order_rp2350(Biquad *bq,
 
     float inv = 1.0f / A0;
     if (is_hp) {
-        bq->b0 = (K * K) * inv;
-        bq->b1 = (-2.0f * K * K) * inv;
-        bq->b2 = (K * K) * inv;
+        f->b0 = (K * K) * inv;
+        f->b1 = (-2.0f * K * K) * inv;
+        f->b2 = (K * K) * inv;
     } else {
-        bq->b0 = B * inv;
-        bq->b1 = (2.0f * B) * inv;
-        bq->b2 = B * inv;
+        f->b0 = B * inv;
+        f->b1 = (2.0f * B) * inv;
+        f->b2 = B * inv;
     }
-    bq->a1 = A1 * inv;
-    bq->a2 = A2 * inv;
-    bq->sva1 = 0.0f; bq->sva2 = 0.0f; bq->sva3 = 0.0f;
-    bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 0.0f;
-    bq->svf_type = FILTER_FLAT;
-    bq->bypass = false;
+    f->a1 = A1 * inv;
+    f->a2 = A2 * inv;
+    f->sva1 = 0.0f; f->sva2 = 0.0f; f->sva3 = 0.0f;
+    f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 0.0f;
+    f->svf_type = FILTER_FLAT;
+    f->bypass = false;
 }
 
-static void biquad_assign_1st_order_rp2350(Biquad *bq,
+static void filter_assign_1st_order_rp2350(Filter *f,
                                            float sigma_real,
                                            bool is_hp, float Fs, float fc) {
     // First-order section: pole at -sigma_real (already denormalised).
     // Follows the same hybrid rule as the 2nd-order path: one-pole SVF below
     // Fs/7.5, degenerate TDF2 biquad above.  Section state is cleared when the
     // topology changes (matching the 2nd-order convention).
-    bool was_svf = bq->use_svf;
-    bq->use_svf = (fc < (Fs / 7.5f));
-    if (was_svf != bq->use_svf) {
-        bq->s1 = 0.0f; bq->s2 = 0.0f;
-        bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
+    bool was_svf = f->use_svf;
+    f->use_svf = (fc < (Fs / 7.5f));
+    if (was_svf != f->use_svf) {
+        f->s1 = 0.0f; f->s2 = 0.0f;
+        f->svic1eq = 0.0f; f->svic2eq = 0.0f;
     }
 
-    bq->first_order = true;
+    f->first_order = true;
 
-    if (bq->use_svf) {
+    if (f->use_svf) {
         // One-pole TPT SVF.  g = sigma_real/(2*Fs) is the prewarped one-pole
         // gain (same direct form as the 2nd-order section; avoids an atan->tan
         // round-trip), yielding a pole identical to the biquad form.  The
         // 1/(1+g) reciprocal is folded into sva1 so the loop is multiply-only.
         float g    = sigma_real / (2.0f * Fs);
         float sva1 = 1.0f / (1.0f + g);
-        bq->sva1 = sva1;
-        bq->sva2 = g * sva1;
-        bq->sva3 = 0.0f;
+        f->sva1 = sva1;
+        f->sva2 = g * sva1;
+        f->sva3 = 0.0f;
         if (is_hp) {
-            bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 1.0f;   // out = in - lp
-            bq->svf_type = FILTER_HIGHPASS1;
+            f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 1.0f;   // out = in - lp
+            f->svf_type = FILTER_HIGHPASS1;
         } else {
-            bq->svm0 = 0.0f; bq->svm1 = 1.0f; bq->svm2 = 0.0f;   // out = lp
-            bq->svf_type = FILTER_LOWPASS1;
+            f->svm0 = 0.0f; f->svm1 = 1.0f; f->svm2 = 0.0f;   // out = lp
+            f->svf_type = FILTER_LOWPASS1;
         }
-        bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;
-        bq->bypass = false;
+        f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f; f->a1 = 0.0f; f->a2 = 0.0f;
+        f->bypass = false;
         return;
     }
 
@@ -352,23 +352,23 @@ static void biquad_assign_1st_order_rp2350(Biquad *bq,
     float inv = 1.0f / A0;
 
     if (is_hp) {
-        bq->b0 = K * inv;
-        bq->b1 = -K * inv;
+        f->b0 = K * inv;
+        f->b1 = -K * inv;
     } else {
-        bq->b0 = sigma_real * inv;
-        bq->b1 = sigma_real * inv;
+        f->b0 = sigma_real * inv;
+        f->b1 = sigma_real * inv;
     }
-    bq->b2 = 0.0f;
-    bq->a1 = A1 * inv;
-    bq->a2 = 0.0f;
-    bq->sva1 = 0.0f; bq->sva2 = 0.0f; bq->sva3 = 0.0f;
-    bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 0.0f;
-    bq->svf_type = FILTER_FLAT;
-    bq->bypass = false;
+    f->b2 = 0.0f;
+    f->a1 = A1 * inv;
+    f->a2 = 0.0f;
+    f->sva1 = 0.0f; f->sva2 = 0.0f; f->sva3 = 0.0f;
+    f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 0.0f;
+    f->svf_type = FILTER_FLAT;
+    f->bypass = false;
 }
 #else
 // RP2040: Q28 fixed-point TDF2 biquad. Same bilinear math, scaled into Q28.
-static void biquad_assign_2nd_order_rp2040(Biquad *bq,
+static void filter_assign_2nd_order_rp2040(Filter *f,
                                            float sigma, float omega,
                                            bool is_hp, float Fs) {
     float K  = 2.0f * Fs;
@@ -382,20 +382,20 @@ static void biquad_assign_2nd_order_rp2040(Biquad *bq,
     float inv   = scale / A0;
 
     if (is_hp) {
-        bq->b0 = (int32_t)((K * K) * inv);
-        bq->b1 = (int32_t)((-2.0f * K * K) * inv);
-        bq->b2 = (int32_t)((K * K) * inv);
+        f->b0 = (int32_t)((K * K) * inv);
+        f->b1 = (int32_t)((-2.0f * K * K) * inv);
+        f->b2 = (int32_t)((K * K) * inv);
     } else {
-        bq->b0 = (int32_t)(B * inv);
-        bq->b1 = (int32_t)((2.0f * B) * inv);
-        bq->b2 = (int32_t)(B * inv);
+        f->b0 = (int32_t)(B * inv);
+        f->b1 = (int32_t)((2.0f * B) * inv);
+        f->b2 = (int32_t)(B * inv);
     }
-    bq->a1 = (int32_t)(A1 * inv);
-    bq->a2 = (int32_t)(A2 * inv);
-    bq->bypass = false;
+    f->a1 = (int32_t)(A1 * inv);
+    f->a2 = (int32_t)(A2 * inv);
+    f->bypass = false;
 }
 
-static void biquad_assign_1st_order_rp2040(Biquad *bq,
+static void filter_assign_1st_order_rp2040(Filter *f,
                                            float sigma_real,
                                            bool is_hp, float Fs) {
     float K  = 2.0f * Fs;
@@ -405,16 +405,16 @@ static void biquad_assign_1st_order_rp2040(Biquad *bq,
     float inv   = scale / A0;
 
     if (is_hp) {
-        bq->b0 = (int32_t)(K * inv);
-        bq->b1 = (int32_t)(-K * inv);
+        f->b0 = (int32_t)(K * inv);
+        f->b1 = (int32_t)(-K * inv);
     } else {
-        bq->b0 = (int32_t)(sigma_real * inv);
-        bq->b1 = (int32_t)(sigma_real * inv);
+        f->b0 = (int32_t)(sigma_real * inv);
+        f->b1 = (int32_t)(sigma_real * inv);
     }
-    bq->b2 = 0;
-    bq->a1 = (int32_t)(A1 * inv);
-    bq->a2 = 0;
-    bq->bypass = false;
+    f->b2 = 0;
+    f->a1 = (int32_t)(A1 * inv);
+    f->a2 = 0;
+    f->bypass = false;
 }
 #endif
 
@@ -430,7 +430,7 @@ static void biquad_assign_1st_order_rp2040(Biquad *bq,
 // poles — we must apply the reciprocal explicitly here. The transform is a
 // no-op for r² = 1, so applying it unconditionally is correct for all
 // families and required by Bessel.
-static void section_emit_2nd_order(Biquad *bq, float sigma_n, float omega_n,
+static void section_emit_2nd_order(Filter *f, float sigma_n, float omega_n,
                                    float omega_a, bool is_hp,
                                    float Fs, float fc) {
     if (is_hp) {
@@ -446,14 +446,14 @@ static void section_emit_2nd_order(Biquad *bq, float sigma_n, float omega_n,
     float sigma = sigma_n * omega_a;
     float omega = omega_n * omega_a;
 #if PICO_RP2350
-    biquad_assign_2nd_order_rp2350(bq, sigma, omega, is_hp, Fs, fc);
+    filter_assign_2nd_order_rp2350(f, sigma, omega, is_hp, Fs, fc);
 #else
     (void)fc;
-    biquad_assign_2nd_order_rp2040(bq, sigma, omega, is_hp, Fs);
+    filter_assign_2nd_order_rp2040(f, sigma, omega, is_hp, Fs);
 #endif
 }
 
-static void section_emit_1st_order(Biquad *bq, float sigma_n,
+static void section_emit_1st_order(Filter *f, float sigma_n,
                                    float omega_a, bool is_hp, float Fs,
                                    float fc) {
     if (is_hp && sigma_n > 0.0f) {
@@ -466,10 +466,10 @@ static void section_emit_1st_order(Biquad *bq, float sigma_n,
     }
     float sigma = sigma_n * omega_a;
 #if PICO_RP2350
-    biquad_assign_1st_order_rp2350(bq, sigma, is_hp, Fs, fc);
+    filter_assign_1st_order_rp2350(f, sigma, is_hp, Fs, fc);
 #else
     (void)fc;
-    biquad_assign_1st_order_rp2040(bq, sigma, is_hp, Fs);
+    filter_assign_1st_order_rp2040(f, sigma, is_hp, Fs);
 #endif
 }
 
@@ -547,7 +547,7 @@ static void design_linkwitz_riley(XoverFilter *band,
     // copies don't share internal state.
     uint8_t bw_section_count = idx;
     for (uint8_t i = 0; i < bw_section_count; i++) {
-        Biquad copy = band->sections[i];
+        Filter copy = band->sections[i];
         copy.s1 = copy.s2 = 0;
 #if PICO_RP2350
         copy.svic1eq = copy.svic2eq = 0.0f;
@@ -617,7 +617,7 @@ void xover_design_filter(const EqParamPacket *recipe,
     // Mark all sections passthrough first, so any unused slots are inert
     // even if the design fails partway.
     for (uint8_t i = 0; i < MAX_XOVER_BAND_SECTIONS; i++) {
-        biquad_set_passthrough(&band->sections[i]);
+        filter_set_passthrough(&band->sections[i]);
     }
     band->num_sections = 0;
     band->bypass = true;
@@ -728,40 +728,35 @@ void xover_recalculate_all(float sample_rate) {
 // =============================================================================
 // Processing kernel
 //
-// Each band is a cascade of section_count Biquads. Per-section processing
-// uses exactly the same arithmetic as dsp_process_channel_block() — TDF2 on
-// RP2040, hybrid SVF/TDF2 on RP2350 — but with the section's own state and
-// coefficients. We don't reuse dsp_process_channel_block() directly because
-// it walks channel_band_counts[channel]; the crossover walk is bounded by
-// per-band num_sections instead.
+// Each band is a cascade of section_count Filters.
 // =============================================================================
 
 #if PICO_RP2350
 DSP_TIME_CRITICAL
-static inline void apply_section_block(Biquad * __restrict bq,
+static inline void apply_section_block(Filter * __restrict f,
                                        float * __restrict samples,
                                        uint32_t count) {
-    if (bq->bypass) return;
+    if (f->bypass) return;
 
-    if (bq->use_svf) {
-        float a1 = bq->sva1, a2 = bq->sva2, a3 = bq->sva3;
-        float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
-        float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
+    if (f->use_svf) {
+        float a1 = f->sva1, a2 = f->sva2, a3 = f->sva3;
+        float m0 = f->svm0, m1 = f->svm1, m2 = f->svm2;
+        float ic1eq = f->svic1eq, ic2eq = f->svic2eq;
         float *sp = samples;
 
-        if (bq->first_order) {
-            dsp_svf_first_order(bq, samples, count);
+        if (f->first_order) {
+            dsp_svf_first_order(f, samples, count);
             return;
         }
-        dsp_svf_second_order(bq, samples, count);
+        dsp_svf_second_order(f, samples, count);
         return;
     }
 
-    if(bq->first_order) {
-        dsp_biquad_first_order(bq, samples, count);
+    if(f->first_order) {
+        dsp_biquad_first_order(f, samples, count);
         return;
     }
-    dsp_biquad_second_order(bq, samples, count);
+    dsp_biquad_second_order(f, samples, count);
 }
 
 DSP_TIME_CRITICAL
@@ -786,7 +781,7 @@ void xover_process_channel_block(XoverFilter *bands,
 // section count. The asm body is identical to dsp_process_channel_block()'s
 // inner loop, just driven from num_sections instead of
 // channel_band_counts[channel]. See dsp_process_rp2040.S.
-extern void dsp_process_band_cascade_block(Biquad * __restrict sections,
+extern void dsp_process_band_cascade_block(Filter * __restrict sections,
                                            int32_t * __restrict samples,
                                            uint32_t sample_count,
                                            uint32_t num_sections);

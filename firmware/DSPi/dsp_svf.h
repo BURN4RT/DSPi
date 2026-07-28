@@ -4,16 +4,16 @@
 #include "config.h"
 
 #if PICO_RP2350
-static inline void dsp_svf_first_order(Biquad * __restrict bq, float * __restrict samples, uint32_t count) {
+static inline void dsp_svf_first_order(Filter * __restrict f, float * __restrict samples, uint32_t count) {
     // Load SVF coefficients
-    float a1 = bq->sva1, a2 = bq->sva2;
-    float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
-    float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
+    float a1 = f->sva1, a2 = f->sva2;
+    float m0 = f->svm0, m1 = f->svm1, m2 = f->svm2;
+    float ic1eq = f->svic1eq, ic2eq = f->svic2eq;
     float *sp = samples;
     float v0, v1;
     uint32_t blk_count = count >> 2; // unroll loops by 4
     // Per-type specialization: eliminates zero-multiplies in inner loop
-    switch (bq->svf_type)
+    switch (f->svf_type)
     {
         // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
         case FILTER_LOWPASS1:
@@ -230,21 +230,21 @@ static inline void dsp_svf_first_order(Biquad * __restrict bq, float * __restric
             }
     }
 
-    bq->svic1eq = ic1eq;
+    f->svic1eq = ic1eq;
 }
 
-static inline void dsp_svf_second_order(Biquad * __restrict bq, float * __restrict samples, uint32_t count) {
+static inline void dsp_svf_second_order(Filter * __restrict f, float * __restrict samples, uint32_t count) {
     // Load SVF coefficients
-    float a1 = bq->sva1, a2 = bq->sva2, a3 = bq->sva3;
-    float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
-    float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
-    float g = bq->g;
+    float a1 = f->sva1, a2 = f->sva2, a3 = f->sva3;
+    float m0 = f->svm0, m1 = f->svm1, m2 = f->svm2;
+    float ic1eq = f->svic1eq, ic2eq = f->svic2eq;
+    float g = f->g;
     float *sp = samples;
     float v0, v1, v2, v3;
     uint32_t blk_count = count >> 2; // unroll loops by 4
 
     // Per-type specialization: eliminates zero-multiplies in inner loop
-    switch (bq->svf_type) {
+    switch (f->svf_type) {
         case FILTER_LOWPASS:
             while(blk_count > 0) {
                 v0 = sp[0];
@@ -448,8 +448,8 @@ static inline void dsp_svf_second_order(Biquad * __restrict bq, float * __restri
             }
             break;
     }
-    bq->svic1eq = ic1eq;
-    bq->svic2eq = ic2eq;
+    f->svic1eq = ic1eq;
+    f->svic2eq = ic2eq;
 }
 #endif // PICO_RP2350
 
