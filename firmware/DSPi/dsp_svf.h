@@ -6,17 +6,15 @@
 #if PICO_RP2350
 static inline void dsp_svf_first_order(Biquad * __restrict bq, float * __restrict samples, uint32_t count) {
     // Load SVF coefficients
-    float a1 = bq->sva1, a2 = bq->sva2, a3 = bq->sva3;
+    float a1 = bq->sva1, a2 = bq->sva2;
     float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
     float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
-    float g = bq->g;
     float *sp = samples;
     float v0, v1;
     uint32_t blk_count = count >> 2; // unroll loops by 4
     // Per-type specialization: eliminates zero-multiplies in inner loop
     switch (bq->svf_type)
     {
-        // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
         // One-pole TPT SVF: a1 = 1/(1+g), a2 = g/(1+g) (multiply-only).
         case FILTER_LOWPASS1:
             while(blk_count > 0) {
