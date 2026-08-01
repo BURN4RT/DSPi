@@ -25,7 +25,7 @@
  */
 
 #include "config.h"
-#include "dsp_pipeline.h"   // Biquad type + per-platform kernel API
+#include "dsp_pipeline.h"   // Filter type + per-platform kernel API
 
 #ifdef __cplusplus
 extern "C" {
@@ -61,13 +61,13 @@ bool xover_filter_meta(uint8_t type, XoverFilterMeta *out);
 
 // A single crossover band = an ordered cascade of biquad sections.
 // `num_sections` ∈ [0..MAX_XOVER_BAND_SECTIONS]; 0 means the band is bypassed
-// (also reflected in `bypass`). All sections are pre-baked Biquads; the
+// (also reflected in `bypass`). All sections are pre-baked Filters; the
 // existing per-platform kernel (TDF2 on RP2040, hybrid SVF/TDF2 on RP2350)
 // runs each section as-is.
 #define MAX_XOVER_BAND_SECTIONS 4
 
 typedef struct {
-    Biquad   sections[MAX_XOVER_BAND_SECTIONS];
+    Filter   sections[MAX_XOVER_BAND_SECTIONS];
     uint8_t  num_sections;
     bool     bypass;         // True ⇒ skip entire band (whole-cascade bypass)
 } XoverFilter;

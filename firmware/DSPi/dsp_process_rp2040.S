@@ -21,7 +21,7 @@
 .global dsp_process_channel
 .type dsp_process_channel, %function
 
-// int32_t dsp_process_channel(Biquad *biquads, int32_t input, uint8_t channel)
+// int32_t dsp_process_channel(Filter *filters, int32_t input, uint8_t channel)
 // r0: biquads pointer
 // r1: input sample (x)
 // r2: channel index
@@ -212,9 +212,9 @@ dsp_process_channel:
 .global dsp_process_band_cascade_block
 .type dsp_process_band_cascade_block, %function
 
-// void dsp_process_band_cascade_block(Biquad *sections, int32_t *samples,
+// void dsp_process_band_cascade_block(Filter *sections, int32_t *samples,
 //                                     uint32_t count, uint32_t num_sections)
-// r0: sections pointer (cascade of Biquads)
+// r0: sections pointer (cascade of Filters)
 // r1: samples pointer
 // r2: sample count
 // r3: num_sections (already in place — no channel_band_counts lookup)
@@ -240,7 +240,7 @@ dsp_process_band_cascade_block:
 .global dsp_process_channel_block
 .type dsp_process_channel_block, %function
 
-// void dsp_process_channel_block(Biquad *biquads, int32_t *samples,
+// void dsp_process_channel_block(Filter *filters, int32_t *samples,
 //                                uint32_t count, uint8_t channel)
 // r0: biquads pointer
 // r1: samples pointer

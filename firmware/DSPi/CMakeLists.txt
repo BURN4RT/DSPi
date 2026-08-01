@@ -33,8 +33,10 @@ add_executable(DSPi
     dac_hw_mute.c
     dac_hw_mute.h
     dcp_inline.h
+    dsp_biquad.h
     dsp_pipeline.c
     dsp_pipeline.h
+    dsp_svf.h
     flash_clkdiv.c
     flash_clkdiv.h
     flash_storage.c

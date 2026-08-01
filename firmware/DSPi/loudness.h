@@ -18,7 +18,7 @@ typedef struct {
     bool bypass;
 } LoudnessCoeffs;
 
-// Minimal SVF state for loudness filters (separate from main EQ Biquad struct)
+// Minimal SVF state for loudness filters (separate from main EQ Filter struct)
 typedef struct {
     float ic1eq, ic2eq;
 } LoudnessSvfState;

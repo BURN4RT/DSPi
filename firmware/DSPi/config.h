@@ -833,18 +833,19 @@ typedef struct {
     float sva1, sva2, sva3;                    // integrator coefficients
     float svm0, svm1, svm2;                    // output mix coefficients
     float svic1eq, svic2eq;                    // integrator state
-    uint32_t svf_type;                         // FilterType enum for inner loop specialization
+    float g;                                   // frequency warped cutoff frequency
 
+    uint32_t filter_type;                      // FilterType enum for inner loop specialization
     bool use_svf;                              // true = SVF path, false = biquad path
-    bool svf_first_order;                      // true = one-pole SVF inner loop (1st-order types)
+    bool first_order;                          // true = filter type is first order
     bool bypass;
-} Biquad;
+} Filter;
 #else
 typedef struct {
     int32_t b0, b1, b2, a1, a2;
     int32_t s1, s2;
     bool bypass;
-} Biquad;
+} Filter;
 #endif
 
 // FilterType value-space contract.  These values are persisted in flash
@@ -888,7 +889,11 @@ enum FilterType {
     // see peq_qp_x512[] and Documentation/Features/peq_filters.md.
     FILTER_LINKWITZ_TRANSFORM = 11,
 
-    // 12..31 reserved for future PEQ types.
+    // First order low/highpass
+    FILTER_LOWPASS1 = 12,
+    FILTER_HIGHPASS1 = 13,
+
+    // 14..31 reserved for future PEQ types.
 
     // Crossover filter types — indices 32..63. See crossover.h /
     // Documentation/Features/crossover_filters_spec.md for semantics.

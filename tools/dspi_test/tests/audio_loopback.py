@@ -46,7 +46,9 @@ FS = audio.DEFAULT_FS       # 48 kHz; DSPi follows the host USB rate
 
 # FilterType enum (firmware) by RBJ-reference name.
 TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5,
-        "notch": 6, "allpass": 7, "allpass1": 8, "lowshelf1": 9, "highshelf1": 10}
+        "notch": 6, "allpass": 7, "allpass1": 8, "lowshelf1": 9, "highshelf1": 10,
+        "lowpass1":12, "highpass1":13}
+
 FLAT = 0
 INPUT_USB = 0
 TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
@@ -58,17 +60,33 @@ TYPE_SWITCH_SETTLE_S = 2.0
 
 # Magnitude-shaping PEQ configs: (name, rbj_name, fc, Q, gain_db). Frequencies
 # straddle the RP2350 SVF/biquad boundary (Fs/7.5 ~= 6400 Hz @ 48 kHz).
+
 PEQ_CONFIGS = [
-    ("peaking_lo",  "peaking",    300.0, 2.0,   6.0),
-    ("peaking_hi",  "peaking",   9000.0, 2.0,   6.0),
-    ("peaking_cut", "peaking",   1000.0, 1.0,  -6.0),
-    ("lowshelf",    "lowshelf",   200.0, 0.707, 6.0),
-    ("highshelf",   "highshelf", 8000.0, 0.707, 6.0),
-    ("lowpass",     "lowpass",   2000.0, 0.707, 0.0),
-    ("highpass",    "highpass",   200.0, 0.707, 0.0),
-    ("notch",       "notch",     1000.0, 4.0,   0.0),
-    ("lowshelf1",   "lowshelf1",  200.0, 0.707, 6.0),
-    ("highshelf1",  "highshelf1",5000.0, 0.707, 6.0),
+    ("lowpass1_lo",   "lowpass1",      300.0, 0.707, 0.0),
+    ("lowpass1_hi",   "lowpass1",     9000.0, 0.707, 0.0),
+    ("highpass1_lo",  "highpass1",     300.0, 0.707, 0.0),
+    ("highpass1_hi",  "highpass1",    9000.0, 0.707, 0.0),
+    ("peaking_lo",    "peaking",       300.0, 2.0,   6.0),
+    ("peaking_hi",    "peaking",      9000.0, 2.0,   6.0),
+    ("peaking_cut",   "peaking",      1000.0, 1.0,  -6.0),
+    ("lowshelf_lo",   "lowshelf",      300.0, 0.707, 6.0),
+    ("lowshelf_hi",   "lowshelf",     9000.0, 0.707, 6.0),
+    ("highshelf_lo",  "highshelf",     300.0, 0.707, 6.0),
+    ("highshelf_hi",  "highshelf",    9000.0, 0.707, 6.0),
+    ("lowpass_lo",    "lowpass",       300.0, 0.707, 0.0),
+    ("lowpass_hi",    "lowpass",      9000.0, 0.707, 0.0),
+    ("highpass_lo",   "highpass",      300.0, 0.707, 0.0),
+    ("highpass_hi",   "highpass",     9000.0, 0.707, 0.0),
+    ("notch_lo",      "notch",         300.0, 4.0,   0.0),
+    ("notch_hi",      "notch",        9000.0, 4.0,   0.0),
+    ("lowshelf1_lo",  "lowshelf1",     300.0, 0.707, 6.0),
+    ("lowshelf1_hi",  "lowshelf1",    9000.0, 0.707, 6.0),
+    ("highshelf1_lo", "highshelf1",    300.0, 0.707, 6.0),
+    ("highshelf1_hi", "highshelf1",   9000.0, 0.707, 6.0),
+    ("allpass1_lo",   "allpass1",      300.0, 0.707, 0.0),
+    ("allpass1_hi",   "allpass1",     9000.0, 0.707, 0.0),
+    ("allpass_lo",    "allpass",       300.0, 0.707, 0.0),
+    ("allpass_hi",    "allpass",      9000.0, 0.707, 0.0),
 ]
 
 
@@ -284,19 +302,30 @@ def loopback_allpass_phase(dev, profile, chk):
 
 
 def _make_peq_test(name, rbj_name, fc, q, gain):
+    # An all-pass is flat by definition, so a magnitude-only check passes even on
+    # a filter that does nothing at all.  Assert the phase shape too, or these
+    # configs have no fault-detection value.
+    is_allpass = rbj_name in ("allpass", "allpass1")
+
     def fn(dev, profile, chk):
         rig = _get_rig(dev, profile)
         _set_band(dev, rig["ch_l"], 0, TYPE[rbj_name], fc, q, gain)
         dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
-        mag, _phase, strength = audio.measure_transfer(
+        mag, phase, strength = audio.measure_transfer(
             rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=_signal_amp(gain))
         chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
-        exp_mag, _ = _expected(rbj_name, fc, q, gain, rig["fs"], freqs)
+        exp_mag, exp_phase = _expected(rbj_name, fc, q, gain, rig["fs"], freqs)
         err = float(np.max(np.abs(mag - exp_mag)))
         chk.ok(err < MAG_TOL_DB,
                f"{name} fc={fc:g} Q={q:g} gain={gain:g}: max |mag err| {err:.3f} dB < {MAG_TOL_DB}")
-        chk.note(f"{name}: max_mag_err={err:.3f}dB corr={strength:.2f}")
+        if is_allpass:
+            perr = _phase_shape_err(freqs, phase, exp_phase)
+            chk.ok(perr < PHASE_TOL_DEG,
+                   f"{name} fc={fc:g}: phase-shape err {perr:.2f} deg < {PHASE_TOL_DEG}")
+            chk.note(f"{name}: max_mag_err={err:.3f}dB phase_err={perr:.2f}deg corr={strength:.2f}")
+        else:
+            chk.note(f"{name}: max_mag_err={err:.3f}dB corr={strength:.2f}")
     fn.__name__ = f"peq_{name}"
     fn.__doc__ = f"PEQ {rbj_name} fc={fc:g} Q={q:g} gain={gain:g}: measured FR matches RBJ reference."
     return test("audio", mutating=True)(fn)
@@ -317,19 +346,42 @@ XO_BASE = 32                 # FILTER_XOVER_FIRST = FILTER_LR2_LP
 # Representative spread: families × orders × LP/HP, fc straddling Fs/7.5 (~6400 Hz).
 # (name, family, order, is_hp, fc)
 XO_CONFIGS = [
-    ("lr2_lp",  "lr",  2, False,  500.0),
-    ("lr4_lp",  "lr",  4, False,  800.0),
-    ("lr4_hp",  "lr",  4, True,   800.0),
-    ("lr8_lp",  "lr",  8, False, 2000.0),
-    ("lr8_hp",  "lr",  8, True,  9000.0),
-    ("bw1_lp",  "bw",  1, False,  200.0),
-    ("bw1_hp",  "bw",  1, True,   200.0),
-    ("bw4_lp",  "bw",  4, False, 1000.0),
-    ("bw4_hp",  "bw",  4, True,  9000.0),
-    ("bw8_lp",  "bw",  8, False, 2000.0),
-    ("bes2_lp", "bes", 2, False,  500.0),
-    ("bes4_hp", "bes", 4, True,  1000.0),
-    ("bes8_lp", "bes", 8, False, 3000.0),
+    ("lr2_lp_lo",  "lr",  2, False,   500.0),
+    ("lr2_lp_hi",  "lr",  2, False,  9000.0),
+    ("lr2_hp_lo",  "lr",  2, True,    500.0),
+    ("lr2_hp_hi",  "lr",  2, True,   9000.0),
+    ("lr4_lp",     "lr",  4, False,   800.0),
+    ("lr4_hp",     "lr",  4, True,    800.0),
+    ("lr6_hp",     "lr",  6, True,   1000.0),
+    ("lr6_lp",     "lr",  6, False,  2000.0),
+    ("lr8_lp",     "lr",  8, False,  5000.0),
+    ("lr8_hp",     "lr",  8, True,   9000.0),
+    ("bw1_lp_lo",  "bw",  1, False,   200.0),
+    ("bw1_lp_hi",  "bw",  1, False,  9000.0),
+    ("bw1_hp_lo",  "bw",  1, True,    200.0),
+    ("bw1_hp_hi",  "bw",  1, True,   9000.0),
+    ("bw2_lp",     "bw",  2, False,  1000.0),
+    ("bw2_hp",     "bw",  2, True,   1000.0),
+    ("bw3_lp",     "bw",  3, False,  2000.0),
+    ("bw3_hp",     "bw",  3, True,   2000.0),
+    ("bw4_lp",     "bw",  4, False,  3000.0),
+    ("bw4_hp",     "bw",  4, True,   3000.0),
+    ("bw5_lp",     "bw",  5, False,  5000.0),
+    ("bw5_hp",     "bw",  5, True,   5000.0),
+    ("bw6_lp",     "bw",  6, False,  7000.0),
+    ("bw6_hp",     "bw",  6, True,   7000.0),
+    ("bw7_lp",     "bw",  7, False,  9000.0),
+    ("bw7_hp",     "bw",  7, True,   9000.0),
+    ("bw8_lp",     "bw",  8, False, 10000.0),
+    ("bw8_hp",     "bw",  8, True,  10000.0),
+    ("bes2_lp",    "bes", 2, False,   500.0),
+    ("bes2_hp",    "bes", 2, True,    500.0),
+    ("bes4_lp",    "bes", 4, False,  1000.0),
+    ("bes4_hp",    "bes", 4, True,   1000.0),
+    ("bes6_lp",    "bes", 6, False,  4000.0),
+    ("bes6_hp",    "bes", 6, True,   4000.0),
+    ("bes8_lp",    "bes", 8, False,  8000.0),
+    ("bes8_hp",    "bes", 8, True,   3000.0),
 ]
 
 
