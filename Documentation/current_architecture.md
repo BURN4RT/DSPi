@@ -396,7 +396,7 @@ The DSP pipeline is decoupled from USB audio transfer completion via a lock-free
 The `process_input_block()` function reads from `buf_l[]`/`buf_r[]` arrays (extern, defined in `audio_pipeline.c`, filled by the input decode stage). This separation enables future alternative input sources (S/PDIF, I2S) to fill the same buffers and call `process_input_block()` directly. Buffer statistics helpers (`get_slot_consumer_fill()`, `get_slot_consumer_stats()`, `reset_buffer_watermarks()`) also live in `audio_pipeline.c`.
 
 ### RP2350 Float Pipeline
-*Last updated: 2026-07-19 (upmixer presence bell added to the centre engine)*
+*Last updated: 2026-08-01 (upmixer centre engine gains an OFF mode)*
 
 All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filtering (SVF for bands below Fs/7.5, TDF2 biquad above).
 
@@ -405,7 +405,7 @@ All processing in IEEE 754 single-precision float. Hybrid SVF/biquad EQ filterin
 | Input conversion | USB int16/24-bit or SPDIF RX 24-bit → float full-scale, per-channel preamp gain (`global_preamp_linear[ch]`) |
 | Per-Input EQ + metering | Per active input: block-based `dsp_process_channel_block()`, 10 bands, hybrid SVF/biquad; then peak/clip into `peaks[k]`/`clip_flags` |
 | Volume Leveller | Upward RMS compressor over active inputs (2 to 8), mask-driven detector/apply link, gain-reduction limiter, 5 ms per-channel lookahead (float throughout) |
-| Stereo Upmixer | Stereo input only: derives Centre/Ls/Rs into matrix source rows 2..4 and removes centre from L/R; raises the matrix source count to 3 or 5. Parks in multichannel modes. Zero-latency steering; deliberate identical-per-row surround Haas delay (see "Stereo Upmixer") |
+| Stereo Upmixer | Stereo input only: derives Centre/Ls/Rs into matrix source rows 2..4 and removes centre from L/R (nothing removed with the centre engine OFF, leaving L/R bit-exact); raises the matrix source count to 3 or 5. Parks in multichannel modes. Zero-latency steering; deliberate identical-per-row surround Haas delay (see "Stereo Upmixer") |
 | Matrix mixing | Block-based: 2 inputs × 9 outputs (8 inputs in 8-channel USB mode, or 3/5 sources with the upmixer active) with gain/phase (loudness now per-output post-gain; leveller still runs) |
 | Crossfeed | BS2B lowpass + allpass (ILD + ITD) per output pair, post-matrix (PASS 4.5), pre-output-EQ; `output_pair_mask`-selected (up to 4 pairs); works in every input mode |
 | Output EQ | Block-based, 10 bands per output (Core 0: outputs 0-1, Core 1: outputs 2-7) |
@@ -1120,7 +1120,7 @@ Follows the loudness/crossfeed module pattern:
 ---
 
 ## Stereo Upmixer
-*Last updated: 2026-07-19*
+*Last updated: 2026-08-01 (centre engine OFF mode)*
 
 ### Purpose
 
@@ -1132,11 +1132,14 @@ The pass sits between the leveller and the matrix (PASS 3 in the RP2350 pipeline
 
 Two independent engines feed the derived rows.
 
-**Centre engine** (always produces row 2 when enabled):
+**Centre engine** (owns row 2 whenever the pass runs):
 - `PASSIVE`: `C = 0.7071 * (L + R)`, fixed constant-power sum.
+- `OFF` (value 2, added 2026-08-01): `upmix_compute_coefficients()` forces `strength = 0`, and `upmix_process_block()` additionally snaps `um.g_c` to exactly zero instead of running it through the release ballistic (which only decays asymptotically). Both the C output and the L/R removal scale by that gain, so row 2 goes silent and `l[i] = l0 - 0.0f * mid` is bit-exact. The one-block linear gain ramp still applies, so the switch glides out over ~1 ms rather than stepping. Row 2 stays reserved (`n_derived` tracks the surround mode alone) so Ls/Rs keep rows 3/4 and existing matrix routing is not renumbered.
 - `ADAPTIVE`: a running normalized cross-correlation and L/R balance (one-pole estimators on a bass-cut, one-pole-HP detector path) drive the centre gain through a threshold gate with renormalization above the knee, then attack/release ballistics applied per block (packet-size independent) and per-sample gain ramps. Only genuinely centre-panned correlated content is extracted, so the image does not pump; long-wavelength content is excluded by the detector HP (industry-standard bass-steering mitigation).
 
 Extracted centre energy is subtracted from L/R scaled by strength and by centre-width (`0.5 * (1 - width)` removal), so a physical centre speaker and the L/R phantom do not comb-filter. Constant-power conventions: `0.7071` centre extraction, `0.5` removal.
+
+That removal is the only write the pass makes to the mains: the surround engine reads L/R but never modifies them (the patent's front-channel gain riding is deliberately omitted). Centre `OFF` and `center_width_pct = 100` therefore both yield a bit-exact stereo pair with the surrounds still running. Because the removal is common-mode, it also barely affects the surrounds: the passive surround feed's coefficients sum to exactly zero so it is mathematically unchanged by centre width, and the adaptive feed changes only in its `0.3812 * M` mono term. Steering decisions are unaffected either way; the correlation and dominance estimators read `l0`/`r0` before removal.
 
 Both centre modes then run a **presence bell** on the extracted C (added 2026-07-19, Syn-style presence control): a Cytomic TPT-SVF bell at fixed 3 kHz / Q 0.6, `presence_db` in [-12, +12] dB, boost/cut symmetric (`k = 1/(Q*A)`), `m1 = k*(A^2 - 1)` so 0 dB is an exact passthrough. Negative moves voices back, positive brings them forward. The filter runs unconditionally while the pass is active so gain sweeps through 0 dB stay continuous.
 
@@ -1164,7 +1167,7 @@ One global config (`UpmixConfig`); ranges are clamped downstream in `upmix_compu
 | Parameter | Range | Default | Description |
 |-----------|-------|---------|-------------|
 | enabled | 0/1 | false | Enable/disable the upmixer |
-| center_mode | 0/1 | ADAPTIVE (1) | Centre engine: 0 PASSIVE, 1 ADAPTIVE |
+| center_mode | 0..2 | ADAPTIVE (1) | Centre engine: 0 PASSIVE, 1 ADAPTIVE, 2 OFF. Out-of-range falls back to the default (not clamped up to OFF) via `upmix_clamp_center_mode()`, shared by the wire, bulk, and flash paths |
 | surround_mode | 0..2 | ADAPTIVE (2) | Surround engine: 0 OFF, 1 PASSIVE, 2 ADAPTIVE |
 | strength_pct | 0..100 | 100 | Centre extraction strength |
 | center_width_pct | 0..100 | 25 | Residual L/R retention (0 = full removal, 100 = phantom kept) |
@@ -1180,7 +1183,7 @@ One global config (`UpmixConfig`); ranges are clamped downstream in `upmix_compu
 
 ### Persistence & Control
 
-- **Wire format V25 (presence byte V26):** `WireUpmixParams` (44 bytes, layout-identical to `UpmixConfigPacket`) is tail-appended to `WireBulkParams` (total 5944 bytes). V26 claims the section's reserved byte for `presence_q1` (int8, dB * 2, 0.5 dB steps; no size change). Bulk collect/apply copy it straight to/from `upmix_config` and raise the pending flag; the section is zeroed on collect and ignored on apply on RP2040.
+- **Wire format V25 (presence byte V26; centre OFF V27):** `WireUpmixParams` (44 bytes, layout-identical to `UpmixConfigPacket`) is tail-appended to `WireBulkParams` (total 5944 bytes). V26 claims the section's reserved byte for `presence_q1` (int8, dB * 2, 0.5 dB steps; no size change). V27 changes no layout at all; it exists so hosts can detect that `center_mode` accepts 2 (OFF). Bulk collect/apply copy it straight to/from `upmix_config` and raise the pending flag; the section is zeroed on collect and ignored on apply on RP2040.
 - **Preset slot V33 (presence byte V34):** the config is tail-appended to `PresetSlot` (struct grows 44 bytes; `SLOT_DATA_SIZE_V33`), gated on `slot->version >= 33` in `apply_slot_to_live()` (RP2350). V34 claims the upmix reserved byte for `upmix_presence_q1` (no size change; `SLOT_DATA_SIZE_V34` = `SLOT_DATA_SIZE_V33`); V33 slots always wrote 0 there, which decodes to the 0 dB default, so no version gate is needed for the byte. Older slots have no upmix data and load the disabled defaults; V21..V33 slots still validate via `slot_data_size_for_version()`. Factory reset sets it disabled with `UPMIX_DEFAULT_*` values. RP2040 round-trips the fields as zeros and never applies them.
 - **Vendor commands:** `0x4A-0x4E`; RP2350 only (SETs STALL on RP2040, GETs return zeros). `0x4A` SET_CONFIG takes the 44-byte `UpmixConfigPacket` (byte 3 = `presence_q1`, int8 dB * 2); `0x4B` GET_CONFIG returns it; `0x4C`/`0x4D` SET/GET_PARAM address a single field by `wValue` (`UPMIX_PARAM_*` 0..13; 13 = `UPMIX_PARAM_PRESENCE`, plain float dB) as a 4-byte float; `0x4E` GET_STATUS returns the 16-byte `UpmixStatus`. `0x4F` is reserved. See the Vendor Command Reference table.
 
@@ -1722,7 +1725,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-07-19 (upmixer presence bell; wire/slot version row now V26 / V34)*
+*Last updated: 2026-08-01 (upmixer centre OFF mode; wire version row now V27, caps v5)*
 
 ### Hardware
 
@@ -1734,7 +1737,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
 | UART + I2C external control | Yes (identical) | Yes (identical) |
-| Control Surfaces nouns (caps v4) | 49 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 49, all usable |
+| Control Surfaces nouns (caps v5) | 49 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 49, all usable |
 | Binary type | `default` (XIP) | `default` (XIP) |
 | Cold code location (control paths, storage, coeff design, init) | Flash XIP | Flash XIP |
 | RAM code+rodata+data (.data) | 44,376 B (was 108,692 under copy_to_ram) | 48,688 B (was 147,332 under copy_to_ram) |
@@ -1766,7 +1769,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | ADAT input | Config state only (never selectable) | Yes (8 ch, 24-bit, 44.1/48 kHz; master/slave clock; PIO1 SM2 + DMA CH15) |
 | USB input bit depth | 16-bit or 24-bit (alt) | 16/24-bit (stereo) or 16-bit (multichannel) |
 | AS alt settings | 0, 1 (16-bit), 2 (24-bit) | 0, 1, 2, 3 (4ch), 4 (6ch), 5 (8ch) |
-| Wire / slot version | V26 / V34 | V26 / V34 |
+| Wire / slot version | V27 / V34 | V27 / V34 |
 | S/PDIF bit depth | 24-bit | 24-bit |
 | S/PDIF input conversion | 24-bit sign-extended full-scale → Q28 via `>> 2` (equivalent to `sample << 6`) | 24-bit sign-extended full-scale → float via `÷ 2147483648.0f` |
 | S/PDIF output conversion | Q28 >> 6 → int24 | float × 8388607 → int24 |
@@ -1774,7 +1777,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | Loudness | Per output, post-gain: 2 Q28 shelf biquads; `loudness_output_mask` (5 outputs) | Per output, post-gain: 2 SVF shelves; `loudness_output_mask` (9 outputs). Both platforms: volume-keyed, works in stereo and multichannel input modes |
 | Crossfeed | Per output pair, post-matrix (PASS 4.5); 2 pairs; `output_pair_mask` (default pair 1) | Per output pair, post-matrix (PASS 4.5); 4 pairs; `output_pair_mask` (default pair 1). Both platforms: shared coeffs, per-pair state, works in every input mode |
 | Psychoacoustic bass | Per output, pre-crossover; RBJ Q28 biquads (with pre-drive low-band clamp) | Per output, pre-crossover; TPT SVF float. Both platforms: missing-fundamental NLD, `output_mask`, zero added latency |
-| Stereo upmixer | Not available (compiled out; matrix untouched) | Stereo input only: derives C/Ls/Rs into matrix rows 2..4 (passive or adaptive centre; OFF/passive/adaptive surround). Zero-latency steering; deliberate per-row surround Haas delay |
+| Stereo upmixer | Not available (compiled out; matrix untouched) | Stereo input only: derives C/Ls/Rs into matrix rows 2..4 (passive/adaptive/off centre; off/passive/adaptive surround). Zero-latency steering; deliberate per-row surround Haas delay |
 | EQ channels | 7 (NUM_CHANNELS) | 11 (NUM_CHANNELS) |
 
 ### Delay Lines
@@ -2336,6 +2339,13 @@ default step 0.1 ms, range = the full delay ring at 48 kHz: 21 ms RP2040 /
 42 ms RP2350), and `CS_NOUN_PRESET_RELOAD` (a `TRIGGER` that reloads the
 active preset from flash via the deferred `REQ_PRESET_LOAD` path, discarding
 unsaved live edits).
+
+**Caps v5** (2026-08-01) adds no nouns, units, or structure changes (directory
+stays V11): it signals only that `CS_NOUN_UPMIX_CENTER_MODE` widened from two
+values to three, the third being `Off`. Hosts reading `enum_count` from the
+noun descriptor need no change; the bump is for hosts that hard-code the mode
+labels. `Off` is value 2 rather than 0 because the vendor enum could not be
+renumbered without silently remapping existing hosts and saved presets.
 
 ### File layout
 

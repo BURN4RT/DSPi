@@ -15,7 +15,10 @@
 // rate is 48 kHz or below (ADAT-style park above; rings are sized for 48 kHz).  It reads the
 // post-EQ/leveller stereo bus (buf_l/buf_r), writes the derived channels into
 // the otherwise-idle multichannel input rows (buf_in_ext[0..2] = matrix source
-// rows 2..4), and applies centre removal to L/R in place.  The matrix then
+// rows 2..4), and applies centre removal to L/R in place.  Centre removal is
+// the ONLY thing the pass does to the mains; the surround engine never writes
+// L/R, so with the centre engine OFF (or width at 100%) the stereo pair passes
+// through bit-exact and the surrounds are derived from it.  The matrix then
 // treats the derived channels as ordinary sources: routing, crosspoint gains,
 // and the whole per-output chain (PEQ, crossover, delay, gain, loudness) are
 // reused unchanged.  In multichannel input modes those rows carry real inputs
@@ -23,7 +26,10 @@
 //
 // Two independent engines:
 //
-//   Centre engine (always produces row 2 when enabled):
+//   Centre engine (owns row 2 whenever the pass runs):
+//     OFF     : no extraction and no removal.  Row 2 goes silent but stays
+//               reserved so Ls/Rs keep matrix rows 3/4, and L/R are untouched,
+//               which is the "surround effects only, mains as recorded" setup.
 //     PASSIVE : C = 0.7071*(L+R), fixed gain (power-preserving for
 //               uncorrelated content; correlated content sums to +3 dB).
 //     ADAPTIVE: running normalized cross-correlation and L/R balance (one-pole
@@ -70,6 +76,10 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 // Engine modes
 #define UPMIX_CENTER_PASSIVE    0
 #define UPMIX_CENTER_ADAPTIVE   1
+// OFF is appended rather than renumbered to 0 (which would mirror the surround
+// enum): the vendor interface has no per-command version negotiation, so moving
+// PASSIVE/ADAPTIVE would silently remap every existing host and saved preset.
+#define UPMIX_CENTER_OFF        2
 #define UPMIX_SURROUND_OFF      0
 #define UPMIX_SURROUND_PASSIVE  1
 #define UPMIX_SURROUND_ADAPTIVE 2
@@ -111,6 +121,14 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 #define UPMIX_DEFAULT_SUR_LPF     7000.0f
 #define UPMIX_DEFAULT_DECORR        90.0f
 #define UPMIX_DEFAULT_PRESENCE       0.0f
+
+// Clamp a centre-mode value arriving from wire, bulk, or flash.  Out-of-range
+// falls back to the default instead of the top of the range (the surround
+// clamp's convention): OFF is the top value here, and a corrupt byte must not
+// silently switch the centre engine off.
+static inline uint8_t upmix_clamp_center_mode(long m) {
+    return (m >= 0 && m <= UPMIX_CENTER_OFF) ? (uint8_t)m : UPMIX_DEFAULT_CENTER_MODE;
+}
 
 // Fixed internals
 #define UPMIX_CORR_TAU_MS       100.0f   // correlation/balance estimator time constant

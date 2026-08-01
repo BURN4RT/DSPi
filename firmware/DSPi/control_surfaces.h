@@ -308,7 +308,10 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (4)
+    uint8_t  caps_version; // capability format version (5; v5 widened the
+                           // upmix centre-mode enum to 3 for hosts that
+                           // hard-code the labels rather than reading
+                           // enum_count from the noun descriptor)
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
     uint8_t  noun_count;   // CS_NOUN_COUNT

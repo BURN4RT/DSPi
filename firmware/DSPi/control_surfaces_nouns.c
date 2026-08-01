@@ -74,13 +74,13 @@ extern volatile bool sync_started;
 // compiled out there) so both platforms publish identical descriptors.
 #if PICO_RP2350
 #define CS_UPMIX_ACTS(group)     group
-#define CS_UPMIX_CENTER_MODES    (UPMIX_CENTER_ADAPTIVE + 1)
+#define CS_UPMIX_CENTER_MODES    (UPMIX_CENTER_OFF + 1)
 #define CS_UPMIX_SURROUND_MODES  (UPMIX_SURROUND_ADAPTIVE + 1)
 #define CS_UPMIX_PRES_MIN        UPMIX_PRESENCE_MIN
 #define CS_UPMIX_PRES_MAX        UPMIX_PRESENCE_MAX
 #else
 #define CS_UPMIX_ACTS(group)     0
-#define CS_UPMIX_CENTER_MODES    2       // Passive / Logic
+#define CS_UPMIX_CENTER_MODES    3       // Passive / Logic / Off
 #define CS_UPMIX_SURROUND_MODES  3       // Off / Passive / Logic
 #define CS_UPMIX_PRES_MIN        -12.0f  // mirror UPMIX_PRESENCE_MIN/MAX
 #define CS_UPMIX_PRES_MAX         12.0f

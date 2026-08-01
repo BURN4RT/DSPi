@@ -1043,7 +1043,10 @@ typedef struct __attribute__((packed)) {
     // uniformity; RP2040 writes zeros and never applies them.  Gated on version
     // >= 33 in apply_slot_to_live() so older slots load the disabled defaults.
     uint8_t upmix_enabled;           // 0/1
-    uint8_t upmix_center_mode;       // UPMIX_CENTER_* (0..1)
+    uint8_t upmix_center_mode;       // UPMIX_CENTER_* (0..2; OFF = 2 added
+                                     // without a layout change, so firmware
+                                     // predating it clamps the byte to the
+                                     // ADAPTIVE default rather than misreading)
     uint8_t upmix_surround_mode;     // UPMIX_SURROUND_* (0..2)
     int8_t  upmix_presence_q1;       // V34+: presence bell dB * 2 (was reserved,
                                      // always 0 in V33 slots = 0 dB default)
@@ -3018,8 +3021,7 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #if PICO_RP2350
     if (slot->version >= 33) {
         upmix_config.enabled            = (slot->upmix_enabled != 0);
-        upmix_config.center_mode        = (slot->upmix_center_mode <= 1)
-                                          ? slot->upmix_center_mode : UPMIX_DEFAULT_CENTER_MODE;
+        upmix_config.center_mode        = upmix_clamp_center_mode(slot->upmix_center_mode);
         upmix_config.surround_mode      = (slot->upmix_surround_mode <= 2)
                                           ? slot->upmix_surround_mode : UPMIX_DEFAULT_SURROUND_MODE;
         upmix_config.strength_pct       = slot->upmix_strength_pct;

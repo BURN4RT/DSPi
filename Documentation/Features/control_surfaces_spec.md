@@ -1,6 +1,6 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 4*
+*Firmware capability format version: 5*
 *Config (flash) version: 2; IR config version: 1*
 *Directory version: 11*
 
@@ -242,7 +242,7 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (4) |
+| 0 | 1 | `caps_version` | capability format version (5) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (8); the type table has this many entries, indexed by `CsType` |
 | 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (49) |
@@ -734,7 +734,7 @@ target and dispatches it.
 | `LG_PRESENT` | (read-only) | 1 while an LG Sound Sync source is detected. |
 | `LG_MUTED` | (read-only) | 1 while an LG source is present and reports muted. |
 | `UPMIX` | `REQ_UPMIX_SET_PARAM` (`0x4C`, wValue = 0, float) | Stereo upmixer enable (RP2350 only, mask 0 on RP2040; likewise the five nouns below). |
-| `UPMIX_CENTER_MODE` | `REQ_UPMIX_SET_PARAM` (wValue = 1) | Centre engine: 0 = Passive (fixed 0.7071 sum), 1 = Logic (adaptive correlation-steered extraction). INC+WRAP cycles. |
+| `UPMIX_CENTER_MODE` | `REQ_UPMIX_SET_PARAM` (wValue = 1) | Centre engine: 0 = Passive (fixed 0.7071 sum), 1 = Logic (adaptive correlation-steered extraction), 2 = Off (no centre output, L/R untouched; surrounds keep working). INC+WRAP cycles. |
 | `UPMIX_SURROUND_MODE` | `REQ_UPMIX_SET_PARAM` (wValue = 2) | Surround engine: 0 = Off, 1 = Passive (difference feed), 2 = Logic (Dolby low-complexity steering). INC+WRAP cycles. |
 | `UPMIX_STRENGTH` | `REQ_UPMIX_SET_PARAM` (wValue = 3) | Centre extraction strength 0..100 %. |
 | `UPMIX_WIDTH` | `REQ_UPMIX_SET_PARAM` (wValue = 4) | Centre width 0..100 % (0 = full removal from L/R, 100 = phantom kept). |
@@ -1289,6 +1289,20 @@ are flash-persistent) and try the decoder before the hash fallback.
 ---
 
 ## 11. Compatibility
+
+### 11.0 v4 -> v5 (caps version 5, directory unchanged)
+
+- **No stored-config change and no structure size change.** The directory stays
+  V11 and both caps and status structures keep their sizes; nothing migrates.
+- The bump signals one thing: `UPMIX_CENTER_MODE` now has three values instead
+  of two, the third being `Off` (2). Hosts that read `enum_count` from the noun
+  descriptor need no change at all; the bump exists for hosts that hard-code
+  the mode labels.
+- Note the centre enum puts `Off` last while `UPMIX_SURROUND_MODE` puts it
+  first. `Off` was appended rather than renumbered because the vendor interface
+  has no per-command version negotiation, so moving 0/1 would have silently
+  remapped existing hosts and saved presets. A front panel is free to cycle the
+  modes in any order it likes.
 
 ### 11.1 v3 -> v4 (caps version 4, directory unchanged)
 

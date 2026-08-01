@@ -1453,7 +1453,7 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                 upmix_config.enabled       = (pkt.enabled != 0);
                 // Clamp mode fields so garbage cannot persist; ranges of the
                 // float params are clamped inside upmix_compute_coefficients.
-                upmix_config.center_mode   = (pkt.center_mode   <= 1) ? pkt.center_mode   : 1;
+                upmix_config.center_mode   = upmix_clamp_center_mode(pkt.center_mode);
                 upmix_config.surround_mode = (pkt.surround_mode <= 2) ? pkt.surround_mode : 2;
                 upmix_config.strength_pct       = pkt.strength_pct;
                 upmix_config.center_width_pct   = pkt.center_width_pct;
@@ -1486,11 +1486,9 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
                         // Plain nonzero test, matching SET_CONFIG/bulk/flash
                         upmix_config.enabled = (v != 0.0f);
                         break;
-                    case UPMIX_PARAM_CENTER_MODE: {
-                        long m = lrintf(v);
-                        upmix_config.center_mode = (m < 0) ? 0 : (m > 1) ? 1 : (uint8_t)m;
+                    case UPMIX_PARAM_CENTER_MODE:
+                        upmix_config.center_mode = upmix_clamp_center_mode(lrintf(v));
                         break;
-                    }
                     case UPMIX_PARAM_SURROUND_MODE: {
                         long m = lrintf(v);
                         upmix_config.surround_mode = (m < 0) ? 0 : (m > 2) ? 2 : (uint8_t)m;

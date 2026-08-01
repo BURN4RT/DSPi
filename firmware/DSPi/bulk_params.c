@@ -915,10 +915,9 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // the raised pending flag, mirroring psybass above.
 #if PICO_RP2350
     {
-        uint8_t cm = in->upmix.center_mode;
         uint8_t sm = in->upmix.surround_mode;
         upmix_config.enabled            = (in->upmix.enabled != 0);
-        upmix_config.center_mode        = (cm > 1) ? 1 : cm;
+        upmix_config.center_mode        = upmix_clamp_center_mode(in->upmix.center_mode);
         upmix_config.surround_mode      = (sm > 2) ? 2 : sm;
         upmix_config.strength_pct       = in->upmix.strength_pct;
         upmix_config.center_width_pct   = in->upmix.center_width_pct;

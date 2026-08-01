@@ -99,13 +99,18 @@ void upmix_compute_coefficients(UpmixCoeffs *c, const UpmixConfig *cfg, float sa
     const float pi = 3.1415926535f;
     float fs = sample_rate;
 
-    c->center_mode = cfg->center_mode > UPMIX_CENTER_ADAPTIVE
-                     ? UPMIX_CENTER_ADAPTIVE : cfg->center_mode;
+    c->center_mode = upmix_clamp_center_mode(cfg->center_mode);
     c->surround_mode = cfg->surround_mode > UPMIX_SURROUND_ADAPTIVE
                        ? UPMIX_SURROUND_ADAPTIVE : cfg->surround_mode;
+    // n_derived tracks the surround mode alone: row 2 stays reserved with the
+    // centre engine OFF so switching it does not renumber the Ls/Rs source rows
+    // under existing matrix routing.
     c->n_derived = (c->surround_mode == UPMIX_SURROUND_OFF) ? 1 : UPMIX_NUM_DERIVED;
 
     c->strength = clampf(cfg->strength_pct, UPMIX_STRENGTH_MIN, UPMIX_STRENGTH_MAX) * 0.01f;
+    // Both the C output and the removal from L/R scale by strength, so zeroing
+    // it is the whole of centre OFF.
+    if (c->center_mode == UPMIX_CENTER_OFF) c->strength = 0.0f;
     c->width    = clampf(cfg->center_width_pct, UPMIX_WIDTH_MIN, UPMIX_WIDTH_MAX) * 0.01f;
     c->corr_thresh = clampf(cfg->corr_threshold_pct, UPMIX_THRESH_MIN, UPMIX_THRESH_MAX) * 0.01f;
     c->inv_thresh_range = 1.0f / (1.0f - c->corr_thresh);
@@ -246,6 +251,10 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
     // Attack/release ballistics, applied per block (packet-size independent)
     float alpha_blk = powf(g_target > um.g_c ? c->alpha_att : c->alpha_rel, (float)n);
     um.g_c = g_target + (um.g_c - g_target) * alpha_blk;
+    // Centre OFF skips the release ballistic: the gain must reach exactly zero,
+    // not decay toward it forever, or L/R would never be bit-exact again.  The
+    // per-sample ramp below still glides out over this one block.
+    if (c->center_mode == UPMIX_CENTER_OFF) um.g_c = 0.0f;
 
     // Surround steering gains from the smoothed dominance (patent pan law)
     float gls_t = 1.0f, grs_t = 1.0f;
