@@ -32,7 +32,14 @@ CLI (bring-up / diagnosis):
 
 from __future__ import annotations
 
+import atexit
+import os
+import pathlib
+import pickle
+import select
+import subprocess
 import sys
+import time
 
 try:
     import numpy as np
@@ -62,6 +69,14 @@ USBRX_IN_NAME = DSPI_IN_NAME
 DEFAULT_FS = 48000
 PAD_S = 0.10          # leading/trailing silence around an excitation
 TAIL_S = 0.40         # extra record time after playback ends
+
+# Stream blocksize. 1536 frames keeps the client inside coreaudiod's IO cycle
+# budget, silencing the chronic overloads that precondition the zero-stuffing
+# runaway (test_failures_diag.md 8c). Safe as the default ONLY because stream
+# IO runs in a disposable worker process: PortAudio's stop path can deadlock
+# (rare), and a wedged worker is killed and respawned instead of hanging the
+# suite. DSPI_AUDIO_BLOCKSIZE=0 restores the PortAudio-chosen size.
+BLOCKSIZE = int(os.environ.get("DSPI_AUDIO_BLOCKSIZE", "1536") or 0)
 
 # Diagnostic tap: play_record() records its most recent run here so the test
 # layer can dump raw waveforms (see test_failures_diag.md section 8). Fields:
@@ -166,30 +181,19 @@ def make_tone(fs, freq=1000.0, dur_s=0.5, amp=0.4):
 # Play + record (two independent streams; single clock domain)
 # ---------------------------------------------------------------------------
 
-def play_record(excitation, fs, out_dev, in_dev,
-                in_channels=2, out_channels=2, tail_s=TAIL_S, max_retries=3):
-    """Play `excitation` on out_dev while recording in_channels from in_dev.
-
-    `excitation` is mono [N] (duplicated across out_channels) or [N, out_channels].
-    Returns the captured float32 array, shape [M, in_channels].
-
-    Uses two explicit callback streams (a recording InputStream + a feeding
-    OutputStream) started together, NOT sd.play()+InputStream (which does not
-    sync cleanly) and NOT a combined cross-device duplex stream (CoreAudio will
-    not open one reliably across two devices). The streams free-run on the shared
-    DSPi clock; the caller recovers the fixed latency by cross-correlation.
-    """
+def _play_record_streams(exc, fs, out_dev, in_dev,
+                         in_channels, out_channels, tail_s, max_retries,
+                         blocksize):
+    """The actual PortAudio stream IO. WORKER PROCESS ONLY: PortAudio's
+    CoreAudio stop path can deadlock, so the parent must never open streams
+    (see play_record and test_failures_diag.md 8c)."""
     _require()
-    exc = np.asarray(excitation, dtype=np.float32)
-    if exc.ndim == 1:
-        exc = np.column_stack([exc] * out_channels)
     n = exc.shape[0]
 
     # Retry on an xrun: opening/closing two cross-device streams repeatedly can
     # make CoreAudio drop buffers (input overflow / output underflow), which
     # corrupts a capture. `latency="high"` makes that rare; a retry catches the
     # stragglers so a long test run stays reliable.
-    global LAST_RUN
     last = np.zeros((0, in_channels), dtype=np.float32)
     attempts_log = []
     for _attempt in range(max_retries + 1):
@@ -223,14 +227,12 @@ def play_record(excitation, fs, out_dev, in_dev,
                 counts["in_underflow"] += 1
             rec_frames.append(indata.copy())
 
-        # 1536-frame blocks keep the Python client inside coreaudiod's IO cycle
-        # budget (measured ladder in test_failures_diag.md 8c; 1024 is too small).
         instream = sd.InputStream(samplerate=fs, device=in_dev, channels=in_channels,
-                                  dtype="float32", latency="high", blocksize=1536,
-                                  callback=_in_cb)
+                                  dtype="float32", latency="high",
+                                  blocksize=blocksize, callback=_in_cb)
         outstream = sd.OutputStream(samplerate=fs, device=out_dev, channels=out_channels,
-                                    dtype="float32", latency="high", blocksize=1536,
-                                    callback=_out_cb)
+                                    dtype="float32", latency="high",
+                                    blocksize=blocksize, callback=_out_cb)
         instream.start()                # capture first so we never miss the onset
         outstream.start()
         sd.sleep(int((n / fs + tail_s) * 1000.0))
@@ -247,11 +249,178 @@ def play_record(excitation, fs, out_dev, in_dev,
     final = attempts_log[-1]
     final_bad = bool(final["in_overflow"] or final["out_underflow"]) or last.shape[0] == 0
     blocks = [f.shape[0] for f in rec_frames]
-    LAST_RUN = {"exc": exc, "cap": last, "fs": fs,
-                "attempts": attempts_log, "final_bad": final_bad,
-                "in_blocks": blocks[:8] + (["..."] if len(blocks) > 8 else []),
-                "in_block_max": max(blocks) if blocks else 0}
-    return last
+    return {"cap": last, "attempts": attempts_log, "final_bad": final_bad,
+            "in_blocks": blocks[:8] + (["..."] if len(blocks) > 8 else []),
+            "in_block_max": max(blocks) if blocks else 0}
+
+
+# ---------------------------------------------------------------------------
+# Capture worker process
+# ---------------------------------------------------------------------------
+# All stream IO runs in a disposable subprocess (python3 -m ...audio --worker)
+# speaking length-prefixed pickles over stdin/stdout. A wedged worker (the
+# rare PortAudio stop deadlock) is killed and respawned instead of hanging
+# the suite; the interrupted capture is retried on the fresh worker.
+
+_REPO_ROOT = str(pathlib.Path(__file__).resolve().parents[2])
+_WORKER = None          # subprocess.Popen, or None
+_WORKER_TIMEOUT_SLACK_S = 15.0
+
+
+class _WorkerWedged(Exception):
+    """The worker did not answer in time (presumed native deadlock)."""
+
+
+def _pipe_send(proc, obj):
+    data = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
+    proc.stdin.write(len(data).to_bytes(4, "little") + data)
+    proc.stdin.flush()
+
+
+def _pipe_recv(proc, timeout_s):
+    """Receive one message, enforcing the deadline across partial reads."""
+    deadline = time.monotonic() + timeout_s
+    buf = b""
+    need = 4
+    body = None
+    while True:
+        remain = deadline - time.monotonic()
+        if remain <= 0:
+            raise _WorkerWedged(f"no reply within {timeout_s:.0f}s")
+        r, _w, _x = select.select([proc.stdout], [], [], min(remain, 1.0))
+        if not r:
+            if proc.poll() is not None:
+                raise _WorkerWedged(f"worker exited (rc={proc.returncode})")
+            continue
+        chunk = proc.stdout.read1(65536)
+        if not chunk:
+            raise _WorkerWedged("worker closed its pipe")
+        buf += chunk
+        while True:
+            if body is None and len(buf) >= 4:
+                need = int.from_bytes(buf[:4], "little")
+                buf = buf[4:]
+                body = b""
+            if body is not None:
+                take = min(need - len(body), len(buf))
+                body += buf[:take]
+                buf = buf[take:]
+                if len(body) == need:
+                    return pickle.loads(body)
+            if body is None or len(body) < need:
+                break
+
+
+def _kill_worker():
+    global _WORKER
+    if _WORKER is not None:
+        _WORKER.kill()
+        try:
+            _WORKER.wait(timeout=5)
+        except Exception:  # noqa: BLE001 — unkillable child; abandon it
+            pass
+        _WORKER = None
+
+
+def _ensure_worker():
+    global _WORKER
+    if _WORKER is not None and _WORKER.poll() is None:
+        return _WORKER
+    _WORKER = subprocess.Popen(
+        [sys.executable, "-m", "tools.dspi_test.audio", "--worker"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=None,
+        cwd=_REPO_ROOT)
+    atexit.register(_kill_worker)
+    return _WORKER
+
+
+def worker_ping(timeout_s=20.0):
+    """Round-trip a no-op through the worker (selftest / bring-up)."""
+    proc = _ensure_worker()
+    _pipe_send(proc, {"op": "ping"})
+    return _pipe_recv(proc, timeout_s) == ("ok", "pong")
+
+
+def _worker_loop():
+    """Child main: serve requests until stdin closes. stdout is the protocol
+    channel, so nothing in the child may print to it."""
+    inp = sys.stdin.buffer
+    out = sys.stdout.buffer
+
+    def read_exact(n):
+        b = b""
+        while len(b) < n:
+            chunk = inp.read(n - len(b))
+            if not chunk:
+                return None
+            b += chunk
+        return b
+
+    while True:
+        hdr = read_exact(4)
+        if hdr is None:
+            return 0
+        body = read_exact(int.from_bytes(hdr, "little"))
+        if body is None:
+            return 0
+        req = pickle.loads(body)
+        try:
+            if req.get("op") == "ping":
+                resp = ("ok", "pong")
+            else:
+                resp = ("ok", _play_record_streams(**req["args"]))
+        except Exception as e:  # noqa: BLE001 — reported to the parent
+            resp = ("err", f"{type(e).__name__}: {e}")
+        data = pickle.dumps(resp, protocol=pickle.HIGHEST_PROTOCOL)
+        out.write(len(data).to_bytes(4, "little") + data)
+        out.flush()
+
+
+def play_record(excitation, fs, out_dev, in_dev,
+                in_channels=2, out_channels=2, tail_s=TAIL_S, max_retries=3):
+    """Play `excitation` on out_dev while recording in_channels from in_dev.
+
+    `excitation` is mono [N] (duplicated across out_channels) or [N, out_channels].
+    Returns the captured float32 array, shape [M, in_channels].
+
+    Uses two explicit callback streams (a recording InputStream + a feeding
+    OutputStream) started together, NOT sd.play()+InputStream (which does not
+    sync cleanly) and NOT a combined cross-device duplex stream (CoreAudio will
+    not open one reliably across two devices). The streams free-run on the shared
+    DSPi clock; the caller recovers the fixed latency by cross-correlation.
+
+    The IO itself runs in the capture worker process; a wedged worker is
+    killed, respawned, and the capture retried once before giving up.
+    """
+    _require()
+    global LAST_RUN
+    exc = np.asarray(excitation, dtype=np.float32)
+    if exc.ndim == 1:
+        exc = np.column_stack([exc] * out_channels)
+    n = exc.shape[0]
+    per_attempt_s = n / fs + tail_s + 0.5
+    timeout_s = per_attempt_s * (max_retries + 1) + _WORKER_TIMEOUT_SLACK_S
+    args = {"exc": exc, "fs": fs, "out_dev": out_dev, "in_dev": in_dev,
+            "in_channels": in_channels, "out_channels": out_channels,
+            "tail_s": tail_s, "max_retries": max_retries,
+            "blocksize": BLOCKSIZE}
+
+    for _spawn_try in range(2):
+        proc = _ensure_worker()
+        try:
+            _pipe_send(proc, {"op": "capture", "args": args})
+            status, res = _pipe_recv(proc, timeout_s)
+        except (_WorkerWedged, BrokenPipeError, OSError) as e:
+            print(f"    ! capture worker wedged ({e}); respawning", flush=True)
+            _kill_worker()
+            continue
+        if status == "err":
+            raise AudioUnavailable(f"capture worker: {res}")
+        LAST_RUN = {"exc": exc, "fs": fs, **res}
+        return res["cap"]
+    raise AudioUnavailable(
+        "capture worker wedged twice in a row (PortAudio stop deadlock?); "
+        "see tools/dspi_test/test_failures_diag.md 8c")
 
 
 # ---------------------------------------------------------------------------
@@ -527,6 +696,10 @@ def bit_exact_residual(out_dev, in_dev, in_channel, fs, dur_s=0.4, amp=0.4):
 
 def _main(argv=None):
     import argparse
+    # Worker mode first: stdout is the pickle protocol channel, so nothing
+    # else (argparse help, device listings) may touch it.
+    if (argv or sys.argv[1:]) == ["--worker"]:
+        return _worker_loop()
     ap = argparse.ArgumentParser(prog="dspi_test.audio",
                                  description="DSPi loopback audio bring-up tool")
     ap.add_argument("--list", action="store_true", help="enumerate host audio devices")

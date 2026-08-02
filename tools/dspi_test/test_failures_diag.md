@@ -388,11 +388,22 @@ overload lines counted in the unified log, worst flat-path residual
 | 2048 | 42.7 ms | 0 |
 | 4096 | 85 ms | 0 |
 
-`play_record()` now passes `blocksize=1536` on both streams: the smallest
-measured-clean size (the client's IO work is 19-25 ms, so 1024's budget sits
-inside it). If overloads ever reappear at 1536 on a slower machine, go to
-2048. Verify with `/usr/bin/log stream --predicate 'process ==
-"coreaudiod"'` that HALS_OverloadMessage stays quiet during a run.
+1536 is the smallest measured-clean size (the client's IO work is 19-25 ms,
+so 1024's budget sits inside it) and is the default via
+`DSPI_AUDIO_BLOCKSIZE` (0 restores the PortAudio-chosen 512).
+
+Caveat that shaped the design: the first full run with `blocksize=1536`
+hung in PortAudio's stop path (main thread wedged in AudioOutputUnitStop,
+an IO thread in PA's startStopCallback -> AudioUnitGetProperty) within ~10
+stream stops, against zero hangs in thousands of stops at the default size
+the same day; a 200-cycle open/stop stress at 1536 then passed, so the
+deadlock is rare and racy, plausibly widened by the longer IO cycle.
+Because of it, ALL stream IO now runs in a disposable capture worker
+subprocess (`python3 -m tools.dspi_test.audio --worker`, length-prefixed
+pickles over stdin/stdout): the parent never opens a stream, a wedged
+worker is killed and respawned with the capture retried once, and a worker
+that wedges twice in a row raises AudioUnavailable (test SKIPs, run
+continues). Covered by selftest section 32.
 
 Two additional live observations (2026-08-02 afternoon):
 

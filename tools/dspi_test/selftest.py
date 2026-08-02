@@ -532,6 +532,23 @@ else:
     check(A.capture_zero_gaps(cap_of(tail), cap_of(exc)) == 0,
           "tail re-prime bursts outside the excitation span: no gaps")
 
+print("32. capture worker isolation")
+src_audio = pathlib.Path("tools/dspi_test/audio.py").read_text()
+streams_in = [ln for ln in src_audio.splitlines()
+              if "sd.InputStream(" in ln or "sd.OutputStream(" in ln]
+check(len(streams_in) == 2, f"streams opened in exactly one place ({len(streams_in)} sites)")
+body = src_audio[src_audio.index("def _play_record_streams"):
+                 src_audio.index("def _worker_loop")]
+check("sd.InputStream(" in body and "sd.OutputStream(" in body,
+      "both stream opens live inside _play_record_streams (worker-only code)")
+if A.np is not None and A.sd is not None:
+    check(A.worker_ping(), "worker subprocess round-trips a ping")
+    A._kill_worker()
+    check(A.worker_ping(), "worker respawns after a kill")
+    A._kill_worker()
+else:
+    print("  (sounddevice/numpy missing: worker ping skipped)")
+
 print()
 print("FAILURES:", len(fails))
 for f in fails:
