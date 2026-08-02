@@ -221,6 +221,127 @@ for label, want, got in rows:
         bad.append(label)
 check(bad == ["d", "e"], f"only real mismatches reported (got {bad})")
 
+
+# --------------------------------------------------------------------------
+# Phase 3: rate parameterisation
+# --------------------------------------------------------------------------
+
+print("12. rate tags: primary is unsuffixed, others are identifier-safe")
+check(L._rate_tag(L.PRIMARY_RATES[0]) == "", "primary rate has no suffix")
+check(L._rate_tag(44100) == "_44k1", f"44.1k tag (got {L._rate_tag(44100)!r})")
+for fs in (44100, 96000, 32000):
+    tag = L._rate_tag(fs)
+    check(("x" + tag).isidentifier(), f"{fs} tag {tag!r} is identifier-safe")
+
+print("13. every SECONDARY_TESTS name resolves to a registered test")
+from tools.dspi_test.framework import REGISTRY
+registered = {tc.name for tc in REGISTRY}
+missing = [n for n in L.SECONDARY_TESTS if n not in registered]
+check(not missing, f"all subset names exist (missing: {missing})")
+variants = [n + "_44k1" for n in L.SECONDARY_TESTS]
+absent = [v for v in variants if v not in registered]
+check(not absent, f"all 44.1k variants registered (absent: {absent})")
+
+print("14. rate variants are contiguous and last, so only ONE rate switch")
+audio_names = [tc.name for tc in REGISTRY if tc.group == "audio"]
+idx = [i for i, n in enumerate(audio_names) if n.endswith("_44k1")]
+check(idx == list(range(min(idx), max(idx) + 1)),
+      "44.1k variants form one contiguous block")
+check(max(idx) < len(audio_names) - 1 and audio_names[-1] == "rate_switch_round_trip",
+      f"round-trip test registered last (last is {audio_names[-1]!r})")
+
+print("15. _rate_variant restores _ACTIVE_FS even when the body raises")
+seen = {}
+
+
+def _body(dev, profile, chk):
+    seen["fs"] = L._ACTIVE_FS
+    raise RuntimeError("boom")
+
+
+L._ACTIVE_FS = None
+v = L._rate_variant(_body, 44100)
+try:
+    v(None, None, None)
+except RuntimeError:
+    pass
+check(seen["fs"] == 44100, f"body saw the variant rate (got {seen['fs']})")
+check(L._ACTIVE_FS is None, f"_ACTIVE_FS restored after the raise (got {L._ACTIVE_FS})")
+# _rate_variant registers as a side effect; drop the throwaway, asserting what
+# we remove so a future reorder cannot silently delete a real test.
+assert REGISTRY[-1].name == "_body_44k1", REGISTRY[-1].name
+REGISTRY.pop()
+
+print("16. _get_rig honours _ACTIVE_FS and keeps per-rate caches apart")
+L._RIG.clear(); L._RIG_FAIL.clear()
+L._RIG[48000] = {"fs": 48000, "slot": 0, "out": 0, "in": 1}
+L._RIG[44100] = {"fs": 44100, "slot": 0, "out": 0, "in": 1}
+L._DEVS = (0, 1, {"out": {"name": "m"}, "in": {"name": "m"}})
+
+
+class RateDev:
+    def __init__(self, rate):
+        self.rate = rate
+
+    def get_u32(self, opcode, wvalue=0):
+        assert wvalue == L.STATUS_SAMPLE_RATE
+        return self.rate
+
+
+L._ACTIVE_FS = 44100
+check(L._get_rig(RateDev(44100), None)["fs"] == 44100, "picks the 44.1k rig")
+L._ACTIVE_FS = None
+check(L._get_rig(RateDev(48000), None)["fs"] == 48000, "falls back to the primary rig")
+check(L._get_rig(RateDev(44100), None, 44100)["fs"] == 44100, "explicit fs wins")
+L._RIG.clear(); L._RIG_FAIL.clear()
+
+print("17. a cached per-rate failure does not poison the other rate")
+L._RIG_FAIL[44100] = "nope"
+L._RIG[48000] = {"fs": 48000, "slot": 0, "out": 0, "in": 1}
+try:
+    L._get_rig(RateDev(48000), None, 44100)
+    check(False, "should have raised Skip for the failed rate")
+except L.Skip as e:
+    check(str(e) == "nope", "failed rate skips with its cached reason")
+check(L._get_rig(RateDev(48000), None, 48000)["fs"] == 48000,
+      "the healthy rate still works")
+L._RIG.clear(); L._RIG_FAIL.clear(); L._DEVS = None; L._ACTIVE_FS = None
+
+print("18. --audio-rates registration modes (end to end, via --list)")
+import subprocess
+
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def _list_audio(*extra):
+    out = subprocess.run(
+        [sys.executable, "-m", "tools.dspi_test.run", "--list", "--group", "audio", *extra],
+        cwd=ROOT, capture_output=True, text=True, check=True).stdout
+    names = [ln.strip().split()[0] for ln in out.splitlines()
+             if ln.startswith("  ") and ln.strip() and not ln.startswith("  [")]
+    return names
+
+
+base = _list_audio()
+both = _list_audio("--audio-rates", "48000,44100")
+alt = _list_audio("--audio-rates", "44100")
+
+n_primary = len(base) - sum(n.endswith("_44k1") for n in base) - 1   # minus round-trip
+check(sum(n.endswith("_44k1") for n in base) == len(L.SECONDARY_TESTS),
+      f"default: subset-sized 44.1k pass ({sum(n.endswith('_44k1') for n in base)})")
+check(len(both) == 2 * n_primary + 1,
+      f"override lists the FULL matrix twice plus the round trip "
+      f"({len(both)} vs {2 * n_primary + 1})")
+check(len(alt) == n_primary + 1, f"single-rate override runs one full matrix ({len(alt)})")
+check(not any(n.endswith("_44k1") for n in alt),
+      "44.1k-as-primary names are unsuffixed")
+for label, names in (("default", base), ("override", both)):
+    idx = [i for i, n in enumerate(names) if n.endswith("_44k1")]
+    check(idx == list(range(min(idx), max(idx) + 1)),
+          f"{label}: 44.1k variants contiguous, so exactly one rate change")
+    check(names[-1] == "rate_switch_round_trip",
+          f"{label}: round trip last, leaving the device on the primary rate")
+
 print()
 print("FAILURES:", len(fails))
 for f in fails:

@@ -13,6 +13,11 @@ Options:
                             its auto-probe sees a pristine device.
     --audio                 Include the hardware audio-loopback group (needs the
                             DSPI_LOOPBACK firmware + sounddevice; excluded by default).
+    --audio-rates HZ[,HZ]   Run the FULL audio matrix at each listed rate (e.g.
+                            48000,44100). Default: full matrix at 48 kHz plus a
+                            targeted 44.1 kHz subset. DSPi follows the host USB
+                            rate, so the harness moves it by opening a host
+                            stream there and waiting for the change to apply.
     --group G[,G...]        Run only these test groups (default: all).
     --list                  List registered tests and exit (no device needed if
                             modules import; still imports the package).
@@ -32,6 +37,7 @@ Exit code: 0 if no FAIL/ERROR, 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -53,6 +59,10 @@ def main(argv=None):
     ap.add_argument("--audio", action="store_true",
                     help="include the hardware audio-loopback group (needs the "
                          "DSPI_LOOPBACK firmware + sounddevice; excluded by default)")
+    ap.add_argument("--audio-rates", default=None, metavar="HZ[,HZ...]",
+                    help="run the FULL audio matrix at each listed rate (e.g. "
+                         "48000,44100). Default: full matrix at 48 kHz plus a "
+                         "targeted 44.1 kHz subset.")
     ap.add_argument("--all", action="store_true",
                     help="run the COMPLETE suite: audio-loopback group + flash tests "
                          "+ factory reset (= --audio --allow-flash --allow-factory-reset)")
@@ -69,6 +79,11 @@ def main(argv=None):
         args.audio = True
         args.allow_flash = True
         args.allow_factory_reset = True
+
+    # Must be set BEFORE the test modules import: the audio group decides which
+    # per-rate test variants to register at import time.
+    if args.audio_rates:
+        os.environ["DSPI_AUDIO_RATES"] = args.audio_rates
 
     _import_tests()
     from .framework import REGISTRY, Runner, catalog_markdown
@@ -158,6 +173,12 @@ def main(argv=None):
                     dir_after = dev.get(lifecycle.OP.PRESET_GET_DIR, 7)
                     if bytes(dir_after) != bytes(snap.directory):
                         print(f"  ⚠️ directory changed: {snap.directory.hex()} -> {bytes(dir_after).hex()}")
+                    # The operating rate is host driven, so the bulk restore
+                    # cannot put it back; only report drift.
+                    rate_after = dev.get_u32(lifecycle.OP.GET_STATUS, wvalue=15)
+                    if rate_after != snap.sample_rate:
+                        print(f"  ⚠️ sample rate changed: {snap.sample_rate} -> {rate_after} Hz "
+                              f"(host driven; re-open a stream at {snap.sample_rate} to restore)")
                 else:
                     print("  ✗ device unresponsive — cannot restore")
             except Exception as e:  # noqa: BLE001

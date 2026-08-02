@@ -21,11 +21,12 @@ restored at the end.
 
 from __future__ import annotations
 
+import os
 import struct
 import time
 
 from ..device import OP, Stall, Timeout
-from ..framework import test, Skip
+from ..framework import test, Skip, REGISTRY
 from .. import audio
 
 try:
@@ -42,7 +43,35 @@ CORR_MIN = 0.30         # cross-correlation strength that means "signal present"
 NOISE_MAX_DBFS = -100.0
 RESIDUAL_MAX_DBFS = -80.0   # flat-path per-sample residual (bit-exact-ish)
 GAIN_TOL_DB = 0.5           # flat-path overall gain vs unity
-FS = audio.DEFAULT_FS       # 48 kHz; DSPi follows the host USB rate
+
+# --- Operating rates --------------------------------------------------------
+#
+# DSPi follows the host USB rate, and the loopback capture function advertises
+# 44.1 and 48 kHz (usb_descriptors.c), so both are real operating points that
+# have to be verified.  Running the whole matrix at both roughly doubles a
+# multi-minute run for little extra signal, so the default is the full matrix at
+# the primary rate plus a targeted second pass (SECONDARY_TESTS) at 44.1 kHz.
+#
+# The device's playback function also advertises 96 kHz on the stereo alt, but
+# the capture does not and the servo's 52-frame packet ceiling cannot carry it;
+# _require_rate() skips rather than measuring garbage there.
+FS = audio.DEFAULT_FS       # 48 kHz, the primary rate
+FS_ALT = 44100              # secondary rate
+
+# run.py --audio-rates sets this to run the FULL matrix at each listed rate
+# instead (and then no secondary subset, since it would be redundant).
+_RATES_ENV = os.environ.get("DSPI_AUDIO_RATES", "").replace(",", " ").split()
+RATES_OVERRIDE = [int(r) for r in _RATES_ENV] if _RATES_ENV else None
+PRIMARY_RATES = RATES_OVERRIDE or [FS]
+SECONDARY_RATES = [] if RATES_OVERRIDE else [FS_ALT]
+
+# Suffix for a rate's generated test names.  Empty at the first primary rate so
+# existing names (and saved baseline reports) stay comparable.
+_RATE_TAGS = {48000: "48k", 44100: "44k1", 96000: "96k"}
+
+
+def _rate_tag(fs):
+    return "" if fs == PRIMARY_RATES[0] else "_" + _RATE_TAGS.get(fs, str(fs))
 
 # FilterType enum (firmware) by RBJ-reference name.
 TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5,
@@ -222,6 +251,32 @@ def _device_rate(dev):
     return _read_settled(lambda: dev.get_u32(OP.GET_STATUS, wvalue=STATUS_SAMPLE_RATE))
 
 
+def _set_rate(dev, out_dev, in_dev, fs):
+    """Move DSPi to `fs` and wait until it is applied.  Returns True on success.
+
+    DSPi has no vendor command for this: it follows the host USB rate, so the
+    device only moves when the host issues the UAC1 SET_CUR, which happens when
+    a stream opens at the new rate.  A short quiet tone is enough to open and
+    close a stream pair there.  The rate change is then deferred to the main
+    loop behind pipeline_reset_ready() like every other pipeline reset
+    (main.c rate_change_pending), so the applied read-back is the barrier.
+    """
+    if _device_rate(dev) == fs:
+        return True
+    try:
+        audio.measure_tone(out_dev, in_dev, 0, fs, 1000.0, amp=0.1)
+    except Exception:  # noqa: BLE001
+        # The host backend can refuse the rate outright (PortAudio raises when
+        # the device will not open there).  That is a "cannot test at this rate"
+        # condition, not a harness error, so let the caller turn it into a Skip.
+        return False
+    got = _wait_applied(lambda: dev.get_u32(OP.GET_STATUS, wvalue=STATUS_SAMPLE_RATE), fs)
+    if got != fs:
+        return False
+    time.sleep(PIPELINE_SETTLE_S)
+    return True
+
+
 def _require_rate(dev, fs):
     """Skip unless the device is actually running at `fs`.
 
@@ -266,7 +321,14 @@ def _signal_amp(gain_db):
 
 # --- Session rig (devices + auto-probed target slot), discovered once --------
 
-_RIG = None  # dict on success, or a str reason once we know it's unavailable
+_RIG = {}        # fs -> rig dict, built on first use at that rate
+_RIG_FAIL = {}   # fs -> reason, once we know that rate is unusable
+_DEVS = None     # (out_dev, in_dev, info) from find_devices(), rate-independent
+
+# Rate a _rate_variant() wrapper has selected for the test currently running.
+# The framework runs tests strictly serially, so a module-level current-rate is
+# safe; it lets an existing test body be replayed at another rate untouched.
+_ACTIVE_FS = None
 
 
 def _slot_indices(profile, slot):
@@ -466,46 +528,66 @@ def _autoprobe_slot(dev, profile, out_dev, in_dev, fs):
     return best
 
 
-def _get_rig(dev, profile):
-    """Discover audio devices and the target slot once; cache for the session."""
-    global _RIG
-    if isinstance(_RIG, str):
-        raise Skip(_RIG)
-    if _RIG is not None:
-        # Re-checked per test: the host can move the device's nominal rate at
-        # any point (another client opening the device), and every reference
-        # here is computed from fs.  One GET is cheap next to a measurement.
-        _require_rate(dev, _RIG["fs"])
-        return _RIG
+def _find_devices_once():
+    """Host audio devices, discovered once (they do not depend on the rate)."""
+    global _DEVS
+    if _DEVS is None:
+        _DEVS = audio.find_devices()
+    return _DEVS
+
+
+def _get_rig(dev, profile, fs=None):
+    """Rig for `fs`, building it on first use at that rate and caching it.
+
+    `fs` defaults to whatever rate the running test was registered for
+    (_ACTIVE_FS), or the primary rate for the tests registered directly.
+    """
+    if fs is None:
+        fs = _ACTIVE_FS if _ACTIVE_FS is not None else PRIMARY_RATES[0]
+    if fs in _RIG_FAIL:
+        raise Skip(_RIG_FAIL[fs])
     if np is None:
-        _RIG = "numpy not installed (pip install numpy scipy sounddevice)"
-        raise Skip(_RIG)
+        _RIG_FAIL[fs] = "numpy not installed (pip install numpy scipy sounddevice)"
+        raise Skip(_RIG_FAIL[fs])
     try:
-        out_dev, in_dev, info = audio.find_devices()
+        out_dev, in_dev, info = _find_devices_once()
     except audio.AudioUnavailable as e:
-        _RIG = f"audio loopback unavailable: {e}"
-        raise Skip(_RIG)
+        _RIG_FAIL[fs] = f"audio loopback unavailable: {e}"
+        raise Skip(_RIG_FAIL[fs])
+
+    if fs in _RIG:
+        # The device may have been moved since this rig was built (the previous
+        # test ran at another rate, or another host client changed it), so put
+        # it back before measuring rather than just failing the comparison.
+        if not _set_rate(dev, out_dev, in_dev, fs):
+            raise Skip(f"could not return the device to {fs} Hz "
+                       f"(now at {_device_rate(dev)})")
+        return _RIG[fs]
+
 
     try:
         _baseline(dev, profile)
-        # Prime the host streams at FS first: DSPi follows the host USB rate, so
-        # the device only moves to FS once a stream is opened there.  A short
-        # tone is enough to make CoreAudio issue the UAC1 SET_CUR; then require
-        # it applied before any reference-based measurement runs.
-        audio.measure_tone(out_dev, in_dev, 0, FS, 1000.0, amp=0.1)
-        _require_rate(dev, FS)
-        slot = _autoprobe_slot(dev, profile, out_dev, in_dev, FS)
+        if not _set_rate(dev, out_dev, in_dev, fs):
+            # _require_rate names the specific reason (wrong rate, or above the
+            # capture's ceiling) and always raises here, since the rate cannot
+            # match after _set_rate failed.
+            _require_rate(dev, fs)
+            raise Skip(f"host would not move the device to {fs} Hz")
+        # The target slot is a property of the loopback tap, not of the rate, so
+        # a second rate reuses it rather than paying for another probe sweep.
+        slot = next(iter(_RIG.values()))["slot"] if _RIG else \
+            _autoprobe_slot(dev, profile, out_dev, in_dev, fs)
         ch_l, ch_r = _config_slot(dev, profile, slot, flatten_all=True)
     except Skip as e:
-        # Rig setup runs once per session.  Cache the reason so the remaining
-        # ~80 tests skip instantly rather than each re-running the whole
+        # Rig setup runs once per rate.  Cache the reason so the remaining tests
+        # at this rate skip instantly rather than each re-running the whole
         # (multi-second, barrier-bounded) setup and re-reporting the same fault.
-        _RIG = str(e)
+        _RIG_FAIL[fs] = str(e)
         raise
-    _RIG = {"out": out_dev, "in": in_dev, "chan": 0, "slot": slot,
-            "ch_l": ch_l, "ch_r": ch_r, "fs": FS,
-            "out_name": info["out"]["name"], "in_name": info["in"]["name"]}
-    return _RIG
+    _RIG[fs] = {"out": out_dev, "in": in_dev, "chan": 0, "slot": slot,
+                "ch_l": ch_l, "ch_r": ch_r, "fs": fs,
+                "out_name": info["out"]["name"], "in_name": info["in"]["name"]}
+    return _RIG[fs]
 
 
 def _expected(rbj_name, fc, q, gain, fs, freqs):
@@ -531,6 +613,11 @@ def _test_freqs(fs):
 
 
 # --- Tests ------------------------------------------------------------------
+
+# Where this module's own registrations begin, so the per-rate replay below can
+# pick out exactly the tests defined here (REGISTRY is shared by every module).
+_REGISTRY_MARK = len(REGISTRY)
+
 
 @test("audio", mutating=True)
 def loopback_baseline_clean(dev, profile, chk):
@@ -1263,3 +1350,104 @@ def output_clip_limit(dev, profile, chk):
         chk.note(f"clip: clean {lvl0:.1f}dBFS/{thd0:.3f}% clipped {lvl1:.1f}dBFS/{thd1:.3f}%")
     finally:
         _set_band(dev, rig["ch_l"], 0, FLAT, 1000.0, 0.707, 0.0); dev.wait_ready()
+
+
+# --- Per-rate replay --------------------------------------------------------
+#
+# Everything above is registered once, at the first primary rate.  Two further
+# passes can follow, both built by replaying existing test bodies at another
+# rate (see _rate_variant):
+#
+#   * PRIMARY_RATES[1:] replay the FULL matrix.  Only --audio-rates produces
+#     these, because doubling a multi-minute run is an explicit choice.
+#   * SECONDARY_RATES replay the targeted SECONDARY_TESTS subset.  This is the
+#     default 44.1 kHz pass.
+#
+# Variants are registered in rate order and the round-trip test comes last, so a
+# run performs exactly one rate change per extra rate rather than thrashing.
+#
+# The subset covers the tests where the rate genuinely changes behaviour, rather
+# than the whole matrix (which would roughly double the run for little signal).
+#
+#   * loopback_integrity: the capture servo now runs at a NON-INTEGER 44.1
+#     frames per USB frame, so its fractional accumulator, not just the
+#     feed-forward term, has to hold bit-exactness and unity gain.
+#   * output_delay: the expected sample count is derived from fs (220 vs 240).
+#   * multiband_eq and the PEQ/XO picks: the hybrid SVF/biquad boundary is
+#     Fs/7.5, so it moves from 6400 Hz to 5880 Hz.  multiband_eq's 6 kHz high
+#     shelf is on the SVF side at 48 kHz and the biquad side at 44.1 kHz, so the
+#     same configuration covers both paths across the two rates.
+#   * slot_lr_alignment: inter-leg alignment at the second rate.
+#
+# Rates come from run.py --audio-rates; see PRIMARY_RATES / SECONDARY_RATES.
+
+SECONDARY_TESTS = [
+    "loopback_integrity",
+    "slot_lr_alignment",
+    "output_delay",
+    "multiband_eq",
+    "xo_lr4_complementary_sum",
+    "peq_lowpass1_lo", "peq_lowpass1_hi",
+    "peq_peaking_lo", "peq_peaking_hi",
+    "peq_highshelf_lo", "peq_highshelf_hi",
+    "xo_lr4_lp", "xo_lr4_hp", "xo_bw2_lp", "xo_bes4_hp",
+]
+
+
+def _rate_variant(body, fs):
+    """Register an existing test body to run again at `fs`.
+
+    The body is reused untouched: the wrapper publishes the rate in _ACTIVE_FS,
+    which _get_rig() picks up, so nothing in the test has to thread fs through.
+    Restored in a finally so a failure cannot leak the rate into the next test.
+    """
+    tag = _rate_tag(fs)
+
+    def fn(dev, profile, chk):
+        global _ACTIVE_FS
+        prev = _ACTIVE_FS
+        _ACTIVE_FS = fs
+        try:
+            return body(dev, profile, chk)
+        finally:
+            _ACTIVE_FS = prev
+
+    fn.__name__ = body.__name__ + tag
+    first = (body.__doc__ or body.__name__).strip().split("\n")[0]
+    fn.__doc__ = f"[{fs} Hz] {first}"
+    return test("audio", mutating=True)(fn)
+
+
+# Bodies registered above, in order: the full matrix at the first primary rate.
+_PRIMARY_BODIES = [tc.fn for tc in REGISTRY[_REGISTRY_MARK:]]
+
+for _fs in PRIMARY_RATES[1:]:
+    for _body in _PRIMARY_BODIES:
+        globals()[_body.__name__ + _rate_tag(_fs)] = _rate_variant(_body, _fs)
+
+for _fs in SECONDARY_RATES:
+    for _name in SECONDARY_TESTS:
+        _body = globals().get(_name)
+        if _body is None:      # a renamed/removed test should be loud, not silent
+            raise RuntimeError(f"SECONDARY_TESTS names an unknown test: {_name}")
+        globals()[_body.__name__ + _rate_tag(_fs)] = _rate_variant(_body, _fs)
+
+
+@test("audio", mutating=True)
+def rate_switch_round_trip(dev, profile, chk):
+    """Returning to the primary rate restores signal and L/R alignment.
+
+    Registered last so it also leaves the device on the primary rate: the
+    suite's snapshot restores device CONFIG, but the operating rate is host
+    driven and is not in the bulk blob, so nothing else would put it back.
+    """
+    primary = PRIMARY_RATES[0]
+    rig = _get_rig(dev, profile, primary)
+    chk.ok(_device_rate(dev) == primary, f"device back at {primary} Hz")
+    lag, strength = _lr_lag(dev, profile, rig)
+    chk.ok(strength > 0.5, f"signal present after the rate round trip (corr {strength:.2f})")
+    chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
+    # Multichannel USB alts advertise 48 kHz only (usb_descriptors.c
+    # AS_MULTICH_ALT), so any 44.1 kHz pass necessarily ran on a stereo alt.
+    _note_input_count(dev, chk)
+    chk.note(f"rate_round_trip: rates exercised {sorted(_RIG)} lag={lag}")
