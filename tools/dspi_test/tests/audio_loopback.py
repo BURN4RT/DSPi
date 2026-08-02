@@ -24,7 +24,7 @@ from __future__ import annotations
 import struct
 import time
 
-from ..device import OP
+from ..device import OP, Stall, Timeout
 from ..framework import test, Skip
 from .. import audio
 
@@ -52,11 +52,16 @@ TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5
 FLAT = 0
 INPUT_USB = 0
 TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
-# Settle after an output-type switch before bit-exact measurement: the switch
-# runs complete_pipeline_reset() and the I2S clock + loopback servo re-prime, so
-# the first capture frames after the switch carry a transient.  2 s lets it fully
-# settle so I2S meets the same single-shot bit-exact standard as S/PDIF (no retry).
-TYPE_SWITCH_SETTLE_S = 2.0
+
+# GET_STATUS sub-indices (vendor_commands.c REQ_GET_STATUS switch).
+STATUS_SAMPLE_RATE = 15       # audio_state.freq, the live operating rate
+STATUS_INPUT_COUNT = 23       # active_input_channel_count()
+
+# The loopback capture function advertises 44.1/48 kHz only, and the servo can
+# emit at most LOOPBACK_MAX_FRAMES_PER_PACKET (52) stereo frames per USB frame.
+# The playback function also advertises 96 kHz, so the device can legitimately be
+# running at a rate the capture cannot carry; measuring there yields garbage.
+CAPTURE_MAX_RATE = 48000
 
 # Magnitude-shaping PEQ configs: (name, rbj_name, fc, Q, gain_db). Frequencies
 # straddle the RP2350 SVF/biquad boundary (Fs/7.5 ~= 6400 Hz @ 48 kHz).
@@ -88,6 +93,146 @@ PEQ_CONFIGS = [
     ("allpass_lo",    "allpass",       300.0, 0.707, 0.0),
     ("allpass_hi",    "allpass",      9000.0, 0.707, 0.0),
 ]
+
+
+# --- Deferred-operation barriers --------------------------------------------
+#
+# dev.wait_ready() proves only that the device still answers control transfers:
+# it returns on the FIRST successful poll.  Output-type switches, input-source
+# switches and rate changes are all DEFERRED to the main loop (the vendor
+# handler just arms a flag; main.c's process_type_switches() / input-source
+# handler applies it behind pipeline_reset_ready()), so wait_ready() routinely
+# returns before the operation has even started.
+#
+# Worse, both SET handlers compare against the APPLIED state and drop the
+# request when it already matches: the type switch returns success for
+# `new_type == output_types[slot]`, and the input switch arms only when
+# `src != active_input_source`.  A round trip issued faster than the main loop
+# applies the first leg is therefore compared against stale state and silently
+# swallowed, leaving the device in the intermediate mode while the test believes
+# it was restored.
+#
+# So: poll the applied state instead.  Because these helpers never return with a
+# switch still pending, the entry-time read is always accurate and an unchanged
+# request is a genuine no-op (no reset, no settle).
+
+BARRIER_TIMEOUT_S = 4.0
+BARRIER_POLL_S = 0.05
+
+# After an operation that crossed a pipeline reset the DSP callback stalls, the
+# loopback ring drains, and the capture servo takes its underrun path: it emits
+# silence packets until the ring refills to TARGET_FILL_FRAMES (loopback.c).
+# Measuring inside that window reads a silence gap and a splice, not the DSP.
+PIPELINE_SETTLE_S = 2.0
+
+
+def _wait_applied(getter, expected, timeout_s=None, poll_s=None):
+    """Poll `getter()` until it reports `expected`; return the last value read.
+
+    Transient stalls/timeouts are tolerated: a deferred reset briefly disables
+    the USB control IRQ, so a transfer in that window legitimately fails.
+
+    The bounds default to None and resolve to the module constants HERE rather
+    than in the signature, so raising BARRIER_TIMEOUT_S actually takes effect
+    (a default argument would freeze the value at import time).
+    """
+    timeout_s = BARRIER_TIMEOUT_S if timeout_s is None else timeout_s
+    poll_s = BARRIER_POLL_S if poll_s is None else poll_s
+    deadline = time.monotonic() + timeout_s
+    last = None
+    while True:
+        try:
+            last = getter()
+            if last == expected:
+                return last
+        except (Stall, Timeout):
+            pass
+        if time.monotonic() >= deadline:
+            return last
+        time.sleep(poll_s)
+
+
+def _read_settled(getter, timeout_s=None):
+    """Read a device value, tolerating a transient control-IRQ blackout left by
+    an operation that is still settling.  Returns None if it never answers.
+
+    Every entry-time read below needs this: these helpers are routinely called
+    right after a previous deferred reset, and a bare GET in that window would
+    escape as "unexpected STALL" and turn the test into an ERROR.
+    """
+    timeout_s = BARRIER_TIMEOUT_S if timeout_s is None else timeout_s
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            return getter()
+        except (Stall, Timeout):
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(BARRIER_POLL_S)
+
+
+def _set_output_type(dev, slot, otype):
+    """Switch `slot` to output type `otype` and wait until it is APPLIED.
+
+    Returns True on success.  A request that matches the applied type is a
+    no-op and costs one GET (this is the common case: _config_slot re-asserts
+    the type on every call).
+    """
+    cur = _read_settled(lambda: dev.get_u8(OP.GET_OUTPUT_TYPE, wvalue=slot))
+    if cur is None:
+        return False        # device never answered
+    if cur == otype:
+        return True
+    if dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(otype << 8) | slot) != 0:
+        return False        # rejected outright (bad slot / type / pin conflict)
+    if _wait_applied(lambda: dev.get_u8(OP.GET_OUTPUT_TYPE, wvalue=slot), otype) != otype:
+        return False        # accepted but never applied
+    time.sleep(PIPELINE_SETTLE_S)
+    return True
+
+
+def _set_input_source(dev, src):
+    """Switch the input source and wait until it is APPLIED.  Returns True on
+    success.  The SET returns no status and input_source_selectable() can reject
+    it silently (e.g. a disabled S/PDIF 2/3), so the read-back is also the only
+    way to know the switch happened at all."""
+    cur = _read_settled(lambda: dev.get_u8(OP.GET_INPUT_SOURCE))
+    if cur is None:
+        return False
+    if cur == src:
+        return True
+    dev.set_u8(OP.SET_INPUT_SOURCE, src)
+    if _wait_applied(lambda: dev.get_u8(OP.GET_INPUT_SOURCE), src) != src:
+        return False
+    time.sleep(PIPELINE_SETTLE_S)
+    return True
+
+
+def _device_rate(dev):
+    """DSPi's live operating rate (audio_state.freq), or None if it will not
+    answer (see _read_settled)."""
+    return _read_settled(lambda: dev.get_u32(OP.GET_STATUS, wvalue=STATUS_SAMPLE_RATE))
+
+
+def _require_rate(dev, fs):
+    """Skip unless the device is actually running at `fs`.
+
+    Every reference in this module (RBJ/scipy magnitude and phase, the test
+    frequency grid, the output-delay sample count) is computed from fs, and the
+    capture streams at audio_state.freq regardless of what the host asked for
+    (loopback.c) — a mismatch is a silent pitch error that shows up as dozens of
+    unexplained magnitude failures.  One Skip is far more useful.
+    """
+    actual = _device_rate(dev)
+    if actual is None:
+        raise Skip("device would not report its sample rate (still settling?)")
+    if actual != fs:
+        if actual > CAPTURE_MAX_RATE:
+            raise Skip(f"device at {actual} Hz: above the loopback capture's "
+                       f"{CAPTURE_MAX_RATE} Hz ceiling (servo cannot carry it)")
+        raise Skip(f"device at {actual} Hz, tests reference {fs} Hz "
+                   f"(set the host stream rate to {fs})")
+    return actual
 
 
 # --- Vendor-command helpers (mirror tests/eq.py, tests/outputs.py) -----------
@@ -134,8 +279,8 @@ def _baseline(dev, profile=None):
     user volume + user mute are independent stages; all of them must be zeroed
     explicitly or absolute-level measurements read low. Per-input preamp is
     zeroed across all input channels (8 on RP2350)."""
-    dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_USB)
-    dev.wait_ready()
+    if not _set_input_source(dev, INPUT_USB):
+        raise Skip("could not switch the input source to USB")
     dev.set_f32(OP.SET_MASTER_VOLUME, 0.0)   # power-on default is -20 dB
     dev.set_f32(OP.SET_USER_VOLUME, 0.0)
     dev.set_u8(OP.SET_USER_MUTE, 0)
@@ -162,7 +307,10 @@ def _config_slot(dev, profile, slot, flatten_all=False, otype=TYPE_SPDIF):
     every band on both channels. The loopback tap is pre-encoder, so the
     captured DSP output is identical for either output type."""
     out_l, out_r, ch_l, ch_r = _slot_indices(profile, slot)
-    dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(otype << 8) | slot)
+    if not _set_output_type(dev, slot, otype):
+        raise Skip(f"slot {slot} could not be set to "
+                   f"{'I2S' if otype == TYPE_I2S else 'S/PDIF'} output "
+                   f"(check BCK pin / pin conflict)")
     dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=out_l)
     dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=out_r)
     dev.wait_ready()
@@ -186,7 +334,8 @@ def _autoprobe_slot(dev, profile, out_dev, in_dev, fs):
     succeed."""
     for k in range(profile.num_spdif):     # enable all S/PDIF outputs once
         ol, orr = 2 * k, 2 * k + 1
-        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(0 << 8) | k)
+        if not _set_output_type(dev, k, TYPE_SPDIF):
+            raise Skip(f"could not put slot {k} into S/PDIF mode for the probe")
         dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=ol)
         dev.set_u8(OP.SET_OUTPUT_ENABLE, 1, wvalue=orr)
     dev.wait_ready()
@@ -209,6 +358,10 @@ def _get_rig(dev, profile):
     if isinstance(_RIG, str):
         raise Skip(_RIG)
     if _RIG is not None:
+        # Re-checked per test: the host can move the device's nominal rate at
+        # any point (another client opening the device), and every reference
+        # here is computed from fs.  One GET is cheap next to a measurement.
+        _require_rate(dev, _RIG["fs"])
         return _RIG
     if np is None:
         _RIG = "numpy not installed (pip install numpy scipy sounddevice)"
@@ -219,9 +372,22 @@ def _get_rig(dev, profile):
         _RIG = f"audio loopback unavailable: {e}"
         raise Skip(_RIG)
 
-    _baseline(dev, profile)
-    slot = _autoprobe_slot(dev, profile, out_dev, in_dev, FS)
-    ch_l, ch_r = _config_slot(dev, profile, slot, flatten_all=True)
+    try:
+        _baseline(dev, profile)
+        # Prime the host streams at FS first: DSPi follows the host USB rate, so
+        # the device only moves to FS once a stream is opened there.  A short
+        # tone is enough to make CoreAudio issue the UAC1 SET_CUR; then require
+        # it applied before any reference-based measurement runs.
+        audio.measure_tone(out_dev, in_dev, 0, FS, 1000.0, amp=0.1)
+        _require_rate(dev, FS)
+        slot = _autoprobe_slot(dev, profile, out_dev, in_dev, FS)
+        ch_l, ch_r = _config_slot(dev, profile, slot, flatten_all=True)
+    except Skip as e:
+        # Rig setup runs once per session.  Cache the reason so the remaining
+        # ~80 tests skip instantly rather than each re-running the whole
+        # (multi-second, barrier-bounded) setup and re-reporting the same fault.
+        _RIG = str(e)
+        raise
     _RIG = {"out": out_dev, "in": in_dev, "chan": 0, "slot": slot,
             "ch_l": ch_l, "ch_r": ch_r, "fs": FS,
             "out_name": info["out"]["name"], "in_name": info["in"]["name"]}
@@ -673,14 +839,19 @@ def alignment_after_input_switch(dev, profile, chk):
     """Input-source switch (USB -> S/PDIF -> USB) preserves L/R sample alignment."""
     rig = _get_rig(dev, profile)
     try:
-        dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_SPDIF); dev.wait_ready()
-        dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_USB); dev.wait_ready()
+        # Both legs must be confirmed applied.  Without the barrier the restore
+        # is compared against a stale active_input_source, silently swallowed,
+        # and the test measures with the input still on S/PDIF.
+        if not _set_input_source(dev, INPUT_SPDIF):
+            raise Skip("S/PDIF input not selectable (disabled, or switch never applied)")
+        if not _set_input_source(dev, INPUT_USB):
+            raise Skip("could not switch the input source back to USB")
         lag, strength = _lr_lag(dev, profile, rig)
         chk.ok(strength > 0.5, f"signal restored after input switch (corr {strength:.2f})")
         chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
         chk.note(f"after_input_switch: lag={lag} corr={strength:.2f}")
     finally:
-        dev.set_u8(OP.SET_INPUT_SOURCE, INPUT_USB); dev.wait_ready()
+        _set_input_source(dev, INPUT_USB)
 
 
 @test("audio", mutating=True)
@@ -689,16 +860,20 @@ def alignment_after_output_type_switch(dev, profile, chk):
     rig = _get_rig(dev, profile)
     slot = rig["slot"]
     try:
-        st = dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_I2S << 8) | slot); dev.wait_ready()
-        if st != 0:
-            raise Skip(f"output-type switch to I2S unavailable (status {st})")
-        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+        # Each leg is confirmed applied before the next is requested, so this
+        # really is a S/PDIF -> I2S -> S/PDIF round trip.  Previously the
+        # restore no-op'd against a stale output_types[] and the measurement
+        # ran with the slot still in I2S.
+        if not _set_output_type(dev, slot, TYPE_I2S):
+            raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
+        if not _set_output_type(dev, slot, TYPE_SPDIF):
+            raise Skip("could not restore the slot to S/PDIF")
         lag, strength = _lr_lag(dev, profile, rig)
         chk.ok(strength > 0.5, f"signal restored after type switch (corr {strength:.2f})")
         chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
         chk.note(f"after_type_switch: lag={lag} corr={strength:.2f}")
     finally:
-        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
+        _set_output_type(dev, slot, TYPE_SPDIF)
 
 
 # --- Phase 3b: per-output-type audio integrity ------------------------------
@@ -712,17 +887,6 @@ def alignment_after_output_type_switch(dev, profile, chk):
 # exercise the shared-DMA-channel teardown/re-setup path).
 
 
-def _i2s_available(dev, slot):
-    """True if slot can be put into I2S output mode (restores SPDIF either way)."""
-    st = dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_I2S << 8) | slot)
-    dev.wait_ready()
-    if st != 0:
-        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot)
-        dev.wait_ready()
-        return False
-    return True
-
-
 @test("audio", mutating=True)
 def output_type_i2s_audio(dev, profile, chk):
     """Slot 0 as I2S output: real audio still reaches the capture at unity with
@@ -732,10 +896,13 @@ def output_type_i2s_audio(dev, profile, chk):
     rig = _get_rig(dev, profile)
     slot = rig["slot"]
     try:
-        if not _i2s_available(dev, slot):
+        # _set_output_type waits for the switch to be APPLIED and then settles
+        # PIPELINE_SETTLE_S for the I2S clock and the loopback servo to
+        # re-prime; _config_slot's own type request is then a no-op, so this is
+        # a single switch rather than the probe-then-switch it used to be.
+        if not _set_output_type(dev, slot, TYPE_I2S):
             raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_I2S)
-        time.sleep(TYPE_SWITCH_SETTLE_S)   # let the I2S clock + loopback servo re-prime
         amp = 0.4
         level, thd, strength = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
                                                   rig["fs"], 1000.0, amp=amp)
@@ -746,9 +913,7 @@ def output_type_i2s_audio(dev, profile, chk):
         lag, _st = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
         chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
         # Bit-exactness + unity gain of the (pre-encoder, type-agnostic) capture,
-        # single-shot to the same standard as loopback_integrity.  The 2 s settle
-        # after the type switch lets the I2S clock + loopback servo fully re-prime
-        # so the capture is clean without any retry.
+        # single-shot to the same standard as loopback_integrity.
         resid, scale = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
         chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
         gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
@@ -756,7 +921,6 @@ def output_type_i2s_audio(dev, profile, chk):
         chk.note(f"i2s_audio: level={level:.2f}dBFS thd={thd:.4f}% resid={resid:.1f}dBFS "
                  f"|scale|={abs(scale):.4f} lag={lag}")
     finally:
-        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_SPDIF)
         dev.wait_ready()
 
@@ -768,13 +932,18 @@ def output_type_switch_stress(dev, profile, chk):
     teardown/re-setup path (audio_spdif_teardown + full SPDIF re-setup, I2S
     setup/teardown reclaiming the same channel); a double-claim panic, a stalled
     pipeline, or lost inter-leg alignment would surface here as lost signal, a
-    bad lag, or a device reset (disconnect)."""
+    bad lag, or a device reset (disconnect).
+
+    Every switch is confirmed APPLIED before measuring (_config_slot ->
+    _set_output_type), so these are real switches rather than requests swallowed
+    as no-ops against a stale output_types[]."""
     rig = _get_rig(dev, profile)
     slot = rig["slot"]
-    if not _i2s_available(dev, slot):
-        raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
     cycles = 4
     try:
+        # No separate availability probe: the first I2S leg below raises Skip
+        # (via _config_slot) if the slot cannot take it, and the finally still
+        # restores S/PDIF.  Probing first would cost two extra pipeline resets.
         for i in range(cycles):
             for otype, name in ((TYPE_SPDIF, "SPDIF"), (TYPE_I2S, "I2S")):
                 _config_slot(dev, profile, slot, otype=otype)
@@ -788,7 +957,6 @@ def output_type_switch_stress(dev, profile, chk):
                 chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"cycle {i} -> {name}: L/R aligned (lag {lag})")
         chk.note(f"switch_stress: {cycles}x SPDIF<->I2S, signal+level+alignment intact after every switch")
     finally:
-        dev.get_u8(OP.SET_OUTPUT_TYPE, wvalue=(TYPE_SPDIF << 8) | slot); dev.wait_ready()
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_SPDIF)
         dev.wait_ready()
 
@@ -804,17 +972,19 @@ def _flatten_master(dev, profile):
             _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
 
 
-def _require_stereo_input(dev):
-    """loudness, leveller, and crossfeed are the inherently-stereo chain; the
-    firmware bypasses them whenever more than 2 input channels are active (see
-    audio_pipeline.c `multichannel`).  Many hosts (e.g. macOS CoreAudio) open the
-    DSPi at its advertised 8-channel maximum, which holds the device in
-    multichannel mode where these effects never run — so skip, rather than fail,
-    when that is the case (the effect genuinely cannot be exercised here)."""
-    nin = dev.get_u32(OP.GET_STATUS, wvalue=23)   # live active USB input channel count
-    if nin > 2:
-        raise Skip(f"stereo-only effect not applicable: host holds {nin}-channel input "
-                   f"active (loudness/leveller/crossfeed bypassed in multichannel mode)")
+def _note_input_count(dev, chk):
+    """Record the live active input count alongside a chain measurement.
+
+    Loudness, leveller and crossfeed used to be bypassed whenever more than two
+    input channels were active, so these tests skipped on any host that opened
+    the DSPi at its 8-channel maximum (macOS CoreAudio does).  That bypass is
+    gone: crossfeed runs per output pair post-matrix, loudness runs per output
+    post-gain, and the leveller is mask-driven over the active inputs — all
+    input-count agnostic (audio_pipeline.c PASS 2.5 / 4.5 / 5-7).  The count is
+    still worth reporting, because it selects which code path was exercised."""
+    nin = dev.get_u32(OP.GET_STATUS, wvalue=STATUS_INPUT_COUNT)
+    chk.note(f"active input channels: {nin}")
+    return nin
 
 
 @test("audio", mutating=True)
@@ -850,7 +1020,7 @@ def multiband_eq(dev, profile, chk):
 def loudness_shape(dev, profile, chk):
     """Loudness compensation at low volume boosts bass and treble vs the mid band."""
     rig = _get_rig(dev, profile)
-    _require_stereo_input(dev)
+    _note_input_count(dev, chk)
     try:
         _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
         dev.set_f32(OP.SET_USER_VOLUME, -40.0)
@@ -874,7 +1044,7 @@ def loudness_shape(dev, profile, chk):
 def crossfeed_bleed(dev, profile, chk):
     """Crossfeed mixes a (filtered, attenuated) copy of one channel into the opposite."""
     rig = _get_rig(dev, profile)
-    _require_stereo_input(dev)
+    _note_input_count(dev, chk)
     try:
         _config_slot(dev, profile, rig["slot"])
         _flatten_chain(dev, rig["ch_l"]); _flatten_chain(dev, rig["ch_r"]); _flatten_master(dev, profile)
@@ -894,7 +1064,7 @@ def crossfeed_bleed(dev, profile, chk):
 def leveller_boost(dev, profile, chk):
     """The leveller lifts a sustained quiet signal, bounded by the max-gain ceiling."""
     rig = _get_rig(dev, profile)
-    _require_stereo_input(dev)
+    _note_input_count(dev, chk)
     try:
         _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
         dev.set_u8(OP.SET_LEVELLER_ENABLE, 0); dev.wait_ready()
