@@ -51,11 +51,19 @@ TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5
 
 FLAT = 0
 INPUT_USB = 0
+# Crossover bands live above the PEQ block at wire indices
+# [XOVER_BAND_BASE .. XOVER_BAND_BASE + MAX_XOVER_BANDS - 1] (config.h).
+XO_BAND = 20                  # XOVER_BAND_BASE
+XO_BANDS = 4                  # MAX_XOVER_BANDS
 TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
 
 # GET_STATUS sub-indices (vendor_commands.c REQ_GET_STATUS switch).
 STATUS_SAMPLE_RATE = 15       # audio_state.freq, the live operating rate
 STATUS_INPUT_COUNT = 23       # active_input_channel_count()
+
+# Feature-specific constants used to neutralize a stage (firmware headers).
+UPMIX_PARAM_ENABLED = 0       # upmix.h
+SIGGEN_CTL_STOP_NOW = 2       # siggen.h: immediate hard stop, no fade
 
 # The loopback capture function advertises 44.1/48 kHz only, and the servo can
 # emit at most LOOPBACK_MAX_FRAMES_PER_PACKET (52) stereo frames per USB frame.
@@ -220,7 +228,7 @@ def _require_rate(dev, fs):
     Every reference in this module (RBJ/scipy magnitude and phase, the test
     frequency grid, the output-delay sample count) is computed from fs, and the
     capture streams at audio_state.freq regardless of what the host asked for
-    (loopback.c) — a mismatch is a silent pitch error that shows up as dozens of
+    (loopback.c); a mismatch is a silent pitch error that shows up as dozens of
     unexplained magnitude failures.  One Skip is far more useful.
     """
     actual = _device_rate(dev)
@@ -272,33 +280,139 @@ def _slot_indices(profile, slot):
     return out_l, out_r, base + out_l, base + out_r
 
 
-def _baseline(dev, profile=None):
-    """Clean, deterministic pre-conditions: USB input, EVERY gain stage at unity.
+def _optional(fn, default=None):
+    """Run a device call that a given platform may not implement, returning
+    `default` on STALL (e.g. the upmixer, which is RP2350-only)."""
+    try:
+        return fn()
+    except Stall:
+        return default
 
-    The device master volume powers on at -20 dB (MASTER_VOL_DEFAULT_DB), and
-    user volume + user mute are independent stages; all of them must be zeroed
-    explicitly or absolute-level measurements read low. Per-input preamp is
-    zeroed across all input channels (8 on RP2350)."""
+
+def _baseline(dev, profile):
+    """Put every stage that can perturb a measurement into a known-inert state.
+
+    The audio group runs FIRST (run.py sorts it ahead of the control-plane
+    tests) against whatever preset the device booted with, so anything NOT
+    zeroed here is preset-dependent: a user preset with, say, psybass or a
+    per-output delay enabled would fail the bit-exact and unity-gain checks with
+    no indication why.  loopback_baseline_clean verifies the result.
+
+    Deliberately non-destructive where possible: the per-input PEQ is disabled
+    with the global bypass flag rather than by rewriting every band, so the
+    preset's own EQ survives the run.
+    """
     if not _set_input_source(dev, INPUT_USB):
         raise Skip("could not switch the input source to USB")
-    dev.set_f32(OP.SET_MASTER_VOLUME, 0.0)   # power-on default is -20 dB
+
+    # Gain stages.  Master volume powers on at MASTER_VOL_DEFAULT_DB (-20 dB),
+    # and user volume / user mute are independent stages; all must be zeroed or
+    # absolute-level measurements read low.
+    dev.set_f32(OP.SET_MASTER_VOLUME, 0.0)
     dev.set_f32(OP.SET_USER_VOLUME, 0.0)
     dev.set_u8(OP.SET_USER_MUTE, 0)
-    n_in = profile.num_input_channels if profile is not None else 2
-    for ch in range(n_in):
+    for ch in range(profile.num_input_channels):
         dev.set_f32(OP.SET_PREAMP_CH, 0.0, wvalue=ch)
+
+    # Per-input PEQ off.  bypass_master_eq gates ONLY the per-input EQ pass
+    # (audio_pipeline.c PASS 2, both platforms); output-channel EQ is untouched,
+    # and that is what the filter tests drive.
+    dev.set_u8(OP.SET_BYPASS, 1)
+
+    # Effects that would colour, compress, or replace the signal.  Each sits on
+    # a different part of the chain, so none of them is covered by the others:
+    # leveller pre-matrix, upmixer into matrix rows 2..4, crossfeed per output
+    # pair, psybass pre-crossover per output, loudness post-gain per output,
+    # siggen injected post-matrix.
+    dev.set_u8(OP.SET_LOUDNESS, 0)
+    dev.set_u8(OP.SET_CROSSFEED, 0)
+    dev.set_u8(OP.SET_LEVELLER_ENABLE, 0)
+    dev.set_u8(OP.SET_PSYBASS, 0)
+    _optional(lambda: dev.set_f32(OP.UPMIX_SET_PARAM, 0.0, wvalue=UPMIX_PARAM_ENABLED))
+    _optional(lambda: dev.get_u8(OP.SIGGEN_CONTROL, wvalue=SIGGEN_CTL_STOP_NOW))
+
+    # Output stage at unity on EVERY output, not just the target pair: a stray
+    # delay or mute on the other leg would skew an inter-leg lag measurement.
+    for out in range(profile.num_output_channels):
+        dev.set_f32(OP.SET_OUTPUT_GAIN, 0.0, wvalue=out)
+        dev.set_u8(OP.SET_OUTPUT_MUTE, 0, wvalue=out)
+        dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out)
     dev.wait_ready()
+
+
+def _neutral_state(dev, profile):
+    """Read back what _baseline() set, as [(label, expected, actual), ...].
+
+    Entries a platform does not implement are reported with actual=None by
+    _optional() and skipped by the caller."""
+    checks = [
+        ("input source",   INPUT_USB, _optional(lambda: dev.get_u8(OP.GET_INPUT_SOURCE))),
+        ("master volume",  0.0,  _optional(lambda: dev.get_f32(OP.GET_MASTER_VOLUME))),
+        ("user volume",    0.0,  _optional(lambda: dev.get_f32(OP.GET_USER_VOLUME))),
+        ("user mute",      0,    _optional(lambda: dev.get_u8(OP.GET_USER_MUTE))),
+        ("input EQ bypass", 1,   _optional(lambda: dev.get_u8(OP.GET_BYPASS))),
+        ("loudness",       0,    _optional(lambda: dev.get_u8(OP.GET_LOUDNESS))),
+        ("crossfeed",      0,    _optional(lambda: dev.get_u8(OP.GET_CROSSFEED))),
+        ("leveller",       0,    _optional(lambda: dev.get_u8(OP.GET_LEVELLER_ENABLE))),
+        ("psybass",        0,    _optional(lambda: dev.get_u8(OP.GET_PSYBASS))),
+    ]
+    for ch in range(profile.num_input_channels):
+        checks.append((f"preamp ch{ch}", 0.0,
+                       _optional(lambda c=ch: dev.get_f32(OP.GET_PREAMP_CH, wvalue=c))))
+    for out in range(profile.num_output_channels):
+        checks.append((f"output {out} gain", 0.0,
+                       _optional(lambda o=out: dev.get_f32(OP.GET_OUTPUT_GAIN, wvalue=o))))
+        checks.append((f"output {out} mute", 0,
+                       _optional(lambda o=out: dev.get_u8(OP.GET_OUTPUT_MUTE, wvalue=o))))
+        checks.append((f"output {out} delay", 0.0,
+                       _optional(lambda o=out: dev.get_f32(OP.GET_OUTPUT_DELAY, wvalue=o))))
+    # Upmixer: RP2350-only, so absent entries are legitimate.  Its status byte 0
+    # is "processing this packet stream", which is what actually matters.
+    st = _optional(lambda: dev.get(OP.UPMIX_GET_STATUS, 16))
+    if st is not None:
+        checks.append(("upmixer active", 0, st[0]))
+    return checks
 
 
 def _route_only(dev, profile, out_l, out_r):
     """Route USB L/R 1:1 to exactly the (out_l, out_r) pair at 0 dB and disable
-    USB -> every other output, so only this output pair carries signal. Matrix
-    writes apply immediately (no deferred reset)."""
-    for out in range(profile.num_output_channels):
-        _route(dev, 0, out, 0)
-        _route(dev, 1, out, 0)
+    every other crosspoint, so only this output pair carries signal. Matrix
+    writes apply immediately (no deferred reset).
+
+    EVERY input row is cleared, not just the stereo pair: the matrix has
+    num_input_channels source rows (8 on RP2350), and when the stereo upmixer is
+    running rows 2..4 additionally carry derived C/Ls/Rs (audio_pipeline.c
+    PASS 3).  Clearing only rows 0/1 left those rows free to feed the target
+    output, which silently broke this function's isolation guarantee and
+    _autoprobe_slot's "probed in isolation" claim."""
+    for inp in range(profile.num_input_channels):
+        for out in range(profile.num_output_channels):
+            _route(dev, inp, out, 0)
     _route(dev, 0, out_l, 1, 0.0)   # USB L -> target L
     _route(dev, 1, out_r, 1, 0.0)   # USB R -> target R
+
+
+_BAND_CEILING = {}   # channel -> PEQ band count, probed once per channel
+
+
+def _band_ceiling(dev, ch, hi=16):
+    """PEQ band count for THIS channel: the smallest band index that STALLs.
+
+    channel_band_counts[] is per-channel and runtime-settable (dsp_pipeline.c),
+    while profile.band_ceiling is probed on channel 0, an INPUT channel.  Using
+    that for the output channels the filter tests drive could under-flatten and
+    leave live EQ bands under every measurement."""
+    if ch in _BAND_CEILING:
+        return _BAND_CEILING[ch]
+    ceiling = hi + 1
+    for band in range(hi + 1):
+        try:
+            dev.get(OP.GET_EQ_PARAM, 4, wvalue=(ch << 8) | (band << 3) | 0)
+        except Stall:
+            ceiling = band
+            break
+    _BAND_CEILING[ch] = ceiling
+    return ceiling
 
 
 def _config_slot(dev, profile, slot, flatten_all=False, otype=TYPE_SPDIF):
@@ -317,9 +431,9 @@ def _config_slot(dev, profile, slot, flatten_all=False, otype=TYPE_SPDIF):
     _route_only(dev, profile, out_l, out_r)
     if flatten_all:
         for ch in (ch_l, ch_r):
-            for b in range(profile.band_ceiling):
+            for b in range(_band_ceiling(dev, ch)):
                 _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
-            for b in range(20, 24):          # crossover bands (output channels)
+            for b in range(XO_BAND, XO_BAND + XO_BANDS):
                 _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
     dev.wait_ready()
     return ch_l, ch_r
@@ -419,6 +533,49 @@ def _test_freqs(fs):
 # --- Tests ------------------------------------------------------------------
 
 @test("audio", mutating=True)
+def loopback_baseline_clean(dev, profile, chk):
+    """Every stage the measurements assume inert really is inert.
+
+    Registered first so a baseline that did not take produces ONE diagnostic
+    failure naming the offending stage, instead of ~80 downstream tests failing
+    on bit-exactness, unity gain and THD with no indication of the cause. The
+    audio group runs against the device's live preset, so this is the check that
+    the group's central assumption actually holds."""
+    rig = _get_rig(dev, profile)
+    chk.note(f"out='{rig['out_name']}' in='{rig['in_name']}' slot={rig['slot']} "
+             f"ch_l={rig['ch_l']} ch_r={rig['ch_r']} fs={rig['fs']}")
+    bad = []
+    for label, want, got in _neutral_state(dev, profile):
+        if got is None:
+            continue          # not implemented on this platform
+        ok = abs(got - want) < 1e-3 if isinstance(want, float) else got == want
+        if not ok:
+            bad.append(f"{label}={got!r} (want {want!r})")
+    chk.ok(not bad, "baseline not neutral: " + ", ".join(bad[:8]) +
+           (f" (+{len(bad) - 8} more)" if len(bad) > 8 else ""))
+
+    # Matrix isolation: exactly USB L -> target L and USB R -> target R are
+    # enabled.  This is what makes "unrouted crosspoint is silent" and the
+    # auto-probe's isolation claim meaningful.
+    out_l, out_r, _cl, _cr = _slot_indices(profile, rig["slot"])
+    want_on = {(0, out_l), (1, out_r)}
+    stray = []
+    for inp in range(profile.num_input_channels):
+        for out in range(profile.num_output_channels):
+            r = _optional(lambda i=inp, o=out: dev.get(OP.GET_MATRIX_ROUTE, 8,
+                                                       wvalue=(i << 8) | o))
+            if r is None:
+                continue
+            enabled = bool(r[2])
+            if enabled != ((inp, out) in want_on):
+                stray.append(f"in{inp}->out{out}={'on' if enabled else 'off'}")
+    chk.ok(not stray, "matrix not isolated to the target pair: " + ", ".join(stray[:8]) +
+           (f" (+{len(stray) - 8} more)" if len(stray) > 8 else ""))
+    chk.note(f"band ceilings: ch_l={_band_ceiling(dev, rig['ch_l'])} "
+             f"ch_r={_band_ceiling(dev, rig['ch_r'])} (profile says {profile.band_ceiling})")
+
+
+@test("audio", mutating=True)
 def loopback_integrity(dev, profile, chk):
     """Flat path: signal reaches the DSPi capture at unity, low noise/THD, near bit-exact."""
     rig = _get_rig(dev, profile)
@@ -506,7 +663,6 @@ for _name, _rbj, _fc, _q, _gain in PEQ_CONFIGS:
 
 XO_MAG_TOL_DB = 1.0          # steeper slopes are more sensitive than mild PEQ
 XO_MAG_FLOOR_DB = -60.0      # only compare where |H| is reliably measurable
-XO_BAND = 20                 # first crossover band (bands 20..23, output channels)
 XO_BASE = 32                 # FILTER_XOVER_FIRST = FILTER_LR2_LP
 
 # Representative spread: families × orders × LP/HP, fc straddling Fs/7.5 (~6400 Hz).
@@ -963,13 +1119,10 @@ def output_type_switch_stress(dev, profile, chk):
 
 # --- Phase 4: full chain / dynamics -----------------------------------------
 
-def _flatten_master(dev, profile):
-    """Flatten the stereo-bus EQ (input channels 0/1) so loudness/crossfeed/
-    leveller (which sit on the stereo input bus) are measured against a flat
-    baseline."""
-    for ch in (0, 1):
-        for b in range(profile.band_ceiling):
-            _set_band(dev, ch, b, FLAT, 1000.0, 0.707, 0.0)
+# Input-channel EQ needs no flattening here: _baseline() disables the whole
+# per-input EQ pass with the global bypass flag, which is both cheaper and
+# non-destructive (the preset's own bands survive the run).  loopback_baseline_
+# clean asserts the flag is still set.
 
 
 def _note_input_count(dev, chk):
@@ -979,7 +1132,7 @@ def _note_input_count(dev, chk):
     input channels were active, so these tests skipped on any host that opened
     the DSPi at its 8-channel maximum (macOS CoreAudio does).  That bypass is
     gone: crossfeed runs per output pair post-matrix, loudness runs per output
-    post-gain, and the leveller is mask-driven over the active inputs — all
+    post-gain, and the leveller is mask-driven over the active inputs, all
     input-count agnostic (audio_pipeline.c PASS 2.5 / 4.5 / 5-7).  The count is
     still worth reporting, because it selects which code path was exercised."""
     nin = dev.get_u32(OP.GET_STATUS, wvalue=STATUS_INPUT_COUNT)
@@ -1022,7 +1175,10 @@ def loudness_shape(dev, profile, chk):
     rig = _get_rig(dev, profile)
     _note_input_count(dev, chk)
     try:
-        _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
+        _flatten_chain(dev, rig["ch_l"])
+        # Loudness is applied per output through loudness_output_mask; a preset
+        # that cleared the target's bit would make the enable a silent no-op.
+        dev.set(OP.SET_LOUDNESS_MASK, struct.pack("<H", 0xFFFF))
         dev.set_f32(OP.SET_USER_VOLUME, -40.0)
         dev.set_u8(OP.SET_LOUDNESS, 0); dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
@@ -1047,7 +1203,10 @@ def crossfeed_bleed(dev, profile, chk):
     _note_input_count(dev, chk)
     try:
         _config_slot(dev, profile, rig["slot"])
-        _flatten_chain(dev, rig["ch_l"]); _flatten_chain(dev, rig["ch_r"]); _flatten_master(dev, profile)
+        _flatten_chain(dev, rig["ch_l"]); _flatten_chain(dev, rig["ch_r"])
+        # Crossfeed runs per output PAIR, selected by output_pair_mask; without
+        # the target slot's bit the enable below would do nothing.
+        dev.set_u8(OP.SET_CROSSFEED_OUTPUTS, 1 << rig["slot"])
         dev.set_u8(OP.SET_CROSSFEED, 0); dev.wait_ready()
         l_off, r_off, _ = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True)
         dev.set_u8(OP.SET_CROSSFEED, 1); dev.wait_ready()
@@ -1066,7 +1225,11 @@ def leveller_boost(dev, profile, chk):
     rig = _get_rig(dev, profile)
     _note_input_count(dev, chk)
     try:
-        _flatten_chain(dev, rig["ch_l"]); _flatten_master(dev, profile)
+        _flatten_chain(dev, rig["ch_l"])
+        # Detector and apply masks select which INPUT channels the one linked
+        # gain is derived from and applied to; a preset that cleared the stereo
+        # pair's bits would leave the leveller enabled but inert here.
+        dev.set(OP.SET_LEVELLER_MASKS, bytes([0xFF, 0xFF]))
         dev.set_u8(OP.SET_LEVELLER_ENABLE, 0); dev.wait_ready()
         off, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05)
         dev.set_f32(OP.SET_LEVELLER_AMOUNT, 100.0)

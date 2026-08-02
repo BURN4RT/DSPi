@@ -1,16 +1,25 @@
-"""selftest_barriers.py — no-hardware checks for the audio-loopback harness.
+"""selftest.py: no-hardware checks for the audio-loopback harness.
 
-Exercises the deferred-operation barriers in tests/audio_loopback.py against a
-mock that models the firmware's actual semantics: a SET arms a pending flag and
-NO-OPS when the request equals the APPLIED state, and the main loop applies it
-later (vendor_commands.c REQ_SET_OUTPUT_TYPE, main.c process_type_switches).
-Test 3 deliberately reproduces the pre-barrier bug, so a regression that
-reintroduces fire-and-assume sequencing shows up here rather than as an
-intermittent hardware failure.
+Covers the parts of tests/audio_loopback.py whose correctness does not depend on
+a device being attached, against mocks that model the firmware's actual
+semantics:
 
-    python3 -m tools.dspi_test.selftest_barriers      # exit 0 = all good
+  * Deferred-operation barriers.  A SET arms a pending flag and NO-OPS when the
+    request equals the APPLIED state; the main loop applies it later
+    (vendor_commands.c REQ_SET_OUTPUT_TYPE, main.c process_type_switches).
+    Test 3 deliberately reproduces the pre-barrier bug, so a regression that
+    reintroduces fire-and-assume sequencing shows up here rather than as an
+    intermittent hardware failure.
+  * Matrix isolation.  _route_only() must clear EVERY input row, since the
+    upmixer feeds rows 2..4 and multichannel USB feeds up to row 7.
+  * Per-channel band ceilings, which are probed rather than taken from the
+    profile's channel-0 value.
+
+    python3 -m tools.dspi_test.selftest      # exit 0 = all good
 """
-import sys, time
+import struct
+import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -140,6 +149,77 @@ class AllStall:
 L.BARRIER_TIMEOUT_S = 0.2
 v = L._wait_applied(AllStall().get, 1, timeout_s=0.2)
 check(v is None, f"None when nothing was ever read (got {v!r})")
+
+
+# --------------------------------------------------------------------------
+# Phase 2: deterministic baseline
+# --------------------------------------------------------------------------
+
+class MatrixDev:
+    """Records matrix crosspoint writes and answers per-channel band probes."""
+
+    def __init__(self, n_in, n_out, band_counts=None):
+        self.n_in, self.n_out = n_in, n_out
+        self.xp = {}                       # (inp, out) -> enabled
+        self.band_counts = band_counts or {}
+
+    def set(self, opcode, payload=b"", wvalue=0, windex=0):
+        assert opcode == OP.SET_MATRIX_ROUTE
+        inp, out, enabled, _phase, _gain = struct.unpack("<BBBBf", payload)
+        self.xp[(inp, out)] = bool(enabled)
+        return 0
+
+    def get(self, opcode, length, wvalue=0):
+        assert opcode == OP.GET_EQ_PARAM
+        ch, band = (wvalue >> 8) & 0xFF, (wvalue >> 3) & 0x1F
+        if band >= self.band_counts.get(ch, 10):
+            raise Stall(opcode, "IN", -9, "band above ceiling")
+        return b"\0\0\0\0"
+
+
+class Profile:
+    def __init__(self, n_in, n_out):
+        self.num_input_channels = n_in
+        self.num_output_channels = n_out
+
+
+print("8. _route_only clears EVERY input row, not just the stereo pair")
+d = MatrixDev(n_in=8, n_out=11)
+L._route_only(d, Profile(8, 11), 0, 1)
+on = {k for k, v in d.xp.items() if v}
+check(on == {(0, 0), (1, 1)}, f"exactly the target pair is enabled (got {sorted(on)})")
+covered = {(i, o) for i in range(8) for o in range(11)}
+check(set(d.xp) == covered,
+      f"all {len(covered)} crosspoints written (got {len(d.xp)})")
+upmix_rows = [k for k in d.xp if k[0] in (2, 3, 4)]
+check(len(upmix_rows) == 3 * 11 and not any(d.xp[k] for k in upmix_rows),
+      "upmixer rows 2..4 explicitly disabled")
+
+print("9. _route_only on RP2040 geometry (2 inputs)")
+d = MatrixDev(n_in=2, n_out=7)
+L._route_only(d, Profile(2, 7), 2, 3)
+on = {k for k, v in d.xp.items() if v}
+check(on == {(0, 2), (1, 3)}, f"target pair only (got {sorted(on)})")
+
+print("10. _band_ceiling probes per channel and caches")
+L._BAND_CEILING.clear()
+d = MatrixDev(n_in=8, n_out=11, band_counts={8: 10, 9: 6})
+check(L._band_ceiling(d, 8) == 10, "channel 8 ceiling 10")
+check(L._band_ceiling(d, 9) == 6, "channel 9 ceiling 6 (differs from channel 8)")
+d.band_counts[9] = 99                      # would change the answer if re-probed
+check(L._band_ceiling(d, 9) == 6, "second call served from cache")
+L._BAND_CEILING.clear()
+
+print("11. baseline comparison: float tolerance, int equality, None skipped")
+rows = [("a", 0.0, 0.0), ("b", 0, 0), ("c", 0.0, None), ("d", 0.0, 0.5), ("e", 0, 1)]
+bad = []
+for label, want, got in rows:
+    if got is None:
+        continue
+    ok = abs(got - want) < 1e-3 if isinstance(want, float) else got == want
+    if not ok:
+        bad.append(label)
+check(bad == ["d", "e"], f"only real mismatches reported (got {bad})")
 
 print()
 print("FAILURES:", len(fails))
