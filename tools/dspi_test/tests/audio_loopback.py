@@ -222,24 +222,104 @@ def _glitches(dev):
     return None if ov is None or un is None else (ov, un)
 
 
+# Capture dump instrumentation (test_failures_diag.md section 8): with
+# DSPI_AUDIO_DUMP=<dir> every capture's raw waveforms + context go to <dir> as
+# sequential .npz files, so a failing full run can be analysed offline.
+_DUMP_DIR = os.environ.get("DSPI_AUDIO_DUMP") or None
+_DUMP_SEQ = [0]
+
+
+def _dump_capture(dev, before, after):
+    if not _DUMP_DIR or np is None or audio.LAST_RUN is None:
+        return
+    import json
+    from .. import framework
+    run = audio.LAST_RUN
+    _DUMP_SEQ[0] += 1
+    os.makedirs(_DUMP_DIR, exist_ok=True)
+    name = framework.CURRENT_TEST or "unknown"
+    extra = {}
+    for label, idx in (("spdif_over", 7), ("spdif_under", 8), ("clk_sys", 13),
+                       ("dma_starve", 17), ("usb_ring_over", 22)):
+        extra[label] = _optional(lambda i=idx: dev.get_u32(OP.GET_STATUS, wvalue=i))
+    meta = {"test": name, "seq": _DUMP_SEQ[0], "fs_host": run["fs"],
+            "attempts": run["attempts"], "final_bad": run["final_bad"],
+            "in_blocks": run.get("in_blocks"), "in_block_max": run.get("in_block_max"),
+            "glitch_before": before, "glitch_after": after,
+            "dev_rate": _optional(lambda: dev.get_u32(OP.GET_STATUS,
+                                                      wvalue=STATUS_SAMPLE_RATE)),
+            "counters": extra, "time": time.time()}
+    np.savez(os.path.join(_DUMP_DIR, f"{_DUMP_SEQ[0]:04d}_{name}.npz"),
+             exc=run["exc"], cap=run["cap"], meta=json.dumps(meta))
+
+
+# Engine heals performed this run: (test name, gap count) per event. Reported
+# by rate_switch_round_trip so a chronically tripping host is visible.
+_HEAL_EVENTS = []
+_MAX_HEALS_PER_CAPTURE = 2
+
+
+def _heal_capture_engine(dev):
+    """Reset coreaudiod's input engine by bouncing the nominal rate.
+
+    The zero-stuffing runaway lives in the host engine and survives stream
+    close/reopen; only an engine reconfigure clears it (test_failures_diag.md
+    8a-2/8c). Ends back at the entry rate; True on success.
+    """
+    cur = _device_rate(dev)
+    if cur not in (48000, 44100):
+        return False
+    other = 44100 if cur == 48000 else 48000
+    return (_set_rate(dev, None, None, other)
+            and _set_rate(dev, None, None, cur))
+
+
 def _capture(dev, fn, attempts=3):
-    """Run a capture, retrying while the servo reports a glitch.
+    """Run a capture, retrying while the servo reports a glitch, and healing
+    the host engine when the capture carries the zero-stuffing signature.
 
     The first capture after a pause routinely underruns: the ring drains, the
     servo emits silence, and the capture comes back dead, which reads as a huge
     measurement error rather than as a transport fault. Skip if it never comes
     back clean, so a dead capture is never asserted on.
+
+    Separately, coreaudiod's input engine can enter a runaway where it
+    replaces a growing share of every capture with zeros while no counter on
+    either side moves (test_failures_diag.md section 8a). Detected via
+    audio.capture_zero_gaps() and healed by a nominal-rate bounce; a capture
+    that stays gapped after _MAX_HEALS_PER_CAPTURE heals fails loudly.
     """
-    delta = None
-    for _ in range(attempts):
+    glitch_tries = 0
+    heals = 0
+    while True:
         before = _glitches(dev)
         result = fn()
         after = _glitches(dev)
-        if before is None or after is None or after == before:
-            return result
-        delta = (after[0] - before[0], after[1] - before[1])
-    raise Skip(f"capture never came back clean in {attempts} attempts "
-               f"(last: +{delta[0]} dropped, +{delta[1]} underrun)")
+        _dump_capture(dev, before, after)
+        if not (before is None or after is None or after == before):
+            glitch_tries += 1
+            if glitch_tries >= attempts:
+                delta = (after[0] - before[0], after[1] - before[1])
+                raise Skip(f"capture never came back clean in {attempts} attempts "
+                           f"(last: +{delta[0]} dropped, +{delta[1]} underrun)")
+            continue
+        run = audio.LAST_RUN
+        gaps = 0 if run is None else audio.capture_zero_gaps(run["cap"], run["exc"])
+        if gaps:
+            if heals >= _MAX_HEALS_PER_CAPTURE:
+                raise RuntimeError(
+                    f"capture still zero-stuffed after {heals} engine heals "
+                    f"({gaps} gaps): the coreaudiod input-engine runaway "
+                    f"persists; see tools/dspi_test/test_failures_diag.md")
+            heals += 1
+            from .. import framework
+            _HEAL_EVENTS.append((framework.CURRENT_TEST or "?", gaps))
+            print(f"    ! zero-stuffed capture ({gaps} gaps): bouncing the "
+                  f"CoreAudio nominal rate to reset the input engine", flush=True)
+            if not _heal_capture_engine(dev):
+                raise Skip("engine heal failed: could not bounce the nominal rate")
+            continue
+        return result
 
 
 def _device_rate(dev):
@@ -1568,3 +1648,9 @@ def rate_switch_round_trip(dev, profile, chk):
     # Multichannel USB alts are 48 kHz only, so a 44.1 kHz pass ran on a stereo alt.
     _note_input_count(dev, chk)
     chk.note(f"rate_round_trip: rates exercised {sorted(_RIG)}")
+    # Surface host-engine heals: a host that trips constantly should be seen,
+    # not silently tolerated (test_failures_diag.md 8c).
+    if _HEAL_EVENTS:
+        by_test = ", ".join(f"{t}({g} gaps)" for t, g in _HEAL_EVENTS[:6])
+        chk.note(f"coreaudiod engine healed {len(_HEAL_EVENTS)}x this run: {by_test}"
+                 + (" ..." if len(_HEAL_EVENTS) > 6 else ""))

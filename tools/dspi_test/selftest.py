@@ -491,6 +491,47 @@ check("coreaudio.set_rate_by_name" in src, "_set_rate calls the HAL setter")
 check("measure_tone" not in src,
       "_set_rate no longer relies on opening a stream (CoreAudio would resample)")
 
+print("31. zero-stuffing detector (capture_zero_gaps)")
+from tools.dspi_test import audio as A
+
+if A.np is None:
+    print("  (numpy missing: skipped)")
+else:
+    np = A.np
+    fs = 48000
+    tone = 0.4 * np.sin(2 * np.pi * 1000.0 * np.arange(fs) / fs).astype(np.float32)
+    exc = np.concatenate([np.zeros(4800, np.float32), tone, np.zeros(4800, np.float32)])
+    lead = np.zeros(6000, np.float32)
+
+    def cap_of(x):
+        return np.column_stack([x, x])
+
+    clean = np.concatenate([lead, exc, np.zeros(8000, np.float32)])
+    check(A.capture_zero_gaps(cap_of(clean), cap_of(exc)) == 0,
+          "clean capture: no gaps")
+
+    stuffed = clean.copy()
+    for s in range(6000 + 4800 + 2000, 6000 + 4800 + 40000, 512):
+        stuffed[s:s + 40] = 0.0          # the host engine's mid-signal zero bursts
+    check(A.capture_zero_gaps(cap_of(stuffed), cap_of(exc)) > 10,
+          "zero-stuffed capture: gaps detected")
+
+    check(A.capture_zero_gaps(cap_of(np.zeros(20000, np.float32)),
+                              cap_of(np.zeros(19200, np.float32))) == 0,
+          "silence test (noise floor measurement): no gaps")
+
+    muted = np.concatenate([lead, np.zeros_like(exc), np.zeros(8000, np.float32)])
+    check(A.capture_zero_gaps(cap_of(muted), cap_of(exc)) == 0,
+          "muted capture (no signal present): no gaps")
+
+    # Post-excitation servo re-prime chatter must not read as gaps: real
+    # bursts alternate with silence in the TAIL, outside the aligned span.
+    tail = clean.copy()
+    for s in range(6000 + len(exc) + 500, len(tail) - 600, 1024):
+        tail[s:s + 400] = 0.11
+    check(A.capture_zero_gaps(cap_of(tail), cap_of(exc)) == 0,
+          "tail re-prime bursts outside the excitation span: no gaps")
+
 print()
 print("FAILURES:", len(fails))
 for f in fails:

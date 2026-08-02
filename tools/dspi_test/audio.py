@@ -63,6 +63,12 @@ DEFAULT_FS = 48000
 PAD_S = 0.10          # leading/trailing silence around an excitation
 TAIL_S = 0.40         # extra record time after playback ends
 
+# Diagnostic tap: play_record() records its most recent run here so the test
+# layer can dump raw waveforms (see test_failures_diag.md section 8). Fields:
+# exc, cap, fs, attempts (per-attempt host xrun counts), final_bad (True when
+# every retry glitched and the returned capture is known-corrupt).
+LAST_RUN = None
+
 
 class AudioUnavailable(Exception):
     """sounddevice/numpy or a required loopback audio device is not present."""
@@ -183,15 +189,24 @@ def play_record(excitation, fs, out_dev, in_dev,
     # make CoreAudio drop buffers (input overflow / output underflow), which
     # corrupts a capture. `latency="high"` makes that rare; a retry catches the
     # stragglers so a long test run stays reliable.
+    global LAST_RUN
     last = np.zeros((0, in_channels), dtype=np.float32)
+    attempts_log = []
     for _attempt in range(max_retries + 1):
         pos = {"i": 0}
         rec_frames = []
-        glitch = {"bad": False}
+        # in_underflow is the flag PortAudio raises when it delivers SILENCE in
+        # place of real input ("input data is all silence (zeros) because no
+        # real data is available") — exactly the zero-stuffing signature under
+        # investigation, and previously unmonitored (test_failures_diag.md).
+        counts = {"in_overflow": 0, "in_underflow": 0,
+                  "out_underflow": 0, "out_overflow": 0}
 
         def _out_cb(outdata, frames, time_info, status):  # noqa: ARG001
             if status.output_underflow:
-                glitch["bad"] = True
+                counts["out_underflow"] += 1
+            if status.output_overflow:
+                counts["out_overflow"] += 1
             i0 = pos["i"]
             chunk = exc[i0:i0 + frames]
             m = chunk.shape[0]
@@ -203,23 +218,39 @@ def play_record(excitation, fs, out_dev, in_dev,
 
         def _in_cb(indata, frames, time_info, status):  # noqa: ARG001
             if status.input_overflow:
-                glitch["bad"] = True
+                counts["in_overflow"] += 1
+            if status.input_underflow:
+                counts["in_underflow"] += 1
             rec_frames.append(indata.copy())
 
+        # 1536-frame blocks keep the Python client inside coreaudiod's IO cycle
+        # budget (measured ladder in test_failures_diag.md 8c; 1024 is too small).
         instream = sd.InputStream(samplerate=fs, device=in_dev, channels=in_channels,
-                                  dtype="float32", latency="high", callback=_in_cb)
+                                  dtype="float32", latency="high", blocksize=1536,
+                                  callback=_in_cb)
         outstream = sd.OutputStream(samplerate=fs, device=out_dev, channels=out_channels,
-                                    dtype="float32", latency="high", callback=_out_cb)
+                                    dtype="float32", latency="high", blocksize=1536,
+                                    callback=_out_cb)
         instream.start()                # capture first so we never miss the onset
         outstream.start()
         sd.sleep(int((n / fs + tail_s) * 1000.0))
         outstream.stop(); instream.stop()
         outstream.close(); instream.close()
 
-        last = np.concatenate(rec_frames, axis=0) if rec_frames else last
-        if not glitch["bad"] and last.shape[0] > 0:
-            return last
+        attempts_log.append(dict(counts))
+        got = np.concatenate(rec_frames, axis=0) if rec_frames else None
+        if got is not None:
+            last = got
+        if got is not None and not (counts["in_overflow"] or counts["out_underflow"]):
+            break
         sd.sleep(120)                   # settle, then retry
+    final = attempts_log[-1]
+    final_bad = bool(final["in_overflow"] or final["out_underflow"]) or last.shape[0] == 0
+    blocks = [f.shape[0] for f in rec_frames]
+    LAST_RUN = {"exc": exc, "cap": last, "fs": fs,
+                "attempts": attempts_log, "final_bad": final_bad,
+                "in_blocks": blocks[:8] + (["..."] if len(blocks) > 8 else []),
+                "in_block_max": max(blocks) if blocks else 0}
     return last
 
 
@@ -420,6 +451,53 @@ def measure_noise(out_dev, in_dev, in_channel, fs, dur_s=0.4):
         return -200.0
     y = cap[:, in_channel] if cap.ndim > 1 else cap
     return dbfs(y)
+
+
+def capture_zero_gaps(cap, exc=None, dead=1e-7, live_rms=1e-3, min_run=4, guard=64):
+    """Count hard zero gaps inside otherwise-live audio on channel 0.
+
+    This is the coreaudiod input-engine zero-stuffing signature (see
+    tools/dspi_test/test_failures_diag.md): runs of exact zeros dropped into
+    the middle of healthy signal. A gap only counts when the `guard` samples
+    on BOTH sides are live (RMS > live_rms), so filter-attenuated regions,
+    silence tests, mutes, and capture edges never trigger it. With `exc`,
+    the scan is bounded to the excitation's aligned span: the capture tail
+    legitimately alternates silence and stale ring bursts while the loopback
+    servo re-primes, and must not read as gaps.
+    """
+    if np is None or cap is None or len(cap) == 0:
+        return 0
+    sig = np.asarray(cap[:, 0] if cap.ndim > 1 else cap, np.float64)
+    if exc is not None:
+        ref = np.asarray(exc[:, 0] if exc.ndim > 1 else exc, np.float64)
+        nz = np.flatnonzero(np.abs(ref) > 0)
+        if len(nz) == 0:
+            return 0                     # silence excitation: nothing to bound
+        ref = ref[nz[0]:nz[-1] + 1]
+        if len(sig) <= len(ref):
+            return 0
+        lag, strength = _xcorr_lag(sig, ref)
+        if strength < 0.1:
+            return 0                     # no recognizable signal to scan inside
+        sig = sig[lag:lag + len(ref)]
+    y = np.abs(sig)
+    is_dead = y < dead
+    d = np.diff(is_dead.astype(np.int8))
+    starts = np.flatnonzero(d == 1) + 1
+    ends = np.flatnonzero(d == -1) + 1
+    if is_dead[0]:
+        starts = np.r_[0, starts]
+    if is_dead[-1]:
+        ends = np.r_[ends, len(is_dead)]
+    gaps = 0
+    for s, e in zip(starts, ends):
+        if e - s < min_run or s < guard or e + guard > len(y):
+            continue
+        pre = np.sqrt(np.mean(y[s - guard:s] ** 2))
+        post = np.sqrt(np.mean(y[e:e + guard] ** 2))
+        if pre > live_rms and post > live_rms:
+            gaps += 1
+    return gaps
 
 
 def bit_exact_residual(out_dev, in_dev, in_channel, fs, dur_s=0.4, amp=0.4):

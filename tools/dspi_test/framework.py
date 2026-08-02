@@ -109,6 +109,10 @@ class TestCase:
 
 REGISTRY: list[TestCase] = []
 
+# Name of the test currently executing (None between tests). Diagnostic hooks
+# (e.g. the audio capture dumper) read this to label their artifacts.
+CURRENT_TEST: str | None = None
+
 
 def catalog_markdown(cases=None) -> str:
     """Generate the test catalog from registered metadata (never drifts from code)."""
@@ -197,10 +201,12 @@ class Runner:
         return self.results
 
     def _run_one(self, tc: TestCase):
+        global CURRENT_TEST
         chk = Check()
         t0 = time.monotonic()
         reenum_before = self.dev.reenumerations
         status, detail = "PASS", ""
+        CURRENT_TEST = tc.name
         try:
             tc.fn(self.dev, self.profile, chk)
             if chk.failures:
@@ -222,6 +228,8 @@ class Runner:
         except Exception as e:  # noqa: BLE001
             status = "ERROR"
             detail = f"{type(e).__name__}: {e}\n{traceback.format_exc(limit=3)}"
+        finally:
+            CURRENT_TEST = None
         dur = (time.monotonic() - t0) * 1000.0
 
         if status == "PASS" and tc.flash:
