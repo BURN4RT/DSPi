@@ -1334,6 +1334,211 @@ def output_clip_limit(dev, profile, chk):
         _set_band(dev, rig["ch_l"], 0, FLAT, 1000.0, 0.707, 0.0); dev.wait_ready()
 
 
+# --- Phase 5: feature coverage ----------------------------------------------
+
+LT_TYPE = 11                  # FILTER_LINKWITZ_TRANSFORM
+UPMIX_PARAM_CENTER_MODE = 1   # upmix.h
+UPMIX_PARAM_SURROUND_MODE = 2
+UPMIX_CENTER_OFF = 2
+UPMIX_SURROUND_PASSIVE = 1
+UPMIX_ROW_LS = 3
+PSYBASS_CUTOFF, PSYBASS_HARMONICS, PSYBASS_DRIVE = 120.0, 12.0, 18.0
+
+
+def _set_lt_band(dev, ch, band, f0, q0, fp, qp):
+    """Linkwitz Transform SET: the 16-byte EqParamPacket carries f0/Q0/fp in the
+    freq/Q/gain fields, with target Qp appended as uint16 Q*512 (wire V22)."""
+    dev.set(OP.SET_EQ_PARAM,
+            _eq_packet(ch, band, LT_TYPE, f0, q0, fp) + struct.pack("<H", round(qp * 512)))
+
+
+@test("audio", mutating=True)
+def peq_linkwitz_transform(dev, profile, chk):
+    """Linkwitz Transform: measured FR matches the firmware's own LT design.
+
+    The only PEQ type with no coverage, and the one carrying an out-of-band
+    sidecar (Qp), so a wire-format regression here is otherwise silent.
+    """
+    rig = _get_rig(dev, profile)
+    f0, q0, fp, qp = 80.0, 0.707, 50.0, 0.707
+    try:
+        from tools.filter_tester.user_linkwitz import _lt_biquad
+        _set_lt_band(dev, rig["ch_l"], 0, f0, q0, fp, qp)
+        dev.wait_ready()
+        freqs = _test_freqs(rig["fs"])
+        # DC boost is (f0/fp)^2, so back the drive off to keep the peak in range.
+        mag, _p, strength = audio.measure_transfer(
+            rig["out"], rig["in"], rig["chan"], rig["fs"], freqs,
+            amp=_signal_amp(20.0 * np.log10((f0 / fp) ** 2)))
+        chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
+        b, a = _lt_biquad(f0, q0, fp, qp, float(rig["fs"]))
+        z = np.exp(-1j * 2.0 * np.pi * np.asarray(freqs) / rig["fs"])
+        H = (b[0] + b[1] * z + b[2] * z * z) / (a[0] + a[1] * z + a[2] * z * z)
+        exp = 20.0 * np.log10(np.abs(H) + 1e-30)
+        err = float(np.max(np.abs(mag - exp)))
+        chk.ok(err < MAG_TOL_DB,
+               f"LT f0={f0:g} Q0={q0:g} fp={fp:g} Qp={qp:g}: max |mag err| "
+               f"{err:.3f} dB < {MAG_TOL_DB}")
+        chk.note(f"linkwitz: max_err={err:.3f}dB DC boost expected "
+                 f"{20.0 * np.log10((f0 / fp) ** 2):.1f}dB")
+    finally:
+        _set_band(dev, rig["ch_l"], 0, FLAT, 1000.0, 0.707, 0.0); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def xo_all_band_slots(dev, profile, chk):
+    """Every crossover band slot (20..23) applies its filter, not just band 20."""
+    rig = _get_rig(dev, profile)
+    fc, ftype = 1000.0, _xo_enum("bw", 2, False)
+    freqs = _test_freqs(rig["fs"])
+    exp = 20.0 * np.log10(np.abs(_xo_reference("bw", 2, False, fc, rig["fs"], freqs)) + 1e-30)
+    band_sel = exp > XO_MAG_FLOOR_DB
+    try:
+        for b in range(XO_BAND, XO_BAND + XO_BANDS):
+            for other in range(XO_BAND, XO_BAND + XO_BANDS):
+                _set_band(dev, rig["ch_l"], other, FLAT, 1000.0, 0.707, 0.0)
+            _set_band(dev, rig["ch_l"], b, ftype, fc, 0.707, 0.0)
+            dev.wait_ready()
+            mag, _p, _s = audio.measure_transfer(
+                rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+            err = float(np.max(np.abs(mag[band_sel] - exp[band_sel])))
+            chk.ok(err < XO_MAG_TOL_DB, f"band {b}: BW2 LP applied (max err {err:.3f} dB)")
+    finally:
+        for b in range(XO_BAND, XO_BAND + XO_BANDS):
+            _set_band(dev, rig["ch_l"], b, FLAT, 1000.0, 0.707, 0.0)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def xo_two_band_cascade(dev, profile, chk):
+    """Two crossover bands on one channel cascade into a band-pass."""
+    rig = _get_rig(dev, profile)
+    f_hp, f_lp = 300.0, 4000.0
+    try:
+        _set_band(dev, rig["ch_l"], XO_BAND, _xo_enum("bw", 2, True), f_hp, 0.707, 0.0)
+        _set_band(dev, rig["ch_l"], XO_BAND + 1, _xo_enum("bw", 2, False), f_lp, 0.707, 0.0)
+        dev.wait_ready()
+        freqs = _test_freqs(rig["fs"])
+        mag, _p, _s = audio.measure_transfer(
+            rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+        H = (_xo_reference("bw", 2, True, f_hp, rig["fs"], freqs)
+             * _xo_reference("bw", 2, False, f_lp, rig["fs"], freqs))
+        exp = 20.0 * np.log10(np.abs(H) + 1e-30)
+        sel = exp > XO_MAG_FLOOR_DB
+        err = float(np.max(np.abs(mag[sel] - exp[sel])))
+        chk.ok(err < XO_MAG_TOL_DB, f"HP{f_hp:g}+LP{f_lp:g} cascade: max err {err:.3f} dB")
+        chk.note(f"xo_cascade: max_err={err:.3f}dB")
+    finally:
+        for b in (XO_BAND, XO_BAND + 1):
+            _set_band(dev, rig["ch_l"], b, FLAT, 1000.0, 0.707, 0.0)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def loudness_output_mask(dev, profile, chk):
+    """Loudness only lifts outputs selected by loudness_output_mask."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        dev.set_f32(OP.SET_USER_VOLUME, -40.0)
+        dev.set_u8(OP.SET_LOUDNESS, 1)
+        dev.set(OP.SET_LOUDNESS_MASK, struct.pack("<H", 0))          # target excluded
+        dev.wait_ready()
+        freqs = _test_freqs(rig["fs"])
+        lf_i = int(np.argmin(np.abs(freqs - 60.0)))
+        mid_i = int(np.argmin(np.abs(freqs - 1000.0)))
+        off, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
+                                             rig["fs"], freqs, amp=0.4)
+        dev.set(OP.SET_LOUDNESS_MASK, struct.pack("<H", 1 << out_l))  # target included
+        dev.wait_ready()
+        on, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
+                                            rig["fs"], freqs, amp=0.4)
+        lift = (on[lf_i] - on[mid_i]) - (off[lf_i] - off[mid_i])
+        chk.ok(lift > 2.0, f"masked-in output gains bass lift (+{lift:.1f} dB @60Hz vs mid)")
+        chk.note(f"loudness_mask: lift={lift:.1f}dB with bit {out_l} set")
+    finally:
+        dev.set_u8(OP.SET_LOUDNESS, 0)
+        dev.set(OP.SET_LOUDNESS_MASK, struct.pack("<H", 0xFFFF))
+        dev.set_f32(OP.SET_USER_VOLUME, 0.0); dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def upmix_centre_off_passthrough(dev, profile, chk):
+    """Centre engine OFF leaves L/R bit-exact while surrounds are still derived.
+
+    upmix.h states this explicitly: the surround engine never writes L/R, so
+    with the centre engine off the mains pass through untouched.
+    """
+    rig = _get_rig(dev, profile)
+    if profile.platform_id != 1:
+        raise Skip("upmixer is RP2350-only")
+    out_l, out_r, _cl, _cr = _slot_indices(profile, rig["slot"])
+    try:
+        if _optional(lambda: dev.set_f32(OP.UPMIX_SET_PARAM, float(UPMIX_CENTER_OFF),
+                                         wvalue=UPMIX_PARAM_CENTER_MODE)) is None:
+            raise Skip("upmixer not available on this build")
+        dev.set_f32(OP.UPMIX_SET_PARAM, float(UPMIX_SURROUND_PASSIVE),
+                    wvalue=UPMIX_PARAM_SURROUND_MODE)
+        dev.set_f32(OP.UPMIX_SET_PARAM, 1.0, wvalue=UPMIX_PARAM_ENABLED)
+        dev.wait_ready()
+        st = dev.get(OP.UPMIX_GET_STATUS, 16)
+        if not st[0]:
+            raise Skip(f"upmixer parked (reason {st[1]}: "
+                       f"1=disabled 2=input not stereo 3=rate>48k)")
+        (resid, scale), glitch = _clean_capture(
+            dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
+        if glitch:
+            chk.note(f"capture glitched {glitch}; residual {resid:.1f} dBFS unreliable")
+        else:
+            chk.ok(resid < RESIDUAL_MAX_DBFS,
+                   f"centre OFF: L/R bit-exact through the upmixer "
+                   f"({resid:.1f} dBFS < {RESIDUAL_MAX_DBFS})")
+            chk.approx(20.0 * np.log10(abs(scale) + 1e-20), 0.0, GAIN_TOL_DB,
+                       f"centre OFF: unity gain (|scale| {abs(scale):.4f})")
+        # Surrounds are still produced: route the derived Ls row to the target.
+        _route(dev, 0, out_l, 0)
+        _route(dev, UPMIX_ROW_LS, out_l, 1, 0.0)
+        dev.wait_ready()
+        # Ls = 0.7071*(L-R) under PASSIVE, so a mono-duplicated tone would
+        # cancel to silence; drive the left channel only.
+        lvl, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"],
+                                             1000.0, amp=0.4, left_only=True)
+        chk.ok(lvl > -40.0, f"derived Ls row carries audio ({lvl:.1f} dBFS)")
+        chk.note(f"upmix: resid={resid:.1f}dBFS Ls={lvl:.1f}dBFS")
+    finally:
+        _optional(lambda: dev.set_f32(OP.UPMIX_SET_PARAM, 0.0, wvalue=UPMIX_PARAM_ENABLED))
+        _route(dev, UPMIX_ROW_LS, out_l, 0)
+        _route(dev, 0, out_l, 1, 0.0)
+        dev.wait_ready()
+
+
+@test("audio", mutating=True)
+def psybass_harmonics(dev, profile, chk):
+    """Psychoacoustic bass adds harmonics to content below its cutoff."""
+    rig = _get_rig(dev, profile)
+    out_l = _slot_indices(profile, rig["slot"])[0]
+    tone = 60.0                        # well below PSYBASS_CUTOFF
+    try:
+        _flatten_chain(dev, rig["ch_l"])
+        dev.set_u8(OP.SET_PSYBASS, 0); dev.wait_ready()
+        _lvl0, thd0, _s = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                             rig["fs"], tone, amp=0.4)
+        dev.set_f32(OP.SET_PSYBASS_CUTOFF, PSYBASS_CUTOFF)
+        dev.set_f32(OP.SET_PSYBASS_HARMONICS, PSYBASS_HARMONICS)
+        dev.set_f32(OP.SET_PSYBASS_DRIVE, PSYBASS_DRIVE)
+        dev.set(OP.SET_PSYBASS_MASK, struct.pack("<H", 1 << out_l))
+        dev.set_u8(OP.SET_PSYBASS, 1); dev.wait_ready()
+        _lvl1, thd1, _s = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                             rig["fs"], tone, amp=0.4)
+        chk.ok(thd1 > thd0 + 1.0,
+               f"harmonics generated below cutoff (THD {thd0:.3f}% -> {thd1:.3f}%)")
+        chk.note(f"psybass: {tone:g}Hz THD {thd0:.3f}% -> {thd1:.3f}% "
+                 f"(cutoff {PSYBASS_CUTOFF:g}Hz)")
+    finally:
+        dev.set_u8(OP.SET_PSYBASS, 0); dev.wait_ready()
+
+
 # --- Per-rate replay --------------------------------------------------------
 # Existing test bodies are re-registered at another rate via _rate_variant.
 # Variants go in rate order with the round-trip last, so a run performs one rate
@@ -1348,7 +1553,9 @@ SECONDARY_TESTS = [
     "peq_lowpass1_lo", "peq_lowpass1_hi",
     "peq_peaking_lo", "peq_peaking_hi",
     "peq_highshelf_lo", "peq_highshelf_hi",
+    "peq_linkwitz_transform",
     "xo_lr4_lp", "xo_lr4_hp", "xo_bw2_lp", "xo_bes4_hp",
+    "xo_two_band_cascade",
 ]
 
 

@@ -419,6 +419,66 @@ check(not c.fails and len(c.notes) == 1,
 check("dropped" in c.notes[0] and "underrun" in c.notes[0],
       f"note names both counters ({c.notes[0]!r})")
 
+
+# --------------------------------------------------------------------------
+# Phase 5: feature coverage
+# --------------------------------------------------------------------------
+
+print("24. LT SET packet is 18 bytes with the Qp sidecar the firmware reads")
+
+
+class EqDev:
+    def __init__(self):
+        self.payload = None
+
+    def set(self, opcode, payload=b"", wvalue=0, windex=0):
+        assert opcode == OP.SET_EQ_PARAM
+        self.payload = payload
+        return len(payload)
+
+
+d = EqDev()
+L._set_lt_band(d, 8, 0, 80.0, 0.707, 50.0, 0.707)
+check(len(d.payload) == 18, f"18-byte packet (got {len(d.payload)})")
+ch, band, ftype, byp, f0, q0, fp = struct.unpack("<BBBBfff", d.payload[:16])
+check(ftype == 11, f"FILTER_LINKWITZ_TRANSFORM (got {ftype})")
+check((ch, band) == (8, 0), f"channel/band ({ch},{band})")
+check(abs(f0 - 80.0) < 1e-3 and abs(q0 - 0.707) < 1e-3 and abs(fp - 50.0) < 1e-3,
+      "f0/Q0/fp carried in the freq/Q/gain fields")
+# Firmware reads vendor_rx_buf[16] | (vendor_rx_buf[17] << 8) as Qp * 512.
+qp = struct.unpack("<H", d.payload[16:18])[0]
+check(qp == round(0.707 * 512), f"Qp sidecar = round(Qp*512) = {qp}")
+
+print("25. LT reference matches the documented DC boost (f0/fp)^2")
+from tools.filter_tester.user_linkwitz import _lt_biquad
+import numpy as _np
+for f0, fp, fs in ((80.0, 50.0, 48000.0), (80.0, 50.0, 44100.0)):
+    b, a = _lt_biquad(f0, 0.707, fp, 0.707, fs)
+    z = _np.exp(-1j * 2 * _np.pi * 5.0 / fs)          # near DC
+    H = (b[0] + b[1] * z + b[2] * z * z) / (a[0] + a[1] * z + a[2] * z * z)
+    want = 20 * _np.log10((f0 / fp) ** 2)
+    got = 20 * _np.log10(abs(H))
+    check(abs(got - want) < 0.5,
+          f"{fs:.0f} Hz: DC boost {got:.2f} dB ~ (f0/fp)^2 = {want:.2f} dB")
+
+print("26. LT corners stay inside the firmware's 0.15*Fs clamp at both rates")
+for fs in (48000.0, 44100.0):
+    check(max(80.0, 50.0) < 0.15 * fs,
+          f"{fs:.0f} Hz: f0/fp below the {0.15 * fs:.0f} Hz clamp")
+
+print("27. Phase 5 tests registered, and the replay block still comes last")
+audio_names = [tc.name for tc in REGISTRY if tc.group == "audio"]
+for n in ("peq_linkwitz_transform", "xo_all_band_slots", "xo_two_band_cascade",
+          "loudness_output_mask", "upmix_centre_off_passthrough", "psybass_harmonics"):
+    check(n in audio_names, f"{n} registered")
+check(audio_names[-1] == "rate_switch_round_trip",
+      f"round trip still last (got {audio_names[-1]!r})")
+check(audio_names.index("psybass_harmonics") < audio_names.index("rate_switch_round_trip"),
+      "Phase 5 tests precede the per-rate replay, so --audio-rates replays them")
+
+print("28. crossover band slots under test span the firmware's whole range")
+check(L.XO_BAND == 20 and L.XO_BANDS == 4, "XOVER_BAND_BASE=20, MAX_XOVER_BANDS=4")
+
 print()
 print("FAILURES:", len(fails))
 for f in fails:
