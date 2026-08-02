@@ -22,6 +22,7 @@ version.
 7. [Running the tests](#7-running-the-tests)
 8. [Command-line options](#8-command-line-options)
 9. [How the audio measurement works](#9-how-the-audio-measurement-works)
+9a. [Sample rates (48 kHz and 44.1 kHz)](#9a-sample-rates-48-khz-and-441-khz)
 10. [Every test, explained](#10-every-test-explained)
 11. [Every tunable parameter](#11-every-tunable-parameter)
 12. [Reading the results](#12-reading-the-results)
@@ -325,6 +326,46 @@ real measurement noise never trips them.
 
 ---
 
+## 9a. Sample rates (48 kHz and 44.1 kHz)
+
+DSPi has no vendor command for its operating rate: it follows the host USB rate.
+The loopback capture function advertises 44.1 and 48 kHz only, so both are real
+operating points and both are worth measuring. The playback function also
+advertises 96 kHz, but the capture cannot carry it (the servo's per-frame packet
+ceiling is 52 stereo frames), so the harness skips rather than measuring garbage
+there.
+
+**Changing the rate needs the CoreAudio HAL, not a stream open.** Opening a
+PortAudio stream at 44.1 kHz appears to work and reports the stream running at
+44100, but macOS leaves the device at its nominal rate and resamples in
+software. `tools/dspi_test/coreaudio.py` sets
+`kAudioDevicePropertyNominalSampleRate` directly instead. The loopback build
+exposes two UAC functions, so macOS creates two devices (playback and capture)
+and **both** must move, or `play_record` straddles a rate boundary and CoreAudio
+resamples one side. Off macOS the helper is a no-op and the 44.1 kHz tests skip.
+
+**What runs at each rate.** By default the full matrix runs at 48 kHz plus a
+targeted subset (`SECONDARY_TESTS`) at 44.1 kHz, because running everything
+twice roughly doubles a multi-minute run for little extra signal. The subset is
+the tests where the rate genuinely changes behaviour:
+
+| Test | Why it is rate-sensitive |
+|---|---|
+| `loopback_integrity` | the capture servo runs at a non-integer 44.1 frames per USB frame, exercising its fractional accumulator rather than just the feed-forward term |
+| `output_delay` | the expected sample count is derived from fs (220 vs 240 samples for 5 ms) |
+| `slot_lr_alignment` | inter-leg alignment at the second rate |
+| PEQ / crossover picks, `multiband_eq` | the hybrid SVF/biquad boundary is Fs/7.5, so it moves from 6400 Hz to 5880 Hz. `multiband_eq`'s 6 kHz shelf is on the SVF side at 48 kHz and the biquad side at 44.1 kHz, so one configuration covers both paths across the two rates |
+| `peq_linkwitz_transform`, `xo_two_band_cascade` | both designs are computed from fs |
+
+`--audio-rates 48000,44100` runs the **full** matrix at each listed rate
+instead. Variants are registered in rate order with `rate_switch_round_trip`
+last, so a run performs one rate change per extra rate rather than thrashing,
+and the device is left on the primary rate at the end. The rate is host-driven
+and absent from the bulk blob, so the suite's snapshot cannot restore it; that
+final test is what puts it back.
+
+---
+
 ## 10. Every test, explained
 
 All audio tests are in the `audio` group. "PASS" means the firmware's real audio output
@@ -514,8 +555,10 @@ What it **cannot** verify with this rig:
 | `tools/dspi_test/device.py` | USB vendor-command transport to the DSPi (`pyusb`). |
 | `tools/dspi_test/profile.py` | Detects the attached board's capabilities (channels, slots, etc.). |
 | `tools/dspi_test/lifecycle.py` | Pre-run snapshot and post-run restore. |
+| `tools/dspi_test/selftest.py` | No-hardware checks of the harness's own logic (`python3 -m tools.dspi_test.selftest`). |
 | `tools/dspi_test/audio.py` | The audio measurement engine (device discovery, play/record, sweeps, metrics) + the `--list`/`--probe` tool. |
-| `tools/dspi_test/tests/audio_loopback.py` | The `audio` group: all 40 loopback tests + their fixtures and parameters. |
+| `tools/dspi_test/coreaudio.py` | macOS HAL access to set the device's nominal sample rate (PortAudio cannot: it resamples instead). No-op off macOS. |
+| `tools/dspi_test/tests/audio_loopback.py` | The `audio` group: the loopback tests + their fixtures and parameters. |
 | `tools/dspi_test/tests/*.py` | The control-plane test modules (eq, outputs, inputs, volume, presets, etc.). |
 | `tools/filter_tester/compare_filter.py` | RBJ filter reference reused for the expected PEQ responses. |
 | `tools/dspi_test/README.md` | The short quick-start (this guide is the long version). |

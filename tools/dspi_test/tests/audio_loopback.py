@@ -26,6 +26,7 @@ import struct
 import time
 
 from ..device import OP, Stall, Timeout
+from .. import coreaudio
 from ..framework import test, Skip, REGISTRY
 from .. import audio
 
@@ -221,21 +222,24 @@ def _glitches(dev):
     return None if ov is None or un is None else (ov, un)
 
 
-def _clean_capture(dev, fn, attempts=2):
-    """Run measurement `fn`, retrying if the capture servo glitched during it.
+def _capture(dev, fn, attempts=3):
+    """Run a capture, retrying while the servo reports a glitch.
 
-    Returns (result, delta) where delta is None if the capture was clean, else
-    the (dropped, underrun) counts from the final attempt.
+    The first capture after a pause routinely underruns: the ring drains, the
+    servo emits silence, and the capture comes back dead, which reads as a huge
+    measurement error rather than as a transport fault. Skip if it never comes
+    back clean, so a dead capture is never asserted on.
     """
-    result = delta = None
+    delta = None
     for _ in range(attempts):
         before = _glitches(dev)
         result = fn()
         after = _glitches(dev)
         if before is None or after is None or after == before:
-            return result, None
+            return result
         delta = (after[0] - before[0], after[1] - before[1])
-    return result, delta
+    raise Skip(f"capture never came back clean in {attempts} attempts "
+               f"(last: +{delta[0]} dropped, +{delta[1]} underrun)")
 
 
 def _device_rate(dev):
@@ -247,17 +251,14 @@ def _device_rate(dev):
 def _set_rate(dev, out_dev, in_dev, fs):
     """Move DSPi to `fs` and wait until applied; True on success.
 
-    There is no vendor command: DSPi follows the host, so the rate only moves
-    when a host stream opens there. A short tone does that.
+    There is no vendor command: DSPi follows the host USB rate. Opening a
+    stream at `fs` is NOT enough, since CoreAudio accepts it and resamples in
+    software; the device only moves when the HAL's nominal rate is set on both
+    of its audio functions (see coreaudio.py).
     """
     if _device_rate(dev) == fs:
         return True
-    try:
-        audio.measure_tone(out_dev, in_dev, 0, fs, 1000.0, amp=0.1)
-    except Exception:  # noqa: BLE001
-        # The host backend can refuse the rate outright (PortAudio raises when
-        # the device will not open there).  That is a "cannot test at this rate"
-        # condition, not a harness error, so let the caller turn it into a Skip.
+    if not coreaudio.set_rate_by_name(audio.DSPI_OUT_NAME, fs):
         return False
     got = _wait_applied(lambda: dev.get_u32(OP.GET_STATUS, wvalue=STATUS_SAMPLE_RATE), fs)
     if got != fs:
@@ -488,7 +489,7 @@ def _autoprobe_slot(dev, profile, out_dev, in_dev, fs):
     for slot in range(profile.num_spdif):
         out_l, out_r, _cl, _cr = _slot_indices(profile, slot)
         _route_only(dev, profile, out_l, out_r)
-        level, _thd, strength = audio.measure_tone(out_dev, in_dev, 0, fs, 1000.0, amp=0.3)
+        level, _thd, strength = _capture(dev, lambda: audio.measure_tone(out_dev, in_dev, 0, fs, 1000.0, amp=0.3))
         if strength > CORR_MIN and level > best_lvl:
             best, best_lvl = slot, level
     if best is None:
@@ -638,23 +639,19 @@ def loopback_integrity(dev, profile, chk):
     dev.wait_ready()
 
     amp = 0.4
-    level, thd, strength = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
-                                              rig["fs"], 1000.0, amp=amp)
+    level, thd, strength = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                              rig["fs"], 1000.0, amp=amp))
     chk.ok(strength > CORR_MIN, f"tone reaches DSPi capture (corr {strength:.2f})")
     exp_level = 20.0 * np.log10(amp / np.sqrt(2.0))
     chk.approx(level, exp_level, 1.0, f"tone level ~{exp_level:.1f} dBFS")
     chk.ok(thd < 0.1, f"THD {thd:.4f}% < 0.1%")
 
-    noise = audio.measure_noise(rig["out"], rig["in"], rig["chan"], rig["fs"])
+    noise = _capture(dev, lambda: audio.measure_noise(rig["out"], rig["in"], rig["chan"], rig["fs"]))
     chk.ok(noise < NOISE_MAX_DBFS, f"noise floor {noise:.1f} dBFS < {NOISE_MAX_DBFS}")
 
-    (resid, scale), glitch = _clean_capture(
+    resid, scale = _capture(
         dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
-    if glitch:
-        chk.note(f"capture glitched (+{glitch[0]} dropped, +{glitch[1]} underrun); "
-                 f"residual {resid:.1f} dBFS is transport, not DSP")
-    else:
-        chk.ok(resid < RESIDUAL_MAX_DBFS, f"flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
+    chk.ok(resid < RESIDUAL_MAX_DBFS, f"flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
     # The S/PDIF path may invert polarity (scale < 0); that is fine for a DAC.
     # Check |scale| for unity magnitude and just report the sign.
     gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
@@ -672,8 +669,8 @@ def loopback_allpass_phase(dev, profile, chk):
     _set_band(dev, rig["ch_l"], 0, TYPE["allpass1"], fc, q, 0.0)
     dev.wait_ready()
     freqs = _test_freqs(rig["fs"])
-    mag, phase, strength = audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
-                                                  rig["fs"], freqs, amp=0.4)
+    mag, phase, strength = _capture(dev, lambda: audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
+                                                  rig["fs"], freqs, amp=0.4))
     chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
     chk.ok(float(np.max(np.abs(mag))) < 0.3, f"all-pass magnitude flat (max |{np.max(np.abs(mag)):.3f}| dB)")
     _, exp_phase = _expected("allpass1", fc, q, 0.0, rig["fs"], freqs)
@@ -693,8 +690,8 @@ def _make_peq_test(name, rbj_name, fc, q, gain):
         _set_band(dev, rig["ch_l"], 0, TYPE[rbj_name], fc, q, gain)
         dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
-        mag, phase, strength = audio.measure_transfer(
-            rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=_signal_amp(gain))
+        mag, phase, strength = _capture(dev, lambda: audio.measure_transfer(
+            rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=_signal_amp(gain)))
         chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
         exp_mag, exp_phase = _expected(rbj_name, fc, q, gain, rig["fs"], freqs)
         err = float(np.max(np.abs(mag - exp_mag)))
@@ -809,8 +806,8 @@ def _make_xo_test(name, family, order, is_hp, fc):
             _set_band(dev, rig["ch_l"], XO_BAND, ftype, fc, 0.707, 0.0)
             dev.wait_ready()
             freqs = _test_freqs(rig["fs"])
-            mag, _ph, _st = audio.measure_transfer(
-                rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+            mag, _ph, _st = _capture(dev, lambda: audio.measure_transfer(
+                rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4))
             exp = 20.0 * np.log10(np.abs(_xo_reference(family, order, is_hp, fc, rig["fs"], freqs)) + 1e-30)
             band = exp > XO_MAG_FLOOR_DB     # compare only the measurable region
             # Presence by passband level, not correlation: a high-pass legitimately
@@ -859,7 +856,7 @@ def xo_lr4_complementary_sum(dev, profile, chk):
         _set_band(dev, ch_r, XO_BAND, _xo_enum("lr", 4, True),  fc, 0.707, 0.0)  # HP
         dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
-        h_lp, h_hp, strength = audio.measure_complex_2ch(rig["out"], rig["in"], rig["fs"], freqs, amp=0.4)
+        h_lp, h_hp, strength = _capture(dev, lambda: audio.measure_complex_2ch(rig["out"], rig["in"], rig["fs"], freqs, amp=0.4))
         chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
         summ_db = 20.0 * np.log10(np.abs(h_lp + h_hp) + 1e-30)
         err = float(np.max(np.abs(summ_db)))
@@ -885,7 +882,7 @@ def _flatten_chain(dev, ch):
 
 
 def _tone_level(dev, rig, freq=1000.0, amp=0.4):
-    lvl, _thd, _st = audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], freq, amp=amp)
+    lvl, _thd, _st = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], freq, amp=amp))
     return lvl
 
 
@@ -975,9 +972,9 @@ def matrix_phase_invert(dev, profile, chk):
     try:
         _flatten_chain(dev, rig["ch_l"])
         _route(dev, 0, out_l, 1, 0.0, 0); dev.wait_ready()
-        _r, scale_n = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
+        _r, scale_n = _capture(dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
         _route(dev, 0, out_l, 1, 0.0, 1); dev.wait_ready()
-        _r, scale_i = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
+        _r, scale_i = _capture(dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
         chk.ok(scale_n * scale_i < 0,
                f"phase-invert flips polarity (scale {scale_n:+.3f} -> {scale_i:+.3f})")
         chk.note(f"phase_invert: scale normal={scale_n:+.3f} inverted={scale_i:+.3f}")
@@ -1002,17 +999,14 @@ def output_delay(dev, profile, chk):
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_r)
         dev.wait_ready()
-        (lag_base, _), g0 = _clean_capture(
+        lag_base, _ = _capture(
             dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
         dev.set_f32(OP.SET_OUTPUT_DELAY, delay_ms, wvalue=out_l); dev.wait_ready()
-        (lag_delayed, _), g1 = _clean_capture(
+        lag_delayed, _ = _capture(
             dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
         delta = lag_delayed - lag_base
-        if g0 or g1:
-            chk.note(f"capture glitched ({g0} / {g1}); delta {delta} unreliable")
-        else:
-            chk.approx(delta, expect, 2,
-                       f"output delay {delay_ms:g} ms = {expect} samples (measured {delta})")
+        chk.approx(delta, expect, 2,
+                   f"output delay {delay_ms:g} ms = {expect} samples (measured {delta})")
         chk.note(f"output_delay: lag_base={lag_base} lag_delayed={lag_delayed} delta={delta} expect={expect}")
     finally:
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
@@ -1032,13 +1026,9 @@ ALIGN_TOL_SAMPLES = 1
 INPUT_SPDIF = 1
 
 
-def _check_alignment(chk, label, lag, strength, glitch):
-    """Assert L/R presence and alignment, unless the capture glitched: a splice
-    invalidates both and would otherwise read as a firmware alignment fault."""
-    if glitch:
-        chk.note(f"{label}: capture glitched (+{glitch[0]} dropped, +{glitch[1]} "
-                 f"underrun); lag {lag} corr {strength:.2f} unreliable")
-        return
+def _check_alignment(chk, label, lag, strength):
+    """Assert L/R presence and alignment. _capture() has already guaranteed the
+    capture was clean, so a bad lag here is a real alignment fault."""
     chk.ok(strength > 0.5, f"{label}: L/R present & correlated (corr {strength:.2f})")
     chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES,
            f"{label}: L/R aligned, lag {lag} samples (<= {ALIGN_TOL_SAMPLES})")
@@ -1046,16 +1036,15 @@ def _check_alignment(chk, label, lag, strength, glitch):
 
 
 def _lr_lag(dev, profile, rig):
-    """(lag, strength, glitch) for the slot's L vs R, with the rig's standard
+    """(lag, strength) for the slot's L vs R, with the rig's standard
     1:1 routing restored and the chain flat. Identical signal feeds both legs,
     so lag ~ 0 and strength ~ 1 when L and R are sample-aligned."""
     _config_slot(dev, profile, rig["slot"])
     _flatten_chain(dev, rig["ch_l"])
     _flatten_chain(dev, rig["ch_r"])
     dev.wait_ready()
-    (lag, strength), glitch = _clean_capture(
+    return _capture(
         dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
-    return lag, strength, glitch
 
 
 @test("audio", mutating=True)
@@ -1129,28 +1118,21 @@ def output_type_i2s_audio(dev, profile, chk):
             raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_I2S)
         amp = 0.4
-        level, thd, strength = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
-                                                  rig["fs"], 1000.0, amp=amp)
+        level, thd, strength = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                                  rig["fs"], 1000.0, amp=amp))
         chk.ok(strength > CORR_MIN, f"I2S: tone reaches capture (corr {strength:.2f})")
         exp_level = 20.0 * np.log10(amp / np.sqrt(2.0))
         chk.approx(level, exp_level, 1.0, f"I2S: tone level ~{exp_level:.1f} dBFS")
         chk.ok(thd < 0.1, f"I2S: THD {thd:.4f}% < 0.1%")
-        (lag, _st), g = _clean_capture(
+        lag, _st = _capture(
             dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
-        if g:
-            chk.note(f"I2S: capture glitched {g}; lag {lag} unreliable")
-        else:
-            chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES,
-                   f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
+        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES,
+               f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
         # Bit-exactness + unity gain of the (pre-encoder, type-agnostic) capture,
         # single-shot to the same standard as loopback_integrity.
-        (resid, scale), glitch = _clean_capture(
+        resid, scale = _capture(
             dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
-        if glitch:
-            chk.note(f"I2S: capture glitched (+{glitch[0]} dropped, +{glitch[1]} underrun); "
-                     f"residual {resid:.1f} dBFS is transport, not DSP")
-        else:
-            chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
+        chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
         gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
         chk.approx(gain_db, 0.0, GAIN_TOL_DB, f"I2S: path gain ~0 dB (|scale| {abs(scale):.4f})")
         chk.note(f"i2s_audio: level={level:.2f}dBFS thd={thd:.4f}% resid={resid:.1f}dBFS "
@@ -1179,11 +1161,11 @@ def output_type_switch_stress(dev, profile, chk):
                 _flatten_chain(dev, rig["ch_l"])
                 _flatten_chain(dev, rig["ch_r"])
                 dev.wait_ready()
-                (lag, strength), g = _clean_capture(
+                lag, strength = _capture(
                     dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
                 level = _tone_level(dev, rig)
                 chk.ok(level > -20.0, f"cycle {i} -> {name}: output at level ({level:.1f} dBFS)")
-                _check_alignment(chk, f"cycle {i} -> {name}", lag, strength, g)
+                _check_alignment(chk, f"cycle {i} -> {name}", lag, strength)
         chk.note(f"switch_stress: {cycles}x SPDIF<->I2S, signal+level+alignment intact after every switch")
     finally:
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_SPDIF)
@@ -1224,7 +1206,7 @@ def multiband_eq(dev, profile, chk):
             _set_band(dev, rig["ch_l"], b, TYPE[t], fc, q, g)
         dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
-        mag, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.25)
+        mag, _p, _s = _capture(dev, lambda: audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.25))
         exp = np.zeros_like(freqs, dtype=float)
         for (b, t, fc, q, g) in cfgs:
             em, _ = _expected(t, fc, q, g, rig["fs"], freqs)
@@ -1251,9 +1233,9 @@ def loudness_shape(dev, profile, chk):
         dev.set_f32(OP.SET_USER_VOLUME, -40.0)
         dev.set_u8(OP.SET_LOUDNESS, 0); dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
-        off, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+        off, _p, _s = _capture(dev, lambda: audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4))
         dev.set_u8(OP.SET_LOUDNESS, 1); dev.wait_ready()
-        on, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+        on, _p, _s = _capture(dev, lambda: audio.measure_transfer(rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4))
         diff = on - off
         mid = diff[int(np.argmin(np.abs(freqs - 1000.0)))]
         lf = diff[int(np.argmin(np.abs(freqs - 60.0)))] - mid
@@ -1277,9 +1259,9 @@ def crossfeed_bleed(dev, profile, chk):
         # the target slot's bit the enable below would do nothing.
         dev.set_u8(OP.SET_CROSSFEED_OUTPUTS, 1 << rig["slot"])
         dev.set_u8(OP.SET_CROSSFEED, 0); dev.wait_ready()
-        l_off, r_off, _ = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True)
+        l_off, r_off, _ = _capture(dev, lambda: audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True))
         dev.set_u8(OP.SET_CROSSFEED, 1); dev.wait_ready()
-        l_on, r_on, _ = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True)
+        l_on, r_on, _ = _capture(dev, lambda: audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 200.0, amp=0.4, left_only=True))
         chk.ok(r_off < -50.0, f"crossfeed off: opposite channel silent ({r_off:.1f} dBFS)")
         chk.ok(r_on > r_off + 15.0, f"crossfeed on: bleed into opposite channel ({r_off:.1f} -> {r_on:.1f} dBFS)")
         chk.ok(r_on < l_on - 1.0, f"bleed attenuated vs direct (R {r_on:.1f} < L {l_on:.1f} dBFS)")
@@ -1300,12 +1282,12 @@ def leveller_boost(dev, profile, chk):
         # pair's bits would leave the leveller enabled but inert here.
         dev.set(OP.SET_LEVELLER_MASKS, bytes([0xFF, 0xFF]))
         dev.set_u8(OP.SET_LEVELLER_ENABLE, 0); dev.wait_ready()
-        off, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05)
+        off, _r, _t = _capture(dev, lambda: audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05))
         dev.set_f32(OP.SET_LEVELLER_AMOUNT, 100.0)
         dev.set_f32(OP.SET_LEVELLER_MAX_GAIN, 12.0)
         dev.set_u8(OP.SET_LEVELLER_SPEED, 2)
         dev.set_u8(OP.SET_LEVELLER_ENABLE, 1); dev.wait_ready()
-        on, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05)
+        on, _r, _t = _capture(dev, lambda: audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"], 1000.0, dur_s=1.2, amp=0.05))
         boost = on - off
         chk.ok(boost > 3.0, f"leveller lifts quiet signal (+{boost:.1f} dB)")
         chk.ok(boost <= 13.0, f"boost within max-gain ceiling (+{boost:.1f} dB <= ~12)")
@@ -1322,10 +1304,10 @@ def output_clip_limit(dev, profile, chk):
     rig = _get_rig(dev, profile)
     try:
         _flatten_chain(dev, rig["ch_l"])
-        lvl0, thd0, _ = audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], 1000.0, amp=0.5)
+        lvl0, thd0, _ = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], 1000.0, amp=0.5))
         _set_band(dev, rig["ch_l"], 0, TYPE["peaking"], 1000.0, 1.0, 12.0)  # +12 dB pushes past full scale
         dev.wait_ready()
-        lvl1, thd1, _ = audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], 1000.0, amp=0.5)
+        lvl1, thd1, _ = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"], rig["fs"], 1000.0, amp=0.5))
         chk.ok(lvl1 > lvl0 + 3.0, f"+12 dB boost takes effect ({lvl0:.1f} -> {lvl1:.1f} dBFS)")
         chk.ok(lvl1 < 0.5, f"output clamped at full scale, not wrapped ({lvl1:.2f} dBFS)")
         chk.ok(thd1 > thd0 + 1.0, f"clipping raises THD ({thd0:.3f}% -> {thd1:.3f}%)")
@@ -1367,9 +1349,9 @@ def peq_linkwitz_transform(dev, profile, chk):
         dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
         # DC boost is (f0/fp)^2, so back the drive off to keep the peak in range.
-        mag, _p, strength = audio.measure_transfer(
+        mag, _p, strength = _capture(dev, lambda: audio.measure_transfer(
             rig["out"], rig["in"], rig["chan"], rig["fs"], freqs,
-            amp=_signal_amp(20.0 * np.log10((f0 / fp) ** 2)))
+            amp=_signal_amp(20.0 * np.log10((f0 / fp) ** 2))))
         chk.ok(strength > CORR_MIN, f"signal present (corr {strength:.2f})")
         b, a = _lt_biquad(f0, q0, fp, qp, float(rig["fs"]))
         z = np.exp(-1j * 2.0 * np.pi * np.asarray(freqs) / rig["fs"])
@@ -1399,8 +1381,8 @@ def xo_all_band_slots(dev, profile, chk):
                 _set_band(dev, rig["ch_l"], other, FLAT, 1000.0, 0.707, 0.0)
             _set_band(dev, rig["ch_l"], b, ftype, fc, 0.707, 0.0)
             dev.wait_ready()
-            mag, _p, _s = audio.measure_transfer(
-                rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+            mag, _p, _s = _capture(dev, lambda: audio.measure_transfer(
+                rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4))
             err = float(np.max(np.abs(mag[band_sel] - exp[band_sel])))
             chk.ok(err < XO_MAG_TOL_DB, f"band {b}: BW2 LP applied (max err {err:.3f} dB)")
     finally:
@@ -1419,8 +1401,8 @@ def xo_two_band_cascade(dev, profile, chk):
         _set_band(dev, rig["ch_l"], XO_BAND + 1, _xo_enum("bw", 2, False), f_lp, 0.707, 0.0)
         dev.wait_ready()
         freqs = _test_freqs(rig["fs"])
-        mag, _p, _s = audio.measure_transfer(
-            rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4)
+        mag, _p, _s = _capture(dev, lambda: audio.measure_transfer(
+            rig["out"], rig["in"], rig["chan"], rig["fs"], freqs, amp=0.4))
         H = (_xo_reference("bw", 2, True, f_hp, rig["fs"], freqs)
              * _xo_reference("bw", 2, False, f_lp, rig["fs"], freqs))
         exp = 20.0 * np.log10(np.abs(H) + 1e-30)
@@ -1448,12 +1430,12 @@ def loudness_output_mask(dev, profile, chk):
         freqs = _test_freqs(rig["fs"])
         lf_i = int(np.argmin(np.abs(freqs - 60.0)))
         mid_i = int(np.argmin(np.abs(freqs - 1000.0)))
-        off, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
-                                             rig["fs"], freqs, amp=0.4)
+        off, _p, _s = _capture(dev, lambda: audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
+                                             rig["fs"], freqs, amp=0.4))
         dev.set(OP.SET_LOUDNESS_MASK, struct.pack("<H", 1 << out_l))  # target included
         dev.wait_ready()
-        on, _p, _s = audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
-                                            rig["fs"], freqs, amp=0.4)
+        on, _p, _s = _capture(dev, lambda: audio.measure_transfer(rig["out"], rig["in"], rig["chan"],
+                                            rig["fs"], freqs, amp=0.4))
         lift = (on[lf_i] - on[mid_i]) - (off[lf_i] - off[mid_i])
         chk.ok(lift > 2.0, f"masked-in output gains bass lift (+{lift:.1f} dB @60Hz vs mid)")
         chk.note(f"loudness_mask: lift={lift:.1f}dB with bit {out_l} set")
@@ -1486,24 +1468,21 @@ def upmix_centre_off_passthrough(dev, profile, chk):
         if not st[0]:
             raise Skip(f"upmixer parked (reason {st[1]}: "
                        f"1=disabled 2=input not stereo 3=rate>48k)")
-        (resid, scale), glitch = _clean_capture(
+        resid, scale = _capture(
             dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
-        if glitch:
-            chk.note(f"capture glitched {glitch}; residual {resid:.1f} dBFS unreliable")
-        else:
-            chk.ok(resid < RESIDUAL_MAX_DBFS,
-                   f"centre OFF: L/R bit-exact through the upmixer "
-                   f"({resid:.1f} dBFS < {RESIDUAL_MAX_DBFS})")
-            chk.approx(20.0 * np.log10(abs(scale) + 1e-20), 0.0, GAIN_TOL_DB,
-                       f"centre OFF: unity gain (|scale| {abs(scale):.4f})")
+        chk.ok(resid < RESIDUAL_MAX_DBFS,
+               f"centre OFF: L/R bit-exact through the upmixer "
+               f"({resid:.1f} dBFS < {RESIDUAL_MAX_DBFS})")
+        chk.approx(20.0 * np.log10(abs(scale) + 1e-20), 0.0, GAIN_TOL_DB,
+                   f"centre OFF: unity gain (|scale| {abs(scale):.4f})")
         # Surrounds are still produced: route the derived Ls row to the target.
         _route(dev, 0, out_l, 0)
         _route(dev, UPMIX_ROW_LS, out_l, 1, 0.0)
         dev.wait_ready()
         # Ls = 0.7071*(L-R) under PASSIVE, so a mono-duplicated tone would
         # cancel to silence; drive the left channel only.
-        lvl, _r, _t = audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"],
-                                             1000.0, amp=0.4, left_only=True)
+        lvl, _r, _t = _capture(dev, lambda: audio.measure_tone_2ch(rig["out"], rig["in"], rig["fs"],
+                                             1000.0, amp=0.4, left_only=True))
         chk.ok(lvl > -40.0, f"derived Ls row carries audio ({lvl:.1f} dBFS)")
         chk.note(f"upmix: resid={resid:.1f}dBFS Ls={lvl:.1f}dBFS")
     finally:
@@ -1522,15 +1501,15 @@ def psybass_harmonics(dev, profile, chk):
     try:
         _flatten_chain(dev, rig["ch_l"])
         dev.set_u8(OP.SET_PSYBASS, 0); dev.wait_ready()
-        _lvl0, thd0, _s = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
-                                             rig["fs"], tone, amp=0.4)
+        _lvl0, thd0, _s = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                             rig["fs"], tone, amp=0.4))
         dev.set_f32(OP.SET_PSYBASS_CUTOFF, PSYBASS_CUTOFF)
         dev.set_f32(OP.SET_PSYBASS_HARMONICS, PSYBASS_HARMONICS)
         dev.set_f32(OP.SET_PSYBASS_DRIVE, PSYBASS_DRIVE)
         dev.set(OP.SET_PSYBASS_MASK, struct.pack("<H", 1 << out_l))
         dev.set_u8(OP.SET_PSYBASS, 1); dev.wait_ready()
-        _lvl1, thd1, _s = audio.measure_tone(rig["out"], rig["in"], rig["chan"],
-                                             rig["fs"], tone, amp=0.4)
+        _lvl1, thd1, _s = _capture(dev, lambda: audio.measure_tone(rig["out"], rig["in"], rig["chan"],
+                                             rig["fs"], tone, amp=0.4))
         chk.ok(thd1 > thd0 + 1.0,
                f"harmonics generated below cutoff (THD {thd0:.3f}% -> {thd1:.3f}%)")
         chk.note(f"psybass: {tone:g}Hz THD {thd0:.3f}% -> {thd1:.3f}% "

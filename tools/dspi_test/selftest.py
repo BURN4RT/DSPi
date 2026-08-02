@@ -17,6 +17,8 @@ semantics:
 
     python3 -m tools.dspi_test.selftest      # exit 0 = all good
 """
+import pathlib
+import re
 import struct
 import sys
 import time
@@ -368,61 +370,39 @@ class GlitchDev:
         return "result"
 
 
-print("19. clean capture reports no glitch and runs once")
+print("19. clean capture runs once, no retry")
 d = GlitchDev(bump=(0, 0))
-res, delta = L._clean_capture(d, d.measure)
-check(res == "result" and delta is None, f"clean capture (delta={delta})")
+check(L._capture(d, d.measure) == "result", "returns the measurement")
 check(d.calls == 1, f"no needless retry (calls={d.calls})")
 
-print("20. a transient glitch is retried and then reported clean")
+print("20. a transient glitch is retried and the clean result returned")
 d = GlitchDev(bump=(3, 1), bump_times=1)      # only the first attempt glitches
-res, delta = L._clean_capture(d, d.measure)
+check(L._capture(d, d.measure) == "result", "returns the retried result")
 check(d.calls == 2, f"retried once (calls={d.calls})")
-check(delta is None, f"second attempt clean, so no glitch reported (delta={delta})")
 
-print("21. a persistent glitch is reported with its counts, not asserted on")
+print("21. a persistent glitch Skips instead of asserting on a dead capture")
 d = GlitchDev(bump=(5, 2))
-res, delta = L._clean_capture(d, d.measure)
-check(delta == (5, 2), f"reports the final attempt's deltas (got {delta})")
-check(d.calls == 2, f"bounded retries (calls={d.calls})")
+try:
+    L._capture(d, d.measure)
+    check(False, "should have raised Skip")
+except L.Skip as e:
+    check("underrun" in str(e) and "dropped" in str(e), f"Skip names the counters: {e}")
+check(d.calls == 3, f"bounded retries (calls={d.calls})")
 
-print("22. release build (counters absent) degrades to the old behaviour")
+print("22. release build (counters absent) degrades to a single plain call")
 d = GlitchDev(available=False)
 check(L._glitches(d) is None, "counters unavailable reads as None")
-res, delta = L._clean_capture(d, d.measure)
-check(res == "result" and delta is None and d.calls == 1,
-      "measurement runs once and is treated as clean")
+check(L._capture(d, d.measure) == "result" and d.calls == 1,
+      "runs once and is treated as clean")
 
-print("23. _check_alignment asserts when clean, only notes when glitched")
-
-
-class FakeChk:
-    def __init__(self):
-        self.fails, self.notes = [], []
-
-    def ok(self, cond, msg):
-        if not cond:
-            self.fails.append(msg)
-        return cond
-
-    def note(self, msg):
-        self.notes.append(msg)
-
-
-c = FakeChk()
-L._check_alignment(c, "t", 9, 0.1, None)          # bad lag AND bad corr, clean capture
-check(len(c.fails) == 2, f"clean capture asserts both checks (fails={len(c.fails)})")
-c = FakeChk()
-L._check_alignment(c, "t", 9, 0.1, (4, 1))        # same numbers, but glitched
-check(not c.fails and len(c.notes) == 1,
-      f"glitched capture notes instead of failing (fails={c.fails})")
-check("dropped" in c.notes[0] and "underrun" in c.notes[0],
-      f"note names both counters ({c.notes[0]!r})")
-
-
-# --------------------------------------------------------------------------
-# Phase 5: feature coverage
-# --------------------------------------------------------------------------
+print("23. every capture in the module goes through _capture")
+src = pathlib.Path("tools/dspi_test/tests/audio_loopback.py").read_text()
+bare = []
+for m in re.finditer(r"audio\.(measure_\w+|bit_exact_residual)\(", src):
+    ls = src.rfind("\n", 0, m.start()) + 1
+    if "lambda" not in src[ls:m.start()]:
+        bare.append(src[ls:m.end()].strip()[:60])
+check(not bare, f"no unwrapped capture calls (found {len(bare)}: {bare[:3]})")
 
 print("24. LT SET packet is 18 bytes with the Qp sidecar the firmware reads")
 
@@ -478,6 +458,36 @@ check(audio_names.index("psybass_harmonics") < audio_names.index("rate_switch_ro
 
 print("28. crossover band slots under test span the firmware's whole range")
 check(L.XO_BAND == 20 and L.XO_BANDS == 4, "XOVER_BAND_BASE=20, MAX_XOVER_BANDS=4")
+
+
+# --------------------------------------------------------------------------
+# CoreAudio HAL rate control
+# --------------------------------------------------------------------------
+
+print("29. coreaudio helper imports and degrades cleanly")
+from tools.dspi_test import coreaudio as ca
+
+check(isinstance(ca.available(), bool), "available() answers without raising")
+check(ca._fourcc("nsrt") == 0x6E737274, "FourCC packing matches the HAL constants")
+check(ca.kAudioDevicePropertyNominalSampleRate == ca._fourcc("nsrt"),
+      "nominal-sample-rate selector")
+check(ca.kAudioHardwarePropertyDevices == ca._fourcc("dev#"), "device-list selector")
+if not ca.available():
+    check(ca.find_devices("anything") == [], "off macOS: find_devices returns empty")
+    check(ca.set_rate_by_name("anything", 48000) is False,
+          "off macOS: set_rate_by_name reports failure rather than raising")
+else:
+    check(ca.find_devices("\x00no such device\x00") == [],
+          "unknown name matches nothing")
+    check(ca.set_rate_by_name("\x00no such device\x00", 48000) is False,
+          "unknown name reports failure rather than raising")
+
+print("30. _set_rate uses the HAL, not a stream open")
+import inspect
+src = inspect.getsource(L._set_rate)
+check("coreaudio.set_rate_by_name" in src, "_set_rate calls the HAL setter")
+check("measure_tone" not in src,
+      "_set_rate no longer relies on opening a stream (CoreAudio would resample)")
 
 print()
 print("FAILURES:", len(fails))
