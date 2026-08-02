@@ -36,6 +36,7 @@
 #include "upmix.h"
 #include "adat_output.h"
 #include "adat_input.h"
+#include "loopback.h"   // DSPI_LOOPBACK glitch counters (self-guarded; empty otherwise)
 #include "usb_descriptors.h"
 #include "tusb.h"
 #include "pico/audio_spdif.h"
@@ -1888,6 +1889,12 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     case 21: resp = audio_spdif_get_dma_starvations_instance(3); break;  // SPDIF instance 3
                     case 22: resp = usb_audio_ring_overrun_count(); break;  // USB audio ring overruns
                     case 23: resp = active_input_channel_count(); break;  // live active input count (source-aware: USB/I2S/SPDIF)
+#ifdef DSPI_LOOPBACK
+                    // Capture-glitch counters; absent from release builds, so
+                    // 24/25 STALL there and the host treats them as optional.
+                    case 24: resp = loopback_get_overflow_count(); break;
+                    case 25: resp = loopback_get_underrun_count(); break;
+#endif
                 }
                 usb_start_tiny_control_in_transfer(resp, 4);
                 return true;

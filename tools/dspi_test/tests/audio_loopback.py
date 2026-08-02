@@ -45,28 +45,19 @@ RESIDUAL_MAX_DBFS = -80.0   # flat-path per-sample residual (bit-exact-ish)
 GAIN_TOL_DB = 0.5           # flat-path overall gain vs unity
 
 # --- Operating rates --------------------------------------------------------
-#
-# DSPi follows the host USB rate, and the loopback capture function advertises
-# 44.1 and 48 kHz (usb_descriptors.c), so both are real operating points that
-# have to be verified.  Running the whole matrix at both roughly doubles a
-# multi-minute run for little extra signal, so the default is the full matrix at
-# the primary rate plus a targeted second pass (SECONDARY_TESTS) at 44.1 kHz.
-#
-# The device's playback function also advertises 96 kHz on the stereo alt, but
-# the capture does not and the servo's 52-frame packet ceiling cannot carry it;
-# _require_rate() skips rather than measuring garbage there.
+# DSPi follows the host USB rate. The capture advertises 44.1/48 kHz only, so
+# the playback-only 96 kHz cannot be measured; _require_rate() skips there.
 FS = audio.DEFAULT_FS       # 48 kHz, the primary rate
 FS_ALT = 44100              # secondary rate
 
-# run.py --audio-rates sets this to run the FULL matrix at each listed rate
-# instead (and then no secondary subset, since it would be redundant).
+# run.py --audio-rates runs the FULL matrix at each listed rate instead of the
+# default "full matrix at FS + SECONDARY_TESTS subset at FS_ALT".
 _RATES_ENV = os.environ.get("DSPI_AUDIO_RATES", "").replace(",", " ").split()
 RATES_OVERRIDE = [int(r) for r in _RATES_ENV] if _RATES_ENV else None
 PRIMARY_RATES = RATES_OVERRIDE or [FS]
 SECONDARY_RATES = [] if RATES_OVERRIDE else [FS_ALT]
 
-# Suffix for a rate's generated test names.  Empty at the first primary rate so
-# existing names (and saved baseline reports) stay comparable.
+# Empty at the first primary rate, so existing test names stay comparable.
 _RATE_TAGS = {48000: "48k", 44100: "44k1", 96000: "96k"}
 
 
@@ -89,6 +80,8 @@ TYPE_SPDIF, TYPE_I2S = 0, 1   # OutputType enum (firmware)
 # GET_STATUS sub-indices (vendor_commands.c REQ_GET_STATUS switch).
 STATUS_SAMPLE_RATE = 15       # audio_state.freq, the live operating rate
 STATUS_INPUT_COUNT = 23       # active_input_channel_count()
+STATUS_LB_OVERFLOW = 24       # DSPI_LOOPBACK only; STALLs on a release build
+STATUS_LB_UNDERRUN = 25
 
 # Feature-specific constants used to neutralize a stage (firmware headers).
 UPMIX_PARAM_ENABLED = 0       # upmix.h
@@ -133,45 +126,25 @@ PEQ_CONFIGS = [
 
 
 # --- Deferred-operation barriers --------------------------------------------
-#
-# dev.wait_ready() proves only that the device still answers control transfers:
-# it returns on the FIRST successful poll.  Output-type switches, input-source
-# switches and rate changes are all DEFERRED to the main loop (the vendor
-# handler just arms a flag; main.c's process_type_switches() / input-source
-# handler applies it behind pipeline_reset_ready()), so wait_ready() routinely
-# returns before the operation has even started.
-#
-# Worse, both SET handlers compare against the APPLIED state and drop the
-# request when it already matches: the type switch returns success for
-# `new_type == output_types[slot]`, and the input switch arms only when
-# `src != active_input_source`.  A round trip issued faster than the main loop
-# applies the first leg is therefore compared against stale state and silently
-# swallowed, leaving the device in the intermediate mode while the test believes
-# it was restored.
-#
-# So: poll the applied state instead.  Because these helpers never return with a
-# switch still pending, the entry-time read is always accurate and an unchanged
-# request is a genuine no-op (no reset, no settle).
+# Output-type, input-source and rate changes are applied by the main loop, and
+# each SET no-ops when the request already matches the APPLIED state. So a round
+# trip issued faster than the main loop gets silently swallowed. wait_ready()
+# only proves liveness; poll the applied state instead.
 
 BARRIER_TIMEOUT_S = 4.0
 BARRIER_POLL_S = 0.05
 
-# After an operation that crossed a pipeline reset the DSP callback stalls, the
-# loopback ring drains, and the capture servo takes its underrun path: it emits
-# silence packets until the ring refills to TARGET_FILL_FRAMES (loopback.c).
-# Measuring inside that window reads a silence gap and a splice, not the DSP.
+# A pipeline reset drains the loopback ring, so the capture servo emits silence
+# until it re-primes. Measuring inside that window reads a splice, not the DSP.
 PIPELINE_SETTLE_S = 2.0
 
 
 def _wait_applied(getter, expected, timeout_s=None, poll_s=None):
     """Poll `getter()` until it reports `expected`; return the last value read.
 
-    Transient stalls/timeouts are tolerated: a deferred reset briefly disables
-    the USB control IRQ, so a transfer in that window legitimately fails.
-
-    The bounds default to None and resolve to the module constants HERE rather
-    than in the signature, so raising BARRIER_TIMEOUT_S actually takes effect
-    (a default argument would freeze the value at import time).
+    Stalls are tolerated: a deferred reset briefly disables the control IRQ.
+    Bounds resolve from the module constants here, not in the signature, so
+    raising BARRIER_TIMEOUT_S at runtime actually takes effect.
     """
     timeout_s = BARRIER_TIMEOUT_S if timeout_s is None else timeout_s
     poll_s = BARRIER_POLL_S if poll_s is None else poll_s
@@ -190,13 +163,9 @@ def _wait_applied(getter, expected, timeout_s=None, poll_s=None):
 
 
 def _read_settled(getter, timeout_s=None):
-    """Read a device value, tolerating a transient control-IRQ blackout left by
-    an operation that is still settling.  Returns None if it never answers.
-
-    Every entry-time read below needs this: these helpers are routinely called
-    right after a previous deferred reset, and a bare GET in that window would
-    escape as "unexpected STALL" and turn the test into an ERROR.
-    """
+    """Read a device value tolerating a settling reset's control-IRQ blackout;
+    None if it never answers. Entry-time reads need this or a bare GET escapes
+    as an unexpected STALL and turns the test into an ERROR."""
     timeout_s = BARRIER_TIMEOUT_S if timeout_s is None else timeout_s
     deadline = time.monotonic() + timeout_s
     while True:
@@ -209,12 +178,8 @@ def _read_settled(getter, timeout_s=None):
 
 
 def _set_output_type(dev, slot, otype):
-    """Switch `slot` to output type `otype` and wait until it is APPLIED.
-
-    Returns True on success.  A request that matches the applied type is a
-    no-op and costs one GET (this is the common case: _config_slot re-asserts
-    the type on every call).
-    """
+    """Switch `slot` to `otype` and wait until APPLIED; True on success.
+    A request matching the applied type costs one GET and no reset."""
     cur = _read_settled(lambda: dev.get_u8(OP.GET_OUTPUT_TYPE, wvalue=slot))
     if cur is None:
         return False        # device never answered
@@ -245,6 +210,34 @@ def _set_input_source(dev, src):
     return True
 
 
+def _glitches(dev):
+    """(dropped frames, underruns) from the capture servo, None if unavailable.
+
+    A dropped or inserted frame splices the captured stream and fails a strict
+    comparison exactly as a DSP fault would; sampling these tells them apart.
+    """
+    ov = _optional(lambda: dev.get_u32(OP.GET_STATUS, wvalue=STATUS_LB_OVERFLOW))
+    un = _optional(lambda: dev.get_u32(OP.GET_STATUS, wvalue=STATUS_LB_UNDERRUN))
+    return None if ov is None or un is None else (ov, un)
+
+
+def _clean_capture(dev, fn, attempts=2):
+    """Run measurement `fn`, retrying if the capture servo glitched during it.
+
+    Returns (result, delta) where delta is None if the capture was clean, else
+    the (dropped, underrun) counts from the final attempt.
+    """
+    result = delta = None
+    for _ in range(attempts):
+        before = _glitches(dev)
+        result = fn()
+        after = _glitches(dev)
+        if before is None or after is None or after == before:
+            return result, None
+        delta = (after[0] - before[0], after[1] - before[1])
+    return result, delta
+
+
 def _device_rate(dev):
     """DSPi's live operating rate (audio_state.freq), or None if it will not
     answer (see _read_settled)."""
@@ -252,14 +245,10 @@ def _device_rate(dev):
 
 
 def _set_rate(dev, out_dev, in_dev, fs):
-    """Move DSPi to `fs` and wait until it is applied.  Returns True on success.
+    """Move DSPi to `fs` and wait until applied; True on success.
 
-    DSPi has no vendor command for this: it follows the host USB rate, so the
-    device only moves when the host issues the UAC1 SET_CUR, which happens when
-    a stream opens at the new rate.  A short quiet tone is enough to open and
-    close a stream pair there.  The rate change is then deferred to the main
-    loop behind pipeline_reset_ready() like every other pipeline reset
-    (main.c rate_change_pending), so the applied read-back is the barrier.
+    There is no vendor command: DSPi follows the host, so the rate only moves
+    when a host stream opens there. A short tone does that.
     """
     if _device_rate(dev) == fs:
         return True
@@ -280,11 +269,8 @@ def _set_rate(dev, out_dev, in_dev, fs):
 def _require_rate(dev, fs):
     """Skip unless the device is actually running at `fs`.
 
-    Every reference in this module (RBJ/scipy magnitude and phase, the test
-    frequency grid, the output-delay sample count) is computed from fs, and the
-    capture streams at audio_state.freq regardless of what the host asked for
-    (loopback.c); a mismatch is a silent pitch error that shows up as dozens of
-    unexplained magnitude failures.  One Skip is far more useful.
+    Every reference here is computed from fs, and the capture streams at
+    audio_state.freq regardless, so a mismatch is a silent pitch error.
     """
     actual = _device_rate(dev)
     if actual is None:
@@ -354,15 +340,8 @@ def _optional(fn, default=None):
 def _baseline(dev, profile):
     """Put every stage that can perturb a measurement into a known-inert state.
 
-    The audio group runs FIRST (run.py sorts it ahead of the control-plane
-    tests) against whatever preset the device booted with, so anything NOT
-    zeroed here is preset-dependent: a user preset with, say, psybass or a
-    per-output delay enabled would fail the bit-exact and unity-gain checks with
-    no indication why.  loopback_baseline_clean verifies the result.
-
-    Deliberately non-destructive where possible: the per-input PEQ is disabled
-    with the global bypass flag rather than by rewriting every band, so the
-    preset's own EQ survives the run.
+    The group runs against the device's live preset, so anything not zeroed
+    here is preset-dependent. loopback_baseline_clean verifies the result.
     """
     if not _set_input_source(dev, INPUT_USB):
         raise Skip("could not switch the input source to USB")
@@ -381,11 +360,7 @@ def _baseline(dev, profile):
     # and that is what the filter tests drive.
     dev.set_u8(OP.SET_BYPASS, 1)
 
-    # Effects that would colour, compress, or replace the signal.  Each sits on
-    # a different part of the chain, so none of them is covered by the others:
-    # leveller pre-matrix, upmixer into matrix rows 2..4, crossfeed per output
-    # pair, psybass pre-crossover per output, loudness post-gain per output,
-    # siggen injected post-matrix.
+    # Each sits on a different part of the chain, so none covers the others.
     dev.set_u8(OP.SET_LOUDNESS, 0)
     dev.set_u8(OP.SET_CROSSFEED, 0)
     dev.set_u8(OP.SET_LEVELLER_ENABLE, 0)
@@ -437,16 +412,12 @@ def _neutral_state(dev, profile):
 
 
 def _route_only(dev, profile, out_l, out_r):
-    """Route USB L/R 1:1 to exactly the (out_l, out_r) pair at 0 dB and disable
-    every other crosspoint, so only this output pair carries signal. Matrix
-    writes apply immediately (no deferred reset).
+    """Route USB L/R 1:1 to the (out_l, out_r) pair at 0 dB and disable every
+    other crosspoint. Matrix writes apply immediately (no deferred reset).
 
-    EVERY input row is cleared, not just the stereo pair: the matrix has
-    num_input_channels source rows (8 on RP2350), and when the stereo upmixer is
-    running rows 2..4 additionally carry derived C/Ls/Rs (audio_pipeline.c
-    PASS 3).  Clearing only rows 0/1 left those rows free to feed the target
-    output, which silently broke this function's isolation guarantee and
-    _autoprobe_slot's "probed in isolation" claim."""
+    EVERY input row is cleared: with the upmixer running, rows 2..4 carry
+    derived C/Ls/Rs and would otherwise still feed the target output.
+    """
     for inp in range(profile.num_input_channels):
         for out in range(profile.num_output_channels):
             _route(dev, inp, out, 0)
@@ -459,11 +430,8 @@ _BAND_CEILING = {}   # channel -> PEQ band count, probed once per channel
 
 def _band_ceiling(dev, ch, hi=16):
     """PEQ band count for THIS channel: the smallest band index that STALLs.
-
-    channel_band_counts[] is per-channel and runtime-settable (dsp_pipeline.c),
-    while profile.band_ceiling is probed on channel 0, an INPUT channel.  Using
-    that for the output channels the filter tests drive could under-flatten and
-    leave live EQ bands under every measurement."""
+    channel_band_counts[] is per-channel, and profile.band_ceiling comes from
+    channel 0 (an input), so it can under-flatten the output channels."""
     if ch in _BAND_CEILING:
         return _BAND_CEILING[ch]
     ceiling = hi + 1
@@ -623,11 +591,9 @@ _REGISTRY_MARK = len(REGISTRY)
 def loopback_baseline_clean(dev, profile, chk):
     """Every stage the measurements assume inert really is inert.
 
-    Registered first so a baseline that did not take produces ONE diagnostic
-    failure naming the offending stage, instead of ~80 downstream tests failing
-    on bit-exactness, unity gain and THD with no indication of the cause. The
-    audio group runs against the device's live preset, so this is the check that
-    the group's central assumption actually holds."""
+    Registered first, so a baseline that did not take gives one failure naming
+    the stage rather than ~80 downstream failures with no cause.
+    """
     rig = _get_rig(dev, profile)
     chk.note(f"out='{rig['out_name']}' in='{rig['in_name']}' slot={rig['slot']} "
              f"ch_l={rig['ch_l']} ch_r={rig['ch_r']} fs={rig['fs']}")
@@ -682,8 +648,13 @@ def loopback_integrity(dev, profile, chk):
     noise = audio.measure_noise(rig["out"], rig["in"], rig["chan"], rig["fs"])
     chk.ok(noise < NOISE_MAX_DBFS, f"noise floor {noise:.1f} dBFS < {NOISE_MAX_DBFS}")
 
-    resid, scale = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
-    chk.ok(resid < RESIDUAL_MAX_DBFS, f"flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
+    (resid, scale), glitch = _clean_capture(
+        dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
+    if glitch:
+        chk.note(f"capture glitched (+{glitch[0]} dropped, +{glitch[1]} underrun); "
+                 f"residual {resid:.1f} dBFS is transport, not DSP")
+    else:
+        chk.ok(resid < RESIDUAL_MAX_DBFS, f"flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
     # The S/PDIF path may invert polarity (scale < 0); that is fine for a DAC.
     # Check |scale| for unity magnitude and just report the sign.
     gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
@@ -1031,12 +1002,17 @@ def output_delay(dev, profile, chk):
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_r)
         dev.wait_ready()
-        lag_base, _ = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+        (lag_base, _), g0 = _clean_capture(
+            dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
         dev.set_f32(OP.SET_OUTPUT_DELAY, delay_ms, wvalue=out_l); dev.wait_ready()
-        lag_delayed, _ = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+        (lag_delayed, _), g1 = _clean_capture(
+            dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
         delta = lag_delayed - lag_base
-        chk.approx(delta, expect, 2,
-                   f"output delay {delay_ms:g} ms = {expect} samples (measured {delta})")
+        if g0 or g1:
+            chk.note(f"capture glitched ({g0} / {g1}); delta {delta} unreliable")
+        else:
+            chk.approx(delta, expect, 2,
+                       f"output delay {delay_ms:g} ms = {expect} samples (measured {delta})")
         chk.note(f"output_delay: lag_base={lag_base} lag_delayed={lag_delayed} delta={delta} expect={expect}")
     finally:
         dev.set_f32(OP.SET_OUTPUT_DELAY, 0.0, wvalue=out_l)
@@ -1056,25 +1032,37 @@ ALIGN_TOL_SAMPLES = 1
 INPUT_SPDIF = 1
 
 
+def _check_alignment(chk, label, lag, strength, glitch):
+    """Assert L/R presence and alignment, unless the capture glitched: a splice
+    invalidates both and would otherwise read as a firmware alignment fault."""
+    if glitch:
+        chk.note(f"{label}: capture glitched (+{glitch[0]} dropped, +{glitch[1]} "
+                 f"underrun); lag {lag} corr {strength:.2f} unreliable")
+        return
+    chk.ok(strength > 0.5, f"{label}: L/R present & correlated (corr {strength:.2f})")
+    chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES,
+           f"{label}: L/R aligned, lag {lag} samples (<= {ALIGN_TOL_SAMPLES})")
+    chk.note(f"{label}: lag={lag} corr={strength:.2f}")
+
+
 def _lr_lag(dev, profile, rig):
-    """(lag, strength) for the slot's L vs R, with the rig's standard 1:1
-    routing restored and the chain flat. Identical signal feeds both legs, so
-    lag ~ 0 and strength ~ 1 when L and R are sample-aligned."""
+    """(lag, strength, glitch) for the slot's L vs R, with the rig's standard
+    1:1 routing restored and the chain flat. Identical signal feeds both legs,
+    so lag ~ 0 and strength ~ 1 when L and R are sample-aligned."""
     _config_slot(dev, profile, rig["slot"])
     _flatten_chain(dev, rig["ch_l"])
     _flatten_chain(dev, rig["ch_r"])
     dev.wait_ready()
-    return audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+    (lag, strength), glitch = _clean_capture(
+        dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
+    return lag, strength, glitch
 
 
 @test("audio", mutating=True)
 def slot_lr_alignment(dev, profile, chk):
     """The captured S/PDIF slot's L and R channels are sample-aligned."""
     rig = _get_rig(dev, profile)
-    lag, strength = _lr_lag(dev, profile, rig)
-    chk.ok(strength > 0.5, f"L/R present & correlated (corr {strength:.2f})")
-    chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R aligned: lag {lag} samples (<= {ALIGN_TOL_SAMPLES})")
-    chk.note(f"slot_lr_alignment: lag={lag} corr={strength:.2f}")
+    _check_alignment(chk, "slot_lr_alignment", *_lr_lag(dev, profile, rig))
 
 
 @test("audio", mutating=True)
@@ -1089,10 +1077,7 @@ def alignment_after_input_switch(dev, profile, chk):
             raise Skip("S/PDIF input not selectable (disabled, or switch never applied)")
         if not _set_input_source(dev, INPUT_USB):
             raise Skip("could not switch the input source back to USB")
-        lag, strength = _lr_lag(dev, profile, rig)
-        chk.ok(strength > 0.5, f"signal restored after input switch (corr {strength:.2f})")
-        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
-        chk.note(f"after_input_switch: lag={lag} corr={strength:.2f}")
+        _check_alignment(chk, "after_input_switch", *_lr_lag(dev, profile, rig))
     finally:
         _set_input_source(dev, INPUT_USB)
 
@@ -1111,10 +1096,7 @@ def alignment_after_output_type_switch(dev, profile, chk):
             raise Skip("output-type switch to I2S unavailable (check BCK pin / status)")
         if not _set_output_type(dev, slot, TYPE_SPDIF):
             raise Skip("could not restore the slot to S/PDIF")
-        lag, strength = _lr_lag(dev, profile, rig)
-        chk.ok(strength > 0.5, f"signal restored after type switch (corr {strength:.2f})")
-        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
-        chk.note(f"after_type_switch: lag={lag} corr={strength:.2f}")
+        _check_alignment(chk, "after_type_switch", *_lr_lag(dev, profile, rig))
     finally:
         _set_output_type(dev, slot, TYPE_SPDIF)
 
@@ -1153,12 +1135,22 @@ def output_type_i2s_audio(dev, profile, chk):
         exp_level = 20.0 * np.log10(amp / np.sqrt(2.0))
         chk.approx(level, exp_level, 1.0, f"I2S: tone level ~{exp_level:.1f} dBFS")
         chk.ok(thd < 0.1, f"I2S: THD {thd:.4f}% < 0.1%")
-        lag, _st = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
-        chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
+        (lag, _st), g = _clean_capture(
+            dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
+        if g:
+            chk.note(f"I2S: capture glitched {g}; lag {lag} unreliable")
+        else:
+            chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES,
+                   f"I2S: L/R aligned (lag {lag} samples <= {ALIGN_TOL_SAMPLES})")
         # Bit-exactness + unity gain of the (pre-encoder, type-agnostic) capture,
         # single-shot to the same standard as loopback_integrity.
-        resid, scale = audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"])
-        chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
+        (resid, scale), glitch = _clean_capture(
+            dev, lambda: audio.bit_exact_residual(rig["out"], rig["in"], rig["chan"], rig["fs"]))
+        if glitch:
+            chk.note(f"I2S: capture glitched (+{glitch[0]} dropped, +{glitch[1]} underrun); "
+                     f"residual {resid:.1f} dBFS is transport, not DSP")
+        else:
+            chk.ok(resid < RESIDUAL_MAX_DBFS, f"I2S: flat-path residual {resid:.1f} dBFS < {RESIDUAL_MAX_DBFS}")
         gain_db = 20.0 * np.log10(abs(scale) + 1e-20)
         chk.approx(gain_db, 0.0, GAIN_TOL_DB, f"I2S: path gain ~0 dB (|scale| {abs(scale):.4f})")
         chk.note(f"i2s_audio: level={level:.2f}dBFS thd={thd:.4f}% resid={resid:.1f}dBFS "
@@ -1172,14 +1164,8 @@ def output_type_i2s_audio(dev, profile, chk):
 def output_type_switch_stress(dev, profile, chk):
     """Repeated SPDIF<->I2S switching on slot 0 keeps the output alive, at unity,
     and L/R sample-aligned after EVERY switch. Exercises the shared-DMA-channel
-    teardown/re-setup path (audio_spdif_teardown + full SPDIF re-setup, I2S
-    setup/teardown reclaiming the same channel); a double-claim panic, a stalled
-    pipeline, or lost inter-leg alignment would surface here as lost signal, a
-    bad lag, or a device reset (disconnect).
-
-    Every switch is confirmed APPLIED before measuring (_config_slot ->
-    _set_output_type), so these are real switches rather than requests swallowed
-    as no-ops against a stale output_types[]."""
+    teardown/re-setup path; a double-claim panic, a stalled pipeline or lost
+    alignment surfaces as lost signal, a bad lag, or a disconnect."""
     rig = _get_rig(dev, profile)
     slot = rig["slot"]
     cycles = 4
@@ -1193,11 +1179,11 @@ def output_type_switch_stress(dev, profile, chk):
                 _flatten_chain(dev, rig["ch_l"])
                 _flatten_chain(dev, rig["ch_r"])
                 dev.wait_ready()
-                lag, strength = audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"])
+                (lag, strength), g = _clean_capture(
+                    dev, lambda: audio.measure_interchannel_lag(rig["out"], rig["in"], rig["fs"]))
                 level = _tone_level(dev, rig)
-                chk.ok(strength > 0.5, f"cycle {i} -> {name}: signal present (corr {strength:.2f})")
                 chk.ok(level > -20.0, f"cycle {i} -> {name}: output at level ({level:.1f} dBFS)")
-                chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"cycle {i} -> {name}: L/R aligned (lag {lag})")
+                _check_alignment(chk, f"cycle {i} -> {name}", lag, strength, g)
         chk.note(f"switch_stress: {cycles}x SPDIF<->I2S, signal+level+alignment intact after every switch")
     finally:
         _config_slot(dev, profile, slot, flatten_all=True, otype=TYPE_SPDIF)
@@ -1215,13 +1201,9 @@ def output_type_switch_stress(dev, profile, chk):
 def _note_input_count(dev, chk):
     """Record the live active input count alongside a chain measurement.
 
-    Loudness, leveller and crossfeed used to be bypassed whenever more than two
-    input channels were active, so these tests skipped on any host that opened
-    the DSPi at its 8-channel maximum (macOS CoreAudio does).  That bypass is
-    gone: crossfeed runs per output pair post-matrix, loudness runs per output
-    post-gain, and the leveller is mask-driven over the active inputs, all
-    input-count agnostic (audio_pipeline.c PASS 2.5 / 4.5 / 5-7).  The count is
-    still worth reporting, because it selects which code path was exercised."""
+    Loudness, leveller and crossfeed are input-count agnostic (audio_pipeline.c
+    PASS 2.5 / 4.5 / 5-7), but the count selects which path ran.
+    """
     nin = dev.get_u32(OP.GET_STATUS, wvalue=STATUS_INPUT_COUNT)
     chk.note(f"active input channels: {nin}")
     return nin
@@ -1353,33 +1335,9 @@ def output_clip_limit(dev, profile, chk):
 
 
 # --- Per-rate replay --------------------------------------------------------
-#
-# Everything above is registered once, at the first primary rate.  Two further
-# passes can follow, both built by replaying existing test bodies at another
-# rate (see _rate_variant):
-#
-#   * PRIMARY_RATES[1:] replay the FULL matrix.  Only --audio-rates produces
-#     these, because doubling a multi-minute run is an explicit choice.
-#   * SECONDARY_RATES replay the targeted SECONDARY_TESTS subset.  This is the
-#     default 44.1 kHz pass.
-#
-# Variants are registered in rate order and the round-trip test comes last, so a
-# run performs exactly one rate change per extra rate rather than thrashing.
-#
-# The subset covers the tests where the rate genuinely changes behaviour, rather
-# than the whole matrix (which would roughly double the run for little signal).
-#
-#   * loopback_integrity: the capture servo now runs at a NON-INTEGER 44.1
-#     frames per USB frame, so its fractional accumulator, not just the
-#     feed-forward term, has to hold bit-exactness and unity gain.
-#   * output_delay: the expected sample count is derived from fs (220 vs 240).
-#   * multiband_eq and the PEQ/XO picks: the hybrid SVF/biquad boundary is
-#     Fs/7.5, so it moves from 6400 Hz to 5880 Hz.  multiband_eq's 6 kHz high
-#     shelf is on the SVF side at 48 kHz and the biquad side at 44.1 kHz, so the
-#     same configuration covers both paths across the two rates.
-#   * slot_lr_alignment: inter-leg alignment at the second rate.
-#
-# Rates come from run.py --audio-rates; see PRIMARY_RATES / SECONDARY_RATES.
+# Existing test bodies are re-registered at another rate via _rate_variant.
+# Variants go in rate order with the round-trip last, so a run performs one rate
+# change per extra rate. Subset rationale: tools/dspi_test/test_harness.md.
 
 SECONDARY_TESTS = [
     "loopback_integrity",
@@ -1397,9 +1355,8 @@ SECONDARY_TESTS = [
 def _rate_variant(body, fs):
     """Register an existing test body to run again at `fs`.
 
-    The body is reused untouched: the wrapper publishes the rate in _ACTIVE_FS,
-    which _get_rig() picks up, so nothing in the test has to thread fs through.
-    Restored in a finally so a failure cannot leak the rate into the next test.
+    The wrapper publishes the rate in _ACTIVE_FS for _get_rig(), restored in a
+    finally so a failure cannot leak the rate into the next test.
     """
     tag = _rate_tag(fs)
 
@@ -1437,17 +1394,13 @@ for _fs in SECONDARY_RATES:
 def rate_switch_round_trip(dev, profile, chk):
     """Returning to the primary rate restores signal and L/R alignment.
 
-    Registered last so it also leaves the device on the primary rate: the
-    suite's snapshot restores device CONFIG, but the operating rate is host
-    driven and is not in the bulk blob, so nothing else would put it back.
+    Registered last so it also leaves the device there: the rate is host driven
+    and absent from the bulk blob, so the snapshot cannot restore it.
     """
     primary = PRIMARY_RATES[0]
     rig = _get_rig(dev, profile, primary)
     chk.ok(_device_rate(dev) == primary, f"device back at {primary} Hz")
-    lag, strength = _lr_lag(dev, profile, rig)
-    chk.ok(strength > 0.5, f"signal present after the rate round trip (corr {strength:.2f})")
-    chk.ok(abs(lag) <= ALIGN_TOL_SAMPLES, f"L/R still aligned: lag {lag} samples")
-    # Multichannel USB alts advertise 48 kHz only (usb_descriptors.c
-    # AS_MULTICH_ALT), so any 44.1 kHz pass necessarily ran on a stereo alt.
+    _check_alignment(chk, "rate_round_trip", *_lr_lag(dev, profile, rig))
+    # Multichannel USB alts are 48 kHz only, so a 44.1 kHz pass ran on a stereo alt.
     _note_input_count(dev, chk)
-    chk.note(f"rate_round_trip: rates exercised {sorted(_RIG)} lag={lag}")
+    chk.note(f"rate_round_trip: rates exercised {sorted(_RIG)}")

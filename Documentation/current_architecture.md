@@ -450,7 +450,7 @@ Block-based two-phase architecture with dual-core EQ processing, all in Q28 fixe
 ---
 
 ## USB Audio Loopback Capture (DSPI_LOOPBACK)
-*Last updated: 2026-07-05 (XIP: RP2040 no longer RAM-tight; loopback ELFs are accepted by check_ram_placement.py)*
+*Last updated: 2026-08-02 (capture glitch counters on REQ_GET_STATUS 24/25)*
 
 A **debug/verification-only** feature, compiled in only when the `DSPI_LOOPBACK`
 build flag is defined. It folds the standalone `~/USBrx` S/PDIF-to-USB recorder's
@@ -520,6 +520,28 @@ slot-0 final 24-bit samples (audio_pipeline.c, before give_audio_buffer)
   correction toward `TARGET_FILL_FRAMES` = 256 (~5.3 ms), with a fractional-sample
   accumulator. Primes to target before streaming; underrun emits silence and
   re-primes. Ported from USBrx, reading the internal ring instead of a S/PDIF FIFO.
+
+### Glitch counters (`REQ_GET_STATUS` wValue 24/25)
+The capture is asynchronous to the host, so it can lose or insert frames in two
+ways: the ring **overflows** when the host is not draining (`loopback_push_slot0`
+drops the rest of the block), or it **underruns** when the ring runs dry
+(`fill_audio_packet` emits a silence packet and re-primes). Either splices the
+captured stream, and a spliced stream fails a strict comparison (bit-exact
+residual, inter-channel lag) exactly as a real DSP fault would.
+
+Two free-running counters make the two distinguishable:
+
+| wValue | Returns | Increments |
+|---|---|---|
+| 24 | `loopback_get_overflow_count()` | once per frame dropped with the ring full |
+| 25 | `loopback_get_underrun_count()` | once per underrun episode (the following packets take the prime branch, so an episode counts once) |
+
+Both are `#ifdef DSPI_LOOPBACK`, so indices 24/25 STALL on a release build and
+the host treats them as optional. The harness samples them either side of a
+capture (`_clean_capture` in `tools/dspi_test/tests/audio_loopback.py`): a
+measurement whose counters moved is retried once, and a persistent glitch is
+reported as a transport fault instead of being asserted on. With the counters
+absent the harness degrades to its previous behaviour.
 
 ### Driver registration
 The capture driver (`loopback_uac1_driver`, in `loopback.c`) is registered

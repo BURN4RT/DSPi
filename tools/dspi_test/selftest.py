@@ -342,6 +342,83 @@ for label, names in (("default", base), ("override", both)):
     check(names[-1] == "rate_switch_round_trip",
           f"{label}: round trip last, leaving the device on the primary rate")
 
+
+# --------------------------------------------------------------------------
+# Phase 4: capture-glitch counters
+# --------------------------------------------------------------------------
+
+class GlitchDev:
+    """Serves the two counters; `bump` adds to them on each measurement."""
+
+    def __init__(self, bump=(0, 0), available=True, bump_times=99):
+        self.c = [0, 0]
+        self.bump, self.available, self.bump_times = bump, available, bump_times
+        self.calls = 0
+
+    def get_u32(self, opcode, wvalue=0):
+        if not self.available:
+            raise Stall(opcode, "IN", -9, "release build: index unsupported")
+        return self.c[0 if wvalue == L.STATUS_LB_OVERFLOW else 1]
+
+    def measure(self):
+        self.calls += 1
+        if self.calls <= self.bump_times:
+            self.c[0] += self.bump[0]
+            self.c[1] += self.bump[1]
+        return "result"
+
+
+print("19. clean capture reports no glitch and runs once")
+d = GlitchDev(bump=(0, 0))
+res, delta = L._clean_capture(d, d.measure)
+check(res == "result" and delta is None, f"clean capture (delta={delta})")
+check(d.calls == 1, f"no needless retry (calls={d.calls})")
+
+print("20. a transient glitch is retried and then reported clean")
+d = GlitchDev(bump=(3, 1), bump_times=1)      # only the first attempt glitches
+res, delta = L._clean_capture(d, d.measure)
+check(d.calls == 2, f"retried once (calls={d.calls})")
+check(delta is None, f"second attempt clean, so no glitch reported (delta={delta})")
+
+print("21. a persistent glitch is reported with its counts, not asserted on")
+d = GlitchDev(bump=(5, 2))
+res, delta = L._clean_capture(d, d.measure)
+check(delta == (5, 2), f"reports the final attempt's deltas (got {delta})")
+check(d.calls == 2, f"bounded retries (calls={d.calls})")
+
+print("22. release build (counters absent) degrades to the old behaviour")
+d = GlitchDev(available=False)
+check(L._glitches(d) is None, "counters unavailable reads as None")
+res, delta = L._clean_capture(d, d.measure)
+check(res == "result" and delta is None and d.calls == 1,
+      "measurement runs once and is treated as clean")
+
+print("23. _check_alignment asserts when clean, only notes when glitched")
+
+
+class FakeChk:
+    def __init__(self):
+        self.fails, self.notes = [], []
+
+    def ok(self, cond, msg):
+        if not cond:
+            self.fails.append(msg)
+        return cond
+
+    def note(self, msg):
+        self.notes.append(msg)
+
+
+c = FakeChk()
+L._check_alignment(c, "t", 9, 0.1, None)          # bad lag AND bad corr, clean capture
+check(len(c.fails) == 2, f"clean capture asserts both checks (fails={len(c.fails)})")
+c = FakeChk()
+L._check_alignment(c, "t", 9, 0.1, (4, 1))        # same numbers, but glitched
+check(not c.fails and len(c.notes) == 1,
+      f"glitched capture notes instead of failing (fails={c.fails})")
+check("dropped" in c.notes[0] and "underrun" in c.notes[0],
+      f"note names both counters ({c.notes[0]!r})")
+
 print()
 print("FAILURES:", len(fails))
 for f in fails:

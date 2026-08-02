@@ -70,11 +70,17 @@
 static int32_t loopback_ring[RING_FRAMES * 2];
 static volatile uint32_t ring_head;          /* next frame to write (producer) */
 static volatile uint32_t ring_tail;          /* next frame to read  (consumer) */
-static volatile uint32_t ring_overflow_count; /* dropped frames (diagnostic)    */
+/* Glitch counters, read by the host via REQ_GET_STATUS to tell a capture
+ * dropout from a DSP fault; both discontinuities look identical in the audio. */
+static volatile uint32_t ring_overflow_count; /* frames dropped, ring full     */
+static volatile uint32_t ring_underrun_count; /* silence packets sent, ring dry */
 
 static inline uint32_t ring_count(void) {
     return ring_head - ring_tail;            /* unsigned wrap-safe difference */
 }
+
+uint32_t loopback_get_overflow_count(void) { return ring_overflow_count; }
+uint32_t loopback_get_underrun_count(void) { return ring_underrun_count; }
 
 void __not_in_flash_func(loopback_push_slot0)(const int32_t *interleaved_s24, uint32_t frames) {
     uint32_t h = ring_head;
@@ -156,7 +162,9 @@ static uint16_t __not_in_flash_func(fill_audio_packet)(uint8_t *buf) {
     if ((uint32_t)n > avail) n = (int)avail;
 
     if (n == 0) {
-        /* Real underrun: keep the stream alive and re-prime. */
+        /* Real underrun: keep the stream alive and re-prime.  Counted once per
+         * episode; the following packets take the prime branch above. */
+        ring_underrun_count++;
         g_primed = false;
         uint16_t z = silence_bytes();
         memset(buf, 0, z);

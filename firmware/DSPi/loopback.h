@@ -38,6 +38,12 @@ extern "C" {
 // (runs in the audio callback); drops on ring overflow and never blocks.
 void loopback_push_slot0(const int32_t *interleaved_s24, uint32_t frames);
 
+// Capture-glitch counters, surfaced via REQ_GET_STATUS.  A dropped or inserted
+// frame is indistinguishable from a DSP fault in the captured audio, so the
+// host samples these around a measurement to tell the two apart.
+uint32_t loopback_get_overflow_count(void);   // frames dropped, ring full
+uint32_t loopback_get_underrun_count(void);   // silence packets, ring dry
+
 // Custom UAC1 capture class driver.  Registered alongside the playback UAC1
 // driver from usbd_app_driver_get_cb() in usb_audio.c.
 extern const usbd_class_driver_t loopback_uac1_driver;
