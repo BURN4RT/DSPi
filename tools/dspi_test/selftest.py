@@ -229,20 +229,21 @@ check(bad == ["d", "e"], f"only real mismatches reported (got {bad})")
 # --------------------------------------------------------------------------
 
 print("12. rate tags: primary is unsuffixed, others are identifier-safe")
-check(L._rate_tag(L.PRIMARY_RATES[0]) == "", "primary rate has no suffix")
+check(L._rate_tag(L.RATES[0]) == "", "first rate has no suffix")
 check(L._rate_tag(44100) == "_44k1", f"44.1k tag (got {L._rate_tag(44100)!r})")
 for fs in (44100, 96000, 32000):
     tag = L._rate_tag(fs)
     check(("x" + tag).isidentifier(), f"{fs} tag {tag!r} is identifier-safe")
 
-print("13. every SECONDARY_TESTS name resolves to a registered test")
+print("13. every test body is registered at every rate")
 from tools.dspi_test.framework import REGISTRY
-registered = {tc.name for tc in REGISTRY}
-missing = [n for n in L.SECONDARY_TESTS if n not in registered]
-check(not missing, f"all subset names exist (missing: {missing})")
-variants = [n + "_44k1" for n in L.SECONDARY_TESTS]
-absent = [v for v in variants if v not in registered]
-check(not absent, f"all 44.1k variants registered (absent: {absent})")
+audio_all = [tc.name for tc in REGISTRY if tc.group == "audio"]
+base = [n for n in audio_all if not n.endswith("_44k1") and n != "rate_switch_round_trip"]
+var = [n for n in audio_all if n.endswith("_44k1")]
+check(len(var) == len(base),
+      f"full matrix replayed at 44.1k ({len(var)} variants for {len(base)} tests)")
+missing = [n for n in base if n + "_44k1" not in audio_all]
+check(not missing, f"no test lacks a 44.1k variant (missing: {missing[:3]})")
 
 print("14. rate variants are contiguous and last, so only ONE rate switch")
 audio_names = [tc.name for tc in REGISTRY if tc.group == "audio"]
@@ -329,8 +330,9 @@ both = _list_audio("--audio-rates", "48000,44100")
 alt = _list_audio("--audio-rates", "44100")
 
 n_primary = len(base) - sum(n.endswith("_44k1") for n in base) - 1   # minus round-trip
-check(sum(n.endswith("_44k1") for n in base) == len(L.SECONDARY_TESTS),
-      f"default: subset-sized 44.1k pass ({sum(n.endswith('_44k1') for n in base)})")
+check(sum(n.endswith("_44k1") for n in base) == n_primary,
+      f"default: FULL matrix at 44.1k too ({sum(n.endswith('_44k1') for n in base)} "
+      f"variants for {n_primary} tests)")
 check(len(both) == 2 * n_primary + 1,
       f"override lists the FULL matrix twice plus the round trip "
       f"({len(both)} vs {2 * n_primary + 1})")

@@ -344,21 +344,27 @@ exposes two UAC functions, so macOS creates two devices (playback and capture)
 and **both** must move, or `play_record` straddles a rate boundary and CoreAudio
 resamples one side. Off macOS the helper is a no-op and the 44.1 kHz tests skip.
 
-**What runs at each rate.** By default the full matrix runs at 48 kHz plus a
-targeted subset (`SECONDARY_TESTS`) at 44.1 kHz, because running everything
-twice roughly doubles a multi-minute run for little extra signal. The subset is
-the tests where the rate genuinely changes behaviour:
+**What runs at each rate.** By default the **full matrix runs at both rates**
+(175 tests, about 9 minutes). Only one configuration in the test tables actually
+changes DSP path between them, since the hybrid SVF/biquad boundary is Fs/7.5 and
+moves from 6400 Hz to 5880 Hz: `multiband_eq`'s 6 kHz high shelf is on the SVF
+side at 48 kHz and the biquad side at 44.1 kHz. Every other filter runs the same
+code at both rates, but its coefficients are recomputed from fs, so a
+rate-dependent fault (a wrong fs normalisation, a clamp against the wrong rate)
+would show at 44.1 kHz only. Running everything at both costs about 3.5 minutes
+over a single-rate pass, which is cheap enough not to economise on.
 
-| Test | Why it is rate-sensitive |
+A few behaviours are unique to 44.1 kHz and worth knowing:
+
+| Behaviour | Why it only appears at 44.1 kHz |
 |---|---|
-| `loopback_integrity` | the capture servo runs at a non-integer 44.1 frames per USB frame, exercising its fractional accumulator rather than just the feed-forward term |
-| `output_delay` | the expected sample count is derived from fs (220 vs 240 samples for 5 ms) |
-| `slot_lr_alignment` | inter-leg alignment at the second rate |
-| PEQ / crossover picks, `multiband_eq` | the hybrid SVF/biquad boundary is Fs/7.5, so it moves from 6400 Hz to 5880 Hz. `multiband_eq`'s 6 kHz shelf is on the SVF side at 48 kHz and the biquad side at 44.1 kHz, so one configuration covers both paths across the two rates |
-| `peq_linkwitz_transform`, `xo_two_band_cascade` | both designs are computed from fs |
+| Capture servo fractional accumulator | 44.1 frames per USB frame is non-integer; at 48 kHz the accumulator sits idle and only the feed-forward term runs |
+| Output-delay sample count | derived from fs: 220 samples for 5 ms, versus 240 at 48 kHz |
+| Hybrid boundary crossing | `multiband_eq`'s 6 kHz shelf, as above |
 
-`--audio-rates 48000,44100` runs the **full** matrix at each listed rate
-instead. Variants are registered in rate order with `rate_switch_round_trip`
+`--audio-rates` narrows the set, e.g. `--audio-rates 48000` for a faster
+single-rate pass (88 tests). Variants are registered in rate order with
+`rate_switch_round_trip`
 last, so a run performs one rate change per extra rate rather than thrashing,
 and the device is left on the primary rate at the end. The rate is host-driven
 and absent from the bulk blob, so the suite's snapshot cannot restore it; that

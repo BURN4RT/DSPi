@@ -51,19 +51,19 @@ GAIN_TOL_DB = 0.5           # flat-path overall gain vs unity
 FS = audio.DEFAULT_FS       # 48 kHz, the primary rate
 FS_ALT = 44100              # secondary rate
 
-# run.py --audio-rates runs the FULL matrix at each listed rate instead of the
-# default "full matrix at FS + SECONDARY_TESTS subset at FS_ALT".
+# The full matrix runs at every rate in RATES. Only one config in the tables
+# changes DSP path between 48 and 44.1 kHz (the boundary is Fs/7.5), but the
+# coefficients are recomputed from fs for all of them, so both rates are run by
+# default; --audio-rates narrows it (e.g. to a single rate for a faster pass).
 _RATES_ENV = os.environ.get("DSPI_AUDIO_RATES", "").replace(",", " ").split()
-RATES_OVERRIDE = [int(r) for r in _RATES_ENV] if _RATES_ENV else None
-PRIMARY_RATES = RATES_OVERRIDE or [FS]
-SECONDARY_RATES = [] if RATES_OVERRIDE else [FS_ALT]
+RATES = [int(r) for r in _RATES_ENV] if _RATES_ENV else [FS, FS_ALT]
 
 # Empty at the first primary rate, so existing test names stay comparable.
 _RATE_TAGS = {48000: "48k", 44100: "44k1", 96000: "96k"}
 
 
 def _rate_tag(fs):
-    return "" if fs == PRIMARY_RATES[0] else "_" + _RATE_TAGS.get(fs, str(fs))
+    return "" if fs == RATES[0] else "_" + _RATE_TAGS.get(fs, str(fs))
 
 # FilterType enum (firmware) by RBJ-reference name.
 TYPE = {"peaking": 1, "lowshelf": 2, "highshelf": 3, "lowpass": 4, "highpass": 5,
@@ -512,7 +512,7 @@ def _get_rig(dev, profile, fs=None):
     (_ACTIVE_FS), or the primary rate for the tests registered directly.
     """
     if fs is None:
-        fs = _ACTIVE_FS if _ACTIVE_FS is not None else PRIMARY_RATES[0]
+        fs = _ACTIVE_FS if _ACTIVE_FS is not None else RATES[0]
     if fs in _RIG_FAIL:
         raise Skip(_RIG_FAIL[fs])
     if np is None:
@@ -1519,24 +1519,9 @@ def psybass_harmonics(dev, profile, chk):
 
 
 # --- Per-rate replay --------------------------------------------------------
-# Existing test bodies are re-registered at another rate via _rate_variant.
+# Every test body is re-registered at each additional rate via _rate_variant.
 # Variants go in rate order with the round-trip last, so a run performs one rate
-# change per extra rate. Subset rationale: tools/dspi_test/test_harness.md.
-
-SECONDARY_TESTS = [
-    "loopback_integrity",
-    "slot_lr_alignment",
-    "output_delay",
-    "multiband_eq",
-    "xo_lr4_complementary_sum",
-    "peq_lowpass1_lo", "peq_lowpass1_hi",
-    "peq_peaking_lo", "peq_peaking_hi",
-    "peq_highshelf_lo", "peq_highshelf_hi",
-    "peq_linkwitz_transform",
-    "xo_lr4_lp", "xo_lr4_hp", "xo_bw2_lp", "xo_bes4_hp",
-    "xo_two_band_cascade",
-]
-
+# change per extra rate. See tools/dspi_test/test_harness.md section 9a.
 
 def _rate_variant(body, fs):
     """Register an existing test body to run again at `fs`.
@@ -1561,18 +1546,11 @@ def _rate_variant(body, fs):
     return test("audio", mutating=True)(fn)
 
 
-# Bodies registered above, in order: the full matrix at the first primary rate.
+# Bodies registered above, in order: the full matrix at RATES[0].
 _PRIMARY_BODIES = [tc.fn for tc in REGISTRY[_REGISTRY_MARK:]]
 
-for _fs in PRIMARY_RATES[1:]:
+for _fs in RATES[1:]:
     for _body in _PRIMARY_BODIES:
-        globals()[_body.__name__ + _rate_tag(_fs)] = _rate_variant(_body, _fs)
-
-for _fs in SECONDARY_RATES:
-    for _name in SECONDARY_TESTS:
-        _body = globals().get(_name)
-        if _body is None:      # a renamed/removed test should be loud, not silent
-            raise RuntimeError(f"SECONDARY_TESTS names an unknown test: {_name}")
         globals()[_body.__name__ + _rate_tag(_fs)] = _rate_variant(_body, _fs)
 
 
@@ -1583,7 +1561,7 @@ def rate_switch_round_trip(dev, profile, chk):
     Registered last so it also leaves the device there: the rate is host driven
     and absent from the bulk blob, so the snapshot cannot restore it.
     """
-    primary = PRIMARY_RATES[0]
+    primary = RATES[0]
     rig = _get_rig(dev, profile, primary)
     chk.ok(_device_rate(dev) == primary, f"device back at {primary} Hz")
     _check_alignment(chk, "rate_round_trip", *_lr_lag(dev, profile, rig))

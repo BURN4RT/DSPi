@@ -13,11 +13,11 @@ Options:
                             its auto-probe sees a pristine device.
     --audio                 Include the hardware audio-loopback group (needs the
                             DSPI_LOOPBACK firmware + sounddevice; excluded by default).
-    --audio-rates HZ[,HZ]   Run the FULL audio matrix at each listed rate (e.g.
-                            48000,44100). Default: full matrix at 48 kHz plus a
-                            targeted 44.1 kHz subset. DSPi follows the host USB
-                            rate, so the harness moves it by opening a host
-                            stream there and waiting for the change to apply.
+    --audio-rates HZ[,HZ]   Rates to run the full audio matrix at. Default:
+                            48000,44100 (both). Narrow it for a faster pass,
+                            e.g. --audio-rates 48000. DSPi follows the host USB
+                            rate; the harness moves it via the CoreAudio HAL
+                            (see tools/dspi_test/coreaudio.py).
     --group G[,G...]        Run only these test groups (default: all).
     --list                  List registered tests and exit (no device needed if
                             modules import; still imports the package).
@@ -60,9 +60,8 @@ def main(argv=None):
                     help="include the hardware audio-loopback group (needs the "
                          "DSPI_LOOPBACK firmware + sounddevice; excluded by default)")
     ap.add_argument("--audio-rates", default=None, metavar="HZ[,HZ...]",
-                    help="run the FULL audio matrix at each listed rate (e.g. "
-                         "48000,44100). Default: full matrix at 48 kHz plus a "
-                         "targeted 44.1 kHz subset.")
+                    help="rates to run the full audio matrix at "
+                         "(default: 48000,44100). Narrow for a faster pass.")
     ap.add_argument("--all", action="store_true",
                     help="run the COMPLETE suite: audio-loopback group + flash tests "
                          "+ factory reset (= --audio --allow-flash --allow-factory-reset)")
