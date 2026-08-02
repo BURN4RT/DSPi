@@ -168,7 +168,7 @@ static bool collides_with_other_subsystem(uint8_t pin) {
     }
     /* MCK pin (only when MCK enabled) */
     if (i2s_mck_enabled && pin == i2s_mck_pin) return true;
-    /* SPDIF RX (input 1 always; inputs 2/3 only while enabled) */
+    /* SPDIF RX (input 1 always; optional inputs only while enabled) */
     if (pin == spdif_rx_pin) return true;
     for (uint8_t i = 1; i < SPDIF_RX_NUM_INPUTS; i++)
         if (spdif_input_enabled(i) && pin == spdif_rx_pin_for_index(i)) return true;

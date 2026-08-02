@@ -18,9 +18,15 @@ from ..framework import test
 from ..helpers import bool_roundtrip
 
 PIN_SUCCESS, PIN_INVALID_PIN, PIN_IN_USE, PIN_INVALID_OUTPUT, PIN_OUTPUT_ACTIVE = range(5)
-INPUT_USB, INPUT_SPDIF, INPUT_I2S = 0, 1, 2
-# First value past INPUT_SOURCE_MAX (== INPUT_I2S); must be rejected/ignored.
-INPUT_INVALID = INPUT_I2S + 1
+INPUT_USB, INPUT_SPDIF, INPUT_I2S, INPUT_ADAT = 0, 1, 2, 3
+# Optional SPDIF inputs 2..4 (contiguous from 4); selectable only once enabled.
+INPUT_SPDIF2, INPUT_SPDIF3, INPUT_SPDIF4 = 4, 5, 6
+INPUT_SOURCE_MAX = INPUT_SPDIF4
+# Every structurally valid source, whether or not it is currently selectable.
+INPUT_ALL = (INPUT_USB, INPUT_SPDIF, INPUT_I2S, INPUT_ADAT,
+             INPUT_SPDIF2, INPUT_SPDIF3, INPUT_SPDIF4)
+# First value past INPUT_SOURCE_MAX; must be rejected/ignored.
+INPUT_INVALID = INPUT_SOURCE_MAX + 1
 I2S_RATES = (44100, 48000, 96000)
 
 
@@ -35,9 +41,8 @@ def _switch_source(dev, target, timeout_s=1.5):
 
 @test("inputs")
 def input_source_get(dev, profile, chk):
-    """0xE1 returns a valid InputSource enum value (USB / SPDIF / I2S)."""
-    chk.member(dev.get_u8(OP.GET_INPUT_SOURCE),
-               (INPUT_USB, INPUT_SPDIF, INPUT_I2S), "input source")
+    """0xE1 returns a valid InputSource enum value."""
+    chk.member(dev.get_u8(OP.GET_INPUT_SOURCE), INPUT_ALL, "input source")
 
 
 @test("inputs", mutating=True)
@@ -130,7 +135,7 @@ def spdif_rx_status_plausible(dev, profile, chk):
     sample_rate = struct.unpack_from("<I", data, 4)[0]
     fifo = struct.unpack_from("<H", data, 12)[0]
     chk.in_range(state, 0, 3, "RX state enum")
-    chk.member(in_src, (INPUT_USB, INPUT_SPDIF, INPUT_I2S), "RX input_source")
+    chk.member(in_src, INPUT_ALL, "RX input_source")
     chk.in_range(fifo, 0, 100, "RX fifo fill %")
     chk.member(sample_rate, (0, 44100, 48000, 88200, 96000), "RX sample rate")
     chk.note(f"RX state={state} src={in_src} rate={sample_rate} fifo={fifo}% locks={lock_cnt} losses={loss_cnt}")

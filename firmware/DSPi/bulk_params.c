@@ -41,8 +41,8 @@
 // (someone adds a field to one but not the other), this static assert
 // fails at compile time before silent struct mismatches reach runtime.
 _Static_assert(sizeof(WireInputConfig) == 16,
-               "V12 claimed WireInputConfig reserved bytes; the section size "
-               "must not change (V12 and V11 payloads are byte-identical)");
+               "input-config additions must be claimed from this section's "
+               "reserved bytes; growing it shifts every later wire offset");
 _Static_assert(sizeof(WireLgSoundSync) == sizeof(LgSoundSyncStatus),
                "WireLgSoundSync and LgSoundSyncStatus must have identical layout");
 _Static_assert(sizeof(WireBulkParams) <= WIRE_BULK_BUF_SIZE,
@@ -238,10 +238,10 @@ void bulk_params_collect(WireBulkParams *out) {
     for (int p = 0; p < 3; p++)
         out->input_config.i2s_rx_pin_ext[p] =
             (p + 1 < I2S_RX_MAX_PAIRS) ? i2s_rx_pin[p + 1] : 0;
-    // Optional SPDIF inputs 2/3: live pins and the enable mask + 1 (so a host
-    // that pushes zeros here reads as "absent, keep live", not "disable both").
-    out->input_config.spdif_rx_pin_ext[0] = spdif_rx_pin_ext[0];
-    out->input_config.spdif_rx_pin_ext[1] = spdif_rx_pin_ext[1];
+    // Optional SPDIF inputs 2..4: live pins and the enable mask + 1 (so a host
+    // that pushes zeros here reads as "absent, keep live", not "disable all").
+    for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++)
+        out->input_config.spdif_rx_pin_ext[i] = spdif_rx_pin_ext[i];
     out->input_config.spdif_rx_enabled_ext_p1 = (uint8_t)(spdif_rx_enabled_ext + 1);
     // I2S clock master/slave mode (V21+).
     out->input_config.i2s_clock_mode = i2s_clock_mode;
@@ -478,11 +478,11 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             }
         }
 
-        // Optional SPDIF inputs 2/3 RX pins.  Same validation as the
+        // Optional SPDIF inputs 2..4 RX pins.  Same validation as the
         // spdif_rx_pin block above; 0 means absent (keep the live pin).  A
         // pin that changed for the currently-active SPDIF source fires the
         // RX hot-swap so the running library adopts it without a round trip.
-        for (int i = 0; i < 2; i++) {
+        for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
             uint8_t pin = in->input_config.spdif_rx_pin_ext[i];
             if (pin == 0) continue;  // absent; keep live
             bool valid = (pin <= 29) && !(pin >= 23 && pin <= 25);
@@ -500,7 +500,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             }
         }
 
-        // Optional SPDIF 2/3 enable mask.  Encoded PLUS ONE on the wire: 0 =
+        // Optional SPDIF 2..4 enable mask.  Encoded PLUS ONE on the wire: 0 =
         // absent (keep the live mask), else mask = enc - 1.  Applied AFTER the
         // ext-pin block so a pin+enable pair pushed together validates against
         // the new pin.  A newly enabled bit is accepted only if that input's
@@ -510,12 +510,12 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         {
             uint8_t enc = in->input_config.spdif_rx_enabled_ext_p1;
             if (enc != 0) {
-                uint8_t mask = (uint8_t)((enc - 1) & 0x3);
-                // Commit each bit as it is decided so the second enable in one
-                // payload validates against the first (two pushed enables on the
-                // same GPIO must not both pass); disables run first so a push
-                // that moves an enable between inputs validates cleanly.
-                for (int i = 0; i < 2; i++) {
+                uint8_t mask = (uint8_t)((enc - 1) & SPDIF_RX_ENABLED_EXT_MASK);
+                // Commit each bit as it is decided so a later enable in one
+                // payload validates against the earlier ones (two pushed enables
+                // on the same GPIO must not both pass); disables run first so a
+                // push that moves an enable between inputs validates cleanly.
+                for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
                     uint8_t bit = (uint8_t)(1u << i);
                     if ((mask & bit) || !(spdif_rx_enabled_ext & bit)) continue;
                     if (input_source_is_spdif(active_input_source) &&
@@ -526,7 +526,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
                         spdif_rx_enabled_ext &= (uint8_t)~bit;
                     }
                 }
-                for (int i = 0; i < 2; i++) {
+                for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
                     uint8_t bit = (uint8_t)(1u << i);
                     if (!(mask & bit) || (spdif_rx_enabled_ext & bit)) continue;
                     if (spdif_input_enable_acceptable(i + 1)) {
@@ -785,7 +785,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     {
         uint8_t src = in->input_config.input_source;
         // Gate on selectable (valid AND currently offered) so a pushed source
-        // that names a disabled SPDIF 2/3 is refused; the enable-mask apply
+        // that names a disabled optional SPDIF is refused; the enable-mask apply
         // above runs first, so enabling SPDIF2 and selecting it in one payload
         // works.
         if (input_source_selectable(src) && src != active_input_source) {

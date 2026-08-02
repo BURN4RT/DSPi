@@ -173,7 +173,12 @@
 //   V34: Upmixer presence bell claims the upmix reserved byte (int8, dB * 2;
 //        struct size unchanged).  V33 slots always wrote 0 there, which decodes
 //        as the 0 dB default, so V33 loads need no special handling.
-#define SLOT_DATA_VERSION       34
+//   V35: SPDIF input 4 pin appended (spdif_rx_pin4; struct grows by 1 byte).
+//        Backward-compatible tail-append like V22..V33: V21..V34 slots still
+//        load via slot_data_size_for_version and keep the device-level pin.
+//        Input 4's enable bit is bit 2 of the existing V24 spdif_rx_enabled_ext
+//        byte, which pre-V35 firmware masked to 0, so no gate is needed there.
+#define SLOT_DATA_VERSION       35
 
 // ============================================================================
 // ON-FLASH STRUCTURES
@@ -226,11 +231,15 @@ typedef struct __attribute__((packed)) {
                                      // struct by 2 bytes, so the V7→V8 directory migration
                                      // reads old configs via FlashOutputConfig_v7
     uint8_t adat_pin;                // ADAT data GPIO (0 = unset → PICO_ADAT_PIN)
-    uint8_t spdif_rx_enabled_ext;    // Optional SPDIF inputs 2/3 enable mask (DIR V12+;
-                                     // bit 0 = SPDIF2, bit 1 = SPDIF3; 0 = both disabled).
+    uint8_t spdif_rx_enabled_ext;    // Optional SPDIF inputs enable mask (DIR V12+;
+                                     // bit 0 = SPDIF2 .. bit 2 = SPDIF4; 0 = all disabled).
                                      // Grows the struct by 3 bytes, so pre-V12 directory
                                      // migrations read old configs via FlashOutputConfig_v11
-    uint8_t spdif_rx_pin_ext[2];     // SPDIF RX 2/3 GPIOs (0 = unset; defaults 20/21)
+    uint8_t spdif_rx_pin_ext[2];     // SPDIF RX 2/3 GPIOs (0 = unset; defaults 20/21).
+                                     // SPDIF 4's pin is the V16 tail byte, not a third entry
+                                     // here: widening this array in place would break the
+                                     // prefix-memcpy migrations below.  Index all three
+                                     // through cfg_spdif_ext_pin()
     uint8_t i2s_clock_mode;          // I2S clock: 0=master, 1=slave (DIR V13+).  Grows the
                                      // struct by 1 byte, so the V12→V13 directory migration
                                      // reads old configs via FlashOutputConfig_v12; 0 (master)
@@ -248,7 +257,20 @@ typedef struct __attribute__((packed)) {
                                      // is seeded to 0xFF (not the zero-fill 0) on that path
     uint8_t adat_input_enabled;      // ADAT input enable (0/1)
     uint8_t adat_input_clock_mode;   // ADAT input clock: 0=master, 1=slave
-} FlashOutputConfig;                 // 34 bytes
+    uint8_t spdif_rx_pin4;           // SPDIF RX 4 GPIO (DIR V16+; 0 = unset → default 22).
+                                     // Grows the struct by 1 byte, so the V15→V16 directory
+                                     // migration reads old configs via FlashOutputConfig_v15
+} FlashOutputConfig;                 // 35 bytes
+
+// The SPDIF 2/3 pins live in spdif_rx_pin_ext[] (DIR V12) and SPDIF 4's in the
+// V16 tail byte; this indexes all three as one 0-based ext array so callers can
+// loop over SPDIF_RX_NUM_INPUTS - 1 entries.
+static inline uint8_t *cfg_spdif_ext_pin(FlashOutputConfig *cfg, uint8_t i) {
+    return (i < 2) ? &cfg->spdif_rx_pin_ext[i] : &cfg->spdif_rx_pin4;
+}
+static inline uint8_t cfg_spdif_ext_pin_get(const FlashOutputConfig *cfg, uint8_t i) {
+    return (i < 2) ? cfg->spdif_rx_pin_ext[i] : cfg->spdif_rx_pin4;
+}
 
 // Historical 20-byte device-global IO config (directory V4), before the I2S
 // multichannel input fields were appended.  Read only by the V4→V5 directory
@@ -399,6 +421,34 @@ typedef struct __attribute__((packed)) {
     uint8_t i2s_bck_pin_slave;
 } FlashOutputConfig_v14;             // 31 bytes
 
+// Historical 34-byte device-global IO config (directory V15), before the SPDIF
+// input 4 pin was appended.  A strict prefix of the live FlashOutputConfig;
+// read only by the V15→V16 directory migration (prefix memcpy widens it; the
+// new tail byte stays 0 = unset, which resolves to the default GPIO).
+typedef struct __attribute__((packed)) {
+    uint8_t output_pins[8];
+    uint8_t output_types[4];
+    uint8_t i2s_bck_pin;
+    uint8_t i2s_mck_pin;
+    uint8_t i2s_mck_enabled;
+    uint8_t i2s_mck_multiplier;
+    uint8_t spdif_rx_pin;
+    uint8_t i2s_rx_pin;
+    uint8_t i2s_input_rate_p1;
+    uint8_t i2s_input_channels;
+    uint8_t i2s_rx_pin_ext[3];
+    uint8_t adat_enabled;
+    uint8_t adat_pin;
+    uint8_t spdif_rx_enabled_ext;
+    uint8_t spdif_rx_pin_ext[2];
+    uint8_t i2s_clock_mode;
+    uint8_t i2s_clock_pin_mode;
+    uint8_t i2s_bck_pin_slave;
+    uint8_t adat_input_pin;
+    uint8_t adat_input_enabled;
+    uint8_t adat_input_clock_mode;
+} FlashOutputConfig_v15;             // 34 bytes
+
 // --- Preset Directory v1 (legacy — kept only for upgrade migration) ---
 typedef struct __attribute__((packed)) {
     uint32_t magic;
@@ -547,7 +597,8 @@ typedef struct __attribute__((packed)) {
     // i2s_bck_pin_slave).
     // V15 grows it by 3 bytes (ADAT input: adat_input_pin + adat_input_enabled +
     // adat_input_clock_mode).
-    FlashOutputConfig output_config;         // 34 bytes
+    // V16 grows it by 1 byte (SPDIF input 4 pin: spdif_rx_pin4).
+    FlashOutputConfig output_config;         // 35 bytes
 
     // V6 addition: device-level external control-interface config (board-level).
     UartCtrlConfig uart_ctrl;                // 8 bytes; enabled=0 by default
@@ -843,7 +894,34 @@ typedef struct __attribute__((packed)) {
     CsIrConfig cs_ir;                        // 132 bytes
 } PresetDirectory_v14;
 
-#define DIR_VERSION_CURRENT  15
+// --- Preset Directory v15 (kept only for upgrade migration) ---
+// Identical to the live layout except output_config is the 34-byte
+// FlashOutputConfig_v15 (no SPDIF input 4 pin).
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;                        // == 15
+    uint16_t reserved;
+    uint32_t crc32;
+
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig_v15 output_config;     // 34 bytes (frozen pre-SPDIF-4 layout)
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+    CsIrConfig cs_ir;                        // 132 bytes
+} PresetDirectory_v15;
+
+#define DIR_VERSION_CURRENT  16
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -975,7 +1053,9 @@ typedef struct __attribute__((packed)) {
     // Optional SPDIF inputs 2/3 (V24+, struct grows by 3 bytes).  Same 0 =
     // unset semantics for the pins; gated on version >= 24 in
     // io_config_from_slot() so older slots load with both inputs disabled.
-    uint8_t spdif_rx_enabled_ext;    // Enable mask: bit 0 = SPDIF2, bit 1 = SPDIF3
+    // SPDIF 4 reuses bit 2 of this mask but stores its pin in the V35 tail
+    // byte (this array is mid-struct and cannot grow without moving fields).
+    uint8_t spdif_rx_enabled_ext;    // Enable mask: bit 0 = SPDIF2 .. bit 2 = SPDIF4
     uint8_t spdif_rx_pin_ext[2];     // SPDIF RX 2/3 GPIOs (0 = unset; defaults 20/21)
 
     // Leveller channel masks (V25+, struct grows by 2 bytes).  Gated on
@@ -1060,6 +1140,13 @@ typedef struct __attribute__((packed)) {
     float   upmix_surround_hpf_hz;
     float   upmix_surround_lpf_hz;
     float   upmix_decorr_pct;
+
+    // SPDIF input 4 GPIO (V35+, struct grows by 1 byte).  Same 0 = unset
+    // semantics as spdif_rx_pin_ext[]; gated on version >= 35 in
+    // io_config_from_slot() so older slots keep the device-level baseline.
+    // The matching enable bit is bit 2 of spdif_rx_enabled_ext above, which
+    // pre-V35 firmware always wrote as 0.
+    uint8_t spdif_rx_pin4;
 } PresetSlot;
 
 // The whole slot must fit its 2-sector (8 KB) flash allocation.
@@ -1399,6 +1486,44 @@ static bool dir_load_cache(void) {
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
         dir_cache_valid = true;
+        return true;
+    }
+
+    if (flash_dir->version == 15) {
+        // V15 -> V16 migration.  V16 grows the device-global output_config by
+        // 1 byte (SPDIF input 4: spdif_rx_pin4).  Validate the v15 CRC, copy
+        // every field forward, and widen the 34-byte output_config by prefix
+        // memcpy; the new tail byte stays 0 from the memset, which is the
+        // "unset" sentinel and resolves to PICO_SPDIF_RX_PIN4_DEFAULT on apply.
+        const PresetDirectory_v15 *v15 = (const PresetDirectory_v15 *)flash_dir;
+        const uint8_t *v15_data_start = (const uint8_t *)&v15->startup_mode;
+        size_t v15_data_len = sizeof(PresetDirectory_v15) - offsetof(PresetDirectory_v15, startup_mode);
+        if (crc32(v15_data_start, v15_data_len) != v15->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        dir_cache.startup_mode       = v15->startup_mode;
+        dir_cache.default_slot       = v15->default_slot;
+        dir_cache.last_active_slot   = v15->last_active_slot;
+        dir_cache.output_config_mode = v15->output_config_mode;
+        dir_cache.slot_occupied      = v15->slot_occupied;
+        dir_cache.master_volume_mode = v15->master_volume_mode;
+        dir_cache.spdif_rx_pin       = v15->spdif_rx_pin;
+        dir_cache.master_volume_db   = v15->master_volume_db;
+        memcpy(dir_cache.slot_names, v15->slot_names, sizeof(dir_cache.slot_names));
+        dir_cache.dac_hw_mute        = v15->dac_hw_mute;
+        memcpy(&dir_cache.output_config, &v15->output_config, sizeof(v15->output_config));
+        dir_cache.uart_ctrl          = v15->uart_ctrl;
+        dir_cache.i2c_ctrl           = v15->i2c_ctrl;
+        dir_cache.cs_config          = v15->cs_config;
+        memcpy(dir_cache.cs_names, v15->cs_names, sizeof(dir_cache.cs_names));
+        dir_cache.cs_ir              = v15->cs_ir;
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
         return true;
     }
 
@@ -2158,10 +2283,10 @@ static void io_config_defaults(FlashOutputConfig *cfg) {
     cfg->i2s_mck_enabled    = 0;
     cfg->i2s_mck_multiplier = 0;             // 0 = 128x
     cfg->spdif_rx_pin       = PICO_SPDIF_RX_PIN_DEFAULT;
-    // Optional SPDIF inputs 2/3: disabled, default pins.
+    // Optional SPDIF inputs 2..4: disabled, default pins.
     cfg->spdif_rx_enabled_ext = 0;
-    cfg->spdif_rx_pin_ext[0]  = PICO_SPDIF_RX_PIN2_DEFAULT;
-    cfg->spdif_rx_pin_ext[1]  = PICO_SPDIF_RX_PIN3_DEFAULT;
+    for (uint8_t i = 1; i < SPDIF_RX_NUM_INPUTS; i++)
+        *cfg_spdif_ext_pin(cfg, i - 1) = spdif_rx_pin_default_for_index(i);
     cfg->i2s_rx_pin         = PICO_I2S_RX_PIN_DEFAULT;
     cfg->i2s_input_rate_p1  = (uint8_t)(i2s_rate_encode(48000) + 1);
     cfg->i2s_input_channels = 2;   // stereo; i2s_rx_pin_ext[] left 0 (unset) by the memset
@@ -2192,8 +2317,8 @@ static void io_config_from_live(FlashOutputConfig *cfg) {
     cfg->i2s_mck_multiplier = (i2s_mck_multiplier == 256) ? 1 : 0;  // 0=128x, 1=256x
     cfg->spdif_rx_pin       = spdif_rx_pin;
     cfg->spdif_rx_enabled_ext = spdif_rx_enabled_ext;
-    cfg->spdif_rx_pin_ext[0]  = spdif_rx_pin_ext[0];
-    cfg->spdif_rx_pin_ext[1]  = spdif_rx_pin_ext[1];
+    for (uint8_t i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++)
+        *cfg_spdif_ext_pin(cfg, i) = spdif_rx_pin_ext[i];
     cfg->i2s_rx_pin         = i2s_rx_pin[0];
     cfg->i2s_input_rate_p1  = (uint8_t)(i2s_rate_encode(i2s_input_rate) + 1);
     cfg->i2s_input_channels = i2s_input_channels;
@@ -2243,18 +2368,22 @@ static void io_config_from_slot(const PresetSlot *slot, FlashOutputConfig *cfg) 
     if (slot->version >= 13 && slot->spdif_rx_pin != 0)
         cfg->spdif_rx_pin = slot->spdif_rx_pin;
 
-    // Optional SPDIF inputs 2/3 (V24+): device-level baseline, slot overrides.
-    // Pins use the 0 = unset convention; the enable mask has no unset sentinel
-    // in the slot, so it only overrides when the slot actually carries it.
+    // Optional SPDIF inputs 2..4 (V24+; input 4's pin V35+): device-level
+    // baseline, slot overrides.  Pins use the 0 = unset convention; the enable
+    // mask has no unset sentinel in the slot, so it only overrides when the
+    // slot actually carries it.
     cfg->spdif_rx_enabled_ext = dir_cache.output_config.spdif_rx_enabled_ext;
-    memcpy(cfg->spdif_rx_pin_ext, dir_cache.output_config.spdif_rx_pin_ext,
-           sizeof(cfg->spdif_rx_pin_ext));
+    for (uint8_t i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++)
+        *cfg_spdif_ext_pin(cfg, i) =
+            cfg_spdif_ext_pin_get(&dir_cache.output_config, i);
     if (slot->version >= 24) {
         cfg->spdif_rx_enabled_ext = slot->spdif_rx_enabled_ext;
         for (int i = 0; i < 2; i++)
             if (slot->spdif_rx_pin_ext[i] != 0)
                 cfg->spdif_rx_pin_ext[i] = slot->spdif_rx_pin_ext[i];
     }
+    if (slot->version >= 35 && slot->spdif_rx_pin4 != 0)
+        cfg->spdif_rx_pin4 = slot->spdif_rx_pin4;
 
     // I2S input pin + rate (V17+): device-level baseline, slot overrides.
     cfg->i2s_rx_pin        = dir_cache.output_config.i2s_rx_pin;
@@ -2429,18 +2558,16 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
             spdif_rx_pin_change_pending = true;
     }
 
-    // Optional SPDIF inputs 2/3: pins first (0 = unset, platform default),
+    // Optional SPDIF inputs 2..4: pins first (0 = unset, platform default),
     // then the enable mask, so a stored pin+enable pair is validated against
     // the pin it arrives with.  A disabled input's pin is only a stored
     // preference; enabling is what must pass the conflict check.
     {
-        static const uint8_t ext_defaults[2] = {
-            PICO_SPDIF_RX_PIN2_DEFAULT, PICO_SPDIF_RX_PIN3_DEFAULT
-        };
-        for (uint8_t i = 0; i < 2; i++) {
-            uint8_t pin = cfg->spdif_rx_pin_ext[i] ? cfg->spdif_rx_pin_ext[i]
-                                                   : ext_defaults[i];
-            if (!io_pin_valid(pin)) pin = ext_defaults[i];
+        for (uint8_t i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
+            uint8_t dflt = spdif_rx_pin_default_for_index((uint8_t)(i + 1));
+            uint8_t stored = cfg_spdif_ext_pin_get(cfg, i);
+            uint8_t pin = stored ? stored : dflt;
+            if (!io_pin_valid(pin)) pin = dflt;
             if (pin != spdif_rx_pin_ext[i]) {
                 spdif_rx_pin_ext[i] = pin;
                 if (input_source_is_spdif(active_input_source) &&
@@ -2449,8 +2576,8 @@ static void io_config_apply(const FlashOutputConfig *cfg) {
             }
         }
         // Two passes (disables, then enables) so a stored config that moves an
-        // enable from one input to the other's old pin still validates cleanly.
-        uint8_t want = cfg->spdif_rx_enabled_ext & 0x3;
+        // enable from one input to another's old pin still validates cleanly.
+        uint8_t want = cfg->spdif_rx_enabled_ext & SPDIF_RX_ENABLED_EXT_MASK;
         for (uint8_t i = 1; i < SPDIF_RX_NUM_INPUTS; i++) {
             uint8_t bit = (uint8_t)(1u << (i - 1));
             if ((want & bit) || !spdif_input_enabled(i)) continue;
@@ -2702,10 +2829,12 @@ static void collect_live_state(PresetSlot *slot, uint8_t slot_index) {
     // SPDIF RX pin: stored alongside output_pins, applied per output_config_mode.
     slot->spdif_rx_pin = spdif_rx_pin;
 
-    // Optional SPDIF inputs 2/3 (V24): enable mask + pins, same apply model.
+    // Optional SPDIF inputs 2..4: enable mask + pins (V24; input 4's pin V35),
+    // same apply model.
     slot->spdif_rx_enabled_ext = spdif_rx_enabled_ext;
     slot->spdif_rx_pin_ext[0]  = spdif_rx_pin_ext[0];
     slot->spdif_rx_pin_ext[1]  = spdif_rx_pin_ext[1];
+    slot->spdif_rx_pin4        = spdif_rx_pin_ext[2];
 
     // I2S input pin + rate (V17): same storage/apply model as spdif_rx_pin.
     slot->i2s_rx_pin = i2s_rx_pin[0];
@@ -3217,9 +3346,9 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 // loudness output mask; V27 appended the crossfeed output pair mask; V28
 // appended i2s_clock_mode; V29 appended i2s_clock_pin_mode + i2s_bck_pin_slave;
 // V30 appended peq_qp_x512; V31 appended psybass; V32 appended the ADAT input
-// fields; V33 appended the stereo upmixer config, so each version's range stops
-// where the next version's fields begin (a stored slot's CRC was computed
-// without the fields its version predates).
+// fields; V33 appended the stereo upmixer config; V35 appended the SPDIF input
+// 4 pin, so each version's range stops where the next version's fields begin
+// (a stored slot's CRC was computed without the fields its version predates).
 #define SLOT_DATA_SIZE_V21 \
     (offsetof(PresetSlot, i2s_input_channels) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V22 \
@@ -3245,23 +3374,27 @@ static void apply_slot_to_live(const PresetSlot *slot) {
 #define SLOT_DATA_SIZE_V32 \
     (offsetof(PresetSlot, upmix_enabled) - offsetof(PresetSlot, filter_recipes))
 #define SLOT_DATA_SIZE_V33 \
-    (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
+    (offsetof(PresetSlot, spdif_rx_pin4) - offsetof(PresetSlot, filter_recipes))
 // V34 claims the upmix reserved byte (presence); no size change.
 #define SLOT_DATA_SIZE_V34 SLOT_DATA_SIZE_V33
+#define SLOT_DATA_SIZE_V35 \
+    (sizeof(PresetSlot) - offsetof(PresetSlot, filter_recipes))
 
 // V21 broke compatibility (unified channel model); V22 (I2S multichannel input),
 // V23 (ADAT bulk output), V24 (optional SPDIF inputs 2/3), V25 (leveller channel
 // masks), V26 (loudness output mask), V27 (crossfeed output pair mask), V28
 // (I2S clock master/slave mode), V29 (I2S clock-pin mode), V30 (Linkwitz
 // Transform per-band target Q), V31 (psychoacoustic bass), V32 (ADAT input) and
-// V33 (stereo upmixer) are backward-compatible tail-appends; V34 (upmix
-// presence) claims a reserved byte with no size change.  V21..V34 slots are
-// all accepted (an older slot loads with the newer fields defaulted to unset)
-// while older/unknown versions are invalidated and the slot loads factory
-// defaults.
+// V33 (stereo upmixer) and V35 (SPDIF input 4 pin) are backward-compatible
+// tail-appends; V34 (upmix presence) claims a reserved byte with no size
+// change.  V21..V35 slots are all accepted (an older slot loads with the newer
+// fields defaulted to unset) while older/unknown versions are invalidated and
+// the slot loads factory defaults.
 static size_t slot_data_size_for_version(uint8_t version) {
     switch (version) {
-        case SLOT_DATA_VERSION:   // 34
+        case SLOT_DATA_VERSION:   // 35
+            return SLOT_DATA_SIZE_V35;
+        case 34:
             return SLOT_DATA_SIZE_V34;
         case 33:
             return SLOT_DATA_SIZE_V33;

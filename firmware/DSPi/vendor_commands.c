@@ -356,7 +356,7 @@ static bool pin_used_by_fixed_peripheral(uint8_t pin, uint8_t exclude_output) {
     if (adat_input_enabled && pin == adat_input_pin) return true;
 #endif
     if (pin == spdif_rx_pin) return true;                     // SPDIF RX input 1 (always claimed)
-    // Optional SPDIF inputs 2/3: a pin is claimed only while that input is
+    // Optional SPDIF inputs: a pin is claimed only while that input is
     // enabled; a disabled input's stored pin is invisible to conflict checks.
     for (uint8_t i = 1; i < SPDIF_RX_NUM_INPUTS; i++)
         if (spdif_input_enabled(i) && pin == spdif_rx_pin_for_index(i)) return true;
@@ -1353,7 +1353,7 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             // the shadow tracks *active* state, not requested state.
             if (buffer->data_len >= 1) {
                 uint8_t src = vendor_rx_buf[0];
-                // input_source_selectable() also rejects a disabled SPDIF 2/3.
+                // input_source_selectable() also rejects a disabled optional SPDIF.
                 if (input_source_selectable(src) && src != active_input_source) {
                     pending_input_source = src;
                     __dmb();
@@ -3070,7 +3070,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 // bracketed by stop/start).
                 //
                 // wValue = (index << 8) | GPIO.  The high byte selects the SPDIF
-                // input (0..2); old hosts that send just the pin address index 0.
+                // input (0..3); old hosts that send just the pin address index 0.
                 //
                 // RAM-only update; persistence is slot-scoped, so the user must
                 // REQ_PRESET_SAVE to capture the new pin, exactly like
@@ -3079,9 +3079,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                 uint8_t index   = (uint8_t)((setup->wValue >> 8) & 0xFF);
                 uint8_t status;
                 if (index < SPDIF_RX_NUM_INPUTS && new_pin == PIN_RESET_TO_DEFAULT)
-                    new_pin = (index == 0) ? PICO_SPDIF_RX_PIN_DEFAULT
-                            : (index == 1) ? PICO_SPDIF_RX_PIN2_DEFAULT
-                                           : PICO_SPDIF_RX_PIN3_DEFAULT;
+                    new_pin = spdif_rx_pin_default_for_index(index);
                 if (index >= SPDIF_RX_NUM_INPUTS) {
                     status = PIN_CONFIG_INVALID_OUTPUT;   // no such SPDIF input
                 } else if (!is_valid_gpio_pin(new_pin)) {
@@ -3090,8 +3088,8 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                     status = PIN_CONFIG_SUCCESS;  // No-op
                 } else if (spdif_input_enabled(index) && is_pin_in_use(new_pin, 0xFF)) {
                     // Enabled inputs reserve their pin like SPDIF input 1; a
-                    // disabled 2/3 stores the pin as a preference only and its
-                    // conflicts are validated at enable time.
+                    // disabled optional input stores the pin as a preference
+                    // only and its conflicts are validated at enable time.
                     status = PIN_CONFIG_PIN_IN_USE;
                 } else {
                     if (index == 0) spdif_rx_pin = new_pin;
@@ -3104,7 +3102,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
                         spdif_rx_pin_change_pending = true;
                     }
                     status = PIN_CONFIG_SUCCESS;
-                    // Index 0 maps to input_config.spdif_rx_pin; indices 1..2 to
+                    // Index 0 maps to input_config.spdif_rx_pin; indices 1..3 to
                     // input_config.spdif_rx_pin_ext[index-1].
                     uint16_t off = (index == 0)
                         ? (uint16_t)offsetof(WireBulkParams, input_config.spdif_rx_pin)
@@ -3118,7 +3116,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_SPDIF_RX_PIN: {
-                // wValue low byte = index (0..2); old hosts send 0.
+                // wValue low byte = index (0..3); old hosts send 0.
                 uint8_t index = (uint8_t)(setup->wValue & 0xFF);
                 resp_buf[0] = (index < SPDIF_RX_NUM_INPUTS)
                             ? spdif_rx_pin_for_index(index) : 0;
@@ -3127,7 +3125,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_SET_SPDIF_INPUT_ENABLE: {
-                // wValue = (index << 8) | enable.  index 1..2 selects an optional
+                // wValue = (index << 8) | enable.  index 1..3 selects an optional
                 // SPDIF input; enable is 0 or 1.  RAM-only; persisted on
                 // REQ_PRESET_SAVE like REQ_SET_SPDIF_RX_PIN.
                 uint8_t index  = (uint8_t)((setup->wValue >> 8) & 0xFF);
@@ -3180,15 +3178,15 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_SPDIF_INPUT_CONFIG: {
-                // 5 bytes: input count, enable mask over ALL inputs (bit 0 =
-                // input 1, always set), then the GPIO for inputs 0..2.  Lets a
-                // host build its source list data-driven.
+                // 2 + SPDIF_RX_NUM_INPUTS bytes: input count, enable mask over
+                // ALL inputs (bit 0 = input 1, always set), then one GPIO per
+                // input.  Lets a host build its source list data-driven; a host
+                // that asks for fewer bytes gets a short read of the same layout.
                 resp_buf[0] = SPDIF_RX_NUM_INPUTS;
                 resp_buf[1] = (uint8_t)((spdif_rx_enabled_ext << 1) | 1);
-                resp_buf[2] = spdif_rx_pin_for_index(0);
-                resp_buf[3] = spdif_rx_pin_for_index(1);
-                resp_buf[4] = spdif_rx_pin_for_index(2);
-                vendor_send_response(resp_buf, 5);
+                for (uint8_t i = 0; i < SPDIF_RX_NUM_INPUTS; i++)
+                    resp_buf[2 + i] = spdif_rx_pin_for_index(i);
+                vendor_send_response(resp_buf, 2 + SPDIF_RX_NUM_INPUTS);
                 return true;
             }
 

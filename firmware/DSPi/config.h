@@ -419,15 +419,15 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_GET_INPUT_SOURCE        0xE1  // returns uint8_t
 #define REQ_GET_SPDIF_RX_STATUS     0xE2  // returns 16-byte status struct (Phase 2)
 #define REQ_GET_SPDIF_RX_CH_STATUS  0xE3  // returns 24-byte IEC 60958 channel status (Phase 2)
-#define REQ_SET_SPDIF_RX_PIN        0xE4  // wValue = (index<<8)|GPIO; index 0..2 selects the
+#define REQ_SET_SPDIF_RX_PIN        0xE4  // wValue = (index<<8)|GPIO; index 0..3 selects the
                                           // SPDIF input (old hosts send wValue=pin => index 0).
                                           // GPIO = PIN_RESET_TO_DEFAULT restores that input's
                                           // default. Returns status byte.
-#define REQ_GET_SPDIF_RX_PIN        0xE5  // wValue = index (0..2); returns that input's GPIO
-#define REQ_SET_SPDIF_INPUT_ENABLE  0xE9  // wValue = (index<<8)|enable; index 1..2, enable 0/1.
+#define REQ_GET_SPDIF_RX_PIN        0xE5  // wValue = index (0..3); returns that input's GPIO
+#define REQ_SET_SPDIF_INPUT_ENABLE  0xE9  // wValue = (index<<8)|enable; index 1..3, enable 0/1.
                                           // Enables/disables an optional SPDIF input. Returns status byte.
-#define REQ_GET_SPDIF_INPUT_CONFIG  0xEF  // returns 5 bytes: count, enable mask (bit0=input1),
-                                          // then the GPIO for inputs 0..2
+#define REQ_GET_SPDIF_INPUT_CONFIG  0xEF  // returns 6 bytes: count, enable mask (bit0=input1),
+                                          // then the GPIO for inputs 0..3
 
 // I2S Input Commands. The device is the rate authority while I2S input is
 // active (the external source slaves to our BCK/LRCLK), so the sample rate

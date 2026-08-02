@@ -321,8 +321,9 @@ do.
 
 ### Wire format (REQ_GET/SET_ALL_PARAMS, 0xA0/0xA1)
 
-`WIRE_FORMAT_VERSION` = 18. `WireInputConfig` (16-byte section, unchanged
-size and packet total of 5872 bytes):
+`WIRE_FORMAT_VERSION` = 18 when this feature landed; the byte offsets below
+are the CURRENT (V28) ones. `WireInputConfig` is a 16-byte section throughout;
+later versions claimed its reserved bytes rather than growing it:
 
 | Byte | Field |
 |---|---|
@@ -332,10 +333,10 @@ size and packet total of 5872 bytes):
 | 3 | i2s_input_rate (encoded: 0=44100, 1=48000, 2=96000) |
 | 4 | i2s_input_channels (2/4/6/8; 0 = absent) |
 | 5-7 | i2s_rx_pin_ext[3] (pairs 1-3) |
-| 8-9 | spdif_rx_pin_ext[2] (SPDIF inputs 2/3) |
-| 10 | spdif_rx_enabled_ext_p1 (SPDIF 2/3 enable mask + 1) |
-| 11 | **i2s_clock_mode (0=master, 1=slave; new in V21)** |
-| 12-15 | reserved |
+| 8-10 | spdif_rx_pin_ext[3] (SPDIF inputs 2/3/4; the third entry and the one-byte shift of everything below arrived with V28) |
+| 11 | spdif_rx_enabled_ext_p1 (optional-SPDIF enable mask + 1) |
+| 12 | **i2s_clock_mode (0=master, 1=slave; new in V21)** |
+| 13-15 | adat_input_pin, adat_input_enabled_p1, adat_clock_mode_p1 (V24) |
 
 Apply-side semantics match the vendor SET: validated (<= 1), deferred to the
 main loop, no-op when unchanged. Pre-V21 payloads are rejected wholesale by

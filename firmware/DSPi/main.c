@@ -3370,7 +3370,7 @@ int main(void) {
         if (input_source_change_pending) {
             uint8_t new_source = pending_input_source;
             uint8_t old_source = active_input_source;
-            // Selectable, not just valid: a switch into a disabled SPDIF 2/3
+            // Selectable, not just valid: a switch into a disabled optional SPDIF
             // (e.g. from a stored preset in INDEPENDENT mode) is consumed as
             // a no-op instead of bringing up an unclaimed GPIO.
             bool real_switch = (new_source != old_source) && input_source_selectable(new_source);

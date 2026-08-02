@@ -20,14 +20,20 @@ typedef enum {
     INPUT_SOURCE_ADAT   = 3,   // 8-channel ADAT input (RP2350 only, disabled until enabled by host)
     INPUT_SOURCE_SPDIF2 = 4,   // Optional SPDIF input 2 (disabled until enabled by host)
     INPUT_SOURCE_SPDIF3 = 5,   // Optional SPDIF input 3 (disabled until enabled by host)
+    INPUT_SOURCE_SPDIF4 = 6,   // Optional SPDIF input 4 (disabled until enabled by host)
 } InputSource;
 
-#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF3   // Highest valid value
+#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF4   // Highest valid value
 
 // Number of selectable SPDIF inputs. Input 0 (INPUT_SOURCE_SPDIF) is the
-// always-present one; inputs 1..2 (SPDIF2/SPDIF3) are optional and share the
+// always-present one; inputs 1..3 (SPDIF2..SPDIF4) are optional and share the
 // single RX PIO state machine; only the active one ever claims its GPIO.
-#define SPDIF_RX_NUM_INPUTS 3
+#define SPDIF_RX_NUM_INPUTS 4
+
+// The optional inputs must stay contiguous from INPUT_SOURCE_SPDIF2: the
+// index<->source helpers below are arithmetic, not a lookup table.
+_Static_assert(INPUT_SOURCE_MAX == INPUT_SOURCE_SPDIF2 + SPDIF_RX_NUM_INPUTS - 2,
+               "optional SPDIF sources must be contiguous and end at INPUT_SOURCE_MAX");
 
 // Default SPDIF RX GPIO pin.  GPIO 5 sits just below the output-pin
 // neighborhood (SPDIF outs on 6-9, PDM on 10) and is unused by any
@@ -35,11 +41,12 @@ typedef enum {
 // default (see DAC_HW_MUTE_DEFAULT_PIN in dac_hw_mute.h).
 #define PICO_SPDIF_RX_PIN_DEFAULT  5
 
-// Default GPIOs for the optional SPDIF inputs 2 and 3.  Both are free of
+// Default GPIOs for the optional SPDIF inputs 2, 3 and 4.  All are free of
 // every default assignment on RP2350; GPIO 21 is the RP2040 MCK default, so
 // enable-time validation rejects the clash if MCK is enabled there.
 #define PICO_SPDIF_RX_PIN2_DEFAULT 20
 #define PICO_SPDIF_RX_PIN3_DEFAULT 21
+#define PICO_SPDIF_RX_PIN4_DEFAULT 22
 
 // Default I2S RX data GPIO (stereo pair 0).  The four data-pin defaults are the
 // contiguous block GPIO 1/2/3/4 (pairs 0/1/2/3), all unused by any default
@@ -71,16 +78,20 @@ extern volatile uint8_t active_input_source;
 // SPDIF RX pin (device-level setting, stored in PresetDirectory)
 extern uint8_t spdif_rx_pin;
 
-// GPIOs for the optional SPDIF inputs 2 and 3 ([0] = SPDIF2, [1] = SPDIF3).
+// GPIOs for the optional SPDIF inputs 2..4 ([0] = SPDIF2 ... [2] = SPDIF4).
 // Same persistence model as spdif_rx_pin.  A disabled input's pin is only a
 // stored preference: it is not reserved against other functions and is never
 // claimed in hardware until the input is enabled AND selected.
 extern uint8_t spdif_rx_pin_ext[SPDIF_RX_NUM_INPUTS - 1];
 
-// Enable mask for the optional SPDIF inputs: bit 0 = SPDIF2, bit 1 = SPDIF3.
-// 0 by default; both extra inputs absent from the source list and invisible
+// Enable mask for the optional SPDIF inputs: bit 0 = SPDIF2 ... bit 2 = SPDIF4.
+// 0 by default; the extra inputs are absent from the source list and invisible
 // to pin-conflict validation.  SPDIF input 1 is always enabled.
 extern uint8_t spdif_rx_enabled_ext;
+
+// All bits of spdif_rx_enabled_ext that name a real input; anything wider
+// arriving from the wire or flash is masked off before use.
+#define SPDIF_RX_ENABLED_EXT_MASK  ((uint8_t)((1u << (SPDIF_RX_NUM_INPUTS - 1)) - 1))
 
 // I2S RX serial-data pins, one per stereo pair, each independently
 // configurable (same per-pin persistence model as spdif_rx_pin).  [0] is the
@@ -216,29 +227,39 @@ static inline bool input_source_valid(uint8_t src) {
     return src <= INPUT_SOURCE_MAX;
 }
 
-// True for any of the three SPDIF inputs
+// True for any of the SPDIF inputs
 static inline bool input_source_is_spdif(uint8_t src) {
-    return src == INPUT_SOURCE_SPDIF || src == INPUT_SOURCE_SPDIF2 ||
-           src == INPUT_SOURCE_SPDIF3;
+    return src == INPUT_SOURCE_SPDIF ||
+           (src >= INPUT_SOURCE_SPDIF2 && src <= INPUT_SOURCE_MAX);
 }
 
-// SPDIF input index (0..2) for a source; 0 for non-SPDIF sources
+// SPDIF input index (0..SPDIF_RX_NUM_INPUTS-1) for a source; 0 for non-SPDIF
 static inline uint8_t spdif_index_for_source(uint8_t src) {
-    if (src == INPUT_SOURCE_SPDIF2) return 1;
-    if (src == INPUT_SOURCE_SPDIF3) return 2;
+    if (src >= INPUT_SOURCE_SPDIF2 && src <= INPUT_SOURCE_MAX)
+        return (uint8_t)(src - INPUT_SOURCE_SPDIF2 + 1);
     return 0;
 }
 
-// InputSource value for a SPDIF input index (0..2)
+// InputSource value for a SPDIF input index (0..SPDIF_RX_NUM_INPUTS-1)
 static inline uint8_t spdif_source_for_index(uint8_t idx) {
-    if (idx == 1) return INPUT_SOURCE_SPDIF2;
-    if (idx == 2) return INPUT_SOURCE_SPDIF3;
-    return INPUT_SOURCE_SPDIF;
+    if (idx == 0 || idx >= SPDIF_RX_NUM_INPUTS) return INPUT_SOURCE_SPDIF;
+    return (uint8_t)(INPUT_SOURCE_SPDIF2 + idx - 1);
 }
 
-// Configured GPIO for a SPDIF input index (0..2)
+// Configured GPIO for a SPDIF input index (0..SPDIF_RX_NUM_INPUTS-1)
 static inline uint8_t spdif_rx_pin_for_index(uint8_t idx) {
     return (idx == 0) ? spdif_rx_pin : spdif_rx_pin_ext[idx - 1];
+}
+
+// Factory GPIO for a SPDIF input index; the reset-to-default target for
+// REQ_SET_SPDIF_RX_PIN and the fallback for an unset stored pin.
+static inline uint8_t spdif_rx_pin_default_for_index(uint8_t idx) {
+    switch (idx) {
+        case 1:  return PICO_SPDIF_RX_PIN2_DEFAULT;
+        case 2:  return PICO_SPDIF_RX_PIN3_DEFAULT;
+        case 3:  return PICO_SPDIF_RX_PIN4_DEFAULT;
+        default: return PICO_SPDIF_RX_PIN_DEFAULT;
+    }
 }
 
 // True if SPDIF input `idx` is enabled (index 0 is always enabled)
@@ -287,7 +308,7 @@ bool i2s_rx_pin_set_acceptable(const uint8_t *pins, uint8_t n_pairs,
 // vendor_commands.c; declared here for the same reason as above.
 bool i2s_bck_pin_acceptable(uint8_t bck_pin);
 
-// True if SPDIF input `idx` (1..2) could be enabled right now: its configured
+// True if SPDIF input `idx` (1..SPDIF_RX_NUM_INPUTS-1) could be enabled right now: its configured
 // GPIO is valid and not claimed by any other function.  Defined in
 // vendor_commands.c (alongside the other pin helpers); declared here so the
 // bulk/preset restore paths can validate a stored enable before applying it.

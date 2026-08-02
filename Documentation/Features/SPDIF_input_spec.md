@@ -2,9 +2,9 @@
 
 ## 1. Overview
 
-DSPi supports several audio input sources, selected at runtime via vendor USB control transfers: **USB** (0), up to **three S/PDIF inputs** (1, 4, 5), and **I2S** (2, documented separately in `i2s_input_spec.md`). Value 3 is a reserved gap for a future ADAT input. This document covers the S/PDIF inputs. When any S/PDIF input is the active source, received audio feeds through the identical DSP pipeline (preamp, loudness, master EQ, leveller, crossfeed, matrix mixer, per-output EQ, delay) as USB audio.
+DSPi supports several audio input sources, selected at runtime via vendor USB control transfers: **USB** (0), up to **four S/PDIF inputs** (1, 4, 5, 6), and **I2S** (2, documented separately in `i2s_input_spec.md`). Value 3 is the ADAT input. This document covers the S/PDIF inputs. When any S/PDIF input is the active source, received audio feeds through the identical DSP pipeline (preamp, loudness, master EQ, leveller, crossfeed, matrix mixer, per-output EQ, delay) as USB audio.
 
-S/PDIF input 1 is always present. The two optional inputs (S/PDIF 2 and S/PDIF 3) are disabled by default; they are enabled per-configuration by the host and share the single RX PIO state machine and DMA pair with input 1. Only one S/PDIF input is ever active at a time. See section 2 for the multi-input model.
+S/PDIF input 1 is always present. The three optional inputs (S/PDIF 2, 3 and 4) are disabled by default; they are enabled per-configuration by the host and share the single RX PIO state machine and DMA pair with input 1. Only one S/PDIF input is ever active at a time. See section 2 for the multi-input model.
 
 Eight vendor commands control S/PDIF input functionality:
 
@@ -15,7 +15,7 @@ Eight vendor commands control S/PDIF input functionality:
 | 0xE2 | `REQ_GET_SPDIF_RX_STATUS` | IN | Query 16-byte receiver status struct |
 | 0xE3 | `REQ_GET_SPDIF_RX_CH_STATUS` | IN | Query 24-byte raw IEC 60958 channel status |
 | 0xE4 | `REQ_SET_SPDIF_RX_PIN` | SET (immediate response) | Configure a S/PDIF RX GPIO pin; wValue = (index<<8) \| GPIO |
-| 0xE5 | `REQ_GET_SPDIF_RX_PIN` | IN | Query a S/PDIF RX GPIO pin; wValue = index (0..2) |
+| 0xE5 | `REQ_GET_SPDIF_RX_PIN` | IN | Query a S/PDIF RX GPIO pin; wValue = index (0..3) |
 | 0xE9 | `REQ_SET_SPDIF_INPUT_ENABLE` | SET (immediate response) | Enable/disable an optional S/PDIF input; wValue = (index<<8) \| enable |
 | 0xEF | `REQ_GET_SPDIF_INPUT_CONFIG` | IN | Query the 5-byte S/PDIF input inventory (count, enable mask, pins) |
 
@@ -30,25 +30,28 @@ typedef enum {
     // 3 reserved: future INPUT_SOURCE_ADAT
     INPUT_SOURCE_SPDIF2 = 4,   // Optional SPDIF input 2 (disabled until enabled by host)
     INPUT_SOURCE_SPDIF3 = 5,   // Optional SPDIF input 3 (disabled until enabled by host)
+    INPUT_SOURCE_SPDIF4 = 6,   // Optional SPDIF input 4 (disabled until enabled by host)
 } InputSource;
 
-#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF3   // Highest valid value (3 is a gap)
+#define INPUT_SOURCE_MAX    INPUT_SOURCE_SPDIF4   // Highest valid value
 
 // Number of selectable SPDIF inputs (input 1 always present; 2/3 optional).
-#define SPDIF_RX_NUM_INPUTS 3
+#define SPDIF_RX_NUM_INPUTS 4
 
 #define PICO_SPDIF_RX_PIN_DEFAULT  5    // SPDIF input 1 default GPIO
 #define PICO_SPDIF_RX_PIN2_DEFAULT 20   // SPDIF input 2 default GPIO
 #define PICO_SPDIF_RX_PIN3_DEFAULT 21   // SPDIF input 3 default GPIO
 ```
 
-Value 3 is skipped structurally: `input_source_valid()` accepts `src <= INPUT_SOURCE_MAX && src != 3`.
+`input_source_valid()` accepts any `src <= INPUT_SOURCE_MAX`; ADAT (3) is structurally valid on both platforms so presets round-trip, and `input_source_selectable()` is what gates what the host may actually select.
 
 ---
 
 ## 2. Multiple SPDIF Inputs
 
-DSPi exposes up to three S/PDIF inputs. Input 1 (`INPUT_SOURCE_SPDIF`, index 0) is always present and enabled. Inputs 2 and 3 (`INPUT_SOURCE_SPDIF2` = 4 and `INPUT_SOURCE_SPDIF3` = 5, indices 1 and 2) are optional and disabled by default. All three share a single RX PIO state machine and DMA channel pair; only one input is ever active, and only the active input's GPIO is claimed in hardware.
+DSPi exposes up to four S/PDIF inputs. Input 1 (`INPUT_SOURCE_SPDIF`, index 0) is always present and enabled. Inputs 2, 3 and 4 (`INPUT_SOURCE_SPDIF2` = 4 through `INPUT_SOURCE_SPDIF4` = 6, indices 1..3) are optional and disabled by default. All four share a single RX PIO state machine and DMA channel pair; only one input is ever active, and only the active input's GPIO is claimed in hardware.
+
+The optional sources are contiguous from `INPUT_SOURCE_SPDIF2`; `spdif_index_for_source()` / `spdif_source_for_index()` are arithmetic, and a `_Static_assert` in `audio_input.h` holds that layout.
 
 ### Enable model and defaults
 
@@ -57,10 +60,11 @@ DSPi exposes up to three S/PDIF inputs. Input 1 (`INPUT_SOURCE_SPDIF`, index 0) 
 | 0 | `INPUT_SOURCE_SPDIF` (1) | 5 (`PICO_SPDIF_RX_PIN_DEFAULT`) | Always enabled (not disableable) |
 | 1 | `INPUT_SOURCE_SPDIF2` (4) | 20 (`PICO_SPDIF_RX_PIN2_DEFAULT`) | Disabled |
 | 2 | `INPUT_SOURCE_SPDIF3` (5) | 21 (`PICO_SPDIF_RX_PIN3_DEFAULT`) | Disabled |
+| 3 | `INPUT_SOURCE_SPDIF4` (6) | 22 (`PICO_SPDIF_RX_PIN4_DEFAULT`) | Disabled |
 
-The enable state of the two optional inputs is held in a bit mask `spdif_rx_enabled_ext` (bit 0 = SPDIF 2, bit 1 = SPDIF 3). Their GPIOs live in `spdif_rx_pin_ext[2]`. Input 1's pin remains `spdif_rx_pin`. The helpers `spdif_input_enabled(idx)`, `spdif_rx_pin_for_index(idx)`, `spdif_index_for_source(src)`, and `spdif_source_for_index(idx)` (all in `audio_input.h`) map between the two representations.
+The enable state of the optional inputs is held in a bit mask `spdif_rx_enabled_ext` (bit 0 = SPDIF 2 .. bit 2 = SPDIF 4; `SPDIF_RX_ENABLED_EXT_MASK` is the valid-bit mask). Their GPIOs live in `spdif_rx_pin_ext[3]`. Input 1's pin remains `spdif_rx_pin`. The helpers `spdif_input_enabled(idx)`, `spdif_rx_pin_for_index(idx)`, `spdif_rx_pin_default_for_index(idx)`, `spdif_index_for_source(src)`, and `spdif_source_for_index(idx)` (all in `audio_input.h`) map between the two representations.
 
-A disabled optional input is not offered in the source list: `REQ_SET_INPUT_SOURCE` validates the requested source with `input_source_selectable()`, which rejects a disabled SPDIF 2/3. Enable an optional input with `REQ_SET_SPDIF_INPUT_ENABLE` (0xE9) before selecting it.
+A disabled optional input is not offered in the source list: `REQ_SET_INPUT_SOURCE` validates the requested source with `input_source_selectable()`, which rejects a disabled optional input. Enable an optional input with `REQ_SET_SPDIF_INPUT_ENABLE` (0xE9) before selecting it.
 
 ### GPIO ownership rules
 
@@ -74,7 +78,7 @@ Because a disabled input's pin is invisible, enabling an input is where the conf
 
 ### Shared RX resources and switching
 
-All three inputs multiplex onto one RX PIO state machine (RP2040: PIO1 SM2; RP2350: PIO2 SM0) and one DMA channel pair. Only the active input's GPIO is muxed to the PIO; the others are not driven. Switching between two S/PDIF inputs uses the **same deferred switch** as a USB-to-S/PDIF switch (`REQ_SET_INPUT_SOURCE`, handled in the main loop):
+All four inputs multiplex onto one RX PIO state machine (RP2040: PIO1 SM2; RP2350: PIO2 SM0) and one DMA channel pair. Only the active input's GPIO is muxed to the PIO; the others are not driven. Switching between two S/PDIF inputs uses the **same deferred switch** as a USB-to-S/PDIF switch (`REQ_SET_INPUT_SOURCE`, handled in the main loop):
 
 1. Drain pending audio, engage the output mute, fence Core 1.
 2. `spdif_input_stop()` on the old input; its GPIO is released.
@@ -95,6 +99,7 @@ Input-channel default names follow each source (`get_default_channel_name()` in 
 | S/PDIF 1 | `SPDIF L` | `SPDIF R` |
 | S/PDIF 2 | `SPDIF 2 L` | `SPDIF 2 R` |
 | S/PDIF 3 | `SPDIF 3 L` | `SPDIF 3 R` |
+| S/PDIF 4 | `SPDIF 4 L` | `SPDIF 4 R` |
 
 A custom channel name set by the host is preserved across a source switch (only names that still equal the old default are relabelled).
 
@@ -518,12 +523,12 @@ Interpretation:
 
 ### 4.5 REQ_SET_SPDIF_RX_PIN (0xE4)
 
-Set the GPIO pin used for one of the three S/PDIF inputs. The input is selected by an index packed into the high byte of `wValue`; the GPIO number is in the low byte. Old hosts that send a bare pin number in `wValue` implicitly address index 0 (input 1).
+Set the GPIO pin used for one of the four S/PDIF inputs. The input is selected by an index packed into the high byte of `wValue`; the GPIO number is in the low byte. Old hosts that send a bare pin number in `wValue` implicitly address index 0 (input 1).
 
 **Direction:** Host -> Device (GET-style immediate response)
 **bmRequestType:** `0xC1`
 **bRequest:** `0xE4`
-**wValue:** `(index << 8) | GPIO`, index `0..2`
+**wValue:** `(index << 8) | GPIO`, index `0..3`
 **wLength:** `1`
 
 Note: Despite being a "SET" command, this uses a GET-direction transfer (`0xC1`) because it returns an immediate status byte. The pin number is passed in `wValue`, not in the request body. This follows the same pattern as `REQ_SET_I2S_RX_PIN` and other pin configuration commands.
@@ -588,7 +593,7 @@ case REQ_SET_SPDIF_RX_PIN: {
 
 #### GPIO pin constraints
 
-See section 9 for the full pin rules. For an enabled input, the pin must be a valid GPIO (0-28 on RP2040, 0-29 on RP2350; 23-25 excluded) and not conflict with any output, MCK, an enabled S/PDIF input, the DAC hardware-mute, a control interface, active I2S clocks, or an active I2S RX data pin. Defaults: GPIO 5 / 20 / 21 for inputs 1 / 2 / 3.
+See section 9 for the full pin rules. For an enabled input, the pin must be a valid GPIO (0-28 on RP2040, 0-29 on RP2350; 23-25 excluded) and not conflict with any output, MCK, an enabled S/PDIF input, the DAC hardware-mute, a control interface, active I2S clocks, or an active I2S RX data pin. Defaults: GPIO 5 / 20 / 21 / 22 for inputs 1 / 2 / 3 / 4.
 
 #### Hex examples
 
@@ -636,12 +641,12 @@ Response:      03       (INVALID_OUTPUT)
 
 ### 4.6 REQ_GET_SPDIF_RX_PIN (0xE5)
 
-Query the GPIO pin configured for one of the three S/PDIF inputs. The input is selected by `wValue` (low byte = index `0..2`). Old hosts that send `wValue = 0` read input 1's pin.
+Query the GPIO pin configured for one of the four S/PDIF inputs. The input is selected by `wValue` (low byte = index `0..3`). Old hosts that send `wValue = 0` read input 1's pin.
 
 **Direction:** Device -> Host (GET)
 **bmRequestType:** `0xC1`
 **bRequest:** `0xE5`
-**wValue:** index (`0..2`)
+**wValue:** index (`0..3`)
 **wLength:** `1`
 
 #### Response (1 byte)
@@ -680,12 +685,12 @@ Response:      14       (GPIO 20)
 
 ### 4.7 REQ_SET_SPDIF_INPUT_ENABLE (0xE9)
 
-Enable or disable one of the two optional S/PDIF inputs. Input 1 is always enabled.
+Enable or disable one of the three optional S/PDIF inputs. Input 1 is always enabled.
 
 **Direction:** Host -> Device (GET-style immediate response)
 **bmRequestType:** `0xC1`
 **bRequest:** `0xE9`
-**wValue:** `(index << 8) | enable`, index `0..2`, enable `0` or `1`
+**wValue:** `(index << 8) | enable`, index `0..3`, enable `0` or `1`
 **wLength:** `1`
 
 Same GET-style immediate 1-byte status response pattern as 0xE4.
@@ -704,7 +709,7 @@ Same GET-style immediate 1-byte status response pattern as 0xE4.
 |------|--------|
 | index 0, enable=1 | No-op `SUCCESS` (input 1 is always enabled) |
 | index 0, enable=0 | Rejected `INVALID_OUTPUT` (input 1 is not disableable) |
-| index `>= 3` | Rejected `INVALID_OUTPUT` |
+| index `>= 4` | Rejected `INVALID_OUTPUT` |
 | enable already matches current state | No-op `SUCCESS` |
 | Enable, pin OK | Sets the mask bit; `SUCCESS` |
 | Enable, pin invalid/taken | `PIN_IN_USE`, input left disabled |
@@ -1071,7 +1076,7 @@ The pin **can** be changed while the S/PDIF input is active. `REQ_SET_SPDIF_RX_P
 
 ### Persistence
 
-Pin and enable changes are RAM-only until `REQ_PRESET_SAVE` (slot-scoped, plus a device-global directory baseline under `output_config_mode = INDEPENDENT`). On first boot the defaults are GPIO 5 / 20 / 21 for inputs 1 / 2 / 3, with inputs 2/3 disabled. See section 10.
+Pin and enable changes are RAM-only until `REQ_PRESET_SAVE` (slot-scoped, plus a device-global directory baseline under `output_config_mode = INDEPENDENT`). On first boot the defaults are GPIO 5 / 20 / 21 / 22 for inputs 1 / 2 / 3 / 4, with inputs 2..4 disabled. See section 10.
 
 ---
 
@@ -1079,7 +1084,7 @@ Pin and enable changes are RAM-only until `REQ_PRESET_SAVE` (slot-scoped, plus a
 
 The physical IO config (output pins/types, I2S clocks, and all S/PDIF RX pins/enables) travels through the `output_config_mode` mechanism. In `OUTPUT_CONFIG_MODE_WITH_PRESET` (the default) it lives in each preset slot; in `OUTPUT_CONFIG_MODE_INDEPENDENT` it is a device-global block in the directory, applied at boot. A single snapshot/apply path (`io_config_from_slot` / `io_config_from_live` / `io_config_apply` in `flash_storage.c`) serves both sources so they cannot diverge. The **input source** selection (USB vs S/PDIF vs I2S) is always per-preset, not part of that block.
 
-### Flash storage (SLOT_DATA_VERSION = 24)
+### Flash storage (SLOT_DATA_VERSION = 35)
 
 Relevant `PresetSlot` fields (`flash_storage.c`):
 
@@ -1087,26 +1092,28 @@ Relevant `PresetSlot` fields (`flash_storage.c`):
 uint8_t input_source;            // InputSource enum (V13; 0=USB, 1=SPDIF, ...)
 uint8_t spdif_rx_pin;            // SPDIF RX 1 GPIO (V13; 0 = absent -> use default)
 // ...
-uint8_t spdif_rx_enabled_ext;    // Optional SPDIF 2/3 enable mask (V24; bit0=SPDIF2, bit1=SPDIF3)
+uint8_t spdif_rx_enabled_ext;    // Optional SPDIF enable mask (V24; bit0=SPDIF2 .. bit2=SPDIF4)
 uint8_t spdif_rx_pin_ext[2];     // SPDIF RX 2/3 GPIOs (V24; 0 = unset -> defaults 20/21)
+uint8_t spdif_rx_pin4;           // SPDIF RX 4 GPIO (V35 tail-append; 0 = unset -> default 22)
 ```
 
 - `input_source` and `spdif_rx_pin` were added at V13.
 - `spdif_rx_enabled_ext` + `spdif_rx_pin_ext[2]` were appended at V24 (slot grows by 3 bytes). Pre-V24 slots do not carry them; `io_config_from_slot()` gates the read on `slot->version >= 24`, so **older slots load with S/PDIF 2/3 disabled** (baselined from the device-global directory config). A slot pin of `0` means "unset, use the live/default pin".
+- `spdif_rx_pin4` was appended at V35 (slot grows by 1 byte), gated on `slot->version >= 35`. S/PDIF 4's *enable* bit needed no new storage: it is bit 2 of the V24 `spdif_rx_enabled_ext` byte, which pre-V35 firmware always wrote as 0. Because the slot's mask fully overrides the device-global one, loading a V24..V34 preset disables S/PDIF 4 — the same rule that already applied to inputs 2/3.
 
 | Action | Behavior |
 |--------|----------|
 | **Save preset** | Current `active_input_source` and the live pins/enable mask are captured into the slot |
 | **Load preset** | Input source switch is deferred (via `input_source_selectable()`); pins/enables applied through `io_config_apply()`, with a hot-swap if the active input's pin changed |
-| **Factory reset / boot with no preset** | USB input; pins 5/20/21; S/PDIF 2/3 disabled |
+| **Factory reset / boot with no preset** | USB input; pins 5/20/21/22; optional S/PDIF inputs disabled |
 
-### Device-global IO config (INDEPENDENT mode) and directory V12
+### Device-global IO config (INDEPENDENT mode) and directory V16
 
-Under INDEPENDENT mode the IO config lives in the `FlashOutputConfig` block inside the directory. The directory version is **12** (`DIR_VERSION_CURRENT = 12`); `FlashOutputConfig` grew from 25 to 28 bytes to append `spdif_rx_enabled_ext` and `spdif_rx_pin_ext[2]`. Older directories are read through frozen `FlashOutputConfig_v11` (25 bytes) etc. and migrated forward, defaulting the optional inputs to disabled with pins 20/21.
+Under INDEPENDENT mode the IO config lives in the `FlashOutputConfig` block inside the directory. `spdif_rx_enabled_ext` + `spdif_rx_pin_ext[2]` were appended at directory V12 (25 -> 28 bytes) and `spdif_rx_pin4` at directory **V16** (34 -> 35 bytes, `DIR_VERSION_CURRENT = 16`). Input 4's pin is a tail byte rather than a third `spdif_rx_pin_ext` entry because the frozen `FlashOutputConfig_v11..v15` structs are strict prefixes that the older migrations copy forward; `cfg_spdif_ext_pin()` / `cfg_spdif_ext_pin_get()` in `flash_storage.c` index the split storage as one array. Older directories are read through their frozen structs and migrated forward, defaulting the optional inputs to disabled with pins 20/21/22.
 
-### Wire format (WIRE_FORMAT_VERSION = 17)
+### Wire format (WIRE_FORMAT_VERSION = 28)
 
-The bulk parameter transfer includes a `WireInputConfig` section (16 bytes). The optional-SPDIF fields were claimed from its reserved bytes, so the wire size and format version are unchanged (still V17):
+The bulk parameter transfer includes a `WireInputConfig` section (16 bytes). The optional-SPDIF fields are claimed from its reserved bytes, so the section size is unchanged. Widening `spdif_rx_pin_ext` from 2 to 3 entries for input 4 consumed that section's last reserved byte and shifted the fields below it down one, which is why the format version is now 28; no later wire section moved:
 
 ```c
 typedef struct __attribute__((packed)) {
@@ -1116,17 +1123,20 @@ typedef struct __attribute__((packed)) {
     uint8_t  i2s_input_rate;         // I2S input rate enum: 0=44100, 1=48000, 2=96000 (V12+)
     uint8_t  i2s_input_channels;     // Active I2S input channels: 2/4/6/8 (0 = absent)
     uint8_t  i2s_rx_pin_ext[3];      // I2S RX data GPIOs for stereo pairs 1..3 (0 = unset)
-    uint8_t  spdif_rx_pin_ext[2];    // SPDIF RX 2/3 GPIOs (0 = absent, keep live)
-    uint8_t  spdif_rx_enabled_ext_p1;// SPDIF 2/3 enable mask + 1 (0 = absent;
-                                     // 1 = both disabled, 2 = SPDIF2, 3 = both, ...)
-    uint8_t  reserved[5];            // Future expansion (pad to 16 bytes)
-} WireInputConfig;                   // 16 bytes
+    uint8_t  spdif_rx_pin_ext[3];    // SPDIF RX 2/3/4 GPIOs (0 = absent, keep live)
+    uint8_t  spdif_rx_enabled_ext_p1;// SPDIF 2/3/4 enable mask + 1 (0 = absent;
+                                     // 1 = all disabled, 2 = SPDIF2, 3 = 2+3, ...)
+    uint8_t  i2s_clock_mode;         // I2S clock: 0=master, 1=slave (V21+)
+    uint8_t  adat_input_pin;         // ADAT RX GPIO (V24+; 0 = absent, keep live)
+    uint8_t  adat_input_enabled_p1;  // enable + 1 (0 absent, 1 disabled, 2 enabled)
+    uint8_t  adat_clock_mode_p1;     // clock mode + 1 (0 absent, 1 master, 2 slave)
+} WireInputConfig;                   // 16 bytes (full; no reserved bytes left)
 ```
 
 Sentinel semantics on SET (`bulk_params_apply`, with `apply_pins`):
 
 - `spdif_rx_pin` / `spdif_rx_pin_ext[i]` = `0` means "absent, keep the live pin"; a non-zero valid pin is applied (hot-swapped if it is the active input). Unlike the obsolete V7 behavior, `spdif_rx_pin` IS applied on SET when `apply_pins` is true.
-- `spdif_rx_enabled_ext_p1` is the enable mask **plus one**: `0` = "field absent, keep the live mask"; otherwise `mask = enc - 1`. The +1 encoding lets old hosts (which push zeros) mean "absent" rather than "disable both".
+- `spdif_rx_enabled_ext_p1` is the enable mask **plus one**: `0` = "field absent, keep the live mask"; otherwise `mask = enc - 1`. The +1 encoding lets old hosts (which push zeros) mean "absent" rather than "disable all".
 - Bulk apply guards: the ext pins are applied before the enable mask (so a pin+enable pushed together validates against the new pin); a newly enabled bit is accepted only if `spdif_input_enable_acceptable()` passes; a newly disabled bit that names the **live source** is refused (a pushed config must not silently kill the running input).
 
 ### Mute during preset load
@@ -1202,6 +1212,7 @@ The forked `pico_spdif_rx` library (from `elehobica/pico_spdif_rx` v0.9.3) has t
 #define INPUT_SOURCE_I2S     2
 #define INPUT_SOURCE_SPDIF2  4
 #define INPUT_SOURCE_SPDIF3  5
+#define INPUT_SOURCE_SPDIF4  6
 
 // SPDIF receiver states
 #define SPDIF_STATE_INACTIVE   0
@@ -1410,7 +1421,7 @@ void print_spdif_source_info(libusb_device_handle *handle) {
 ### Configure and query RX pin
 
 ```c
-// index: 0 = SPDIF 1, 1 = SPDIF 2, 2 = SPDIF 3.  The GPIO goes in the low
+// index: 0 = SPDIF 1 .. 3 = SPDIF 4.  The GPIO goes in the low
 // byte of wValue, the input index in the high byte.  The pin is hot-swapped
 // if it belongs to the active source; there is no "input active" rejection.
 int set_spdif_rx_pin(libusb_device_handle *handle, uint8_t index, uint8_t pin) {
@@ -1447,7 +1458,7 @@ int set_spdif_rx_pin(libusb_device_handle *handle, uint8_t index, uint8_t pin) {
     }
 }
 
-// index: 0..2.  wValue low byte selects the input; out-of-range returns 0.
+// index: 0..3.  wValue low byte selects the input; out-of-range returns 0.
 int get_spdif_rx_pin(libusb_device_handle *handle, uint8_t index, uint8_t *out_pin) {
     int ret = libusb_control_transfer(handle,
         LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE,
@@ -1463,7 +1474,7 @@ int get_spdif_rx_pin(libusb_device_handle *handle, uint8_t index, uint8_t *out_p
 }
 
 // Enable (enable=1) or disable (enable=0) an optional SPDIF input.
-// index: 1 = SPDIF 2, 2 = SPDIF 3.  Input 1 (index 0) is always enabled.
+// index: 1 = SPDIF 2 .. 3 = SPDIF 4.  Input 1 (index 0) is always enabled.
 int set_spdif_input_enable(libusb_device_handle *handle, uint8_t index,
                            uint8_t enable) {
     uint8_t status;
@@ -1500,10 +1511,10 @@ int set_spdif_input_enable(libusb_device_handle *handle, uint8_t index,
 }
 
 // Read the whole SPDIF input inventory in one transfer.
-// out_count, out_mask, out_pins[3] must be non-NULL (pins array length 3).
+// out_count, out_mask, out_pins[4] must be non-NULL (pins array length 4).
 int get_spdif_input_config(libusb_device_handle *handle, uint8_t *out_count,
-                           uint8_t *out_mask, uint8_t out_pins[3]) {
-    uint8_t resp[5];
+                           uint8_t *out_mask, uint8_t out_pins[4]) {
+    uint8_t resp[6];
     int ret = libusb_control_transfer(handle,
         LIBUSB_ENDPOINT_IN | LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_INTERFACE,
         REQ_GET_SPDIF_INPUT_CONFIG,   // 0xEF
@@ -1514,11 +1525,9 @@ int get_spdif_input_config(libusb_device_handle *handle, uint8_t *out_count,
         fprintf(stderr, "Failed to get SPDIF config: %s\n", libusb_error_name(ret));
         return -1;
     }
-    *out_count  = resp[0];          // 3
-    *out_mask   = resp[1];          // bit0=input1 (always), bit1=SPDIF2, bit2=SPDIF3
-    out_pins[0] = resp[2];
-    out_pins[1] = resp[3];
-    out_pins[2] = resp[4];
+    *out_count  = resp[0];          // 4
+    *out_mask   = resp[1];          // bit0=input1 (always), bit1=SPDIF2 .. bit3=SPDIF4
+    for (int i = 0; i < 4; i++) out_pins[i] = resp[2 + i];
     return 0;
 }
 ```
@@ -1529,10 +1538,10 @@ Combine `REQ_GET_SPDIF_INPUT_CONFIG` (0xEF) to learn which S/PDIF inputs are ena
 
 ```c
 void build_source_menu(libusb_device_handle *handle) {
-    static const uint8_t spdif_src[3] =
-        { INPUT_SOURCE_SPDIF, INPUT_SOURCE_SPDIF2, INPUT_SOURCE_SPDIF3 };
+    static const uint8_t spdif_src[4] = { INPUT_SOURCE_SPDIF, INPUT_SOURCE_SPDIF2,
+                                          INPUT_SOURCE_SPDIF3, INPUT_SOURCE_SPDIF4 };
 
-    uint8_t count, mask, pins[3], current = INPUT_SOURCE_USB;
+    uint8_t count, mask, pins[4], current = INPUT_SOURCE_USB;
     if (get_spdif_input_config(handle, &count, &mask, pins) != 0) return;
     get_input_source(handle, &current);
 
@@ -1614,11 +1623,11 @@ The base S/PDIF input feature is available in firmware v1.1.0 and later; the mul
 
 ### Older presets
 
-Presets saved with `SLOT_DATA_VERSION < 13` carry no `input_source`; loading one leaves the source unchanged (USB on a fresh boot). Presets saved with `SLOT_DATA_VERSION < 24` carry no optional-SPDIF fields; `io_config_from_slot()` gates them on `version >= 24`, so such presets **load with S/PDIF 2/3 disabled** (baselined from the device-global directory config, defaults 20/21).
+Presets saved with `SLOT_DATA_VERSION < 13` carry no `input_source`; loading one leaves the source unchanged (USB on a fresh boot). Presets saved with `SLOT_DATA_VERSION < 24` carry no optional-SPDIF fields; `io_config_from_slot()` gates them on `version >= 24`, so such presets **load with the optional S/PDIF inputs disabled** (baselined from the device-global directory config, defaults 20/21/22). Presets in the V24..V34 range carry the mask and the 2/3 pins but not input 4's pin (gated on `version >= 35`), and their mask has bit 2 clear, so they load with S/PDIF 4 disabled at the device-global pin.
 
 ### Wire format
 
-The `WireInputConfig` section is still 16 bytes at `WIRE_FORMAT_VERSION = 17`; the optional-SPDIF fields were claimed from its reserved bytes, so the size and version did not change. Old hosts push zeros in those bytes, which decode as "absent" (pins kept live; enable mask kept live, thanks to the +1 encoding of `spdif_rx_enabled_ext_p1`). Hosts that request fewer bytes than the full `WireBulkParams` size receive a truncated response (the firmware respects `wLength`).
+The `WireInputConfig` section is still 16 bytes at `WIRE_FORMAT_VERSION = 28`, but the section is now full: input 4's pin took its last reserved byte and shifted `spdif_rx_enabled_ext_p1`, `i2s_clock_mode` and the ADAT input fields down one, which is what forced the version bump (a V27 host's bulk SET is rejected until rebuilt). Zeros in the pin/enable bytes still decode as "absent" (pins kept live; enable mask kept live, thanks to the +1 encoding of `spdif_rx_enabled_ext_p1`). Hosts that request fewer bytes than the full `WireBulkParams` size receive a truncated response (the firmware respects `wLength`).
 
 No pre-existing vendor commands are modified by the multiple-SPDIF feature beyond the additive `wValue` index on 0xE4/0xE5. All prior commands (EQ, matrix mixer, crossfeed, loudness, pin config, presets, etc.) continue to function identically regardless of input source.
 
@@ -1628,12 +1637,12 @@ No pre-existing vendor commands are modified by the multiple-SPDIF feature beyon
 
 | Code | Command | Direction | Data | Description |
 |------|---------|-----------|------|-------------|
-| `0xE0` | `REQ_SET_INPUT_SOURCE` | OUT (0x41) | 1 byte: source (0=USB, 1=SPDIF 1, 2=I2S, 4=SPDIF 2, 5=SPDIF 3) | Select input source (deferred, non-blocking) |
+| `0xE0` | `REQ_SET_INPUT_SOURCE` | OUT (0x41) | 1 byte: source (0=USB, 1=SPDIF 1, 2=I2S, 3=ADAT, 4=SPDIF 2, 5=SPDIF 3, 6=SPDIF 4) | Select input source (deferred, non-blocking) |
 | `0xE1` | `REQ_GET_INPUT_SOURCE` | IN (0xC1) | 1 byte: source | Query current input source |
 | `0xE2` | `REQ_GET_SPDIF_RX_STATUS` | IN (0xC1) | 16 bytes: SpdifRxStatusPacket | Query receiver state, rate, errors, FIFO fill |
 | `0xE3` | `REQ_GET_SPDIF_RX_CH_STATUS` | IN (0xC1) | 24 bytes: IEC 60958 channel status | Raw channel status bits from received stream |
 | `0xE4` | `REQ_SET_SPDIF_RX_PIN` | IN (0xC1)* | wValue=(index<<8)\|GPIO, 1 byte response: status | Set a S/PDIF RX GPIO pin (indexed, hot-swappable) |
-| `0xE5` | `REQ_GET_SPDIF_RX_PIN` | IN (0xC1) | wValue=index (0..2), 1 byte: pin (0 if out of range) | Query a S/PDIF RX GPIO pin |
+| `0xE5` | `REQ_GET_SPDIF_RX_PIN` | IN (0xC1) | wValue=index (0..3), 1 byte: pin (0 if out of range) | Query a S/PDIF RX GPIO pin |
 | `0xE9` | `REQ_SET_SPDIF_INPUT_ENABLE` | IN (0xC1)* | wValue=(index<<8)\|enable, 1 byte response: status | Enable/disable an optional S/PDIF input |
 | `0xEF` | `REQ_GET_SPDIF_INPUT_CONFIG` | IN (0xC1) | 5 bytes: count, enable mask, pins[3] | Query the S/PDIF input inventory |
 
