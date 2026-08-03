@@ -10,6 +10,13 @@
 // Bits above NUM_OUTPUT_CHANNELS are ignored.
 #define LOUDNESS_DEFAULT_OUTPUT_MASK 0xFFFFu
 
+// Accepted spans for the two table parameters, shared by the vendor SET
+// clamps, loudness_recompute_table, and the Control Surfaces noun table.
+#define LOUDNESS_REF_SPL_MIN     40.0f
+#define LOUDNESS_REF_SPL_MAX    100.0f
+#define LOUDNESS_INTENSITY_MIN    0.0f
+#define LOUDNESS_INTENSITY_MAX  200.0f
+
 // Coefficients-only struct (state lives separately per output channel)
 #if PICO_RP2350
 typedef struct {

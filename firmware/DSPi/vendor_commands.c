@@ -745,8 +745,8 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             if (buffer->data_len >= 4) {
                 float val;
                 memcpy(&val, vendor_rx_buf, 4);
-                if (val < 40.0f) val = 40.0f;
-                if (val > 100.0f) val = 100.0f;
+                if (val < LOUDNESS_REF_SPL_MIN) val = LOUDNESS_REF_SPL_MIN;
+                if (val > LOUDNESS_REF_SPL_MAX) val = LOUDNESS_REF_SPL_MAX;
                 loudness_ref_spl = val;
                 loudness_recompute_pending = true;
                 notify_param_write(offsetof(WireBulkParams, global.loudness_ref_spl),
@@ -758,8 +758,8 @@ static bool vendor_handle_set_data(tusb_control_request_t const *req) {
             if (buffer->data_len >= 4) {
                 float val;
                 memcpy(&val, vendor_rx_buf, 4);
-                if (val < 0.0f) val = 0.0f;
-                if (val > 200.0f) val = 200.0f;
+                if (val < LOUDNESS_INTENSITY_MIN) val = LOUDNESS_INTENSITY_MIN;
+                if (val > LOUDNESS_INTENSITY_MAX) val = LOUDNESS_INTENSITY_MAX;
                 loudness_intensity_pct = val;
                 loudness_recompute_pending = true;
                 notify_param_write(offsetof(WireBulkParams, global.loudness_intensity_pct),

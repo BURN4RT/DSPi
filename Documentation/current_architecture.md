@@ -1759,7 +1759,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-08-04 (Control Surfaces caps v6; IR sub-slots 8 -> 16 on both platforms)*
+*Last updated: 2026-08-04 (Control Surfaces caps v7; loudness ref-SPL and intensity nouns on both platforms)*
 
 ### Hardware
 
@@ -1771,7 +1771,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
 | UART + I2C external control | Yes (identical) | Yes (identical) |
-| Control Surfaces nouns (caps v6) | 49 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 49, all usable |
+| Control Surfaces nouns (caps v7) | 51 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 51, all usable |
 | Control Surfaces IR sub-slots | 16 (`CS_MAX_IR_COMMANDS`) | 16 (identical) |
 | Binary type | `default` (XIP) | `default` (XIP) |
 | Cold code location (control paths, storage, coeff design, init) | Flash XIP | Flash XIP |
@@ -2328,7 +2328,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-08-04 (caps v6: IR sub-slots 8 -> 16)*
+*Last updated: 2026-08-04 (caps v7: loudness ref-SPL and intensity nouns)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
@@ -2389,6 +2389,22 @@ bumping the directory to V17; `CsStatusPacket` grows to 41 B, with
 `ir_learn_state` to 24 and `ir_cmd_status[16]` to 25. `CsCapsHeader` keeps its
 40 bytes and its `max_ir_commands` field now reads 16; hosts must size the
 command list from it rather than assume 8.
+
+**Caps v7** (2026-08-04) appends the two remaining loudness parameters as
+nouns 49-50, with no unit, structure, or stored-config changes (directory
+stays V17). `CS_NOUN_LOUDNESS_SPL` is the reference listening level in dB SPL
+(`CS_UNIT_DB`, 40-100, `REQ_SET_LOUDNESS_REF`) and
+`CS_NOUN_LOUDNESS_INTENSITY` is the compensation depth
+(`CS_UNIT_PERCENT`, 0-127, `REQ_SET_LOUDNESS_INTENSITY`); both join
+`CS_NOUN_LOUDNESS` (enable, noun 3) so a front panel can voice the loudness
+curve, not just switch it. The wire commands accept intensity up to 200 %, but
+8.8 percent tops out at 127.99, so the front-panel span stops at 127 %.
+Neither noun is `CS_NDF_DEFERRED`: the SET handler stores the value
+immediately and only the 61-step coefficient rebuild is deferred, coalesced by
+`loudness_recompute_pending` to at most one rebuild per main-loop pass however
+fast a knob is swept. The accepted spans now live in `loudness.h`
+(`LOUDNESS_REF_SPL_MIN`/`MAX`, `LOUDNESS_INTENSITY_MIN`/`MAX`) so the vendor
+clamps and the noun table cannot drift apart.
 
 ### File layout
 

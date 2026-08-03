@@ -174,8 +174,8 @@ void loudness_recompute_table(float ref_spl, float intensity_pct, float sample_r
     if (sample_rate < 1.0f) sample_rate = 48000.0f;
 
     // Clamp ref_spl to valid range
-    if (ref_spl < 40.0f) ref_spl = 40.0f;
-    if (ref_spl > 100.0f) ref_spl = 100.0f;
+    if (ref_spl < LOUDNESS_REF_SPL_MIN) ref_spl = LOUDNESS_REF_SPL_MIN;
+    if (ref_spl > LOUDNESS_REF_SPL_MAX) ref_spl = LOUDNESS_REF_SPL_MAX;
 
     // Write into the INACTIVE buffer
     uint8_t write_buf = 1 - active_buf;

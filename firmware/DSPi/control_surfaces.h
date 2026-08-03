@@ -42,9 +42,16 @@
  * delay noun uses.  No structure sizes change; the bump only signals the
  * new unit value to hosts.
  *
+ * Caps v5 widened the upmix centre-mode enum to 3 (the third being Off).
+ * Nothing else changed; the bump exists for hosts that hard-code the mode
+ * labels instead of reading enum_count from the noun descriptor.
+ *
  * Caps v6 doubles CS_MAX_IR_COMMANDS to 16.  CsStatusPacket grows to 41 bytes
  * (16-bit ir_active_mask, 16-entry ir_cmd_status) and the persisted CsIrConfig
  * to format v2; hosts must read max_ir_commands rather than assume 8.
+ *
+ * Caps v7 adds the loudness reference-SPL and intensity nouns.  No structure
+ * sizes change; hosts pick them up from noun_count as usual.
  *
  * See Documentation/Features/control_surfaces_spec.md.
  */
@@ -128,6 +135,9 @@ typedef enum {
     CS_NOUN_OUTPUT_DELAY   = 47, // continuous ms; target = output channel
     CS_NOUN_PRESET_RELOAD  = 48, // trigger (reload the active preset from flash,
                                  // discarding unsaved live edits)
+    // --- caps v7 additions ---
+    CS_NOUN_LOUDNESS_SPL   = 49, // continuous dB SPL 40..100 (reference listening level)
+    CS_NOUN_LOUDNESS_INTENSITY = 50, // continuous percent 0..127 (compensation depth)
     CS_NOUN_COUNT
 } CsNoun;
 
@@ -313,10 +323,8 @@ typedef struct __attribute__((packed)) {
 } CsTypeDesc;
 
 typedef struct __attribute__((packed)) {
-    uint8_t  caps_version; // capability format version (5; v5 widened the
-                           // upmix centre-mode enum to 3 for hosts that
-                           // hard-code the labels rather than reading
-                           // enum_count from the noun descriptor)
+    uint8_t  caps_version; // capability format version (7); see the file
+                           // header for what each version added
     uint8_t  max_bindings; // CS_MAX_BINDINGS
     uint8_t  type_count;   // CS_TYPE_COUNT (table follows, index = CsType)
     uint8_t  noun_count;   // CS_NOUN_COUNT

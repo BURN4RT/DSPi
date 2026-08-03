@@ -27,6 +27,7 @@
 #include "dsp_pipeline.h"
 #include "psybass.h"
 #include "upmix.h"
+#include "loudness.h"
 #if PICO_RP2350
 #include "adat_output.h"
 #endif
@@ -91,6 +92,10 @@ extern volatile bool sync_started;
 // 96 kHz the pipeline clamps in samples, same as a host-set delay; the
 // stored ms value round-trips unclamped.
 #define CS_DELAY_MAX_MS_Q8  ((int16_t)((MAX_DELAY_SAMPLES / 48) * 256))
+
+// Loudness intensity accepts up to 200 % over the wire, but the int16 8.8
+// value fields top out at 127.99, so the front-panel span stops there.
+#define CS_LOUDNESS_INTENSITY_MAX  127.0f
 
 // Q(8.8) helper for table literals; rounds to nearest (a plain cast would
 // truncate, encoding Q 0.1 as 25 instead of the documented 26).  Must stay a
@@ -219,6 +224,12 @@ const CsNounDesc cs_noun_table[CS_NOUN_COUNT] = {
                                   CS_TARGET_OUTPUT_CH, NUM_OUTPUT_CHANNELS, 0 },
     [CS_NOUN_PRESET_RELOAD]   = { CS_KIND_BOOL, 0, CS_ACT_BIT(CS_ACT_TRIGGER), 0, 0,
                                   CS_UNIT_NONE, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_LOUDNESS_SPL]    = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(LOUDNESS_REF_SPL_MIN), Q8(LOUDNESS_REF_SPL_MAX),
+                                  CS_UNIT_DB, CS_TARGET_NONE, 0, 0 },
+    [CS_NOUN_LOUDNESS_INTENSITY] = { CS_KIND_CONTINUOUS, 0, CS_CONT_RW,
+                                  Q8(LOUDNESS_INTENSITY_MIN), Q8(CS_LOUDNESS_INTENSITY_MAX),
+                                  CS_UNIT_PERCENT, CS_TARGET_NONE, 0, 0 },
 };
 
 // ---------------------------------------------------------------------------
@@ -365,6 +376,10 @@ float cs_noun_get(uint8_t noun, uint8_t target, uint8_t index) {
         case CS_NOUN_PSYBASS_ORIGINAL:  return psybass_config.original_db;
         case CS_NOUN_OUTPUT_DELAY:      return matrix_mixer.outputs[target].delay_ms;
         case CS_NOUN_PRESET_RELOAD:     return 0.0f;
+        // Both read live: the SET handler stores the value immediately and
+        // only the table rebuild is deferred to the main loop.
+        case CS_NOUN_LOUDNESS_SPL:       return loudness_ref_spl;
+        case CS_NOUN_LOUDNESS_INTENSITY: return loudness_intensity_pct;
         default: return 0.0f;
     }
 }
@@ -379,11 +394,15 @@ bool cs_noun_dispatch(uint8_t noun, uint8_t target, uint8_t index, float value) 
     switch (noun) {
         case CS_NOUN_USER_VOLUME:
         case CS_NOUN_MASTER_VOLUME:
-        case CS_NOUN_LEVELLER_AMOUNT: {
+        case CS_NOUN_LEVELLER_AMOUNT:
+        case CS_NOUN_LOUDNESS_SPL:
+        case CS_NOUN_LOUDNESS_INTENSITY: {
             float f = value;
             uint8_t req = (noun == CS_NOUN_USER_VOLUME)   ? REQ_SET_USER_VOLUME
                         : (noun == CS_NOUN_MASTER_VOLUME) ? REQ_SET_MASTER_VOLUME
-                                                          : REQ_SET_LEVELLER_AMOUNT;
+                        : (noun == CS_NOUN_LEVELLER_AMOUNT) ? REQ_SET_LEVELLER_AMOUNT
+                        : (noun == CS_NOUN_LOUDNESS_SPL)  ? REQ_SET_LOUDNESS_REF
+                                                          : REQ_SET_LOUDNESS_INTENSITY;
             r = vendor_dispatch_set(CTRL_SOURCE_GPIO, req, 0, 0,
                                     (const uint8_t *)&f, sizeof(f));
             break;

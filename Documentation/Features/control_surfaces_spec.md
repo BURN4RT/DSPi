@@ -1,8 +1,8 @@
 # Control Surfaces (User-Wired Physical Controls and Indicators)
 
-*Firmware capability format version: 5*
-*Config (flash) version: 2; IR config version: 1*
-*Directory version: 11*
+*Firmware capability format version: 7*
+*Config (flash) version: 2; IR config version: 2*
+*Directory version: 17*
 
 This document is the complete, self-contained specification for the DSPi
 Control Surfaces feature: user-wired push buttons, toggle switches,
@@ -18,7 +18,7 @@ Format v2 supersedes the v1 (16-byte binding, 8 slots, 9 nouns) format
 described by earlier revisions of this document; see section 11 for the
 compatibility story.
 
-Caps v3 adds two things on top of v2 (section 11.3):
+Caps v3 adds two things on top of v2 (section 11.5):
 
 - **The IR remote component** (`CS_TYPE_IR`): one binding slot holds a
   demodulating IR receiver on one GPIO, and up to 8 learned remote-button
@@ -31,9 +31,16 @@ Caps v3 adds two things on top of v2 (section 11.3):
   flash write and `REQ_CS_REVERT` reloads the stored one. Section 3.5.
 
 Caps v4 adds 14 nouns and one unit on top of v3, with no structure or
-stored-config changes (section 11.2): the stereo upmixer (35-40, RP2350
+stored-config changes (section 11.4): the stereo upmixer (35-40, RP2350
 only), psychoacoustic bass (41-46), per-output delay (47, using the new
 `CS_UNIT_MS`), and a preset-reload trigger (48).
+
+Caps v6 doubles the IR command table from 8 to 16 sub-slots (`CsIrConfig`
+format v2, `CsStatusPacket` 41 bytes); hosts must size the list from
+`max_ir_commands`, not assume 8.
+
+Caps v7 appends the two remaining loudness parameters as nouns 49-50
+(reference SPL and intensity), with no structure or stored-config changes.
 
 Writing style note: this doc avoids em-dashes per project convention.
 
@@ -242,10 +249,10 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (6) |
+| 0 | 1 | `caps_version` | capability format version (7) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (8); the type table has this many entries, indexed by `CsType` |
-| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (49) |
+| 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (51) |
 | 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
 | 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (16) |
 | 37 | 3 | `reserved[3]` | 0 |
@@ -664,6 +671,8 @@ Action-mask groups used below:
 | `PSYBASS_ORIGINAL` | 46 | CONT | DB | -60..0 dB | - | CONT-RW |
 | `OUTPUT_DELAY` | 47 | CONT | MS | 0..21 ms (RP2040) / 0..42 ms (RP2350) | OUTPUT_CH | CONT-RW |
 | `PRESET_RELOAD` | 48 | BOOL | - | - | - | `TRIGGER` (`0x0080`) |
+| `LOUDNESS_SPL` | 49 | CONT | DB | 40..100 dB SPL | - | CONT-RW |
+| `LOUDNESS_INTENSITY` | 50 | CONT | PERCENT | 0..127 % | - | CONT-RW |
 
 The *effective* legal action set for a (type, noun) pair is the bitwise AND of
 its two masks. Example: an encoder (`STEP` only) on `USER_MUTE` (bool, no
@@ -748,6 +757,8 @@ target and dispatches it.
 | `PSYBASS_ORIGINAL` | `REQ_SET_PSYBASS_ORIGINAL` (`0x3A`, float dB) | Original low-band level -60..0 dB. |
 | `OUTPUT_DELAY` | `REQ_SET_OUTPUT_DELAY` (`0x78`, wValue = `target`, float ms) | Per-output delay; bindable span is the full delay ring at 48 kHz (21 ms RP2040 / 42 ms RP2350). At 96 kHz the pipeline clamps in samples, exactly as for a host-set delay; the ms value round-trips unclamped. |
 | `PRESET_RELOAD` | `REQ_PRESET_LOAD` (`0x91`, GET, wValue = active slot) | `TRIGGER` reloads the currently active preset from flash via the deferred pipeline-safe path, discarding unsaved live edits. Device-global state (master volume in independent mode, output config, CS bindings) is untouched. |
+| `LOUDNESS_SPL` | `REQ_SET_LOUDNESS_REF` (`0x5A`, float dB SPL) | Reference listening level 40..100 dB SPL: the level at which the ISO 226 compensation reads flat. Lower it and the curve engages sooner as volume drops. |
+| `LOUDNESS_INTENSITY` | `REQ_SET_LOUDNESS_INTENSITY` (`0x5C`, float %) | Compensation depth, 100 % = the full ISO 226 contour difference. The vendor command accepts 0..200 %, but 8.8 percent caps the bindable span at 0..127 %. |
 
 ### 5.1 Enum stepping detail
 
@@ -1291,7 +1302,20 @@ are flash-persistent) and try the decoder before the hash fallback.
 
 ## 11. Compatibility
 
-### 11.0 v5 -> v6 (caps version 6, directory V17)
+### 11.1 v6 -> v7 (caps version 7, directory unchanged)
+
+- **No stored-config change and no structure size change.** The directory stays
+  V17 and both caps and status structures keep their sizes; nothing migrates.
+- The bump signals two appended nouns: `LOUDNESS_SPL` (49, `CS_UNIT_DB`,
+  40..100 dB SPL) and `LOUDNESS_INTENSITY` (50, `CS_UNIT_PERCENT`, 0..127 %).
+  `noun_count` reads 51. No new units or actions, so a v6 host that enumerates
+  nouns from `noun_count` picks them up with no code change.
+- The intensity noun's bindable span stops at 127 % even though
+  `REQ_SET_LOUDNESS_INTENSITY` accepts 0..200 %: 8.8 percent cannot encode a
+  larger value in the int16 wire fields. A host wanting 128..200 % must set it
+  over the vendor command directly.
+
+### 11.2 v5 -> v6 (caps version 6, directory V17)
 
 - **Stored configs migrate automatically.** A V16 directory migrates to V17 on
   first boot: `cs_ir` is the last directory member, so every earlier field keeps
@@ -1307,7 +1331,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   check and rebuilds a fresh directory (presets and CS config are lost); it does
   not misparse.
 
-### 11.1 v4 -> v5 (caps version 5, directory unchanged)
+### 11.3 v4 -> v5 (caps version 5, directory unchanged)
 
 - **No stored-config change and no structure size change.** The directory stays
   V11 and both caps and status structures keep their sizes; nothing migrates.
@@ -1321,7 +1345,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   remapped existing hosts and saved presets. A front panel is free to cycle the
   modes in any order it likes.
 
-### 11.2 v3 -> v4 (caps version 4, directory unchanged)
+### 11.4 v3 -> v4 (caps version 4, directory unchanged)
 
 - **No stored-config change.** The directory stays V11; bindings, IR commands,
   and names are byte-identical, so no migration runs and firmware
@@ -1335,7 +1359,7 @@ are flash-persistent) and try the decoder before the hash fallback.
 - The six upmixer nouns are RP2350-only: on RP2040 their action masks read 0
   (unavailable), the same convention as `ADAT_ACTIVE`.
 
-### 11.3 v2 -> v3 (caps version 3, directory V11)
+### 11.5 v2 -> v3 (caps version 3, directory V11)
 
 - **Stored configs migrate automatically.** A V10 directory migrates to V11
   on first boot by appending the (empty) IR command table; bindings and
@@ -1354,7 +1378,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   version check and rebuilds a fresh directory (presets and CS config are
   lost); it does not misparse.
 
-### 11.4 v1 -> v2
+### 11.6 v1 -> v2
 
 - **Stored configs migrate automatically.** A device with a V8 directory (v1
   16-byte bindings, 8 slots) migrates on first boot: the 8 bindings carry
