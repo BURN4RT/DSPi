@@ -18,7 +18,7 @@ Format v2 supersedes the v1 (16-byte binding, 8 slots, 9 nouns) format
 described by earlier revisions of this document; see section 11 for the
 compatibility story.
 
-Caps v3 adds two things on top of v2 (section 11.1):
+Caps v3 adds two things on top of v2 (section 11.3):
 
 - **The IR remote component** (`CS_TYPE_IR`): one binding slot holds a
   demodulating IR receiver on one GPIO, and up to 8 learned remote-button
@@ -31,7 +31,7 @@ Caps v3 adds two things on top of v2 (section 11.1):
   flash write and `REQ_CS_REVERT` reloads the stored one. Section 3.5.
 
 Caps v4 adds 14 nouns and one unit on top of v3, with no structure or
-stored-config changes (section 11.1): the stereo upmixer (35-40, RP2350
+stored-config changes (section 11.2): the stereo upmixer (35-40, RP2350
 only), psychoacoustic bass (41-46), per-output delay (47, using the new
 `CS_UNIT_MS`), and a preset-reload trigger (48).
 
@@ -135,7 +135,7 @@ physical component, one or two pins. All of a remote's buttons arrive on one
 receiver pin, so modelling each button as a binding would burn a slot's worth
 of bookkeeping per button for no extra hardware. Instead `CS_TYPE_IR` occupies
 **one** binding slot (the receiver: pin plus idle sense) and its buttons are
-**commands** in a separate table of `CS_MAX_IR_COMMANDS` (8) sub-slots. A
+**commands** in a separate table of `CS_MAX_IR_COMMANDS` (16) sub-slots. A
 command is semantically a button-shaped binding (same nouns, same actions
 `INC`/`DEC`/`TOGGLE`/`SET`/`TRIGGER`/`MOMENTARY`, same value/step rules) fired
 by a learned code instead of a GPIO edge, and it dispatches through exactly
@@ -242,12 +242,12 @@ the firmware stores and what `REQ_GET_ALL_PARAMS` does **not** contain.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `caps_version` | capability format version (5) |
+| 0 | 1 | `caps_version` | capability format version (6) |
 | 1 | 1 | `max_bindings` | `CS_MAX_BINDINGS` (16) |
 | 2 | 1 | `type_count` | `CS_TYPE_COUNT` (8); the type table has this many entries, indexed by `CsType` |
 | 3 | 1 | `noun_count` | `CS_NOUN_COUNT` (49) |
 | 4 | 32 | `types[8]` | eight `CsTypeDesc`, one per `CsType` including index 0 (`NONE`, all-zero) |
-| 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (8) |
+| 36 | 1 | `max_ir_commands` | `CS_MAX_IR_COMMANDS` (16) |
 | 37 | 3 | `reserved[3]` | 0 |
 
 Total `4 + 4*8 + 4 = 40` bytes. The v3 tail fields sit **after** the
@@ -275,7 +275,7 @@ Returned by `REQ_GET_CS_CAPS` with `wValue = noun index` (0-48).
 | 10 | 1 | `target_count` | valid `target` values `0..target_count-1`; 0 when untargeted |
 | 11 | 1 | `dflags` | `CS_NDF_DEFERRED` (`0x01`): apply is deferred; the engine steps from a target shadow (7.2) |
 
-### 2.6 `CsStatusPacket` (32 bytes)
+### 2.6 `CsStatusPacket` (41 bytes)
 
 Returned by `REQ_GET_CS_STATUS`.
 
@@ -287,9 +287,9 @@ Returned by `REQ_GET_CS_STATUS`.
 | 3 | 1 | `dirty` | 1 = the live config differs from flash (an unsaved preview; section 3.5) |
 | 4 | 2 | `active_mask` (uint16) | bit N = binding N is live |
 | 6 | 16 | `slot_status[16]` | per-slot apply status; `PIN_CONFIG_SUCCESS` (0) when live, else the failure code |
-| 22 | 1 | `ir_active_mask` | bit N = IR command N is live (valid, learned, and the IR component is up) |
-| 23 | 1 | `ir_learn_state` | `CS_IR_LEARN_*`: 0 idle, 1 armed (listening), 2 done (result available), 3 timeout |
-| 24 | 8 | `ir_cmd_status[8]` | per-sub-slot apply status, same codes as `slot_status` |
+| 22 | 2 | `ir_active_mask` (uint16) | bit N = IR command N is live (valid, learned, and the IR component is up) |
+| 24 | 1 | `ir_learn_state` | `CS_IR_LEARN_*`: 0 idle, 1 armed (listening), 2 done (result available), 3 timeout |
+| 25 | 16 | `ir_cmd_status[16]` | per-sub-slot apply status, same codes as `slot_status` |
 
 ### 2.7 `IrCommand` (16 bytes)
 
@@ -331,16 +331,17 @@ Two occupied sub-slots may carry the **same** protocol+code: one remote
 button then fires several commands at once (e.g. set a preset and switch the
 input). This is deliberate.
 
-### 2.8 `CsIrConfig` (132 bytes)
+### 2.8 `CsIrConfig` (260 bytes)
 
-The device-global persisted IR command table (directory V11), beside
+The device-global persisted IR command table (directory V11+; this format
+v2 layout since directory V17), beside
 `CsFlashConfig`. Not sent by any single command.
 
 | Off | Size | Field | Meaning |
 |----|------|-------|---------|
-| 0 | 1 | `version` | `CS_IR_CONFIG_VERSION` (1) |
+| 0 | 1 | `version` | `CS_IR_CONFIG_VERSION` (2) |
 | 1 | 3 | `reserved[3]` | 0 |
-| 4 | 128 | `cmds[8]` | eight 16-byte `IrCommand` records |
+| 4 | 256 | `cmds[16]` | sixteen 16-byte `IrCommand` records |
 
 All-zero = every sub-slot empty = feature idle; a fresh directory needs no
 seeding. Like the binding table it survives preset changes and factory reset
@@ -355,11 +356,11 @@ and is not part of `WireBulkParams`.
 | `REQ_SET_CS_BINDING` | `0x84` | OUT | slot (0-15) | 24-byte `CsBinding` | none (deferred; poll `0x87`) |
 | `REQ_GET_CS_BINDING` | `0x85` | IN | slot (0-15) | - | 24-byte `CsBinding` (live) |
 | `REQ_GET_CS_CAPS` | `0x86` | IN | `0xFFFF` = header+types; else noun index | - | 40-byte `CsCapsHeader` or 12-byte `CsNounDesc` |
-| `REQ_GET_CS_STATUS` | `0x87` | IN | - | - | 32-byte `CsStatusPacket` |
+| `REQ_GET_CS_STATUS` | `0x87` | IN | - | - | 41-byte `CsStatusPacket` |
 | `REQ_SET_CS_NAME` | `0x8B` | OUT | slot (0-15) | 1-32 byte name | none (deferred; poll `0x87`) |
 | `REQ_GET_CS_NAME` | `0x8C` | IN | slot (0-15) | - | 32-byte NUL-terminated name (live) |
-| `REQ_SET_CS_IR_CMD` | `0x8D` | OUT | sub-slot (0-7) | 16-byte `IrCommand` | none (deferred; poll `0x87`) |
-| `REQ_GET_CS_IR_CMD` | `0x8E` | IN | sub-slot (0-7) | - | 16-byte `IrCommand` (live) |
+| `REQ_SET_CS_IR_CMD` | `0x8D` | OUT | sub-slot (0-15) | 16-byte `IrCommand` | none (deferred; poll `0x87`) |
+| `REQ_GET_CS_IR_CMD` | `0x8E` | IN | sub-slot (0-15) | - | 16-byte `IrCommand` (live) |
 | `REQ_CS_IR_LEARN` | `0x8F` | IN | 1 = arm, 0 = cancel, 2 = read result | - | 1 ack byte (arm/cancel) or 8-byte result (3.6.1) |
 | `REQ_CS_SAVE` | `0x9D` | IN | - | - | 1 ack byte (deferred; poll `0x87`) |
 | `REQ_CS_REVERT` | `0x9E` | IN | - | - | 1 ack byte (deferred; poll `0x87`) |
@@ -401,7 +402,7 @@ real result. The host learns the outcome by polling `REQ_GET_CS_STATUS` until
 poll (a few ms) is ample; the apply is GPIO/engine work only.
 
 If the slot index in `wValue` is out of range (binding slot `>= 16`, IR
-sub-slot `>= 8`), the handler records `CS_STATUS_INVALID_SLOT` immediately (no
+sub-slot `>= 16`), the handler records `CS_STATUS_INVALID_SLOT` immediately (no
 main-loop round trip) and no apply is queued. A payload shorter than the
 record size (24 or 16 bytes) records `CS_STATUS_INVALID_VALUE` immediately. A
 SET arriving while a previous SET of the same kind is still queued for the
@@ -1250,7 +1251,7 @@ are flash-persistent) and try the decoder before the hash fallback.
 
 - **16 bindings** (`CS_MAX_BINDINGS`). Slots are independent; a slot holds one
   component (or one gesture of a shared button). The IR component occupies
-  one slot and carries its own **8 command sub-slots** (`CS_MAX_IR_COMMANDS`);
+  one slot and carries its own **16 command sub-slots** (`CS_MAX_IR_COMMANDS`);
   one IR component per device.
 - **Pin conflicts** use the shared `ctrl_iface_check_pin()`: a pin must be a valid
   GPIO, not already claimed by an output, MCK, SPDIF/I2S RX, ADAT, DAC
@@ -1290,7 +1291,23 @@ are flash-persistent) and try the decoder before the hash fallback.
 
 ## 11. Compatibility
 
-### 11.0 v4 -> v5 (caps version 5, directory unchanged)
+### 11.0 v5 -> v6 (caps version 6, directory V17)
+
+- **Stored configs migrate automatically.** A V16 directory migrates to V17 on
+  first boot: `cs_ir` is the last directory member, so every earlier field keeps
+  its offset, the eight learned commands carry over verbatim, and sub-slots 8-15
+  start empty. Bindings and names are untouched.
+- **Response sizes grew.** `REQ_GET_CS_STATUS` returns 41 bytes: `ir_active_mask`
+  is now a uint16 at offset 22, pushing `ir_learn_state` to 24 and
+  `ir_cmd_status[16]` to 25. `REQ_GET_CS_CAPS` is unchanged at 40 bytes, but
+  `max_ir_commands` now reads 16.
+- Hosts must size the IR command list from `max_ir_commands` rather than assume
+  8, and must not read the status packet at the v5 offsets.
+- Firmware downgrade: an older firmware reading a V17 directory fails the version
+  check and rebuilds a fresh directory (presets and CS config are lost); it does
+  not misparse.
+
+### 11.1 v4 -> v5 (caps version 5, directory unchanged)
 
 - **No stored-config change and no structure size change.** The directory stays
   V11 and both caps and status structures keep their sizes; nothing migrates.
@@ -1304,7 +1321,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   remapped existing hosts and saved presets. A front panel is free to cycle the
   modes in any order it likes.
 
-### 11.1 v3 -> v4 (caps version 4, directory unchanged)
+### 11.2 v3 -> v4 (caps version 4, directory unchanged)
 
 - **No stored-config change.** The directory stays V11; bindings, IR commands,
   and names are byte-identical, so no migration runs and firmware
@@ -1318,7 +1335,7 @@ are flash-persistent) and try the decoder before the hash fallback.
 - The six upmixer nouns are RP2350-only: on RP2040 their action masks read 0
   (unavailable), the same convention as `ADAT_ACTIVE`.
 
-### 11.2 v2 -> v3 (caps version 3, directory V11)
+### 11.3 v2 -> v3 (caps version 3, directory V11)
 
 - **Stored configs migrate automatically.** A V10 directory migrates to V11
   on first boot by appending the (empty) IR command table; bindings and
@@ -1337,7 +1354,7 @@ are flash-persistent) and try the decoder before the hash fallback.
   version check and rebuilds a fresh directory (presets and CS config are
   lost); it does not misparse.
 
-### 11.3 v1 -> v2
+### 11.4 v1 -> v2
 
 - **Stored configs migrate automatically.** A device with a V8 directory (v1
   16-byte bindings, 8 slots) migrates on first boot: the 8 bindings carry

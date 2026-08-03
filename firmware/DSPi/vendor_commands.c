@@ -2393,7 +2393,7 @@ static bool vendor_handle_get(tusb_control_request_t const *req) {
             }
 
             case REQ_GET_CS_STATUS: {
-                // 32-byte snapshot: last SET result, dirty flag, per-slot
+                // 41-byte snapshot: last SET result, dirty flag, per-slot
                 // apply status, IR command status and learn state.
                 CsStatusPacket pkt;
                 control_surfaces_get_status(&pkt);

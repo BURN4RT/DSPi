@@ -42,6 +42,10 @@
  * delay noun uses.  No structure sizes change; the bump only signals the
  * new unit value to hosts.
  *
+ * Caps v6 doubles CS_MAX_IR_COMMANDS to 16.  CsStatusPacket grows to 41 bytes
+ * (16-bit ir_active_mask, 16-entry ir_cmd_status) and the persisted CsIrConfig
+ * to format v2; hosts must read max_ir_commands rather than assume 8.
+ *
  * See Documentation/Features/control_surfaces_spec.md.
  */
 
@@ -202,8 +206,8 @@ typedef enum {
 
 // IR remote control.  One CS_TYPE_IR binding (the receiver) may be live at a
 // time; its remote-button commands live in a separate table of sub-slots so
-// eight commands cost one binding slot and one GPIO.
-#define CS_MAX_IR_COMMANDS  8
+// the whole handset costs one binding slot and one GPIO.
+#define CS_MAX_IR_COMMANDS  16
 
 // IR code protocols (IrCommand.protocol).  Wire/flash-persistent values.
 // NONE marks an empty sub-slot.  NEC and RC5/RC6 are decoded properly (NEC
@@ -291,13 +295,14 @@ typedef struct __attribute__((packed)) {
 
 // IR command table, directory-persisted (device-global, V11+) beside
 // cs_config.  All-zero = every sub-slot empty; a fresh directory needs no
-// seeding (protocol 0 = CS_IR_PROTO_NONE).
-#define CS_IR_CONFIG_VERSION  1
+// seeding (protocol 0 = CS_IR_PROTO_NONE).  Format v2 grew the sub-slot count
+// from 8 to 16; the frozen v1 geometry lives in flash_storage.c.
+#define CS_IR_CONFIG_VERSION  2
 typedef struct __attribute__((packed)) {
     uint8_t   version;     // CS_IR_CONFIG_VERSION
     uint8_t   reserved[3];
     IrCommand cmds[CS_MAX_IR_COMMANDS];
-} CsIrConfig;              // 132 bytes
+} CsIrConfig;              // 260 bytes
 
 // Capability descriptors (REQ_GET_CS_CAPS).  wValue = 0xFFFF returns the
 // header + type table; wValue = noun index returns that noun's descriptor.
@@ -346,11 +351,11 @@ typedef struct __attribute__((packed)) {
     uint8_t  dirty;        // 1 = live config differs from flash (unsaved preview)
     uint16_t active_mask;  // bit N = binding N live
     uint8_t  slot_status[CS_MAX_BINDINGS];  // per-slot apply status
-    // v3 additions
-    uint8_t  ir_active_mask;   // bit N = IR command N live (component up)
+    // v3 additions (widened to 16 IR sub-slots at caps v6)
+    uint16_t ir_active_mask;   // bit N = IR command N live (component up)
     uint8_t  ir_learn_state;   // CS_IR_LEARN_*
     uint8_t  ir_cmd_status[CS_MAX_IR_COMMANDS];  // per-sub-slot apply status
-} CsStatusPacket;          // 32 bytes
+} CsStatusPacket;          // 41 bytes
 
 // Status codes.  0x00..0x05 reuse the shared PIN_CONFIG_* namespace
 // (config.h); Control Surfaces extends it from 0x10.

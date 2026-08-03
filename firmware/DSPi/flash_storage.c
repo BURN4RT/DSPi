@@ -372,6 +372,15 @@ typedef struct __attribute__((packed)) {
     CsBinding_v1  bindings[8];
 } CsFlashConfig_v1;                 // 132 bytes
 
+// Frozen pre-V17 IR command table (config format v1, 8 sub-slots); read by
+// every directory migration that predates V17.  IrCommand itself is unchanged,
+// so only the sub-slot count differs from the live CsIrConfig.
+typedef struct __attribute__((packed)) {
+    uint8_t   version;              // == 1
+    uint8_t   reserved[3];
+    IrCommand cmds[8];
+} CsIrConfig_v1;                    // 132 bytes
+
 // Historical 29-byte device-global IO config (directory V13), before the I2S
 // clock-pin mode fields were appended.  A strict prefix of the live
 // FlashOutputConfig; read only by the V13→V14 directory migration (prefix
@@ -566,6 +575,15 @@ typedef struct __attribute__((packed)) {
 // INDEPENDENT/WITH_PRESET model.  The V14→V15 migration reads the old layout
 // through FlashOutputConfig_v14 / PresetDirectory_v14 and seeds adat_input_pin
 // to 0xFF (the zero-fill 0 would misread as GPIO 0).
+//
+// V16 grows the device-global output_config by 1 byte (SPDIF input 4 pin:
+// spdif_rx_pin4); the zero-fill "unset" resolves to the platform default.
+//
+// V17 upgrades the embedded IR command table from format v1 to v2: the sub-slot
+// count grows from 8 to 16, so cs_ir grows from 132 to 260 bytes.  It is the
+// last directory member, so every earlier field keeps its offset; pre-V17
+// migrations read the old block through CsIrConfig_v1 and widen it with
+// cs_ir_from_v1(), leaving sub-slots 8..15 empty.
 typedef struct __attribute__((packed)) {
     uint32_t magic;                          // DIR_MAGIC
     uint16_t version;                        // Directory format version (4)
@@ -615,8 +633,9 @@ typedef struct __attribute__((packed)) {
 
     // V11 addition: Control Surfaces IR command table (learned remote-button
     // commands for the CS_TYPE_IR component).  Board-level / device-global like
-    // cs_config; all-zero = every sub-slot empty (feature idle).
-    CsIrConfig cs_ir;                        // 132 bytes
+    // cs_config; all-zero = every sub-slot empty (feature idle).  V17 grew this
+    // from 132 to 260 bytes (config format v2: 16 sub-slots).
+    CsIrConfig cs_ir;                        // 260 bytes
 } PresetDirectory;
 
 // Historical directory layout at V4, where output_config was the 20-byte
@@ -809,7 +828,7 @@ typedef struct __attribute__((packed)) {
     I2cCtrlConfig  i2c_ctrl;
     CsFlashConfig cs_config;                 // 388 bytes (current format v2)
     char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
-    CsIrConfig cs_ir;                        // 132 bytes
+    CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
 } PresetDirectory_v11;
 
 // Historical directory layout at V12, before the device-global output_config
@@ -836,7 +855,7 @@ typedef struct __attribute__((packed)) {
     I2cCtrlConfig  i2c_ctrl;
     CsFlashConfig cs_config;                 // 388 bytes (current format v2)
     char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
-    CsIrConfig cs_ir;                        // 132 bytes
+    CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
 } PresetDirectory_v12;
 
 // Historical directory layout at V13, before the I2S clock-pin mode fields grew
@@ -864,7 +883,7 @@ typedef struct __attribute__((packed)) {
     I2cCtrlConfig  i2c_ctrl;
     CsFlashConfig cs_config;                 // 388 bytes (current format v2)
     char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
-    CsIrConfig cs_ir;                        // 132 bytes
+    CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
 } PresetDirectory_v13;
 
 // Historical directory layout at V14, before the ADAT input fields grew the
@@ -891,7 +910,7 @@ typedef struct __attribute__((packed)) {
     I2cCtrlConfig  i2c_ctrl;
     CsFlashConfig cs_config;                 // 388 bytes (current format v2)
     char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
-    CsIrConfig cs_ir;                        // 132 bytes
+    CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
 } PresetDirectory_v14;
 
 // --- Preset Directory v15 (kept only for upgrade migration) ---
@@ -918,10 +937,49 @@ typedef struct __attribute__((packed)) {
     I2cCtrlConfig  i2c_ctrl;
     CsFlashConfig cs_config;                 // 388 bytes (current format v2)
     char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
-    CsIrConfig cs_ir;                        // 132 bytes
+    CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
 } PresetDirectory_v15;
 
-#define DIR_VERSION_CURRENT  16
+// --- Preset Directory v16 (kept only for upgrade migration) ---
+// Identical to the live layout except cs_ir is the frozen 132-byte
+// CsIrConfig_v1 (8 IR sub-slots) rather than the 260-byte v2.  output_config is
+// still the live type only because nothing has grown it since V16; the size
+// assert below pins that, and growing it means snapshotting a
+// FlashOutputConfig_v16 here first.
+typedef struct __attribute__((packed)) {
+    uint32_t magic;
+    uint16_t version;                        // == 16
+    uint16_t reserved;
+    uint32_t crc32;
+
+    uint8_t  startup_mode;
+    uint8_t  default_slot;
+    uint8_t  last_active_slot;
+    uint8_t  output_config_mode;
+    uint16_t slot_occupied;
+    uint8_t  master_volume_mode;
+    uint8_t  spdif_rx_pin;
+    float    master_volume_db;
+    char     slot_names[PRESET_SLOTS][PRESET_NAME_LEN];
+    DacHwMuteConfig dac_hw_mute;
+    FlashOutputConfig output_config;         // 35 bytes (current layout)
+    UartCtrlConfig uart_ctrl;
+    I2cCtrlConfig  i2c_ctrl;
+    CsFlashConfig cs_config;                 // 388 bytes (current format v2)
+    char cs_names[CS_MAX_BINDINGS][CS_NAME_LEN];  // 512 bytes
+    CsIrConfig_v1 cs_ir;                     // 132 bytes (frozen format v1)
+} PresetDirectory_v16;
+
+// The V16->V17 migration copies everything ahead of cs_ir with one memcpy, so
+// the two layouts must agree byte-for-byte up to that point.
+_Static_assert(offsetof(PresetDirectory_v16, cs_ir) == offsetof(PresetDirectory, cs_ir),
+               "V16 and V17 directories must share a byte-identical pre-cs_ir prefix");
+// Pins the on-flash V16 geometry, which the offset check above cannot: it would
+// still pass if a shared embedded struct grew on both sides at once.
+_Static_assert(sizeof(PresetDirectory_v16) == 1443,
+               "V16 directory geometry is frozen; snapshot any struct that grew");
+
+#define DIR_VERSION_CURRENT  17
 
 // The directory occupies exactly one flash sector; growth past it would
 // silently overrun into preset slot 0.
@@ -1215,6 +1273,7 @@ static void dir_sanitize_ctrl_iface(void);                            // defined
 static void dir_sanitize_cs_config(void);                             // defined below
 static void dir_sanitize_cs_ir(void);                                 // defined below
 static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src);  // defined below
+static void cs_ir_from_v1(CsIrConfig *dst, const CsIrConfig_v1 *src);            // defined below
 // Forward declaration — defined alongside validate_slot() in the SLOT
 // VALIDATION section.  collect_live_state() and migrate_legacy() use it
 // to compute the CRC byte range that matches whatever version they're
@@ -1489,6 +1548,33 @@ static bool dir_load_cache(void) {
         return true;
     }
 
+    if (flash_dir->version == 16) {
+        // V16 -> V17 migration.  V17 doubles the IR command table to 16
+        // sub-slots (CsIrConfig format v2), growing the directory's trailing
+        // cs_ir block from 132 to 260 bytes.  Everything before it is
+        // byte-identical, so copy the whole prefix and widen cs_ir; the new
+        // sub-slots start empty (CS_IR_PROTO_NONE).
+        const PresetDirectory_v16 *v16 = (const PresetDirectory_v16 *)flash_dir;
+        const uint8_t *v16_data_start = (const uint8_t *)&v16->startup_mode;
+        size_t v16_data_len = sizeof(PresetDirectory_v16) - offsetof(PresetDirectory_v16, startup_mode);
+        if (crc32(v16_data_start, v16_data_len) != v16->crc32) {
+            dir_cache_valid = false;
+            return false;
+        }
+        memset(&dir_cache, 0, sizeof(dir_cache));
+        // Header excluded: dir_flush() restamps magic/version/crc, and copying
+        // the old one would leave the cache reading V16 until it does.
+        memcpy(&dir_cache.startup_mode, v16_data_start,
+               offsetof(PresetDirectory_v16, cs_ir) - offsetof(PresetDirectory_v16, startup_mode));
+        cs_ir_from_v1(&dir_cache.cs_ir, &v16->cs_ir);
+        dir_sanitize_ctrl_iface();
+        dir_sanitize_cs_config();
+        dir_sanitize_cs_ir();
+        dir_cache_valid = true;
+        (void)dir_flush();   // persist at the current version
+        return true;
+    }
+
     if (flash_dir->version == 15) {
         // V15 -> V16 migration.  V16 grows the device-global output_config by
         // 1 byte (SPDIF input 4: spdif_rx_pin4).  Validate the v15 CRC, copy
@@ -1518,7 +1604,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v15->i2c_ctrl;
         dir_cache.cs_config          = v15->cs_config;
         memcpy(dir_cache.cs_names, v15->cs_names, sizeof(dir_cache.cs_names));
-        dir_cache.cs_ir              = v15->cs_ir;
+        cs_ir_from_v1(&dir_cache.cs_ir, &v15->cs_ir);
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
@@ -1558,7 +1644,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v14->i2c_ctrl;
         dir_cache.cs_config          = v14->cs_config;
         memcpy(dir_cache.cs_names, v14->cs_names, sizeof(dir_cache.cs_names));
-        dir_cache.cs_ir              = v14->cs_ir;
+        cs_ir_from_v1(&dir_cache.cs_ir, &v14->cs_ir);
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
@@ -1597,7 +1683,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v13->i2c_ctrl;
         dir_cache.cs_config          = v13->cs_config;
         memcpy(dir_cache.cs_names, v13->cs_names, sizeof(dir_cache.cs_names));
-        dir_cache.cs_ir              = v13->cs_ir;
+        cs_ir_from_v1(&dir_cache.cs_ir, &v13->cs_ir);
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
@@ -1637,7 +1723,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v12->i2c_ctrl;
         dir_cache.cs_config          = v12->cs_config;
         memcpy(dir_cache.cs_names, v12->cs_names, sizeof(dir_cache.cs_names));
-        dir_cache.cs_ir              = v12->cs_ir;
+        cs_ir_from_v1(&dir_cache.cs_ir, &v12->cs_ir);
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
@@ -1676,7 +1762,7 @@ static bool dir_load_cache(void) {
         dir_cache.i2c_ctrl           = v11->i2c_ctrl;
         dir_cache.cs_config          = v11->cs_config;
         memcpy(dir_cache.cs_names, v11->cs_names, sizeof(dir_cache.cs_names));
-        dir_cache.cs_ir              = v11->cs_ir;
+        cs_ir_from_v1(&dir_cache.cs_ir, &v11->cs_ir);
         dir_sanitize_ctrl_iface();
         dir_sanitize_cs_config();
         dir_sanitize_cs_ir();
@@ -2126,6 +2212,16 @@ static void cs_config_from_v1(CsFlashConfig *dst, const CsFlashConfig_v1 *src) {
         // event / target / index / reserved / reserved2 stay zero.
     }
     // slots 8..15 stay zero (CS_TYPE_NONE) from the memset.
+}
+
+// Widen a frozen format-v1 IR command table (8 sub-slots) to the current v2
+// layout (16).  Read by every pre-V17 directory migration.  IrCommand is
+// unchanged, so the learned commands copy verbatim; sub-slots 8..15 stay empty
+// (CS_IR_PROTO_NONE) from the memset.
+static void cs_ir_from_v1(CsIrConfig *dst, const CsIrConfig_v1 *src) {
+    memset(dst, 0, sizeof(*dst));
+    dst->version = CS_IR_CONFIG_VERSION;
+    for (int s = 0; s < 8; s++) dst->cmds[s] = src->cmds[s];
 }
 
 // Bound-check the directory's Control Surfaces config.  An implausible blob

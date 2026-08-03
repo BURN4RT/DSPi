@@ -241,13 +241,13 @@ extern volatile uint32_t nominal_feedback_10_14;
 #define REQ_SET_CS_BINDING          0x84  // wValue = slot (0-15), payload = 24-byte CsBinding
 #define REQ_GET_CS_BINDING          0x85  // wValue = slot, returns 24-byte CsBinding
 #define REQ_GET_CS_CAPS             0x86  // wValue = 0xFFFF: header + type table; wValue = noun: 12-byte noun descriptor
-#define REQ_GET_CS_STATUS           0x87  // returns 22-byte CsStatusPacket
+#define REQ_GET_CS_STATUS           0x87  // returns 41-byte CsStatusPacket
 // 0x88-0x8A reserved (claimed by the I2S slave-mode branch)
 #define REQ_SET_CS_NAME             0x8B  // wValue = slot (0-15), payload = 1-32 byte name (a single
                                           // NUL byte clears it); apply-live-only preview, deferred,
                                           // result via REQ_GET_CS_STATUS
 #define REQ_GET_CS_NAME             0x8C  // wValue = slot, returns 32-byte NUL-terminated live name
-#define REQ_SET_CS_IR_CMD           0x8D  // wValue = sub-slot (0-7), payload = 16-byte IrCommand;
+#define REQ_SET_CS_IR_CMD           0x8D  // wValue = sub-slot (0-15), payload = 16-byte IrCommand;
                                           // apply-live-only preview, deferred to the main loop
 #define REQ_GET_CS_IR_CMD           0x8E  // wValue = sub-slot, returns 16-byte IrCommand
 #define REQ_CS_IR_LEARN             0x8F  // GET; wValue 1 = arm, 0 = cancel (each returns 1 status

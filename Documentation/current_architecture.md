@@ -1425,10 +1425,10 @@ Last 12 sectors (48 KB) of flash:
 | 1-10 | -44 KB to -8 KB | `0x44535033` ("DSP3") | Preset Slots 0-9 (full DSP state) |
 | 11 | -4 KB | `0x44535031` ("DSP1") | Legacy sector (migration source) |
 
-### Preset Directory Fields (Version 11)
-*Last updated: 2026-07-07 (V11 appends the Control Surfaces IR command table)*
+### Preset Directory Fields (Version 17)
+*Last updated: 2026-08-04 (V17 doubles the Control Surfaces IR command table to 16 sub-slots)*
 
-`DIR_VERSION_CURRENT` = 11. V4 renamed the former `include_pins` byte to
+`DIR_VERSION_CURRENT` = 17. V4 renamed the former `include_pins` byte to
 `output_config_mode` (same offset, 1:1 value mapping) and appended the
 device-global `FlashOutputConfig` block. V5 grew that block by 3 bytes for the
 I2S multichannel input pins (`i2s_rx_pin_ext[3]`). V6 appends the device-level
@@ -1470,8 +1470,20 @@ new block zeroed (every sub-slot empty = feature idle).
 `dir_sanitize_cs_ir()` bounds-checks it on load like `dir_sanitize_cs_config`.
 The Control Surfaces bindings and IR table are persisted together in one
 write by `preset_set_cs_all` (the `REQ_CS_SAVE` path; per-binding SETs no
-longer persist). This growth makes
-`sizeof(PresetDirectory)` 1433 bytes (1301 at V10, 789 at V9), still within
+longer persist). V12 through V16 each grow the embedded `output_config`
+(optional SPDIF inputs 2/3, I2S clock mode, I2S clock-pin mode, ADAT input,
+SPDIF input 4 pin); each has a frozen `PresetDirectory_vN` snapshot and a
+prefix-memcpy widening step, with the zero-filled tail bytes chosen so they
+mean "legacy default". V17 upgrades the IR command table from format v1 (132
+bytes: 8 sub-slots) to v2 (260 bytes: 16), doubling the learnable remote
+buttons. `cs_ir` is the last directory member, so no earlier field moves: the
+V16->V17 step validates the V16 CRC (frozen `PresetDirectory_v16` snapshot),
+copies the whole pre-`cs_ir` prefix in one memcpy (guarded by a `_Static_assert`
+that the two prefixes match), and widens the block via `cs_ir_from_v1()`, which
+carries the 8 learned commands over verbatim and leaves sub-slots 8-15 empty.
+Every pre-V17 migration reads the old block through the frozen `CsIrConfig_v1`
+and widens it the same way. This growth makes
+`sizeof(PresetDirectory)` 1571 bytes (1443 at V16, 1433 at V11), still within
 the single 4 KB directory sector. See
 `Documentation/Features/output_config_independent_load.md`,
 `Documentation/Features/control_interfaces_spec.md`, and
@@ -1494,7 +1506,7 @@ the single 4 KB directory sector. See
 | i2c_ctrl | I2C target control-interface config (V6+, 8 bytes; `enabled=0` by default; survives factory reset) |
 | cs_config | Control Surfaces bindings (V7 format v1 = 132 B / 8x 16-byte; V9 format v2 = 388-byte `CsFlashConfig`: version + 16x 24-byte `CsBinding`; all-zero = idle; board-level, survives factory reset) |
 | cs_names[16][32] | Per-slot Control Surfaces names (V10+): 32-byte NUL-terminated user labels, independent of the bindings; all-zero = unnamed; board-level, survives factory reset |
-| cs_ir | Control Surfaces IR command table (V11+, 132-byte `CsIrConfig`: version + 8x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
+| cs_ir | Control Surfaces IR command table (V11 format v1 = 132 B / 8x 16-byte; V17 format v2 = 260-byte `CsIrConfig`: version + 16x 16-byte `IrCommand`; all-zero = every sub-slot empty = idle; board-level, survives factory reset) |
 
 ### Preset Slot Data (Version 12)
 *Last updated: 2026-07-19 (upmixer presence byte, slot V34; `SLOT_DATA_VERSION` now 34)*
@@ -1747,7 +1759,7 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 ---
 
 ## RP2040 vs RP2350 Comparison
-*Last updated: 2026-08-01 (upmixer centre OFF mode; wire version row now V27, caps v5)*
+*Last updated: 2026-08-04 (Control Surfaces caps v6; IR sub-slots 8 -> 16 on both platforms)*
 
 ### Hardware
 
@@ -1759,7 +1771,8 @@ Core 1 runs sigma-delta modulation loop, popping samples from ring buffer and wr
 | DCP | N/A | Double-precision coprocessor |
 | VREG | 1.20V (for OC) | 1.10V |
 | UART + I2C external control | Yes (identical) | Yes (identical) |
-| Control Surfaces nouns (caps v5) | 49 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 49, all usable |
+| Control Surfaces nouns (caps v6) | 49 in table, `ADAT_ACTIVE` + the 6 upmixer nouns unusable (empty action mask) | 49, all usable |
+| Control Surfaces IR sub-slots | 16 (`CS_MAX_IR_COMMANDS`) | 16 (identical) |
 | Binary type | `default` (XIP) | `default` (XIP) |
 | Cold code location (control paths, storage, coeff design, init) | Flash XIP | Flash XIP |
 | RAM code+rodata+data (.data) | 44,376 B (was 108,692 under copy_to_ram) | 48,688 B (was 147,332 under copy_to_ram) |
@@ -2315,7 +2328,7 @@ format version is unchanged by this feature.
 ---
 
 ## Control Surfaces (User-Wired Physical Controls)
-*Last updated: 2026-07-25 (IR hold vs re-press: RC5/RC6 toggle bit + repeat-frame handset detection lift the 250 ms tap-rate cap)*
+*Last updated: 2026-08-04 (caps v6: IR sub-slots 8 -> 16)*
 
 User-wired push buttons, toggle switches, potentiometers, quadrature rotary
 encoders, plain indicator LEDs, PWM-dimmed LEDs, and an IR remote receiver on
@@ -2369,13 +2382,21 @@ noun descriptor need no change; the bump is for hosts that hard-code the mode
 labels. `Off` is value 2 rather than 0 because the vendor enum could not be
 renumbered without silently remapping existing hosts and saved presets.
 
+**Caps v6** (2026-08-04) doubles `CS_MAX_IR_COMMANDS` from 8 to 16, so one
+receiver can carry a whole handset. `CsIrConfig` grows to format v2 (260 B),
+bumping the directory to V17; `CsStatusPacket` grows to 41 B, with
+`ir_active_mask` widened to a uint16 in place (offset 22), which pushes
+`ir_learn_state` to 24 and `ir_cmd_status[16]` to 25. `CsCapsHeader` keeps its
+40 bytes and its `max_ir_commands` field now reads 16; hosts must size the
+command list from it rather than assume 8.
+
 ### File layout
 
 - `control_surfaces.c` / `.h`: the engine and the wire/flash data model
   (`CsBinding` 24 B, `CsFlashConfig` 388 B, `IrCommand` 16 B, `CsIrConfig`
-  132 B, `CsCapsHeader` 40 B, `CsNounDesc` 12 B, `CsStatusPacket` 32 B, with a
-  `uint16_t active_mask` for the 16 slots and a `uint8_t ir_active_mask` for
-  the 8 IR sub-slots).
+  260 B, `CsCapsHeader` 40 B, `CsNounDesc` 12 B, `CsStatusPacket` 41 B, with a
+  `uint16_t active_mask` for the 16 slots and a `uint16_t ir_active_mask` for
+  the 16 IR sub-slots).
   The type-capability table and the noun-descriptor table (`cs_noun_table`, in
   `control_surfaces_nouns.c`) are the single source of truth for the validity
   model and are served verbatim by `REQ_GET_CS_CAPS`, so host UIs and firmware
@@ -2489,7 +2510,8 @@ adds `CS_STATUS_IR_IN_USE` (0x1D, a second IR component) and
 
 One binding slot holds the receiver (one GPIO; `CS_FLAG_INVERT` = idle-low
 module; every other binding field must be 0; single instance). Its remote
-buttons are up to 8 `IrCommand` sub-slots in a separate table: button-subset
+buttons are up to `CS_MAX_IR_COMMANDS` (16) `IrCommand` sub-slots in a
+separate table: button-subset
 noun/action records (INC/DEC/TOGGLE/SET/TRIGGER/MOMENTARY, WRAP/REPEAT flags)
 fired by a learned `{protocol, code}` pair instead of a GPIO edge, validated
 against the same caps masks and dispatched through the same `cs_noun_dispatch`

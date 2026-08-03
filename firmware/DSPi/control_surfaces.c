@@ -115,7 +115,7 @@ volatile bool    cs_revert_pending = false;
 // ---------------------------------------------------------------------------
 
 static const CsCapsHeader s_caps = {
-    .caps_version = 5,
+    .caps_version = 6,
     .max_bindings = CS_MAX_BINDINGS,
     .type_count   = CS_TYPE_COUNT,
     .noun_count   = CS_NOUN_COUNT,
@@ -1235,33 +1235,40 @@ uint8_t control_surfaces_apply_binding(uint8_t slot, const CsBinding *nb) {
 // released the live state.  A stored entry that no longer validates is kept
 // visible (inactive) so the config survives round-trips; the failure is
 // reported in slot_status / ir_cmd_status.
-static void cs_load_stored(void) {
+// The 388-byte CsFlashConfig and 260-byte CsIrConfig snapshots are kept in
+// separate noinline frames: merged, they would sit on the 2 KB main stack at
+// once, above whatever depth the apply path below them needs.
+static void __attribute__((noinline)) cs_load_stored_bindings(void) {
     CsFlashConfig stored;
     preset_get_cs_config(&stored);
-    if (stored.version <= CS_CONFIG_VERSION) {   // future format stays idle
-        for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++) {
-            const CsBinding *b = &stored.bindings[slot];
-            if (b->type == CS_TYPE_NONE) continue;
-            uint8_t st = control_surfaces_apply_binding(slot, b);
-            if (st != PIN_CONFIG_SUCCESS) {
-                s_cfg.bindings[slot] = *b;
-                s_slot_status[slot] = st;
-            }
+    if (stored.version > CS_CONFIG_VERSION) return;   // future format stays idle
+    for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++) {
+        const CsBinding *b = &stored.bindings[slot];
+        if (b->type == CS_TYPE_NONE) continue;
+        uint8_t st = control_surfaces_apply_binding(slot, b);
+        if (st != PIN_CONFIG_SUCCESS) {
+            s_cfg.bindings[slot] = *b;
+            s_slot_status[slot] = st;
         }
     }
+}
 
+static void __attribute__((noinline)) cs_load_stored_ir(void) {
     CsIrConfig ir;
     preset_get_cs_ir_config(&ir);
-    if (ir.version <= CS_IR_CONFIG_VERSION) {
-        for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
-            const IrCommand *c = &ir.cmds[sub];
-            if (c->protocol == CS_IR_PROTO_NONE) continue;
-            uint8_t st = cs_validate_ir_cmd(c);
-            s_ir.cmds[sub] = *c;
-            s_ir_cmd_status[sub] = st;
-        }
+    if (ir.version > CS_IR_CONFIG_VERSION) return;
+    for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
+        const IrCommand *c = &ir.cmds[sub];
+        if (c->protocol == CS_IR_PROTO_NONE) continue;
+        uint8_t st = cs_validate_ir_cmd(c);
+        s_ir.cmds[sub] = *c;
+        s_ir_cmd_status[sub] = st;
     }
+}
 
+static void cs_load_stored(void) {
+    cs_load_stored_bindings();
+    cs_load_stored_ir();
     for (uint8_t slot = 0; slot < CS_MAX_BINDINGS; slot++)
         preset_get_cs_name(slot, s_names[slot]);
 }
@@ -1416,7 +1423,7 @@ void control_surfaces_get_status(CsStatusPacket *out) {
     out->ir_active_mask = 0;
     out->ir_learn_state = cs_ir_learn_state();
     for (uint8_t sub = 0; sub < CS_MAX_IR_COMMANDS; sub++) {
-        if (cs_ir_cmd_live(sub)) out->ir_active_mask |= (uint8_t)(1u << sub);
+        if (cs_ir_cmd_live(sub)) out->ir_active_mask |= (uint16_t)(1u << sub);
         out->ir_cmd_status[sub] = s_ir_cmd_status[sub];
     }
 }
