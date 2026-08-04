@@ -858,7 +858,8 @@ typedef struct {
 //     8       FILTER_ALLPASS1  first-order all-pass
 //     9..10   FILTER_LOWSHELF1, FILTER_HIGHSHELF1  first-order shelves
 //     11      FILTER_LINKWITZ_TRANSFORM  pole/zero bass-extension biquad
-//     12..31  reserved for future PEQ types (the PEQ block is everything
+//     12..13  FILTER_LOWPASS1, FILTER_HIGHPASS1  first-order low/high pass
+//     14..31  reserved for future PEQ types (the PEQ block is everything
 //             below FILTER_XOVER_FIRST; see filter_is_peq_type())
 //     32..63  crossover types  FILTER_XOVER_FIRST .. FILTER_XOVER_LAST
 //     64..    reserved for future crossover types (they must stay contiguous
@@ -889,7 +890,10 @@ enum FilterType {
     // see peq_qp_x512[] and Documentation/Features/peq_filters.md.
     FILTER_LINKWITZ_TRANSFORM = 11,
 
-    // First order low/highpass
+    // First-order low/high pass: single-pole 6 dB/oct rolloff, -3 dB at the
+    // corner, no resonance.  Single parameter (freq); Q and gain are unused.
+    // Same hybrid rule as the other 1st-order types: one-pole SVF below
+    // Fs/7.5, degenerate biquad above (and always on RP2040).
     FILTER_LOWPASS1 = 12,
     FILTER_HIGHPASS1 = 13,
 

@@ -1,6 +1,6 @@
 # Crossover Filters Specification
 
-*Last updated: 2026-06-17*
+*Last updated: 2026-08-04*
 
 ## Purpose
 
@@ -48,7 +48,9 @@ Crossovers apply only to **output channels**. Master channels (`CH_MASTER_LEFT=0
 - **0–7** core PEQ types: FLAT, PEAKING, LOWSHELF, HIGHSHELF, LOWPASS, HIGHPASS, NOTCH, ALLPASS (the second-order RBJ all-pass).
 - **8** `FILTER_ALLPASS1` — first-order all-pass (a PEQ type). Flat magnitude, phase 0° → -180° (-90° at the corner freq); single parameter (`freq`), `Q` and `gain_db` unused.
 - **9–10** `FILTER_LOWSHELF1`, `FILTER_HIGHSHELF1` — first-order shelves (PEQ types, added 2026-06-20). Gentle 6 dB/oct shelf, monotonic, no `Q`; parameters `freq` + `gain_db`.
-- **11–31** reserved for future PEQ types.
+- **11** `FILTER_LINKWITZ_TRANSFORM`: Linkwitz Transform (PEQ type, added 2026-07-12). Pole/zero bass-extension biquad; the only PEQ type needing four parameters, so it repurposes `gain_db` and carries a `Qp` sidecar. See [`peq_filters.md`](peq_filters.md).
+- **12–13** `FILTER_LOWPASS1`, `FILTER_HIGHPASS1`: first-order low/high pass (PEQ types, added 2026-07-27). Single-pole 6 dB/oct rolloff, -3 dB at the corner, no resonance; single parameter (`freq`), `Q` and `gain_db` unused.
+- **14–31** reserved for future PEQ types.
 - **32–63** crossover types (table below).
 - **64+** reserved for future crossover types; they must stay contiguous from `FILTER_XOVER_FIRST` because `xover_type_table[]` is indexed by `type - FILTER_XOVER_FIRST`.
 

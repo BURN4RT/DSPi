@@ -1,6 +1,6 @@
 # PEQ Filters: Host Integration Specification
 
-*Last updated: 2026-07-12*
+*Last updated: 2026-08-04*
 
 This document is the complete host-side reference for the DSPi parametric EQ
 (PEQ) system: every filter type, every parameter, and every wire interface an
@@ -72,7 +72,9 @@ sample-rate change), so send in-range values.
 | 9  | LOWSHELF1 | 1 | corner | ignored | shelf dB | First-order (6 dB/oct) low shelf, monotonic. |
 | 10 | HIGHSHELF1 | 1 | corner | ignored | shelf dB | First-order high shelf. |
 | 11 | LINKWITZ_TRANSFORM | 2 | **f0** | **Q0** | **fp (Hz)** | Pole/zero bass-extension biquad, see section 3. |
-| 12..31 | reserved | | | | | Rejected as flat by current firmware. |
+| 12 | LOWPASS1 | 1 | corner | ignored | ignored | First-order (6 dB/oct) low pass; unity at DC, -3 dB at the corner, no resonance. |
+| 13 | HIGHPASS1 | 1 | corner | ignored | ignored | First-order (6 dB/oct) high pass; -3 dB at the corner, no resonance. |
+| 14..31 | reserved | | | | | Rejected as flat by current firmware. |
 
 Gain-based types (1, 2, 3, 9, 10) treat |gain| < 0.01 dB as flat. Shelf gain
 follows the RBJ convention `A = 10^(gain_db/40)`; the dB value you send is

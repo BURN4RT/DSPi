@@ -281,7 +281,7 @@ When the PDM subwoofer is active, Core 1 is fully dedicated to the delta-sigma m
 
 ### Parametric Equalization
 
-Each band can be set to any of these 11 types. Every type uses a corner/center **frequency**; **Q** and **gain** apply only where listed (other types ignore them).
+Each band can be set to any of these 14 types. Every type uses a corner/center **frequency**; **Q** and **gain** apply only where listed (other types ignore them).
 
 | Type | Order | Parameters | Description |
 |------|-------|------------|-------------|
@@ -296,6 +296,9 @@ Each band can be set to any of these 11 types. Every type uses a corner/center *
 | First-Order All-Pass | 1st | freq | Flat magnitude; rotates phase 0 to -180 deg (-90 deg at freq) |
 | First-Order Low Shelf | 1st | freq, gain | Gentle 6 dB/oct low shelf; monotonic, no Q or overshoot |
 | First-Order High Shelf | 1st | freq, gain | Gentle 6 dB/oct high shelf; monotonic, no Q or overshoot |
+| Linkwitz Transform | 2nd | freq (f0), Q (Q0), gain (fp in Hz), target Q | Replaces a driver's measured sealed-box rolloff (f0, Q0) with a target alignment (fp, Qp) for bass extension; see [PEQ filters](Documentation/Features/peq_filters.md) |
+| First-Order Low Pass | 1st | freq | Gentle 6 dB/oct rolloff above freq; -3 dB at freq, no resonance |
+| First-Order High Pass | 1st | freq | Gentle 6 dB/oct rolloff below freq; -3 dB at freq, no resonance |
 
 Frequency ranges from 10 Hz to 0.45xFs; Q from 0.1 to 20. First-order types are single-pole (6 dB/oct) and have no resonance.
 
