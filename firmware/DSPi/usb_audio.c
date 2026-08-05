@@ -35,6 +35,7 @@
 
 #include "usb_audio.h"
 #include "audio_pipeline.h"
+#include "adat_output.h"
 #include "usb_descriptors.h"
 #include "dsp_pipeline.h"
 #include "dcp_inline.h"
@@ -50,6 +51,7 @@
 #include "vendor_commands.h"
 #include "audio_input.h"
 #include "lg_sound_sync.h"
+#include "loopback.h"   // DSPI_LOOPBACK capture driver (self-guarded; empty otherwise)
 
 #include <stddef.h>  // offsetof
 
@@ -63,9 +65,30 @@ volatile SystemStatusPacket global_status = {0};
 
 volatile bool eq_update_pending = false;
 volatile EqParamPacket pending_packet;
+// Linkwitz Transform target Qp (Q*512); latched with pending_packet, consumed by the eq_update_pending handler.
+volatile uint16_t pending_eq_qp_x512 = 0;
 volatile bool rate_change_pending = false;
 volatile uint32_t pending_rate = 48000;
 volatile bool bulk_params_pending = false;
+
+// UAC1 endpoint state is retained while USB is a decorative, inactive source;
+// audio_state.freq remains the rate actually applied to the live pipeline.
+static volatile uint32_t usb_selected_rate = 44100u;
+
+uint32_t usb_audio_get_selected_rate(void) {
+    return usb_selected_rate;
+}
+
+// Record the host's endpoint rate unconditionally, but only retune the live
+// pipeline when USB currently owns it.  The main loop performs the retune.
+static void usb_audio_set_selected_rate(uint32_t rate) {
+    usb_selected_rate = rate;
+    if (active_input_source != INPUT_SOURCE_USB || rate == audio_state.freq) return;
+
+    pending_rate = rate;
+    __dmb();
+    rate_change_pending = true;
+}
 
 // Output type switching — deferred to main loop (needs heap allocation).
 // Per-slot bitmask supports back-to-back requests without dropping any.
@@ -144,6 +167,16 @@ volatile bool dac_hw_mute_test_pending = false;
 // into the directory's independent field.  Value is read at dispatch time.
 volatile bool flash_save_master_volume_pending = false;
 
+// Deferred UART / I2C control-interface config (USB-only commands).  Main
+// loop validates, applies live (GPIO/IRQ work), and persists to the
+// directory; the status bytes back REQ_GET_CTRL_IFACE_STATUS.
+volatile bool ctrl_set_uart_pending = false;
+UartCtrlConfig ctrl_set_uart_val;
+volatile uint8_t ctrl_uart_last_status = PIN_CONFIG_SUCCESS;
+volatile bool ctrl_set_i2c_pending = false;
+I2cCtrlConfig ctrl_set_i2c_val;
+volatile uint8_t ctrl_i2c_last_status = PIN_CONFIG_SUCCESS;
+
 // Deferred SPDIF RX hot-swap. Set when the spdif_rx_pin live global is
 // updated (by vendor command, bulk params apply, or preset load) while
 // INPUT_SOURCE_SPDIF is active — main loop bridges the stop/start
@@ -207,6 +240,7 @@ volatile bool loudness_enabled = false;
 volatile float loudness_ref_spl = 87.0f;
 volatile float loudness_intensity_pct = 100.0f;
 volatile bool loudness_recompute_pending = false;
+volatile uint16_t loudness_output_mask = LOUDNESS_DEFAULT_OUTPUT_MASK;
 
 const LoudnessCoeffs *volatile current_loudness_coeffs = NULL;
 
@@ -223,10 +257,10 @@ volatile CrossfeedConfig crossfeed_config = {
     .itd_enabled = true,
     .preset = CROSSFEED_PRESET_DEFAULT,
     .custom_fc = 700.0f,
-    .custom_feed_db = 4.5f
+    .custom_feed_db = 4.5f,
+    .output_pair_mask = 0x01  // Default: pair 1 only (outputs 0/1)
 };
 volatile bool crossfeed_update_pending = false;
-volatile bool crossfeed_bypassed = true;  // Fast bypass flag for audio callback
 
 // Volume Leveller state
 volatile LevellerConfig leveller_config = {
@@ -235,7 +269,9 @@ volatile LevellerConfig leveller_config = {
     .speed = LEVELLER_DEFAULT_SPEED,
     .max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB,
     .lookahead = LEVELLER_DEFAULT_LOOKAHEAD,
-    .gate_threshold_db = LEVELLER_DEFAULT_GATE_DB
+    .gate_threshold_db = LEVELLER_DEFAULT_GATE_DB,
+    .detector_mask = LEVELLER_DEFAULT_DETECTOR_MASK,
+    .apply_mask = LEVELLER_DEFAULT_APPLY_MASK
 };
 volatile bool leveller_update_pending = false;
 volatile bool leveller_reset_pending = false;
@@ -250,17 +286,36 @@ void get_default_channel_name(int ch, uint8_t input_source,
     if (ch < 0 || ch >= NUM_CHANNELS) return;
 
     if (ch < NUM_INPUT_CHANNELS) {
-        const char *prefix;
-        switch (input_source) {
-            case INPUT_SOURCE_SPDIF: prefix = "SPDIF"; break;
-            case INPUT_SOURCE_USB:   /* fallthrough */
-            default:                 prefix = "USB";   break;
+        // Input channel names follow each source's natural model:
+        //   USB   - discrete channels: "USB 1" .. "USB 8".  A USB stream's
+        //           channels are independent, not stereo pairs, so they are
+        //           numbered per channel with no L/R.
+        //   I2S   - stereo pairs: "I2S 1 L", "I2S 1 R", "I2S 2 L", ... (matches
+        //           the output naming style; I2S input can be 1..4 pairs).
+        //   SPDIF - a single stereo pair: "SPDIF L" / "SPDIF R".
+        //   ADAT  - 8 discrete channels: "ADAT 1" .. "ADAT 8" (like USB).
+        if (input_source == INPUT_SOURCE_I2S) {
+            snprintf(buf, PRESET_NAME_LEN, "I2S %d %c",
+                     ch / 2 + 1, (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source_is_spdif(input_source)) {
+            // Input 1 keeps the historical bare "SPDIF L/R"; the optional
+            // inputs are numbered so the host can tell them apart.
+            uint8_t idx = spdif_index_for_source(input_source);
+            if (idx == 0)
+                snprintf(buf, PRESET_NAME_LEN, "SPDIF %c", (ch % 2 == 0) ? 'L' : 'R');
+            else
+                snprintf(buf, PRESET_NAME_LEN, "SPDIF %u %c",
+                         (unsigned)(idx + 1), (ch % 2 == 0) ? 'L' : 'R');
+        } else if (input_source == INPUT_SOURCE_ADAT) {
+            // ADAT lightpipe carries 8 discrete channels; number them like USB.
+            snprintf(buf, PRESET_NAME_LEN, "ADAT %d", ch + 1);
+        } else {  // USB (and any future per-channel source)
+            snprintf(buf, PRESET_NAME_LEN, "USB %d", ch + 1);
         }
-        snprintf(buf, PRESET_NAME_LEN, "%s %c", prefix, (ch == 0) ? 'L' : 'R');
         return;
     }
 
-    if (ch == NUM_CHANNELS - 1) {
+    if (ch == NUM_CHANNELS - 1) {   // PDM sub (last output)
         strncpy(buf, "PDM", PRESET_NAME_LEN - 1);
         return;
     }
@@ -289,9 +344,8 @@ void update_preamp(uint8_t ch, float db) {
     float linear = powf(10.0f, db / 20.0f);
     global_preamp_mul[ch]    = (int32_t)(linear * (float)(1 << 28));
     global_preamp_linear[ch] = linear;
-    notify_param_write(
-        (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float)),
-        sizeof(float), &db);
+    uint16_t off = (uint16_t)(offsetof(WireBulkParams, preamp.preamp_db) + ch * sizeof(float));
+    notify_param_write(off, sizeof(float), &db);
 }
 
 // Update the device-side master volume from a dB value.
@@ -389,7 +443,22 @@ volatile uint64_t start_time_us = 0;
 volatile bool sync_started = false;
 static volatile uint64_t last_packet_time_us = 0;
 static volatile uint8_t usb_input_bit_depth = 16;
+// Active USB input channel count: 2 for the stereo alts (1/2), or 4/6/8 for the
+// RP2350-only multichannel alts (3/4/5).  Read by the audio pipeline to size the
+// per-input EQ + metering and the matrix, and to bypass the stereo master chain
+// in multichannel mode.  Always 2 on RP2040 (no multichannel alts advertised).
+volatile uint8_t usb_input_channels = 2;
 #define AUDIO_GAP_THRESHOLD_US 50000  // 50ms - reset sync if packets stop this long
+
+// True while USB audio packets are actively arriving.  The in-band gap check
+// in process_audio_packet only fires on the NEXT packet, so a host that stops
+// streaming leaves sync_started latched; the test-signal pump needs a live
+// view to know when to take over pacing.
+bool usb_audio_stream_active(void) {
+    if (!sync_started) return false;
+    uint64_t last = last_packet_time_us;
+    return last > 0 && (time_us_64() - last) <= AUDIO_GAP_THRESHOLD_US;
+}
 
 // Consumer fill for instance 0 — used by watermark monitoring only
 // (no longer part of the active feedback path).
@@ -487,8 +556,19 @@ void audio_set_volume(int16_t volume) {
 static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint16_t data_len) {
     // USB format snapshot
     const uint8_t bit_depth = usb_input_bit_depth;  // snapshot once — avoid double-read of volatile
-    uint32_t bytes_per_frame = (bit_depth == 24) ? 6 : 4;
+    const uint8_t channels  = usb_input_channels;   // 2 (stereo alts) or 4/6/8 (multichannel alts)
+    // Multichannel alts are always 16-bit; stereo alts are 16- or 24-bit.
+    uint32_t bytes_per_frame = (channels > NUM_STEREO_INPUTS)
+                                   ? (uint32_t)channels * 2
+                                   : (bit_depth == 24) ? 6 : 4;
     uint32_t sample_count = data_len / bytes_per_frame;
+    // Clamp to the fixed decode-buffer depth.  The iso OUT EP is armed for
+    // AUDIO_EP_MAX_PKT (788 on RP2350 to fit 8-channel frames); a conformant
+    // host never sends more than ~1 ms of audio per frame (<=97 stereo / 49
+    // eight-channel samples), but a non-conformant host or USB anomaly could
+    // deliver a larger transfer.  Without this guard a 16-bit stereo packet of
+    // 788 B would decode 197 samples and overrun buf_l/buf_r[192].
+    if (sample_count > AUDIO_BUFFER_SAMPLES) sample_count = AUDIO_BUFFER_SAMPLES;
 
     // USB-specific gap detection + sync tracking
     // NOTE: USB packet gap detection has moved to _as_audio_packet() (ISR
@@ -511,7 +591,26 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
     // PASS 1: USB byte decode → buf_l/buf_r + preamp
 #if PICO_RP2350
     {
-        if (bit_depth == 24) {
+        if (channels > NUM_STEREO_INPUTS) {
+            // Multichannel USB input (4/6/8 ch, 48 kHz / 16-bit).  Frame layout
+            // is c0,c1,...,c(N-1) interleaved (stride = channels); channels 0/1
+            // land in buf_l/buf_r (the shared stereo bus), channels 2..N-1 in
+            // buf_in_ext.  Per-channel preamp applied here; the stereo master
+            // chain is bypassed downstream (process_input_block multichannel).
+            const int16_t *in = (const int16_t *)data;
+            const float inv_32768 = 1.0f / 32768.0f;
+            float gain[NUM_INPUT_CHANNELS];
+            for (int c = 0; c < channels; c++)
+                gain[c] = inv_32768 * global_preamp_linear[c];
+            for (uint32_t i = 0; i < sample_count; i++) {
+                const int16_t *frame = &in[i * channels];
+                buf_l[i] = (float)frame[0] * gain[0];
+                buf_r[i] = (float)frame[1] * gain[1];
+                for (int c = NUM_STEREO_INPUTS; c < channels; c++)
+                    buf_in_ext[c - NUM_STEREO_INPUTS][i] =
+                        (float)frame[c] * gain[c];
+            }
+        } else if (bit_depth == 24) {
             //     input 32 bit word to 24 bit output packing
             //        in0     in1      in2
             //     +-------+-------+-------+
@@ -645,6 +744,7 @@ static void __not_in_flash_func(process_audio_packet)(const uint8_t *data, uint1
 // Drain all pending packets from the ring, running the DSP pipeline for
 // each.  Called as the first operation in the main loop and before any
 // disruptive deferred operation (rate change, output type switch, etc.).
+DSP_TIME_CRITICAL
 void usb_audio_drain_ring(void) {
     usb_audio_slot_t *slot;
     while ((slot = usb_audio_ring_peek(&audio_ring)) != NULL) {
@@ -656,6 +756,7 @@ void usb_audio_drain_ring(void) {
 // Discard all pending ring data and reset gap-detection timestamp.
 // Used on stream stop/start transitions to flush stale packets from a
 // previous stream.
+DSP_TIME_CRITICAL
 void usb_audio_flush_ring(void) {
     usb_audio_ring_flush(&audio_ring);
     audio_ring_last_push_us = 0;
@@ -743,8 +844,21 @@ static const usbd_class_driver_t uac1_driver = {
 // here makes TinyUSB dispatch all interface/endpoint events for our AC+AS
 // interfaces through our callbacks.
 usbd_class_driver_t const *usbd_app_driver_get_cb(uint8_t *driver_count) {
+#ifdef DSPI_LOOPBACK
+    // Debug build: register the loopback capture driver alongside the playback
+    // driver.  TinyUSB iterates the returned array, so both driver structs must
+    // be contiguous; loopback_uac1_driver is defined in another TU and is not a
+    // constant initializer, so the array is filled at call time (this runs once
+    // during tud_init() and the static storage outlives the device).
+    static usbd_class_driver_t drivers[2];
+    drivers[0] = uac1_driver;
+    drivers[1] = loopback_uac1_driver;
+    *driver_count = 2;
+    return drivers;
+#else
     *driver_count = 1;
     return &uac1_driver;
+#endif
 }
 
 // ----------------------------------------------------------------------------
@@ -800,6 +914,13 @@ static uint16_t uac1_driver_open(uint8_t rhport, tusb_desc_interface_t const *it
     TU_VERIFY(itf_desc->bInterfaceClass == TUSB_CLASS_AUDIO);
     TU_VERIFY(itf_desc->bInterfaceSubClass == AUDIO_SUBCLASS_CONTROL);
     TU_VERIFY(itf_desc->bAlternateSetting == 0);
+#ifdef DSPI_LOOPBACK
+    // With the loopback capture function present there is a SECOND audio-control
+    // interface (ITF_NUM_LOOPBACK_AC).  Scope this driver to the playback AC
+    // interface so it doesn't claim — and hijack — the capture function; the
+    // loopback driver claims ITF_NUM_LOOPBACK_AC.
+    TU_VERIFY(itf_desc->bInterfaceNumber == ITF_NUM_AUDIO_CONTROL);
+#endif
 
     uac1.ac_itf = itf_desc->bInterfaceNumber;
 
@@ -883,9 +1004,13 @@ static inline void uac1_arm_feedback(uint8_t rhport) {
     usbd_edpt_xfer(rhport, AUDIO_IN_ENDPOINT, ep_fb_buf, 3);
 }
 
-// Open isochronous endpoints for the specified alt (1 or 2).
+// Open isochronous endpoints for the specified alt (1..5 on RP2350, 1..2 else).
 static bool uac1_open_stream_eps(uint8_t rhport, uint8_t alt) {
+#if PICO_RP2350
+    if (alt < 1 || alt > 5) return false;   // alts 3/4/5 = 4/6/8-channel input
+#else
     if (alt != 1 && alt != 2) return false;
+#endif
 
     const uint8_t *data_ep = usb_audio_data_ep_desc[alt - 1];
     const uint8_t *fb_ep   = usb_audio_fb_ep_desc[alt - 1];
@@ -966,10 +1091,11 @@ static void __not_in_flash_func(usb_notify_drain)(uint8_t rhport) {
     uint16_t len;
     bool consumed_ring_entry = false;
 
-    if (notify_has_pending()) {
+    if (notify_has_pending_for(NOTIFY_CONSUMER_USB)) {
         // Format the next queued event.  peek does NOT advance the tail;
         // we commit only after the xfer is accepted by DCD.
-        len = notify_peek_next(notify_buf, NOTIFY_EP_MAX_PKT);
+        len = notify_peek_next_for(NOTIFY_CONSUMER_USB, notify_buf,
+                                   NOTIFY_EP_MAX_PKT);
         consumed_ring_entry = (len > 0);
     } else {
         len = 0;
@@ -993,7 +1119,7 @@ static void __not_in_flash_func(usb_notify_drain)(uint8_t rhport) {
     // Xfer accepted.  Advance the ring tail only if this packet represented
     // a real event; idle keep-alives don't consume ring entries.
     if (consumed_ring_entry) {
-        notify_commit_pop();
+        notify_commit_pop_for(NOTIFY_CONSUMER_USB);
     }
 }
 
@@ -1008,9 +1134,14 @@ static void uac1_close_stream_eps(uint8_t rhport) {
     }
 }
 
-// Apply a new AS alt setting (0, 1, or 2). Mirrors the old as_set_alternate().
+// Apply a new AS alt setting.  Alts: 0 = zero-bw; 1 = 2ch/16; 2 = 2ch/24;
+// and (RP2350 only) 3 = 4ch, 4 = 6ch, 5 = 8ch (all 48 kHz / 16-bit).
 static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
+#if PICO_RP2350
+    if (alt > 5) return false;   // alts 3/4/5 = 4/6/8-channel input (RP2350 only)
+#else
     if (alt > 2) return false;
+#endif
 
     uint32_t prev_alt = usb_audio_alt_set;
 
@@ -1019,28 +1150,61 @@ static bool uac1_apply_alt(uint8_t rhport, uint8_t alt) {
     // pause in the stream and a risk of DCD state desync — bail early.
     if (alt == prev_alt) return true;
 
-    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;
+    uint8_t  new_bit_depth = (alt == 2) ? 24 : 16;  // only alt 2 is 24-bit
+    uint8_t  new_channels;
+    switch (alt) {
+#if PICO_RP2350
+        case 3:  new_channels = 4; break;
+        case 4:  new_channels = 6; break;
+        case 5:  new_channels = 8; break;
+#endif
+        default: new_channels = NUM_STEREO_INPUTS; break;  // alt 0/1/2 = stereo
+    }
     bool     bit_depth_changed = (new_bit_depth != usb_input_bit_depth);
-    // Any active→active transition (e.g. alt 1↔alt 2) needs the same
-    // mute/drain/feedback-reset treatment as a cold start (alt 0→>0).
-    // Otherwise stale consumer-pool audio plays out across the switch and
-    // a drifted feedback value is handed back to the host the instant the
-    // feedback EP re-arms, producing an audible click.
-    bool need_resync = (alt > 0) && (prev_alt == 0 || bit_depth_changed);
+    bool     channels_changed  = (new_channels != usb_input_channels);
+    bool     format_changed    = bit_depth_changed || channels_changed;
+    // Any active→active transition (e.g. alt 1↔alt 2, or a channel-count
+    // change) needs the same mute/drain/feedback-reset treatment as a cold
+    // start (alt 0→>0).  Otherwise stale consumer-pool audio plays out across
+    // the switch and a drifted feedback value is handed back to the host the
+    // instant the feedback EP re-arms, producing an audible click.
+    bool need_resync = (alt > 0) && (prev_alt == 0 || format_changed);
 
     usb_audio_alt_set = alt;
     uac1.cur_alt = alt;
     usb_input_bit_depth = new_bit_depth;
+    usb_input_channels  = new_channels;
 
-    // If the bit depth is changing, any packets still queued in the ring were
-    // encoded under the old format. Decoding them with the new bytes/frame
-    // assumption would misread sample counts and channel layout. Flush them.
-    if (bit_depth_changed) {
+    // If the format (bit depth or channel count) is changing, any packets still
+    // queued in the ring were encoded under the old layout. Decoding them with
+    // the new bytes/frame assumption would misread sample counts and channel
+    // layout. Flush them.
+    if (format_changed) {
         usb_audio_flush_ring();
     }
 
+    // Tell the host (DSPi Console) the active input channel count changed so it
+    // can relayout its mixer/sidebar immediately, without waiting for the next
+    // status poll.
+    if (channels_changed) {
+        notify_push_input_format(new_channels);
+    }
+
+#if PICO_RP2350
+    // Multichannel alts advertise 48 kHz only.  Retain that USB endpoint state
+    // while USB is inactive without disturbing the rate owned by another input.
+    if (new_channels > NUM_STEREO_INPUTS)
+        usb_audio_set_selected_rate(48000u);
+#endif
+
     bool active = (alt > 0);
     audio_spdif_set_starvation_monitoring(active);
+    audio_i2s_set_starvation_monitoring(active);
+#if PICO_RP2350
+    // ADAT slaves its silence insertion to slot 0's starvation counter while
+    // the stream is active (see adat_output.c).
+    adat_output_set_stream_active(active);
+#endif
     audio_ring_last_push_us = 0;
 
     if (active) {
@@ -1134,7 +1298,7 @@ static bool uac1_handle_ep_get(uint8_t rhport, tusb_control_request_t const *req
     uint8_t cs = TU_U16_HIGH(req->wValue);
     if (req->bRequest == UAC1_REQ_GET_CUR && cs == UAC1_EP_CTRL_SAMPLING_FREQ) {
         static uint8_t freq_bytes[3];
-        uint32_t f = audio_state.freq;
+        uint32_t f = usb_audio_get_selected_rate();
         freq_bytes[0] = (uint8_t)(f & 0xFF);
         freq_bytes[1] = (uint8_t)((f >> 8) & 0xFF);
         freq_bytes[2] = (uint8_t)((f >> 16) & 0xFF);
@@ -1270,20 +1434,25 @@ static bool uac1_driver_control_xfer_cb(uint8_t rhport, uint8_t stage, tusb_cont
                 // Accepting arbitrary values used to commit audio_state.freq
                 // to garbage that perform_rate_change() would silently
                 // coerce to 44100 — GET_CUR would then lie to the host.
-                bool rate_ok = (new_freq == 44100u ||
-                                new_freq == 48000u ||
-                                new_freq == 96000u);
+                bool rate_ok;
+#if PICO_RP2350
+                if (usb_input_channels > NUM_STEREO_INPUTS) {
+                    // Multichannel alts (4/6/8) advertise a single rate: 48 kHz.
+                    rate_ok = (new_freq == 48000u);
+                } else
+#endif
+                {
+                    rate_ok = (new_freq == 44100u ||
+                               new_freq == 48000u ||
+                               new_freq == 96000u);
+                }
                 if (!rate_ok) {
                     // Stall EP0 — per UAC1, unsupported control values
                     // must be rejected rather than silently clamped.
                     uac1.pending_recipient = 0;
                     return false;
                 }
-                if (new_freq != audio_state.freq) {
-                    audio_state.freq = new_freq;
-                    rate_change_pending = true;
-                    pending_rate = new_freq;
-                }
+                usb_audio_set_selected_rate(new_freq);
             }
         }
         uac1.pending_recipient = 0;
@@ -1448,6 +1617,11 @@ _Static_assert(PICO_AUDIO_I2S_CONSUMER_FRAME_BYTES <= PICO_AUDIO_SPDIF_CONSUMER_
 
 // I2S clock configuration
 uint8_t i2s_bck_pin = PICO_I2S_BCK_PIN;     // BCK GPIO; LRCLK = BCK + 1
+// Clock-pin mode + slave-mode pair (see audio_input.h / clock_pins_spec.md).
+// The slave pair is dormant unless SPLIT mode AND slave clock mode are both
+// selected; i2s_effective_bck_pin() resolves the pair the hardware uses.
+uint8_t i2s_clock_pin_mode = I2S_CLOCK_PIN_MODE_UNIFIED;
+uint8_t i2s_bck_pin_slave = PICO_I2S_BCK_PIN_SLAVE;
 uint8_t i2s_mck_pin = PICO_I2S_MCK_PIN;     // MCK GPIO
 bool    i2s_mck_enabled = false;             // MCK enabled state
 // MCK multiplier: actual value (128 or 256).

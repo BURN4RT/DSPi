@@ -31,10 +31,20 @@ extern volatile int32_t channel_gain_mul[3];
 extern volatile float channel_gain_linear[3];
 extern volatile bool channel_mute[3];
 
-// Per-input-channel preamp gain (indexed by input channel: 0=USB L, 1=USB R)
+// Per-input-channel preamp gain (indexed by input channel: 0=USB L, 1=USB R,
+// 2..7 = extra channels in RP2350 8-channel USB mode)
 extern volatile float global_preamp_db[NUM_INPUT_CHANNELS];
 extern volatile int32_t global_preamp_mul[NUM_INPUT_CHANNELS];
 extern volatile float global_preamp_linear[NUM_INPUT_CHANNELS];
+
+// Active USB input channel count: 2 (stereo alts 1/2) or 8 (RP2350 alt 3).
+// The audio pipeline reads this to select the 8-channel matrix path and bypass
+// the stereo master chain.  Always 2 on RP2040.
+extern volatile uint8_t usb_input_channels;
+
+// Host-selected rate for the USB playback endpoint.  This remains distinct
+// from audio_state.freq while another input source owns the live pipeline.
+uint32_t usb_audio_get_selected_rate(void);
 
 // Master volume — device-side ceiling on all output (does not affect DSP stages)
 extern volatile float master_volume_db;
@@ -56,6 +66,8 @@ extern volatile bool loudness_enabled;
 extern volatile float loudness_ref_spl;
 extern volatile float loudness_intensity_pct;
 extern volatile bool loudness_recompute_pending;
+// Output-channel mask: bit k = compensate output k (see loudness.h)
+extern volatile uint16_t loudness_output_mask;
 // Pointer-typed `volatile` (qualifier on the pointer itself, not the
 // pointee) — the audio pipeline reads this every packet, and any write
 // from apply_vol_index_to_audio() must not be hoisted/cached across
@@ -76,8 +88,9 @@ extern volatile uint8_t effective_vol_index;
 #include "crossfeed.h"
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool crossfeed_update_pending;
-extern volatile bool crossfeed_bypassed;
-extern CrossfeedState crossfeed_state;
+
+// Psychoacoustic bass (config/state/coeffs live in psybass.c)
+#include "psybass.h"
 
 // Volume Leveller
 extern volatile LevellerConfig leveller_config;
@@ -96,6 +109,8 @@ extern MatrixMixer matrix_mixer;
 
 extern volatile bool eq_update_pending;
 extern volatile EqParamPacket pending_packet;
+// Linkwitz Transform target Qp (Q*512); latched with pending_packet, consumed by the eq_update_pending handler.
+extern volatile uint16_t pending_eq_qp_x512;
 extern volatile bool rate_change_pending;
 extern volatile uint32_t pending_rate;
 extern volatile bool bulk_params_pending;
@@ -165,6 +180,15 @@ extern volatile bool flash_set_dac_hw_mute_pending;
 extern volatile bool dac_hw_mute_test_pending;
 
 extern volatile bool flash_set_spdif_rx_pin_pending;
+
+// External control interface (UART / I2C) config apply+persist, deferred to
+// the main loop.  Last-status bytes feed REQ_GET_CTRL_IFACE_STATUS.
+extern volatile bool ctrl_set_uart_pending;
+extern UartCtrlConfig ctrl_set_uart_val;
+extern volatile uint8_t ctrl_uart_last_status;
+extern volatile bool ctrl_set_i2c_pending;
+extern I2cCtrlConfig ctrl_set_i2c_val;
+extern volatile uint8_t ctrl_i2c_last_status;
 
 extern volatile bool save_params_pending;
 extern volatile bool preset_save_pending;
@@ -245,6 +269,7 @@ void usb_notify_tick(void);
 // USB audio ring buffer — main-loop entry points for decoupled DSP processing
 void usb_audio_drain_ring(void);   // Process all pending USB audio packets
 void usb_audio_flush_ring(void);   // Discard stale ring data + reset gap timestamp
+bool usb_audio_stream_active(void); // Packets arriving within the gap threshold
 
 // Exposed in usb_descriptors.h (populated by main.c from the chip unique ID).
 

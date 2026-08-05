@@ -1,0 +1,57 @@
+; adat_input.pio; ADAT lightpipe NRZI receiver (RP2350 only)
+;
+; Runs at clock divider 1.0 (full sys_clk) and counts each wire bit cell
+; with a 2-cycle poll loop of Y+1 iterations: cell period = 2*Y+5 sys
+; cycles, set per sample rate by the CPU (307.2 MHz: Y=11 at 44.1 kHz for
+; a 27-cycle cell, Y=10 at 48 kHz for 25). An integer divider means zero
+; cell-length jitter; every detected transition re-anchors the cell grid
+; to within 2 sys cycles, in BOTH directions, so neither clock-offset sign
+; can accumulate phase debt.
+;
+; History: the first version of this decoder ran 8 PIO cycles per cell on
+; a fractional divider with polls every half cell. That architecture has a
+; one-way ratchet (after a detected edge the next poll is a full cell
+; later, so locally-slow cells convert to permanent phase debt repaid only
+; by deleting bits), and the fractional divider guarantees locally slow
+; cells at 44.1 kHz. See tools/adat_rx_test/adat_rx_bitdiff.c, which
+; models both designs cycle-accurately: the old one loses a bit every few
+; frames at 44.1 kHz; this one is bit-exact at both rates across at least
+; +-1000 ppm of source clock offset.
+;
+; Window geometry: after a transition the poll window opens 11 cycles
+; later and closes 6 cycles past the next nominal cell boundary, giving
+; about -6/+16 sys cycles of per-edge displacement margin and +-4 cycles
+; of cumulative drift margin across the sync header's 11-cell
+; transition-free run; actual worst-case drift there is under 0.5 cycles.
+;
+; Emits the DECODED bitstream (1 = transition), MSB first, autopush 32.
+; Setup: Y = cell reload value, OSR = all-ones (so `in osr, 1` emits a 1
+; without disturbing X or Y), IN shift left, autopush 32, RX FIFO join,
+; jmp_pin = the RX GPIO. No out/set/side pins.
+
+.program adat_rx
+
+.wrap_target
+l_top:                     ; line low: count one cell, watching for a rise
+    mov x, y
+l_poll:
+    jmp pin l_edge         ; rose
+    jmp x-- l_poll         ; 2-cycle poll loop
+    in null, 1             ; cell elapsed with no transition: emit 0
+    jmp l_top
+l_edge:
+    in osr, 1 [7]          ; emit 1; delay sets the +11 window offset
+    jmp h_top
+h_top:                     ; line high: count one cell, watching for a fall
+    mov x, y
+h_poll:
+    jmp pin h_cont         ; still high
+    jmp h_edge             ; fell
+h_cont:
+    jmp x-- h_poll
+    in null, 1
+    jmp h_top
+h_edge:
+    in osr, 1 [6]          ; emit 1 (this entry path is 1 cycle longer)
+    jmp l_top
+.wrap

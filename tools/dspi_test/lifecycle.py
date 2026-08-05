@@ -48,6 +48,7 @@ class Snapshot:
     channel_names: list               # current per-channel names (raw 32B)
     active_slot: int
     occupied_mask: int
+    sample_rate: int                  # live audio_state.freq (GET_STATUS 15)
 
 
 def capture(dev: DspiDevice, profile) -> Snapshot:
@@ -80,6 +81,10 @@ def capture(dev: DspiDevice, profile) -> Snapshot:
         channel_names=channel_names,
         active_slot=dev.get_u8(OP.PRESET_GET_ACTIVE),
         occupied_mask=occupied_mask,
+        # Host-driven, so NOT in the bulk blob and not restorable from it. The
+        # audio group returns the device to its primary rate itself; capturing
+        # it here lets the final report flag any drift the suite left behind.
+        sample_rate=dev.get_u32(OP.GET_STATUS, wvalue=15),
     )
 
 

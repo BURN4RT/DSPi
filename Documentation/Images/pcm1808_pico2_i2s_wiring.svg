@@ -1,0 +1,118 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1060" height="770" viewBox="0 0 1060 770" font-family="'Segoe UI', Helvetica, Arial, sans-serif">
+  <defs>
+    <marker id="arrR" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M0,0 L8,3 L0,6 Z" fill="#444"/>
+    </marker>
+    <marker id="arrL" markerWidth="10" markerHeight="10" refX="0" refY="3" orient="auto" markerUnits="userSpaceOnUse">
+      <path d="M8,0 L0,3 L8,6 Z" fill="#444"/>
+    </marker>
+  </defs>
+
+  <!-- background -->
+  <rect x="0" y="0" width="1060" height="770" fill="#f7f9fc"/>
+
+  <!-- title -->
+  <text x="530" y="44" text-anchor="middle" font-size="26" font-weight="700" fill="#1a2330">Connecting a PCM1808 ADC to DSPi (Pico 2 / RP2350)</text>
+  <text x="530" y="72" text-anchor="middle" font-size="15" fill="#566">I2S input &#8212; DSPi is the clock master; the PCM1808 runs as a slave</text>
+
+  <!-- ===================== PICO 2 BOARD ===================== -->
+  <rect x="130" y="140" width="210" height="330" rx="12" fill="#ffffff" stroke="#1f3b57" stroke-width="2"/>
+  <rect x="130" y="140" width="210" height="44" rx="12" fill="#1f3b57"/>
+  <rect x="130" y="166" width="210" height="18" fill="#1f3b57"/>
+  <text x="235" y="169" text-anchor="middle" font-size="18" font-weight="700" fill="#ffffff">Raspberry Pi Pico 2</text>
+  <text x="235" y="461" text-anchor="middle" font-size="12" fill="#8aa">RP2350 &#183; USB device</text>
+
+  <!-- Pico pins (right edge x=340) -->
+  <!-- 3V3 -->
+  <circle cx="340" cy="210" r="5" fill="#d62728"/><text x="330" y="214" text-anchor="end" font-size="14" fill="#222">3V3</text>
+  <!-- GND -->
+  <circle cx="340" cy="255" r="5" fill="#333"/><text x="330" y="259" text-anchor="end" font-size="14" fill="#222">GND</text>
+  <!-- GP4 DATA -->
+  <circle cx="340" cy="300" r="5" fill="#2ca02c"/><text x="330" y="304" text-anchor="end" font-size="14" fill="#222">GP4</text>
+  <!-- GP13 MCK -->
+  <circle cx="340" cy="345" r="5" fill="#ff7f0e"/><text x="330" y="349" text-anchor="end" font-size="14" fill="#222">GP13</text>
+  <!-- GP14 BCK -->
+  <circle cx="340" cy="390" r="5" fill="#1f77b4"/><text x="330" y="394" text-anchor="end" font-size="14" fill="#222">GP14</text>
+  <!-- GP15 LRCLK -->
+  <circle cx="340" cy="435" r="5" fill="#9467bd"/><text x="330" y="439" text-anchor="end" font-size="14" fill="#222">GP15</text>
+
+  <!-- ===================== PCM1808 MODULE ===================== -->
+  <rect x="720" y="140" width="210" height="330" rx="12" fill="#ffffff" stroke="#3a5a1f" stroke-width="2"/>
+  <rect x="720" y="140" width="210" height="44" rx="12" fill="#3a5a1f"/>
+  <rect x="720" y="166" width="210" height="18" fill="#3a5a1f"/>
+  <text x="825" y="169" text-anchor="middle" font-size="18" font-weight="700" fill="#ffffff">PCM1808 ADC</text>
+  <text x="825" y="461" text-anchor="middle" font-size="12" fill="#8aa">slave mode &#183; standard I2S &#183; 256fs</text>
+
+  <!-- PCM left-edge pins (x=720) -->
+  <circle cx="720" cy="210" r="5" fill="#d62728"/><text x="730" y="214" font-size="14" fill="#222">VCC</text>
+  <circle cx="720" cy="255" r="5" fill="#333"/><text x="730" y="259" font-size="14" fill="#222">GND</text>
+  <circle cx="720" cy="300" r="5" fill="#2ca02c"/><text x="730" y="304" font-size="14" fill="#222">DOUT</text>
+  <circle cx="720" cy="345" r="5" fill="#ff7f0e"/><text x="730" y="349" font-size="14" fill="#222">SCKI</text>
+  <circle cx="720" cy="390" r="5" fill="#1f77b4"/><text x="730" y="394" font-size="14" fill="#222">BCK</text>
+  <circle cx="720" cy="435" r="5" fill="#9467bd"/><text x="730" y="439" font-size="14" fill="#222">LRC</text>
+
+  <!-- PCM right-edge pins (x=930): analog in + mode straps -->
+  <circle cx="930" cy="210" r="5" fill="#888"/><text x="920" y="214" text-anchor="end" font-size="13" fill="#222">VINL</text>
+  <circle cx="930" cy="255" r="5" fill="#888"/><text x="920" y="259" text-anchor="end" font-size="13" fill="#222">VINR</text>
+  <circle cx="930" cy="300" r="5" fill="#888"/><text x="920" y="304" text-anchor="end" font-size="13" fill="#222">AGND</text>
+  <circle cx="930" cy="345" r="5" fill="#333"/><text x="920" y="349" text-anchor="end" font-size="13" fill="#222">FMT</text>
+  <circle cx="930" cy="390" r="5" fill="#333"/><text x="920" y="394" text-anchor="end" font-size="13" fill="#222">MD0</text>
+  <circle cx="930" cy="435" r="5" fill="#333"/><text x="920" y="439" text-anchor="end" font-size="13" fill="#222">MD1</text>
+
+  <!-- analog source bracket -->
+  <path d="M945,205 L955,205 L955,305 L945,305" fill="none" stroke="#999" stroke-width="1.5"/>
+  <text x="962" y="251" font-size="12" fill="#667">analog</text>
+  <text x="962" y="266" font-size="12" fill="#667">line in</text>
+
+  <!-- mode-strap bracket to GND -->
+  <path d="M945,340 L985,340 L985,440 L945,440" fill="none" stroke="#333" stroke-width="1.5"/>
+  <text x="992" y="385" font-size="12" fill="#222">tie all</text>
+  <text x="992" y="400" font-size="12" fill="#222">to GND</text>
+  <text x="992" y="415" font-size="12" fill="#222">(LOW)</text>
+
+  <!-- ===================== WIRES ===================== -->
+  <!-- 3V3 -> VCC -->
+  <line x1="340" y1="210" x2="720" y2="210" stroke="#d62728" stroke-width="2.5" marker-end="url(#arrR)"/>
+  <rect x="488" y="196" width="64" height="18" rx="4" fill="#f7f9fc"/>
+  <text x="520" y="209" text-anchor="middle" font-size="12.5" fill="#a01">3.3 V</text>
+
+  <!-- GND -> GND -->
+  <line x1="340" y1="255" x2="720" y2="255" stroke="#333" stroke-width="2.5"/>
+  <rect x="496" y="241" width="48" height="18" rx="4" fill="#f7f9fc"/>
+  <text x="520" y="254" text-anchor="middle" font-size="12.5" fill="#333">GND</text>
+
+  <!-- DOUT -> GP4 (data, source to device) -->
+  <line x1="720" y1="300" x2="340" y2="300" stroke="#2ca02c" stroke-width="2.5" marker-end="url(#arrL)"/>
+  <rect x="452" y="286" width="136" height="18" rx="4" fill="#f7f9fc"/>
+  <text x="520" y="299" text-anchor="middle" font-size="12.5" fill="#176117">DATA &#183; 24-bit I2S</text>
+
+  <!-- GP13 -> SCKI (MCK 256x) -->
+  <line x1="340" y1="345" x2="720" y2="345" stroke="#ff7f0e" stroke-width="2.5" marker-end="url(#arrR)"/>
+  <rect x="446" y="331" width="148" height="18" rx="4" fill="#f7f9fc"/>
+  <text x="520" y="344" text-anchor="middle" font-size="12.5" fill="#b35c00">MCK = 256 &#215; Fs</text>
+
+  <!-- GP14 -> BCK -->
+  <line x1="340" y1="390" x2="720" y2="390" stroke="#1f77b4" stroke-width="2.5" marker-end="url(#arrR)"/>
+  <rect x="452" y="376" width="136" height="18" rx="4" fill="#f7f9fc"/>
+  <text x="520" y="389" text-anchor="middle" font-size="12.5" fill="#16557f">BCK = 64 &#215; Fs</text>
+
+  <!-- GP15 -> LRC -->
+  <line x1="340" y1="435" x2="720" y2="435" stroke="#9467bd" stroke-width="2.5" marker-end="url(#arrR)"/>
+  <rect x="456" y="421" width="128" height="18" rx="4" fill="#f7f9fc"/>
+  <text x="520" y="434" text-anchor="middle" font-size="12.5" fill="#5e3a86">LRCLK = Fs</text>
+
+  <!-- direction key -->
+  <text x="530" y="118" text-anchor="middle" font-size="12.5" fill="#888">clocks &#8594; to PCM1808 &#160;&#160;&#160; data &#8592; back to Pico</text>
+
+  <!-- ===================== NOTES PANEL ===================== -->
+  <rect x="130" y="500" width="800" height="232" rx="10" fill="#ffffff" stroke="#c7d2dd" stroke-width="1.5"/>
+  <text x="148" y="528" font-size="16" font-weight="700" fill="#1a2330">Firmware &amp; wiring notes</text>
+
+  <text x="148" y="556" font-size="13.5" fill="#333">&#8226; Logic is 3.3 V. Power the module VCC from Pico 3V3; some PCM1808 boards expect 5 V, check your module's regulator.</text>
+  <text x="148" y="582" font-size="13.5" fill="#333">&#8226; Strap the PCM1808 as slave / standard-I2S / 256fs: tie FMT, MD0 and MD1 to GND.</text>
+  <text x="148" y="608" font-size="13.5" fill="#333">&#8226; DSPi generates MCK, BCK and LRCLK; the PCM1808 follows them. No clock servo, no signal detection (floating data = noise).</text>
+  <text x="148" y="634" font-size="13.5" fill="#333">&#8226; Enable MCK and set the multiplier to 256&#215;, so SCKI = 11.2896 MHz @44.1k, 12.288 MHz @48k, 24.576 MHz @96k.</text>
+  <text x="148" y="660" font-size="13.5" fill="#333">&#8226; Firmware: REQ_SET_INPUT_SOURCE = 2 (I2S), REQ_SET_INPUT_RATE = 48000, REQ_SET_MCK_ENABLE = 1, REQ_SET_MCK_MULTIPLIER = 256&#215;.</text>
+  <text x="148" y="686" font-size="13.5" fill="#333">&#8226; Default Pico 2 pins shown (MCK GP13, BCK GP14, LRCLK GP15, DATA GP4); all are runtime-configurable via vendor commands.</text>
+  <text x="148" y="712" font-size="13.5" fill="#333">&#8226; Keep GND common between the boards; route MCK and BCK as short as practical to minimise jitter.</text>
+</svg>

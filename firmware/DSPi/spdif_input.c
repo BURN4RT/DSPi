@@ -24,6 +24,8 @@
 #include "pico/stdlib.h"
 #include "pico/audio_spdif.h"
 #include "pico/audio_i2s_multi.h"
+#include "adat_output.h"
+#include "input_servo.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -33,14 +35,12 @@
 // CONFIGURATION
 // ============================================================================
 
-// Clock servo: rate-based + proportional fill trim (mirrors USB feedback controller)
-// The library's measured actual sample rate provides the base divider.
-// FIFO fill level provides a small proportional trim to prevent drift.
-// Fill trim biases the rounding of the PIO divider between adjacent integer
-// values, dithering across LSB boundaries to achieve sub-LSB rate matching.
+// Clock servo: rate-based + proportional fill trim (mirrors USB feedback controller).
+// The divider math and PIO/MCK writes live in input_servo.c (shared with the
+// ADAT input's slave clock mode); this module owns lock gating, rate limiting,
+// and the library's rate measurement.
 // With output prefill at 50% (8 buffers), worst-case PIO quantization drift
 // (~156 ppm at 96kHz) takes ~19s to exhaust headroom, so gentle gains suffice.
-#define SERVO_FILL_KP         0.0005f   // Fill-level proportional gain
 #define SERVO_UPDATE_INTERVAL 1000      // Main loop iterations between servo updates (~20ms)
 
 // ============================================================================
@@ -48,6 +48,11 @@
 // ============================================================================
 
 static volatile SpdifInputState spdif_state = SPDIF_INPUT_INACTIVE;
+
+// GPIO the RX library was started on.  Recorded at start so stop() releases
+// the right pad even if the live pin config changed while running (the RX
+// library's teardown does not reset the GPIO function itself).
+static uint8_t spdif_active_data_pin = 0xFF;
 
 // Flags set by DMA IRQ callbacks (minimal ISR work — main loop handles)
 static volatile bool spdif_rx_stable_flag = false;
@@ -95,7 +100,7 @@ static volatile uint32_t dbg_stable_count = 0;
 static volatile uint32_t dbg_lost_count = 0;
 static volatile spdif_rx_samp_freq_t dbg_last_freq = SAMP_FREQ_NONE;
 
-static void on_stable_callback(spdif_rx_samp_freq_t freq) {
+static void __not_in_flash_func(on_stable_callback)(spdif_rx_samp_freq_t freq) {
     dbg_stable_count++;
     dbg_last_freq = freq;
     spdif_rx_detected_rate = spdif_freq_to_hz(freq);
@@ -103,7 +108,7 @@ static void on_stable_callback(spdif_rx_samp_freq_t freq) {
     spdif_rx_stable_flag = true;
 }
 
-static void on_lost_stable_callback(void) {
+static void __not_in_flash_func(on_lost_stable_callback)(void) {
     dbg_lost_count++;
     spdif_rx_lost_flag = true;
 }
@@ -129,19 +134,6 @@ static void servo_cache_base_dividers(uint32_t sample_freq) {
     i2s_tx_base_divider = (uint32_t)((i2s_num + sample_freq - 1) / sample_freq);
 }
 
-// Apply a divider (16.8 fixed-point) to a PIO SM
-static inline void set_divider(PIO pio, uint sm, uint32_t div_16_8) {
-    pio_sm_set_clkdiv_int_frac(pio, sm, div_16_8 >> 8, div_16_8 & 0xFF);
-}
-
-// Apply a fractional adjustment to all output PIO dividers.
-// delta is a small signed fraction: positive = slow down outputs, negative = speed up.
-// Uses cached base dividers so each output type keeps its correct rate ratio.
-// Last written dividers — skip PIO writes when unchanged
-static uint32_t last_spdif_div = 0;
-static uint32_t last_i2s_div = 0;
-static uint32_t last_mck_div = 0;
-
 // ============================================================================
 // PUBLIC API
 // ============================================================================
@@ -163,8 +155,11 @@ void spdif_input_start(void) {
     const uint rx_pio_sm = 2;
 #endif
 
+    // Run on the GPIO of whichever SPDIF input (1/2/3) is the active source
+    spdif_active_data_pin = spdif_rx_active_pin();
+
     spdif_rx_config_t cfg = {
-        .data_pin = spdif_rx_pin,
+        .data_pin = spdif_active_data_pin,
         .pio_sm = rx_pio_sm,
         .dma_channel0 = PICO_SPDIF_RX_DMA_CH0,
         .dma_channel1 = PICO_SPDIF_RX_DMA_CH1,
@@ -193,9 +188,10 @@ void spdif_input_start(void) {
     servo_skip_counter = 0;
     spdif_tx_base_divider = 0;
     i2s_tx_base_divider = 0;
+    input_servo_reset();  // force a full divider rewrite after (re)lock
     lock_debounce_polls = 0;
 
-    printf("SPDIF RX: started on GPIO %u\n", spdif_rx_pin);
+    printf("SPDIF RX: started on GPIO %u\n", spdif_active_data_pin);
 }
 
 void spdif_input_stop(void) {
@@ -203,6 +199,14 @@ void spdif_input_stop(void) {
         spdif_rx_end();
         // Release the DMA IRQ refcount hold we took in start()
         audio_spdif_irq_refcount_adjust(PICO_SPDIF_RX_DMA_IRQ, -1);
+        // The library's teardown leaves the pad muxed to PIO input; reset it
+        // so a pin/input switch actually frees the old GPIO (mirrors
+        // i2s_input_stop).
+        if (spdif_active_data_pin != 0xFF) {
+            gpio_set_function(spdif_active_data_pin, GPIO_FUNC_NULL);
+            gpio_set_dir(spdif_active_data_pin, GPIO_IN);
+            spdif_active_data_pin = 0xFF;
+        }
         spdif_state = SPDIF_INPUT_INACTIVE;
         spdif_rx_detected_rate = 0;
         printf("SPDIF RX: stopped\n");
@@ -349,6 +353,7 @@ uint32_t spdif_input_poll(void) {
 // CLOCK SERVO
 // ============================================================================
 
+DSP_TIME_CRITICAL
 void spdif_input_update_clock_servo(void) {
     if (spdif_state != SPDIF_INPUT_LOCKED || spdif_tx_base_divider == 0)
         return;
@@ -357,79 +362,14 @@ void spdif_input_update_clock_servo(void) {
     if (++servo_skip_counter < SERVO_UPDATE_INTERVAL) return;
     servo_skip_counter = 0;
 
-    // -----------------------------------------------------------------------
-    // Loop A: Rate-based divider (primary control)
-    // Use the library's measured actual input sample rate to compute the
-    // ideal output divider directly. No IIR needed — the library already
-    // averages over 8 blocks (~32ms at 48kHz).
-    // -----------------------------------------------------------------------
-    float actual_freq = spdif_rx_get_samp_freq_actual();
-    if (actual_freq < 20000.0f || actual_freq > 200000.0f) return;  // Sanity check
+    // Rate measurement: the library's measured actual input sample rate.
+    // No IIR needed; the library already averages over 8 blocks (~32ms at
+    // 48kHz). Divider math and PIO/MCK writes are shared (input_servo.c).
+    input_servo_apply(spdif_rx_get_samp_freq_actual());
+}
 
-    uint32_t sys_clk = clock_get_hz(clk_sys);
-    // No ceiling — precise float division lets the fill trim dither between
-    // adjacent integer divider values to achieve sub-LSB rate matching.
-    float spdif_div_f = (float)sys_clk / actual_freq;
-    float i2s_div_f   = (float)sys_clk * 2.0f / actual_freq;
-
-    // -----------------------------------------------------------------------
-    // Loop B: Consumer fill trim (proportional only, mirrors USB servo)
-    // Uses output consumer buffer fill — the direct measure of whether
-    // outputs are consuming too fast or too slow. The RX FIFO only shows
-    // input-vs-pipeline rate, NOT pipeline-vs-output rate.
-    // -----------------------------------------------------------------------
-    uint8_t consumer_fill = get_slot_consumer_fill(0);  // Slot 0 as reference
-    int32_t fill_error = (int32_t)consumer_fill - 8;    // Target 50% of 16 buffers
-
-    float fill_trim = 0.0f;
-    if (fill_error > 2 || fill_error < -2) {
-        // Positive error (overfull) → negative trim → reduce divider → speed up outputs
-        fill_trim = -(float)fill_error / 16.0f * SERVO_FILL_KP;
-    }
-
-    // -----------------------------------------------------------------------
-    // Apply: rate-based divider + fill trim
-    // I2S divider is forced to exactly 2× SPDIF divider to prevent independent
-    // rounding from causing the two output types to drift apart over time.
-    // -----------------------------------------------------------------------
-    uint32_t spdif_div = (uint32_t)(spdif_div_f * (1.0f + fill_trim) + 0.5f);
-    uint32_t i2s_div   = spdif_div * 2;
-
-    // Skip PIO writes if dividers haven't changed
-    if (spdif_div == last_spdif_div && i2s_div == last_i2s_div) return;
-    last_spdif_div = spdif_div;
-    last_i2s_div = i2s_div;
-
-    extern struct audio_spdif_instance *spdif_instance_ptrs[];
-    extern struct audio_i2s_instance *i2s_instance_ptrs[];
-    extern uint8_t output_types[];
-
-    for (int i = 0; i < NUM_SPDIF_INSTANCES; i++) {
-        if (output_types[i] == OUTPUT_TYPE_SPDIF && spdif_instance_ptrs[i]) {
-            set_divider(spdif_instance_ptrs[i]->pio,
-                        spdif_instance_ptrs[i]->pio_sm, spdif_div);
-        } else if (output_types[i] == OUTPUT_TYPE_I2S && i2s_instance_ptrs[i]) {
-            set_divider(i2s_instance_ptrs[i]->pio,
-                        i2s_instance_ptrs[i]->pio_sm, i2s_div);
-        }
-    }
-
-    // MCK servo: keep master clock frequency-locked to the servoed I2S data rate.
-    // MCK is now driven by CLK_GPOUTn, so the divider is the direct 24.8 form
-    // (no ÷2 for a PIO toggle — see audio_i2s_multi.c MCK section):
-    //     div_24.8 = sys_clk × 256 / (actual_freq × multiplier)
-    // The previous PIO-toggle math used × 128 in the numerator, which now
-    // would write half the correct divider and run MCK at 2× the target.
-    extern bool i2s_mck_enabled;
-    extern uint16_t i2s_mck_multiplier;
-    if (i2s_mck_enabled && i2s_mck_multiplier > 0) {
-        float mck_div_f = (float)sys_clk * 256.0f / (actual_freq * (float)i2s_mck_multiplier);
-        uint32_t mck_div = (uint32_t)(mck_div_f * (1.0f + fill_trim) + 0.5f);
-        if (mck_div != last_mck_div) {
-            last_mck_div = mck_div;
-            audio_i2s_mck_set_divider(mck_div);
-        }
-    }
+uint32_t spdif_input_current_tx_divider(void) {
+    return (spdif_state == SPDIF_INPUT_LOCKED) ? input_servo_current_divider() : 0;
 }
 
 // ============================================================================

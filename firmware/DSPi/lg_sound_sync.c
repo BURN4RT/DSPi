@@ -360,7 +360,7 @@ void lg_sound_sync_tick(void) {
 
     /* Cheap exit path 2: not on SPDIF.  No restore here — the input-
      * source-change handler does its own thaw on USB transitions. */
-    if (active_input_source != INPUT_SOURCE_SPDIF) {
+    if (!input_source_is_spdif(active_input_source)) {
         leave_present(/*restore_host_vol=*/false);
         return;
     }
@@ -501,7 +501,7 @@ void lg_sound_sync_on_input_source_change(uint8_t new_source) {
      * own USB→ branch.  Calling restore here would produce a double-
      * write and (if the handler thaws to a different value than our
      * cached read) a one-packet glitch. */
-    if (new_source != INPUT_SOURCE_SPDIF) {
+    if (!input_source_is_spdif(new_source)) {
         leave_present(/*restore_host_vol=*/false);
     } else {
         /* USB → SPDIF: re-arm.  Streaks zero so we don't prematurely

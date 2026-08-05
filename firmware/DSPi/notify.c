@@ -7,20 +7,21 @@
  *   - param_shadow: a live copy of WireBulkParams used to detect byte-level
  *     changes on every param_write call.  Populated once at init, kept in
  *     sync by param_write, re-baselined on bulk operations.
- *   - notify_ring: SPSC-style FIFO of pending events.  Producer is the main
- *     thread via notify_* push functions; consumer is usb_audio.c's drain
- *     (also main thread, but can interleave with xfer_cb on USB IRQ).
- *     Short interrupt-disabled critical sections guard head/tail/entry
- *     mutation.
+ *   - notify_ring: FIFO of pending events with one producer and multiple
+ *     independent consumers (USB EP 0x83 drain, UART notification frames),
+ *     each owning its own tail.  Short interrupt-disabled critical sections
+ *     guard head/tails/entry mutation.
  *
  * Concurrency model:
  *   - Single producer (main thread).  If this ever changes (e.g. Core 1
  *     writes parameters), promote notify_current_source to per-core and
  *     add a lock around push, or switch to an atomic ring.
- *   - Single consumer (drain in usb_audio.c).  Called from the main loop
- *     tick AND from xfer_cb on EP 0x83 completion; the xfer_cb path runs
- *     on the TinyUSB task, which is the main thread in our cooperative
- *     scheduler — so still effectively single-consumer.
+ *   - All consumers drain from main-thread context (usb_notify_tick and
+ *     the EP 0x83 xfer_cb both run on the TinyUSB task = main thread;
+ *     uart_ctrl_poll is the main loop).  A lagging consumer never blocks
+ *     the producer or another consumer: the producer force-drops the
+ *     laggard's oldest entry to make room, and the consumer detects the
+ *     loss as a sequence gap and re-reads full state.
  */
 
 #include "notify.h"
@@ -56,6 +57,9 @@
 typedef struct {
     uint8_t  event_id;      // NOTIFY_EVT_*
     uint8_t  source;        // ParamSource
+    uint8_t  seq;           // Stamped at push for v2 events (v1 entries carry
+                            // no seq and do not consume one), so every
+                            // consumer can detect its own drops as a gap.
     uint16_t wire_offset;   // For PARAM_CHANGED; unused for others
     uint16_t wire_size;     // For PARAM_CHANGED; unused for others
     uint8_t  value[NOTIFY_MAX_PAYLOAD];  // Payload (or 1-byte slot for PRESET_LOADED)
@@ -70,13 +74,22 @@ typedef struct {
 // 2912 B on RP2350 / RP2040 alike.  Placed in RAM so reads don't stall on XIP.
 static __attribute__((aligned(4))) WireBulkParams param_shadow;
 
-// Event ring.  head = next-free slot, tail = next-to-send.
-// When head == tail → empty; when (head+1)&MASK == tail → full.
+// Event ring.  head = next-free slot; each consumer owns a tail
+// (next-to-send for that consumer).  head == tail_c → empty for c.  The
+// producer never fails a push: if advancing head would collide with an
+// active consumer's tail, that tail is force-advanced first (the lagging
+// consumer drops its oldest entry, counted per consumer).
 static NotifyRingEntry notify_ring[NOTIFY_RING_SIZE];
 static volatile uint8_t notify_head = 0;
-static volatile uint8_t notify_tail = 0;
+static volatile uint8_t notify_tails[NOTIFY_CONSUMER_COUNT];
+static volatile bool    notify_active[NOTIFY_CONSUMER_COUNT];
+// Ring index captured by the last peek, per consumer, so commit can detect
+// that the producer force-dropped past it (0xFF = no peek outstanding).
+static volatile uint8_t notify_peek_idx[NOTIFY_CONSUMER_COUNT];
 
-// Monotonic sequence counter stamped onto every v2 packet.
+// Monotonic sequence counter stamped onto every v2 entry at PUSH time (not
+// at drain time: a re-peeked entry must not burn a number, and per-consumer
+// gap detection needs the seq to identify the event, not the transmission).
 static volatile uint8_t notify_seq = 0;
 
 // Active source tag for the current setter call.  Defaults to UNKNOWN;
@@ -89,6 +102,7 @@ static volatile uint8_t notify_bulk_depth = 0;
 static volatile uint8_t notify_bulk_source = PARAM_SRC_UNKNOWN;
 
 // Diagnostics
+volatile uint32_t notify_consumer_drops[NOTIFY_CONSUMER_COUNT];
 volatile uint32_t notify_overflow_count = 0;
 volatile uint32_t notify_drops_count = 0;
 
@@ -96,22 +110,25 @@ volatile uint32_t notify_drops_count = 0;
 // Ring primitives (all callers hold interrupts disabled)
 // ---------------------------------------------------------------------------
 
-static inline bool ring_empty_locked(void) {
-    return notify_head == notify_tail;
+// Start index of the fully-unsent window: entries no ACTIVE consumer has
+// consumed yet.  That is the fastest consumer's tail (fewest pending).
+// Coalescing may only mutate entries in this window; touching an entry a
+// faster consumer already sent would make that consumer miss the update.
+static uint8_t ring_coalesce_start_locked(void) {
+    uint8_t min_pending = NOTIFY_RING_SIZE;   // > any real count
+    for (int c = 0; c < NOTIFY_CONSUMER_COUNT; c++) {
+        if (!notify_active[c]) continue;
+        uint8_t pending = (uint8_t)(notify_head - notify_tails[c]) & NOTIFY_RING_MASK;
+        if (pending < min_pending) min_pending = pending;
+    }
+    if (min_pending == NOTIFY_RING_SIZE) return notify_head;   // no active consumer
+    return (uint8_t)(notify_head - min_pending) & NOTIFY_RING_MASK;
 }
 
-static inline bool ring_full_locked(void) {
-    return ((uint8_t)(notify_head + 1) & NOTIFY_RING_MASK) == notify_tail;
-}
-
-static inline uint8_t ring_count_locked(void) {
-    return (uint8_t)(notify_head - notify_tail) & NOTIFY_RING_MASK;
-}
-
-// Find an unsent PARAM_CHANGED entry matching (offset, size).  Returns the
-// index or 0xFF if not found.  Only scans occupied slots.
+// Find a fully-unsent PARAM_CHANGED entry matching (offset, size).  Returns
+// the index or 0xFF if not found.
 static uint8_t ring_find_coalesce_locked(uint16_t offset, uint16_t size) {
-    uint8_t i = notify_tail;
+    uint8_t i = ring_coalesce_start_locked();
     while (i != notify_head) {
         NotifyRingEntry *e = &notify_ring[i];
         if (e->event_id == NOTIFY_EVT_PARAM_CHANGED &&
@@ -124,9 +141,9 @@ static uint8_t ring_find_coalesce_locked(uint16_t offset, uint16_t size) {
     return 0xFF;
 }
 
-// Find an unsent BULK_INVALIDATED entry.  At most one is ever useful.
+// Find a fully-unsent BULK_INVALIDATED entry.  At most one is ever useful.
 static uint8_t ring_find_invalidated_locked(void) {
-    uint8_t i = notify_tail;
+    uint8_t i = ring_coalesce_start_locked();
     while (i != notify_head) {
         if (notify_ring[i].event_id == NOTIFY_EVT_BULK_INVALIDATED) return i;
         i = (i + 1) & NOTIFY_RING_MASK;
@@ -134,10 +151,33 @@ static uint8_t ring_find_invalidated_locked(void) {
     return 0xFF;
 }
 
-// Append entry.  Caller must ensure the ring is not full.
-static void ring_push_locked(const NotifyRingEntry *e) {
+// Append entry.  Never fails: any active consumer whose tail would collide
+// with the new head is force-advanced first (it drops its oldest entry).
+// v2 entries are stamped with a push-time sequence number; the v1 legacy
+// master-volume entry carries no seq byte on the wire and must not consume
+// one (a skipped v1 entry would otherwise read as a drop to the UART
+// consumer on every volume change).
+static void ring_push_locked(NotifyRingEntry *e) {
+    uint8_t next = (uint8_t)(notify_head + 1) & NOTIFY_RING_MASK;
+    for (int c = 0; c < NOTIFY_CONSUMER_COUNT; c++) {
+        if (notify_active[c] && notify_tails[c] == next) {
+            // Dropping a v1 entry a non-USB consumer would have skipped
+            // anyway is not an observable loss; keep the counter honest so
+            // it always corresponds to a real seq gap for that consumer.
+            bool observable =
+                (notify_ring[notify_tails[c]].event_id != NOTIFY_EVT_MASTER_VOLUME ||
+                 c == NOTIFY_CONSUMER_USB);
+            notify_tails[c] = (uint8_t)(notify_tails[c] + 1) & NOTIFY_RING_MASK;
+            if (observable) {
+                notify_consumer_drops[c]++;
+                notify_overflow_count++;
+                notify_drops_count++;
+            }
+        }
+    }
+    e->seq = (e->event_id == NOTIFY_EVT_MASTER_VOLUME) ? 0 : ++notify_seq;
     notify_ring[notify_head] = *e;
-    notify_head = (notify_head + 1) & NOTIFY_RING_MASK;
+    notify_head = next;
 }
 
 // ---------------------------------------------------------------------------
@@ -146,8 +186,14 @@ static void ring_push_locked(const NotifyRingEntry *e) {
 
 void notify_init(void) {
     notify_head = 0;
-    notify_tail = 0;
     notify_seq  = 0;
+    for (int c = 0; c < NOTIFY_CONSUMER_COUNT; c++) {
+        notify_tails[c] = 0;
+        notify_peek_idx[c] = 0xFF;
+        notify_active[c] = false;
+        notify_consumer_drops[c] = 0;
+    }
+    notify_active[NOTIFY_CONSUMER_USB] = true;   // USB drain always runs
     notify_current_source = PARAM_SRC_UNKNOWN;
     notify_bulk_depth = 0;
     notify_bulk_source = PARAM_SRC_UNKNOWN;
@@ -156,12 +202,29 @@ void notify_init(void) {
     bulk_params_collect(&param_shadow);
 }
 
+void notify_consumer_set_active(NotifyConsumer c, bool active) {
+    if (c >= NOTIFY_CONSUMER_COUNT) return;
+    uint32_t flags = save_and_disable_interrupts();
+    if (active && !notify_active[c]) {
+        notify_tails[c] = notify_head;   // see events from now on, no backlog
+        notify_peek_idx[c] = 0xFF;
+    }
+    notify_active[c] = active;
+    restore_interrupts(flags);
+}
+
 void notify_rebaseline(void) {
     // Collect into a scratch buffer first so we don't clobber shadow state
     // if collect() reads from any volatile globals racily.  Our collect is
     // synchronous with live state, so this is defensive rather than strictly
     // necessary.
-    WireBulkParams tmp;
+    //
+    // Scratch is `static` (BSS), NOT a stack local: sizeof(WireBulkParams)
+    // is ~3.6 KB after the V11 crossover section, well above what's safe to
+    // park on Core 0's stack.  All callers of notify_rebaseline() run on the
+    // Core 0 main loop (preset load/delete/save + bulk apply); no ISR path
+    // re-enters the function, so a function-static is race-free.
+    static __attribute__((aligned(4))) WireBulkParams tmp;
     bulk_params_collect(&tmp);
     uint32_t flags = save_and_disable_interrupts();
     memcpy(&param_shadow, &tmp, sizeof(param_shadow));
@@ -217,19 +280,14 @@ void notify_param_write(uint16_t wire_offset,
         return;
     }
 
-    // Look for a coalesce target.  If found, overwrite its value in place.
+    // Look for a coalesce target (fully-unsent entries only).  If found,
+    // overwrite its value in place; its push-time seq stands, since only
+    // one packet will ever go out for it.
     uint8_t idx = ring_find_coalesce_locked(wire_offset, size);
     if (idx != 0xFF) {
         NotifyRingEntry *e = &notify_ring[idx];
         memcpy(e->value, src, size);
         e->source = source;   // latest source wins
-        restore_interrupts(flags);
-        return;
-    }
-
-    if (ring_full_locked()) {
-        notify_overflow_count++;
-        notify_drops_count++;
         restore_interrupts(flags);
         return;
     }
@@ -249,8 +307,8 @@ void notify_param_write(uint16_t wire_offset,
 void notify_push_master_volume_v1(float db) {
     uint32_t flags = save_and_disable_interrupts();
 
-    // Coalesce: find an unsent MASTER_VOLUME entry (there is at most one).
-    uint8_t i = notify_tail;
+    // Coalesce: find a fully-unsent MASTER_VOLUME entry (at most one).
+    uint8_t i = ring_coalesce_start_locked();
     while (i != notify_head) {
         if (notify_ring[i].event_id == NOTIFY_EVT_MASTER_VOLUME) {
             memcpy(notify_ring[i].value, &db, sizeof(float));
@@ -258,13 +316,6 @@ void notify_push_master_volume_v1(float db) {
             return;
         }
         i = (i + 1) & NOTIFY_RING_MASK;
-    }
-
-    if (ring_full_locked()) {
-        notify_overflow_count++;
-        notify_drops_count++;
-        restore_interrupts(flags);
-        return;
     }
 
     NotifyRingEntry e = {
@@ -281,12 +332,6 @@ void notify_push_master_volume_v1(float db) {
 
 void notify_push_preset_loaded(uint8_t slot) {
     uint32_t flags = save_and_disable_interrupts();
-    if (ring_full_locked()) {
-        notify_overflow_count++;
-        notify_drops_count++;
-        restore_interrupts(flags);
-        return;
-    }
     NotifyRingEntry e = {
         .event_id = NOTIFY_EVT_PRESET_LOADED,
         .source   = PARAM_SRC_PRESET,
@@ -296,28 +341,103 @@ void notify_push_preset_loaded(uint8_t slot) {
     restore_interrupts(flags);
 }
 
+void notify_push_input_format(uint8_t channels) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_INPUT_FORMAT,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = channels;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
+// Implemented unconditionally so it links on RP2040 (where ADAT is absent and
+// this is never called).
+void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_ADAT_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = enabled;
+    e.value[1] = active;
+    e.value[2] = pin;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
+// Implemented unconditionally so it links on both platforms.
+void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_I2S_SLAVE_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = state;
+    memcpy(&e.value[1], &rate_hz, 4);
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
+// Implemented unconditionally so it links on RP2040 (where ADAT input is
+// absent and this is never called).
+void notify_push_adat_input_state(uint8_t state, uint32_t rate_hz,
+                                  uint8_t clock_mode) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_ADAT_INPUT_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = state;
+    memcpy(&e.value[1], &rate_hz, 4);
+    e.value[5] = clock_mode;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
+void notify_push_siggen_state(uint8_t state, uint8_t reason,
+                              uint8_t signal_type, uint8_t channel) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_SIGGEN_STATE,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = state;
+    e.value[1] = reason;
+    e.value[2] = signal_type;
+    e.value[3] = channel;
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
+void notify_push_cs_ir_learn(uint8_t state, uint8_t protocol, uint32_t code) {
+    uint32_t flags = save_and_disable_interrupts();
+    NotifyRingEntry e = {
+        .event_id = NOTIFY_EVT_CS_IR_LEARN,
+        .source   = PARAM_SRC_INTERNAL,
+    };
+    e.value[0] = state;
+    e.value[1] = protocol;
+    e.value[2] = (uint8_t)(code & 0xFF);
+    e.value[3] = (uint8_t)((code >> 8) & 0xFF);
+    e.value[4] = (uint8_t)((code >> 16) & 0xFF);
+    e.value[5] = (uint8_t)((code >> 24) & 0xFF);
+    ring_push_locked(&e);
+    restore_interrupts(flags);
+}
+
 void notify_push_bulk_invalidated(ParamSource src) {
     uint32_t flags = save_and_disable_interrupts();
 
-    // Coalesce: if an unsent invalidation is already queued, just refresh
-    // its source.  One invalidation is sufficient regardless of cause.
+    // Coalesce: if a fully-unsent invalidation is already queued, just
+    // refresh its source.  One invalidation covers any number of causes.
+    // (The pre-multi-consumer code also had a displace-oldest-on-full path
+    // here; ring_push_locked's force-advance now guarantees delivery
+    // without it, at the cost of the laggard's oldest entry.)
     uint8_t idx = ring_find_invalidated_locked();
     if (idx != 0xFF) {
         notify_ring[idx].source = (uint8_t)src;
-        restore_interrupts(flags);
-        return;
-    }
-
-    // If the ring is full, displace the oldest unsent entry (spec §4.3).
-    // BULK_INVALIDATED is always deliverable because the host cannot
-    // recover state without knowing it happened.
-    if (ring_full_locked()) {
-        notify_ring[notify_tail].event_id = NOTIFY_EVT_BULK_INVALIDATED;
-        notify_ring[notify_tail].source   = (uint8_t)src;
-        notify_ring[notify_tail].wire_offset = 0;
-        notify_ring[notify_tail].wire_size   = 0;
-        notify_overflow_count++;
-        // Do not advance tail; just mutate in place so it'll be next out.
         restore_interrupts(flags);
         return;
     }
@@ -334,34 +454,51 @@ void notify_push_bulk_invalidated(ParamSource src) {
 // Drain
 // ---------------------------------------------------------------------------
 
-bool notify_has_pending(void) {
-    return notify_head != notify_tail;
+bool notify_has_pending_for(NotifyConsumer c) {
+    if (c >= NOTIFY_CONSUMER_COUNT || !notify_active[c]) return false;
+    return notify_head != notify_tails[c];
 }
 
 void notify_reset_queue(void) {
+    // USB bus reset: drop the USB consumer's backlog (the host re-syncs
+    // with a full REQ_GET_ALL_PARAMS on reconnect) and clear the global
+    // source/bulk brackets.  Other consumers' backlogs and the sequence
+    // counter are untouched; resetting seq would fake a wrap-around gap
+    // for a mid-stream UART consumer.
     uint32_t flags = save_and_disable_interrupts();
-    notify_head = 0;
-    notify_tail = 0;
-    notify_seq  = 0;
+    notify_tails[NOTIFY_CONSUMER_USB] = notify_head;
+    notify_peek_idx[NOTIFY_CONSUMER_USB] = 0xFF;
     notify_bulk_depth = 0;
     notify_current_source = PARAM_SRC_UNKNOWN;
     restore_interrupts(flags);
 }
 
-uint16_t notify_peek_next(uint8_t *out_buf, uint16_t max_len) {
-    if (out_buf == NULL) return 0;
+uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_len) {
+    if (out_buf == NULL || c >= NOTIFY_CONSUMER_COUNT) return 0;
 
+  next_entry:;
     uint32_t flags = save_and_disable_interrupts();
 
-    if (notify_head == notify_tail) {
+    if (!notify_active[c] || notify_head == notify_tails[c]) {
         restore_interrupts(flags);
         return 0;
     }
 
-    NotifyRingEntry e = notify_ring[notify_tail];
-    uint8_t seq = ++notify_seq;
+    uint8_t idx = notify_tails[c];
+    NotifyRingEntry e = notify_ring[idx];
+    notify_peek_idx[c] = idx;
 
     restore_interrupts(flags);
+
+    // The v1 legacy master-volume packet exists only for pre-v2 USB hosts;
+    // every v1 event has a v2 PARAM_CHANGED twin, so other consumers skip
+    // it (it carries no seq, so skipping never reads as a drop).
+    if (e.event_id == NOTIFY_EVT_MASTER_VOLUME && c != NOTIFY_CONSUMER_USB) {
+        notify_commit_pop_for(c);
+        goto next_entry;
+    }
+
+    uint8_t seq = e.seq;
 
     // Format the packet.  Every code path writes a bounded number of bytes
     // and returns the length.
@@ -425,18 +562,108 @@ uint16_t notify_peek_next(uint8_t *out_buf, uint16_t max_len) {
             return 8;
         }
 
+        case NOTIFY_EVT_INPUT_FORMAT: {
+            // 8 bytes: active input channel count in byte 4.
+            if (max_len < 8) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_INPUT_FORMAT;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = 0;
+            out_buf[6] = 0;
+            out_buf[7] = 0;
+            return 8;
+        }
+
+        case NOTIFY_EVT_ADAT_STATE: {
+            // 8 bytes: enabled, active, data pin in bytes 4..6.
+            if (max_len < 8) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_ADAT_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = e.value[1];
+            out_buf[6] = e.value[2];
+            out_buf[7] = 0;
+            return 8;
+        }
+
+        case NOTIFY_EVT_I2S_SLAVE_STATE: {
+            // 9 bytes: state in byte 4, detected rate (Hz, LE) in bytes 5..8.
+            if (max_len < 9) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_I2S_SLAVE_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            memcpy(&out_buf[5], &e.value[1], 4);
+            return 9;
+        }
+
+        case NOTIFY_EVT_SIGGEN_STATE: {
+            // 8 bytes: state, stop reason, signal type, walk channel.
+            if (max_len < 8) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_SIGGEN_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = e.value[1];
+            out_buf[6] = e.value[2];
+            out_buf[7] = e.value[3];
+            return 8;
+        }
+
+        case NOTIFY_EVT_ADAT_INPUT_STATE: {
+            // 10 bytes: state, detected rate (Hz, LE), clock mode.
+            if (max_len < 10) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_ADAT_INPUT_STATE;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            memcpy(&out_buf[5], &e.value[1], 4);
+            out_buf[9] = e.value[5];
+            return 10;
+        }
+
+        case NOTIFY_EVT_CS_IR_LEARN: {
+            // 12 bytes: learn state, protocol, pad, pad, learned code LE.
+            if (max_len < 12) return 0;
+            out_buf[0] = NOTIFY_V2_VERSION;
+            out_buf[1] = NOTIFY_EVT_CS_IR_LEARN;
+            out_buf[2] = 0;
+            out_buf[3] = seq;
+            out_buf[4] = e.value[0];
+            out_buf[5] = e.value[1];
+            out_buf[6] = 0;
+            out_buf[7] = 0;
+            out_buf[8]  = e.value[2];
+            out_buf[9]  = e.value[3];
+            out_buf[10] = e.value[4];
+            out_buf[11] = e.value[5];
+            return 12;
+        }
+
         default:
-            // Unknown event (shouldn't happen).  Skip it by committing the
-            // pop without emitting a packet; fall through returns 0.
-            notify_commit_pop();
-            return 0;
+            // Unknown event (shouldn't happen).  Skip it and try the next
+            // entry rather than returning 0 with data still pending.
+            notify_commit_pop_for(c);
+            goto next_entry;
     }
 }
 
-void notify_commit_pop(void) {
+void notify_commit_pop_for(NotifyConsumer c) {
+    if (c >= NOTIFY_CONSUMER_COUNT) return;
     uint32_t flags = save_and_disable_interrupts();
-    if (notify_head != notify_tail) {
-        notify_tail = (notify_tail + 1) & NOTIFY_RING_MASK;
+    // Advance only if the producer's force-drop has not already moved this
+    // consumer's tail past the entry the peek captured.
+    if (notify_head != notify_tails[c] &&
+        notify_tails[c] == notify_peek_idx[c]) {
+        notify_tails[c] = (uint8_t)(notify_tails[c] + 1) & NOTIFY_RING_MASK;
     }
+    notify_peek_idx[c] = 0xFF;
     restore_interrupts(flags);
 }

@@ -48,6 +48,10 @@ uint32_t spdif_input_poll(void);
 // Called from main loop after spdif_input_poll().
 void spdif_input_update_clock_servo(void);
 
+// Current servoed S/PDIF TX divider (16.8), 0 unless locked and applied.
+// ADAT runs the same 256*Fs PIO clock and pulls this on resync.
+uint32_t spdif_input_current_tx_divider(void);
+
 // Get current SPDIF input state
 SpdifInputState spdif_input_get_state(void);
 

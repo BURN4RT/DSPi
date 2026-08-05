@@ -17,6 +17,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 - [DSP Features](#dsp-features)
   - [Matrix Mixer](#matrix-mixer)
   - [Parametric Equalization](#parametric-equalization)
+  - [Crossover Filters](#crossover-filters)
   - [Loudness Compensation](#loudness-compensation)
   - [Headphone Crossfeed](#headphone-crossfeed)
   - [Volume Leveller](#volume-leveller)
@@ -31,6 +32,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
   - [USB Control Protocol](#usb-control-protocol)
   - [System Telemetry](#reqgetstatus-0x50---system-telemetry)
   - [Data Structures](#data-structures)
+  - [USB Audio Loopback Capture (DSPI_LOOPBACK)](#usb-audio-loopback-capture-dspi_loopback)
 - [Building from Source](#building-from-source)
 - [Detailed Specifications](#detailed-specifications)
 - [License](#license)
@@ -40,10 +42,12 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 ## Key Capabilities
 
 *   **USB Audio Interface:** Plug-and-play under macOS, Windows, Linux, and iOS. Supports 16-bit and 24-bit PCM input at 44.1, 48, and 96 kHz.
+*   **S/PDIF Input:** 24-bit PCM stereo audio at 44.1 or 48kHz. Channel status bits and LG SoundSync are decoded. LG Soundsync volume and mute status is optionally used to control the DSPi user volume and output mute.
 *   **24-bit S/PDIF or I2S Outputs:** Up to four independent stereo output slots (8 channels on RP2350, 4 channels on RP2040). Each slot can be switched at runtime between S/PDIF and I2S, enabling direct connection to any standard DAC. I2S slots share a common BCK/LRCLK and can optionally produce a 128×/256× master clock.
 *   **Per-Channel Preamp:** Independent gain control for each USB input channel (L/R), applied as PASS 1 of the DSP pipeline before any other processing.
 *   **Matrix Mixer:** Route either or both USB input channels to any output with independent gain and phase invert per crosspoint. 2x9 on RP2350, 2x5 on RP2040.
-*   **Parametric Equalization:** Up to 10 PEQ bands per channel with 6 filter types. 110 total filter bands on RP2350, 70 on RP2040. RP2350 uses a hybrid SVF/biquad architecture for superior low-frequency accuracy.
+*   **Parametric Equalization:** Up to 10 PEQ bands per channel with 11 filter types (peaking, low/high shelf, low/high pass, notch, all-pass, plus gentle first-order shelf and all-pass variants). 110 total filter bands on RP2350, 70 on RP2040. RP2350 uses a hybrid SVF/biquad architecture for superior low-frequency accuracy.
+*   **Active Crossovers:** Up to 4 dedicated crossover filters per output channel: Linkwitz-Riley, Butterworth, and Bessel low/high-pass up to 8th order (48 dB/oct), for multi-way speaker and subwoofer integration.
 *   **Volume Leveller:** RMS-based, stereo-linked, soft-knee upward compressor that lifts quieter content toward a target level without ever amplifying loud passages. Optional 10 ms lookahead, configurable speed and max-gain ceiling, with a -6 dBFS gain-reduction safety limiter.
 *   **Loudness Compensation:** Volume-dependent EQ based on the ISO 226:2003 equal-loudness contour standard. Automatically boosts bass and treble at low listening levels to maintain perceived tonal balance.
 *   **Headphone Crossfeed:** BS2B-based crossfeed with interaural time delay (ITD) reduces unnatural stereo separation for headphone listening. Three classic presets plus fully custom parameters.
@@ -76,6 +80,7 @@ Feel free to join the [official Discord server](https://discord.gg/RCyqxAQ5xS) f
 | **Math Engine** | Hand-optimized ARM Assembly | Hardware FPU (hybrid SVF/biquad EQ) |
 | **Dual-Core EQ** | Yes (Core 1 processes outputs 3-4) | Yes (Core 1 processes outputs 3-8) |
 | **User Presets** | 10 slots | 10 slots |
+| **S/PDIF Input** | Yes | Yes |
 | **Status** | Production | Production |
 
 Both platforms are fully tested and production-ready. The RP2040 reaches 307.2 MHz with a slight voltage bump; the RP2350 hits the same frequency at the same voltage. Clock is fixed (no rate-dependent switching), and PIO dividers are integer at every supported sample rate. The RP2350 offers significantly more processing headroom thanks to its hardware floating-point unit, enabling more output channels and a hybrid SVF/biquad filter architecture for improved low-frequency accuracy.
@@ -90,6 +95,8 @@ DSPi processes audio in a linear, low-latency pipeline:
 
 ```
 USB Input (16/24-bit PCM Stereo, 44.1 / 48 / 96 kHz)
+or
+S/PDIF Input (24 bit PCM Stereo, 44.1 / 48 kHz)
     |
 PASS 1: Per-Channel Preamp (independent L/R gain) + USB Volume
     |
@@ -117,6 +124,8 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 ```
 USB Input (16/24-bit PCM Stereo, 44.1 / 48 / 96 kHz)
+or
+S/PDIF Input (24 bit PCM Stereo, 44.1 / 48 kHz)
     |
 PASS 1: Per-Channel Preamp + USB Volume
     |
@@ -141,17 +150,18 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 ### Signal Chain Details
 
 1.  **Input (USB):** 16-bit or 24-bit PCM stereo audio at 44.1, 48, or 96 kHz. Bit depth is selected via USB alt setting; sample rate via the USB Audio Class rate-set request.
-2.  **Per-Channel Preamp (PASS 1):** Independent gain control for the USB Left and Right input channels in dB. Applied at the very start of the DSP chain so its setting affects all downstream processing.
-3.  **Master EQ (PASS 2):** Up to 10 bands of parametric EQ per channel (Left/Right). Supports peaking, low shelf, high shelf, low pass, and high pass filter types.
-4.  **Volume Leveller (PASS 2.5):** Optional feedforward, stereo-linked, single-band RMS compressor with soft-knee upward compression — quieter content is boosted toward a target level while content above the threshold passes through untouched. Configurable speed, max-gain ceiling, and noise gate. Optional 10 ms lookahead. A -6 dBFS gain-reduction safety limiter prevents output overshoots.
-5.  **Headphone Crossfeed (PASS 3):** Optional BS2B crossfeed that mixes a filtered, delayed portion of each channel into the opposite channel. Uses a complementary filter design with interaural time delay (ITD) via an all-pass filter. Three presets (Default, Chu Moy, Jan Meier) plus custom frequency and feed level. ITD can be independently toggled. Master peak metering taps into this stage.
-6.  **Loudness Compensation:** Optional ISO 226:2003 equal-loudness EQ that adapts to the current volume level. At low volumes, bass and treble are boosted to compensate for the ear's reduced sensitivity. Configurable reference SPL and intensity. Driven by the USB host volume position so it remains correct regardless of master-volume attenuation downstream.
-7.  **Matrix Mixer (PASS 4):** Routes the two USB input channels (Left/Right) to all output channels. Each crosspoint has independent enable, gain (-inf to +12 dB), and phase invert. Outputs can be individually enabled/disabled to save CPU. RP2350 has a 2x9 matrix (9 outputs), RP2040 has a 2x5 matrix (5 outputs).
-8.  **Output EQ (PASS 5):** Independent 10-band EQ per output channel on both platforms. Ideal for crossover filters and per-driver correction. On RP2350, filters below Fs/7.5 use SVF topology for superior low-frequency accuracy; higher frequencies use traditional biquad.
-9.  **Per-Output Gain & Mute:** Independent gain (-inf to +12 dB) and mute for each output channel.
-10. **Time Alignment:** Per-output delay for speaker alignment, up to 85 ms (4096 samples at 48 kHz). Automatic latency compensation between S/PDIF/I2S and PDM output paths.
-11. **Master Volume:** Device-side output ceiling, -128 to 0 dB with a true-mute sentinel at -128. Folded into the per-output multiplier at PASS 5 so it's effectively free CPU-wise. Independent of the USB host volume — the two multiply together. Does not affect loudness-compensation behavior.
-12. **Outputs:** Each numbered slot is configurable as either 24-bit S/PDIF or 24-bit I2S (left-justified, MSB-first). I2S slots share a common BCK/LRCLK clock pair (LRCLK is always BCK + 1 due to a PIO side-set constraint). An optional master clock (MCK) at 128× or 256× Fs can be routed to a separate GPIO. PDM subwoofer is always on its own dedicated output and pin.
+2.  **Input (S/PDIF):** 24-bit PCM stereo audio at 44.1 or 48kHz. Channel status bits and LG SoundSync are decoded. LG Soundsync volume and mute status is optionally used to control the DSPi user volume and output mute.
+3.  **Per-Channel Preamp (PASS 1):** Independent gain control for the USB Left and Right input channels in dB. Applied at the very start of the DSP chain so its setting affects all downstream processing.
+4.  **Master EQ (PASS 2):** Up to 10 bands of parametric EQ per channel (Left/Right). Supports all PEQ filter types (see [Parametric Equalization](#parametric-equalization)).
+5.  **Volume Leveller (PASS 2.5):** Optional feedforward, stereo-linked, single-band RMS compressor with soft-knee upward compression — quieter content is boosted toward a target level while content above the threshold passes through untouched. Configurable speed, max-gain ceiling, and noise gate. Optional 10 ms lookahead. A -6 dBFS gain-reduction safety limiter prevents output overshoots.
+6.  **Headphone Crossfeed (PASS 3):** Optional BS2B crossfeed that mixes a filtered, delayed portion of each channel into the opposite channel. Uses a complementary filter design with interaural time delay (ITD) via an all-pass filter. Three presets (Default, Chu Moy, Jan Meier) plus custom frequency and feed level. ITD can be independently toggled. Master peak metering taps into this stage.
+7.  **Loudness Compensation:** Optional ISO 226:2003 equal-loudness EQ that adapts to the current volume level. At low volumes, bass and treble are boosted to compensate for the ear's reduced sensitivity. Configurable reference SPL and intensity. Driven by the USB host volume position so it remains correct regardless of master-volume attenuation downstream.
+8.  **Matrix Mixer (PASS 4):** Routes the two USB input channels (Left/Right) to all output channels. Each crosspoint has independent enable, gain (-inf to +12 dB), and phase invert. Outputs can be individually enabled/disabled to save CPU. RP2350 has a 2x9 matrix (9 outputs), RP2040 has a 2x5 matrix (5 outputs).
+9.  **Output EQ (PASS 5):** Independent 10-band EQ per output channel on both platforms. Ideal for crossover filters and per-driver correction. On RP2350, filters below Fs/7.5 use SVF topology for superior low-frequency accuracy; higher frequencies use traditional biquad.
+10.  **Per-Output Gain & Mute:** Independent gain (-inf to +12 dB) and mute for each output channel.
+11. **Time Alignment:** Per-output delay for speaker alignment, up to 85 ms (4096 samples at 48 kHz). Automatic latency compensation between S/PDIF/I2S and PDM output paths.
+12. **Master Volume:** Device-side output ceiling, -128 to 0 dB with a true-mute sentinel at -128. Folded into the per-output multiplier at PASS 5 so it's effectively free CPU-wise. Independent of the USB host volume — the two multiply together. Does not affect loudness-compensation behavior.
+13. **Outputs:** Each numbered slot is configurable as either 24-bit S/PDIF or 24-bit I2S (left-justified, MSB-first). I2S slots share a common BCK/LRCLK clock pair (LRCLK is always BCK + 1 due to a PIO side-set constraint). An optional master clock (MCK) at 128× or 256× Fs can be routed to a separate GPIO. PDM subwoofer is always on its own dedicated output and pin.
 
 ---
 
@@ -171,6 +181,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 | Function | Pin | Connection |
 | :--- | :--- | :--- |
+| **S/PDIF Input** | `GPIO 5` (default) | S/PDIF Input |
 | **Output Slot 0** (Out 1-2) | `GPIO 6` (default) | S/PDIF or I2S data for main L/R or multi-way pair 1 |
 | **Output Slot 1** (Out 3-4) | `GPIO 7` (default) | S/PDIF or I2S data for multi-way pair 2 |
 | **Output Slot 2** (Out 5-6) | `GPIO 8` (default) | S/PDIF or I2S data for multi-way pair 3 |
@@ -185,6 +196,7 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 
 | Function | Pin | Connection |
 | :--- | :--- | :--- |
+| **S/PDIF Input** | `GPIO 5` (default) | S/PDIF Input |
 | **Output Slot 0** (Out 1-2) | `GPIO 6` (default) | S/PDIF or I2S data for main L/R or stereo pair 1 |
 | **Output Slot 1** (Out 3-4) | `GPIO 7` (default) | S/PDIF or I2S data for stereo pair 2 |
 | **Subwoofer Out** (PDM, Out 5) | `GPIO 10` (default) | Active subwoofer or PDM-to-analog filter |
@@ -193,7 +205,17 @@ PASS 5: Per-Output EQ -> Gain/Mute -> Delay -> Output Gain × Master Volume
 | **I2S MCK** (optional) | `GPIO 13` (default) | 128× or 256× Fs master clock when MCK is enabled |
 | **USB** | `Micro-USB` | Host device (PC/Mac/Mobile Device) |
 
-> **Notes:** S/PDIF output requires either a Toshiba TX179 optical transmitter or a simple resistor divider. I2S output is a standard 24-bit-in-32-bit left-justified frame — wires straight into most I2S DACs. PDM output is a 1-bit logic signal that requires a resistor and capacitor to form a low-pass filter for conversion to analog audio.
+> **Warning:** RP2040 input pins are not 5v tolerant, use only 3.3v external devices such as optical receivers.
+
+> **Notes:** S/PDIF input requires either a Toshiba TORX141 optical receiver or a suitable receiver circuit. Possible receiver circuits are described by ST Microelectronics [here](https://www.st.com/resource/en/application_note/an5073-receiving-spdif-audio-stream-with-the-stm32f4f7h7-series-stmicroelectronics.pdf). S/PDIF output requires either a Toshiba TX179 optical transmitter or a simple resistor divider. I2S output is a standard 24-bit-in-32-bit left-justified frame — wires straight into most I2S DACs. PDM output is a 1-bit logic signal that requires a resistor and capacitor to form a low-pass filter for conversion to analog audio.
+
+#### PCM1808 ADC Module on Pico 2 (I2S Input)
+
+<img src="Images/pcm1808_pico2_i2s_wiring.svg" alt="Wiring diagram for connecting a PCM1808 ADC module to DSPi firmware on a Raspberry Pi Pico 2" width="100%">
+
+Use the PCM1808 in slave, standard-I2S mode: `MD1 = LOW`, `MD0 = LOW`, and `FMT = LOW`. In DSPi Console, select **I2S** as the input source, set RX data to `GPIO 4`, keep BCK on `GPIO 14` (`GPIO 15` is LRCLK), enable MCK on `GPIO 13`, and set the MCK multiplier to **256x**. That gives the PCM1808 `SCKI/MCLK` frequencies of 11.2896 MHz at 44.1 kHz, 12.288 MHz at 48 kHz, and 24.576 MHz at 96 kHz.
+
+PCM1808 modules vary: some expose separate `VDD/3V3` and `VCC/5V` pins, while others have a regulator and only expose `VCC`. Follow the module silkscreen for power, keep all digital I/O at 3.3 V logic, and always share ground with the Pico 2.
 
 ### Custom Pin Assignments
 
@@ -259,18 +281,28 @@ When the PDM subwoofer is active, Core 1 is fully dedicated to the delta-sigma m
 
 ### Parametric Equalization
 
-Each filter band supports 6 types:
+Each band can be set to any of these 14 types. Every type uses a corner/center **frequency**; **Q** and **gain** apply only where listed (other types ignore them).
 
-| Type | Description |
-|------|-------------|
-| Flat | Bypass (no processing) |
-| Peaking | Parametric bell filter |
-| Low Shelf | Low-frequency shelf |
-| High Shelf | High-frequency shelf |
-| Low Pass | Low-pass filter |
-| High Pass | High-pass filter |
+| Type | Order | Parameters | Description |
+|------|-------|------------|-------------|
+| Flat | - | - | Bypass; the band does nothing (auto-skipped for zero CPU) |
+| Peaking | 2nd | freq, Q, gain | Parametric bell; boost or cut centered on freq, width set by Q |
+| Low Shelf | 2nd | freq, Q, gain | Boost/cut everything below freq; Q sets the transition slope |
+| High Shelf | 2nd | freq, Q, gain | Boost/cut everything above freq; Q sets the transition slope |
+| Low Pass | 2nd | freq, Q | 12 dB/oct rolloff above freq; Q sets corner resonance |
+| High Pass | 2nd | freq, Q | 12 dB/oct rolloff below freq; Q sets corner resonance |
+| Notch | 2nd | freq, Q | Deep, narrow null at freq; Q sets width |
+| All-Pass | 2nd | freq, Q | Flat magnitude; rotates phase 0 to -360 deg (phase / group-delay tool) |
+| First-Order All-Pass | 1st | freq | Flat magnitude; rotates phase 0 to -180 deg (-90 deg at freq) |
+| First-Order Low Shelf | 1st | freq, gain | Gentle 6 dB/oct low shelf; monotonic, no Q or overshoot |
+| First-Order High Shelf | 1st | freq, gain | Gentle 6 dB/oct high shelf; monotonic, no Q or overshoot |
+| Linkwitz Transform | 2nd | freq (f0), Q (Q0), gain (fp in Hz), target Q | Replaces a driver's measured sealed-box rolloff (f0, Q0) with a target alignment (fp, Qp) for bass extension; see [PEQ filters](Documentation/Features/peq_filters.md) |
+| First-Order Low Pass | 1st | freq | Gentle 6 dB/oct rolloff above freq; -3 dB at freq, no resonance |
+| First-Order High Pass | 1st | freq | Gentle 6 dB/oct rolloff below freq; -3 dB at freq, no resonance |
 
-On RP2040, all filters use biquad IIR (Transposed Direct Form II) with Q28 fixed-point arithmetic. On RP2350, the firmware uses a hybrid SVF/biquad architecture: filters below Fs/7.5 (~6.4 kHz at 48 kHz) use the Cytomic SVF (linear trapezoid) topology for superior numerical accuracy at low frequencies, while higher frequencies use traditional TDF2 biquad. All filters have configurable frequency, Q factor, and gain. Flat filters are automatically bypassed for zero CPU overhead.
+Frequency ranges from 10 Hz to 0.45xFs; Q from 0.1 to 20. First-order types are single-pole (6 dB/oct) and have no resonance.
+
+On RP2040, all filters use biquad IIR (Transposed Direct Form II) with Q28 fixed-point arithmetic. On RP2350, the firmware uses a hybrid SVF/biquad architecture: filters below Fs/7.5 (~6.4 kHz at 48 kHz) use the Cytomic SVF (linear trapezoid) topology for superior numerical accuracy at low frequencies, while higher frequencies use traditional TDF2 biquad. Flat bands (and zero-gain peaking/shelf bands) are automatically bypassed for zero CPU overhead.
 
 **Channel Layout:**
 
@@ -291,6 +323,18 @@ On RP2040, all filters use biquad IIR (Transposed Direct Form II) with Q28 fixed
 | Master Right | 1 | 10 |
 | Output 1-4 (S/PDIF) | 2-5 | 10 each |
 | Output 5 (PDM Sub) | 6 | 10 |
+
+### Crossover Filters
+
+In addition to the parametric bands above, every output channel has up to 4 dedicated crossover filter bands for building active multi-way speaker and subwoofer systems. Crossover filters are low-pass or high-pass only and are tuned by corner frequency alone (Q and gain are not used). Three families are available:
+
+| Family | Orders | Slopes | Character |
+|--------|--------|--------|-----------|
+| Linkwitz-Riley (LR) | 2, 4, 6, 8 | 12 / 24 / 36 / 48 dB/oct | -6 dB at the corner; an LP and HP pair at the same frequency sum to flat magnitude. LR4 (24 dB/oct) is the de-facto studio and hi-fi standard. |
+| Butterworth (BW) | 1-8 | 6 / 12 / 18 / 24 / 30 / 36 / 42 / 48 dB/oct | -3 dB at the corner; maximally flat passband. BW1 is a gentle 6 dB/oct first-order slope. |
+| Bessel (BES) | 2, 4, 6, 8 | 12 / 24 / 36 / 48 dB/oct | Maximally flat group delay for the best transient response and phase behavior. |
+
+Each crossover filter is built from a cascade of up to four biquad sections. On RP2350 the same hybrid rule applies per section (sections below Fs/7.5 use the Cytomic SVF for low-frequency accuracy). Crossover bands exist on output channels only, separate from and in addition to that channel's 10 parametric bands. A typical 2-way active speaker drives one output through a high-pass crossover (tweeter/mid) and another through a low-pass (woofer); a subwoofer output usually takes a low-pass.
 
 ### Loudness Compensation
 
@@ -603,6 +647,86 @@ Output GPIO pins can be reassigned at runtime without reflashing. This is useful
 *   Returns the current GPIO pin number for that output
 
 Pin assignments are stored in each preset and can optionally be included during preset save/load (controlled via `REQ_PRESET_SET_INCLUDE_PINS`).
+
+### USB Audio Loopback Capture (DSPI_LOOPBACK)
+
+A build-flag-gated capture path for bench measurement and automated verification. When the firmware is compiled with `DSPI_LOOPBACK`, the device exposes a second USB Audio Class 1 function that streams **output slot 0** back to the host as a recording input, so a host tool can play a signal into DSPi and record exactly what slot 0 produced. This folds the capability of the standalone Weeb Labs USBrx (an external S/PDIF-to-USB recorder) into DSPi itself, removing the second board and the S/PDIF jumper from the loopback rig. The feature is excluded from release builds; a production device never exposes the capture endpoint.
+
+**Building**
+
+The loopback build lives in dedicated build directories so release artifacts are unaffected:
+
+```bash
+# Configure once (from the repo root):
+cmake -S firmware -B build-rp2040-loopback -DPICO_PLATFORM=rp2040       -DPICO_BOARD=pico  -DDSPI_LOOPBACK=ON
+cmake -S firmware -B build-rp2350-loopback -DPICO_PLATFORM=rp2350-arm-s -DPICO_BOARD=pico2 -DDSPI_LOOPBACK=ON
+
+# Build, then flash build-<plat>-loopback/DSPi/DSPi.uf2:
+cmake --build build-rp2040-loopback -j
+cmake --build build-rp2350-loopback -j
+```
+
+`DSPI_LOOPBACK` is a CMake `option` (default `OFF`); enabling it adds `loopback.c` to the target and defines the `DSPI_LOOPBACK` macro that gates every firmware change. With the flag off, the build is byte-for-byte identical to the normal firmware.
+
+**USB topology**
+
+The capture is a self-contained UAC1 audio function appended after the vendor interface, so the existing interfaces (0 Audio Control, 1 Audio Streaming, 2 Vendor) keep their numbers. The configuration descriptor grows from 207 to 309 bytes.
+
+| Element | Value |
+|---|---|
+| Interface 3 | Capture Audio Control (own IAD grouping interfaces 3 + 4) |
+| Interface 4 | Capture Audio Streaming (alt 0 zero-bandwidth, alt 1 streaming) |
+| Endpoint | `0x81` isochronous, asynchronous IN, `bInterval` 1 |
+| `wMaxPacketSize` | 384 bytes (64 stereo frames of headroom) |
+| Format | Type I PCM, 2 channels, 24-bit, 44.1 / 48 kHz |
+| Terminals | Input terminal ID 4 (internal: slot 0) feeds Output terminal ID 5 (USB streaming) |
+
+The host sees one USB device with both a playback output and a 2-channel capture input. On macOS these appear as two Core Audio entries that share the name "Weeb Labs DSPi" (one with output channels, one with input channels). The Microsoft OS 2.0 / WinUSB descriptors are unchanged: their Function Subset still scopes WinUSB to the vendor interface only, so adding the capture function does not disturb driverless vendor-interface binding on Windows.
+
+**Capture data path**
+
+```
+output slot 0 (audio_pipeline.c, post-DSP, pre-encode)
+  -> loopback_push_slot0() -> SPSC ring (1024 frames, ~8 KB, .bss)
+      -> rate-matching servo (fill_audio_packet, per USB frame)
+          -> iso async IN endpoint 0x81 -> USB host
+```
+
+*   **Tap.** A single call in `process_input_block()` reads slot 0's finished, interleaved 24-bit samples from `audio_buf[0]` immediately before the buffer is handed to the output DMA. It runs after all DSP (EQ, crossover, matrix, gain, delay, mute) and before the output encoder, so it captures exactly what slot 0 sends out whether slot 0 is configured as S/PDIF or I2S. The tap is read-only: it copies samples out and never writes back, so it cannot perturb the firmware's inter-slot output alignment.
+*   **Ring.** A single-producer / single-consumer ring of 1024 interleaved stereo frames (two `int32` per frame, ~8 KB in `.bss`). The producer is the audio pipeline; the consumer is the USB transfer-complete callback. Both run in core-0 thread context, so plain volatile head/tail indices are sufficient. On overflow (host not draining) the producer drops frames and the servo re-primes.
+
+**Rate-matching servo**
+
+The capture IN endpoint is asynchronous to the host's USB frame (SOF) clock in every input mode: with USB input, DSPi is the feedback master on its own crystal; with S/PDIF or I2S input, the output runs on the external source clock. A rate-matching servo therefore varies the packet size each USB frame (implicit feedback), with no resampling:
+
+```
+frames_this_frame = nominal + correction
+  nominal    = audio_state.freq / 1000          (samples per 1 ms USB frame)
+  correction = clamp(KP * (ring_fill - target), +/- MAX_CORR)
+```
+
+A fractional-sample accumulator carries the remainder across frames so non-integer rates (44.1 kHz) stay exact. The stream primes to the target fill level before sending audio and emits silence on underrun.
+
+| Constant | Value | Meaning |
+|---|---|---|
+| `TARGET_FILL_FRAMES` | 256 | Ring set-point (~5.3 ms @ 48 kHz) |
+| `SERVO_KP` | 0.008 | Proportional gain (samples/frame per frame of fill error) |
+| `SERVO_MAX_CORR` | 2.0 | Correction clamp (samples/frame) |
+| `RING_FRAMES` | 1024 | Ring capacity (~21 ms @ 48 kHz) |
+
+**Driver registration**
+
+The capture function uses a dedicated custom UAC1 class driver (`loopback.c`), registered alongside the playback driver. With `DSPI_LOOPBACK` defined, `usbd_app_driver_get_cb()` returns both drivers. Because both audio-control interfaces match the same class / subclass / alt-setting, each driver's `open()` is scoped by interface number: the playback driver claims interface 0 only and the loopback driver claims interface 3 only, so neither hijacks the other's function. All capture control requests (SET / GET_INTERFACE, the endpoint sampling-frequency control) and the isochronous transfers route to the loopback driver.
+
+**Resource cost**
+
+The capture ring and buffers add roughly 8.7 KB of BSS on both platforms (RP2040 129436 to 138120 bytes; RP2350 237404 to 246092 bytes). Because the firmware is built `copy_to_ram`, this BSS competes with the program image in RAM; the RP2040 loopback build has about 6 KB of headroom, which is acceptable for a debug build and is part of why the feature is excluded from release. Capture rates are capped at DSPi's operating range (44.1 / 48 kHz), which also keeps the extra isochronous endpoint within the RP2040 USB controller's DPRAM budget.
+
+**Host usage**
+
+Any class-compliant recording tool can open the DSPi capture input. The repository's verification harness drives it directly: `python3 -m tools.dspi_test.run --group audio` plays signals into DSPi, records slot 0 from the capture, and checks the measured response against the firmware's filter math. See `tools/dspi_test/test_harness.md` for the full rig guide and `Documentation/current_architecture.md` ("USB Audio Loopback Capture") for additional firmware detail.
+
+**Files:** `firmware/DSPi/loopback.c` / `loopback.h` (ring, driver, servo), with `DSPI_LOOPBACK`-gated additions in `usb_descriptors.c` / `.h` (descriptor block), `usb_audio.c` (driver registration and interface scoping), `audio_pipeline.c` (the slot-0 tap), and `CMakeLists.txt` (the build option).
 
 ---
 

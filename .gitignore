@@ -29,4 +29,7 @@ __pycache__/
 !README.md
 !Documentation/current_architecture.md
 !Documentation/Roadmap.md
+!Documentation/commands.md
 !Documentation/Features/*.md
+!tools/dspi_test/test_harness.md
+!tools/dspi_test/test_failures_diag.md

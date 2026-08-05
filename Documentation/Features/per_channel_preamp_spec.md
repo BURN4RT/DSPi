@@ -42,7 +42,7 @@ Because the preamp is first in the chain, its gain affects all downstream proces
 | 0 | USB Left |
 | 1 | USB Right |
 
-The array is sized by `NUM_INPUT_CHANNELS` (currently 2), which is expandable for future S/PDIF input support.
+The array is sized by `NUM_INPUT_CHANNELS`: **2 on RP2040**, **8 on RP2350** (inputs 0/1 are USB L/R; inputs 2-7 carry the extra channels in 8-channel USB input mode — see `usb_8ch_input_spec.md`). On RP2350 the per-channel preamp commands accept channel index 0-7; in the wire format, inputs 2-7 preamp lives in the V15 `WireInputExtConfig` tail section.
 
 ---
 

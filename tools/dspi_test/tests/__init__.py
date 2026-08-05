@@ -11,3 +11,4 @@ from . import inputs          # noqa: F401
 from . import crosscut        # noqa: F401
 from . import presets         # noqa: F401
 from . import stress          # noqa: F401
+from . import audio_loopback  # noqa: F401  (group "audio"; opt-in via --audio)

@@ -21,15 +21,17 @@
 #include <stdint.h>
 #include <stdbool.h>
 
-// Fixed maximums for the wire format (sized for the largest platform)
-#define WIRE_MAX_CHANNELS        11   // RP2350 max
-#define WIRE_MAX_OUTPUT_CHANNELS  9   // RP2350 max
-#define WIRE_MAX_INPUT_CHANNELS   2   // Same on both
+// Fixed maximums for the wire format (sized for the largest platform).
+// Channel index space: [ inputs 0..WIRE_MAX_INPUT_CHANNELS-1 ][ outputs ... ],
+// matching the firmware NUM_CHANNELS layout.
+#define WIRE_MAX_INPUT_CHANNELS   8   // RP2350 max input channels
+#define WIRE_MAX_OUTPUT_CHANNELS  9   // RP2350 max output channels
+#define WIRE_MAX_CHANNELS        17   // inputs + outputs (RP2350 max)
 #define WIRE_MAX_BANDS           12   // Same on both
 #define WIRE_MAX_PIN_OUTPUTS      5   // RP2350 max (4 SPDIF + 1 PDM)
 #define WIRE_NAME_LEN            32   // Must match PRESET_NAME_LEN
 
-#define WIRE_FORMAT_VERSION      10   // V10: + WireDacHwMute (DAC hardware mute pin config)
+#define WIRE_FORMAT_VERSION      28   // V28: fourth selectable SPDIF input; input-config spdif_rx_pin_ext grows 2 to 3 entries, shifting the fields below it down one byte and consuming that section's last reserved byte (section size unchanged). V27: upmixer centre mode gains OFF (2), a surrounds-only setting that leaves L/R bit-exact; enum widening only, no struct or offset changes. V26: upmixer presence bell claims the upmix section reserved byte (int8, dB*2; struct sizes unchanged). V25: append upmixer section (44 bytes; RP2350 stereo upmixer, zeroed/ignored on RP2040). V24: ADAT input config (pin/enable/clock mode) claimed from the input-config reserved bytes (struct size unchanged). V23: append psybass section (24 bytes; psychoacoustic bass enhancement). V22: Linkwitz Transform target Q carried in the EQ WireBandParams reserved[2] bytes (uint16 LE, Q*512; zero for non-LT types; struct size unchanged). V21: I2S clock master/slave mode in the input-config section (claims one reserved byte; size unchanged). V20: crossfeed output_pair_mask replaces WireCrossfeedParams reserved byte; struct sizes unchanged. V19: loudness_output_mask replaces global reserved[2]; struct sizes unchanged. V18: leveller detector/apply channel masks (WireLevellerConfig grows 16 to 20 bytes). V17: append ADAT output config section (RP2350; zeroed/ignored on RP2040). V16: unified channel model (inputs are first-class channels with PEQ + metering; no "master"); matrix/preamp direct (8 inputs); compat-breaking, no migration.
 #define WIRE_MAX_SPDIF_INSTANCES  4   // RP2350 max
 
 // Platform IDs
@@ -42,9 +44,9 @@
 typedef struct __attribute__((packed)) {
     uint8_t  format_version;         // WIRE_FORMAT_VERSION
     uint8_t  platform_id;            // WIRE_PLATFORM_RP2040 or _RP2350
-    uint8_t  num_channels;           // Actual channel count (7 or 11)
+    uint8_t  num_channels;           // Actual channel count (7 or 17)
     uint8_t  num_output_channels;    // Actual output count (5 or 9)
-    uint8_t  num_input_channels;     // Always 2
+    uint8_t  num_input_channels;     // Actual input count (2 or 8)
     uint8_t  max_bands;              // Bands per channel in this payload (12)
     uint16_t payload_length;         // Total packet size including header
     uint16_t fw_version_major;       // Firmware version
@@ -59,7 +61,7 @@ typedef struct __attribute__((packed)) {
     float    preamp_gain_db;         // Preamp gain
     uint8_t  bypass;                 // Master EQ bypass (0/1)
     uint8_t  loudness_enabled;       // Loudness compensation (0/1)
-    uint8_t  reserved[2];
+    uint16_t loudness_output_mask;   // Bit k: loudness processes output channel k (V19+)
     float    loudness_ref_spl;       // Reference SPL
     float    loudness_intensity_pct; // Intensity percentage
 } WireGlobalParams;                  // 16 bytes
@@ -71,7 +73,7 @@ typedef struct __attribute__((packed)) {
     uint8_t  enabled;                // Crossfeed on/off
     uint8_t  preset;                 // Preset index
     uint8_t  itd_enabled;            // ITD simulation on/off
-    uint8_t  reserved;
+    uint8_t  output_pair_mask;       // Bit p: crossfeed runs on output pair p (V20+)
     float    custom_fc;              // Custom crossover frequency (Hz)
     float    custom_feed_db;         // Custom feed level (dB)
     uint32_t reserved2;              // Future expansion
@@ -87,11 +89,11 @@ typedef struct __attribute__((packed)) {
 } WireLegacyChannels;                // 16 bytes
 
 // ============================================================================
-// Section 5: Per-Channel Delays (44 bytes, fixed at WIRE_MAX_CHANNELS)
+// Section 5: Per-Channel Delays (fixed at WIRE_MAX_CHANNELS)
 // ============================================================================
 typedef struct __attribute__((packed)) {
     float    delay_ms[WIRE_MAX_CHANNELS];  // ms, zero-padded beyond num_channels
-} WireChannelDelays;                 // 44 bytes
+} WireChannelDelays;                 // 68 bytes (17 channels)
 
 // ============================================================================
 // Section 6: Matrix Crosspoint (8 bytes each)
@@ -131,18 +133,20 @@ typedef struct __attribute__((packed)) {
 typedef struct __attribute__((packed)) {
     uint8_t  type;                   // Filter type enum
     uint8_t  bypass;                 // 1 = user-bypassed, anything else = active. See band_bypass_spec.md.
-    uint8_t  reserved[2];            // Must be zero
+    uint8_t  reserved[2];            // Since V22: Linkwitz Transform target Q (uint16 LE, Q*512,
+                                     // 0 = 0.707 default) when type == FILTER_LINKWITZ_TRANSFORM;
+                                     // zero for all other types.
     float    freq;                   // Hz
     float    q;                      // Q factor
     float    gain_db;                // dB
 } WireBandParams;                    // 16 bytes
 
 // ============================================================================
-// Section 10: Channel Names (352 bytes)
+// Section 10: Channel Names (544 bytes)
 // ============================================================================
 typedef struct __attribute__((packed)) {
     char names[WIRE_MAX_CHANNELS][WIRE_NAME_LEN];
-} WireChannelNames;                  // 352 bytes
+} WireChannelNames;                  // 544 bytes (17 × 32)
 
 // ============================================================================
 // Section 11: I2S Configuration (16 bytes) — V3+
@@ -153,11 +157,17 @@ typedef struct __attribute__((packed)) {
     uint8_t  mck_pin;                // MCK GPIO
     uint8_t  mck_enabled;            // 0 = off, 1 = on
     uint8_t  mck_multiplier;         // 128 or 256
-    uint8_t  reserved[8];            // Future expansion (must be 0)
+    // I2S clock-pin mode + slave pair.  Claimed from the reserved bytes with
+    // "0 = absent, keep live" conventions so the wire layout/size and format
+    // version are unchanged (old hosts send zeros here).  The mode needs a +1
+    // sentinel because 0 (unified) is a meaningful value.
+    uint8_t  clock_pin_mode_p1;      // 0 = absent; 1 = unified, 2 = split
+    uint8_t  bck_pin_slave;          // Slave-mode BCK GPIO, LRCLK = +1 (0 = absent)
+    uint8_t  reserved[6];            // Future expansion (must be 0)
 } WireI2SConfig;                     // 16 bytes
 
 // ============================================================================
-// Section 12: Volume Leveller Configuration (16 bytes) — V4+
+// Section 12: Volume Leveller Configuration (20 bytes) — V4+
 // ============================================================================
 typedef struct __attribute__((packed)) {
     uint8_t  enabled;                // 0/1
@@ -167,15 +177,17 @@ typedef struct __attribute__((packed)) {
     float    amount;                 // 0.0-100.0 (compression strength %)
     float    max_gain_db;            // 0.0-35.0 (max boost for quiet content)
     float    gate_threshold_db;      // -96.0-0.0 (silence gate level dBFS)
-} WireLevellerConfig;                // 16 bytes
+    uint8_t  detector_mask;          // Bit k: input channel k feeds the detector (V18+)
+    uint8_t  apply_mask;             // Bit k: gain applied to input channel k (V18+)
+    uint8_t  reserved2[2];           // Pad to 4-byte multiple
+} WireLevellerConfig;                // 20 bytes
 
 // ============================================================================
-// Section 13: Per-Channel Preamp Configuration (16 bytes) — V6+
+// Section 13: Per-Channel Preamp Configuration (32 bytes)
 // ============================================================================
 typedef struct __attribute__((packed)) {
-    float    preamp_db[WIRE_MAX_INPUT_CHANNELS]; // Per-input-channel preamp (dB), 0=L, 1=R
-    uint8_t  reserved[8];                        // Pad to 16 bytes (future input channels)
-} WirePreampConfig;                              // 16 bytes
+    float    preamp_db[WIRE_MAX_INPUT_CHANNELS]; // Per-input-channel preamp (dB), 0..7
+} WirePreampConfig;                              // 32 bytes (8 inputs)
 
 // ============================================================================
 // Section 14: Master Volume (16 bytes) — V6+
@@ -189,10 +201,36 @@ typedef struct __attribute__((packed)) {
 // Section 15: Input Source Configuration (16 bytes) — V7+
 // ============================================================================
 typedef struct __attribute__((packed)) {
-    uint8_t  input_source;           // InputSource enum (0=USB, 1=SPDIF)
+    uint8_t  input_source;           // InputSource enum (0=USB, 1=SPDIF, 2=I2S)
     uint8_t  spdif_rx_pin;          // SPDIF RX GPIO pin (applied on SET when apply_pins=true)
-    uint8_t  reserved[14];           // Future expansion (pad to 16 bytes)
-} WireInputConfig;                   // 16 bytes
+    uint8_t  i2s_rx_pin;             // I2S RX data GPIO, stereo pair 0 (V12+)
+    uint8_t  i2s_input_rate;         // I2S input rate enum: 0=44100, 1=48000, 2=96000 (V12+)
+    // I2S multichannel input (RP2350).  Claimed from the reserved bytes with a
+    // 0 = "absent, keep live value" convention (matching i2s_rx_pin), so the
+    // wire layout/size is unchanged and the format version need not bump.
+    uint8_t  i2s_input_channels;     // Active I2S input channels: 2/4/6/8 (0 = absent)
+    uint8_t  i2s_rx_pin_ext[3];      // I2S RX data GPIOs for stereo pairs 1..3 (0 = unset)
+    // Optional SPDIF inputs 2..4, claimed from the reserved bytes with the same
+    // 0 = "absent, keep live value" convention as the I2S fields above.  The
+    // enable mask is stored PLUS ONE for that reason: a host that pushes zeros
+    // here means "absent", and plain encoding 0 would read as "disable all".
+    // V28 widened the pin array from 2 to 3 entries (SPDIF 4), shifting every
+    // field below it down one byte and consuming the section's last reserved
+    // byte; the section is now full.
+    uint8_t  spdif_rx_pin_ext[3];    // SPDIF RX 2/3/4 GPIOs (0 = absent, keep live)
+    uint8_t  spdif_rx_enabled_ext_p1;// SPDIF 2/3/4 enable mask + 1 (0 = absent;
+                                     // 1 = all disabled, 2 = SPDIF2, 3 = 2+3, ...)
+    uint8_t  i2s_clock_mode;         // I2S clock: 0=master, 1=slave.  Valid from wire V21;
+                                     // pre-V21 readers see this as a reserved (zero) byte,
+                                     // which decodes as master (the correct legacy default).
+    // ADAT input (V24+, RP2350), claimed from the reserved bytes with the
+    // same 0 = "absent, keep live value" convention as the SPDIF ext fields
+    // (enable and clock mode stored PLUS ONE so an old host's zeros are
+    // absent, not "disable/master").
+    uint8_t  adat_input_pin;         // ADAT RX GPIO (0 = absent, keep live)
+    uint8_t  adat_input_enabled_p1;  // enable + 1 (0 absent, 1 disabled, 2 enabled)
+    uint8_t  adat_clock_mode_p1;     // clock mode + 1 (0 absent, 1 master, 2 slave)
+} WireInputConfig;                   // 16 bytes (full; no reserved bytes left)
 
 // ============================================================================
 // Section 16: LG Sound Sync (16 bytes) — V8+
@@ -255,50 +293,128 @@ typedef struct __attribute__((packed)) {
 } WireDacHwMute;                     // 16 bytes
 
 // ============================================================================
+// Section 19: Crossover Bands (704 bytes) — V11+
+// ============================================================================
+//
+// Per-channel crossover bands, layout exactly mirrors `eq[][]` but with
+// MAX_XOVER_BANDS columns (4 vs 12 for EQ).  Wire band indices for crossover
+// are XOVER_BAND_BASE..XOVER_BAND_BASE+MAX_XOVER_BANDS-1 (20..23) when
+// addressed via vendor commands; see
+// Documentation/Features/crossover_filters_spec.md.
+// `band` field in WireBandParams (which the legacy EQ section also doesn't
+// carry) is implicit in the section's array position; row index = channel,
+// column index = local crossover-band index (0..3).
+//
+// `q` and `gain_db` are unused for crossover filter types (any value in the
+// FILTER_XOVER_FIRST..FILTER_XOVER_LAST range); the design code ignores
+// them, but they exist in the struct for wire-format parity with EQ.
+// Master rows (channel 0..1, the CH_MASTER_* slots) are zeroed on collect
+// and skipped on apply because crossovers are an output-channel-only
+// feature; storage symmetry with EQ is a UI convenience, not a usable slot.
+#define WIRE_MAX_XOVER_BANDS  4   // == MAX_XOVER_BANDS
+
+typedef struct __attribute__((packed)) {
+    WireBandParams bands[WIRE_MAX_CHANNELS][WIRE_MAX_XOVER_BANDS];  // 17 × 4 × 16 = 1088
+} WireCrossoverConfig;                                              // 1088 bytes (input rows unused)
+
+// ============================================================================
+// Section 20: ADAT Output Configuration (8 bytes); V17+
+// ============================================================================
+//
+// ADAT lightpipe output (RP2350 only); streams the 8 post-gain output channels
+// as one ADAT frame per sample (see adat_output.h).  Zeroed on collect and
+// ignored on apply on RP2040.  `pin == 0` on apply means the platform default
+// (PICO_ADAT_PIN).
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1 configured enable (persisted intent)
+    uint8_t  pin;                    // data GPIO (0 = platform default on apply)
+    uint8_t  reserved[6];            // Pad to 8 bytes (future fields here)
+} WireAdatConfig;                    // 8 bytes
+
+// ============================================================================
+// Section 21: Psychoacoustic Bass (24 bytes); V23+
+// ============================================================================
+//
+// Missing-fundamental bass enhancement (see psybass.h and
+// Documentation/Features/psychoacoustic_bass_spec.md).  One global parameter
+// set applied to the output channels selected by output_mask.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  reserved0;              // Zero
+    uint16_t output_mask;            // Bit k: psybass processes output channel k
+    float    cutoff_hz;              // Speaker LF limit, 30-300 Hz
+    float    harmonics_db;           // Harmonic mix level, -24..+12 dB
+    float    drive_db;               // Odd-path clipper drive, 0..18 dB
+    float    character_pct;          // Even<->odd harmonic blend, 0..100
+    float    original_db;            // Original low-band level, -60..0 dB
+} WirePsybassParams;                 // 24 bytes
+
+// ============================================================================
+// Section 22: Stereo Upmixer (44 bytes); V25+ (presence byte V26+)
+// ============================================================================
+//
+// RP2350-only stereo upmixer (see upmix.h).  One global config; layout mirrors
+// UpmixConfigPacket in upmix.h.  Zeroed on collect and ignored on apply on
+// RP2040.  Float ranges are clamped downstream in upmix_compute_coefficients,
+// so only enabled/mode fields need validation on apply.
+typedef struct __attribute__((packed)) {
+    uint8_t  enabled;                // 0/1
+    uint8_t  center_mode;            // UPMIX_CENTER_* (0-1)
+    uint8_t  surround_mode;          // UPMIX_SURROUND_* (0-2)
+    int8_t   presence_q1;            // V26+: presence bell dB * 2 (was reserved)
+    float    strength_pct;
+    float    center_width_pct;
+    float    corr_threshold_pct;
+    float    attack_ms;
+    float    release_ms;
+    float    detector_hpf_hz;
+    float    surround_delay_ms;
+    float    surround_hpf_hz;
+    float    surround_lpf_hz;
+    float    decorr_pct;
+} WireUpmixParams;                   // 44 bytes
+
+// ============================================================================
 // Complete Packet
 // ============================================================================
 typedef struct __attribute__((packed)) {
-    WireHeader          header;                                          //   16
-    WireGlobalParams    global;                                          //   16
-    WireCrossfeedParams crossfeed;                                       //   16
-    WireLegacyChannels  legacy;                                          //   16
-    WireChannelDelays   delays;                                          //   44
-    WireCrosspoint      crosspoints[WIRE_MAX_INPUT_CHANNELS][WIRE_MAX_OUTPUT_CHANNELS];  // 144
+    WireHeader          header;          //   16
+    WireGlobalParams    global;          //   16
+    WireCrossfeedParams crossfeed;       //   16
+    WireLegacyChannels  legacy;          //   16
+    WireChannelDelays   delays;          //   68  (17 channels)
+    WireCrosspoint      crosspoints[WIRE_MAX_INPUT_CHANNELS][WIRE_MAX_OUTPUT_CHANNELS];  // 576 (8×9)
     WireOutputChannel   outputs[WIRE_MAX_OUTPUT_CHANNELS];               //  108
-    WirePinConfig       pins;                                             //    8
-    WireBandParams      eq[WIRE_MAX_CHANNELS][WIRE_MAX_BANDS];           // 2112
-    WireChannelNames    channel_names;                                    //  352
-    WireI2SConfig       i2s_config;                                       //   16
-    WireLevellerConfig  leveller;                                          //   16
-    WirePreampConfig    preamp;                                            //   16
-    WireMasterVolume    master_volume;                                     //   16
-    WireInputConfig     input_config;                                      //   16
-    WireLgSoundSync     lg_sound_sync;                                     //   16
-    WireUserVolume      user_volume;                                       //   16
-    WireDacHwMute       dac_hw_mute;                                       //   16
-} WireBulkParams;                    // Total: 2960 bytes (V10)
+    WirePinConfig       pins;            //    8
+    WireBandParams      eq[WIRE_MAX_CHANNELS][WIRE_MAX_BANDS];           // 3264 (17×12)
+    WireChannelNames    channel_names;   //  544  (17 channels)
+    WireI2SConfig       i2s_config;      //   16
+    WireLevellerConfig  leveller;        //   20
+    WirePreampConfig    preamp;          //   32  (8 inputs)
+    WireMasterVolume    master_volume;   //   16
+    WireInputConfig     input_config;    //   16
+    WireLgSoundSync     lg_sound_sync;   //   16
+    WireUserVolume      user_volume;     //   16
+    WireDacHwMute       dac_hw_mute;     //   16
+    WireCrossoverConfig crossovers;      // 1088 (17×4; input rows unused)
+    WireAdatConfig      adat_config;     //    8
+    WirePsybassParams   psybass;         //   24  (V23+)
+    WireUpmixParams     upmix;           //   44  (V25+)
+} WireBulkParams;                        // Total: 5944 bytes (V25 appends the 44-byte upmixer section)
 
 #define WIRE_BULK_PARAMS_SIZE  sizeof(WireBulkParams)
 
-// Smallest bulk SET payload accepted — corresponds to V2 (pre-I2S, pre-leveller,
-// pre-preamp, pre-master, pre-input, pre-LG, pre-user-volume).  Kept in lockstep
-// with the size-compat chain inside bulk_params_apply(): every section appended
-// after V2 shows up as a subtraction here.  The dispatcher gate (vendor_commands.c
-// REQ_SET_ALL_PARAMS branch) and the apply path's lower bound must agree on this
-// number, so it lives in the header rather than being recomputed in two places.
-#define WIRE_BULK_PARAMS_MIN_SIZE \
-    (sizeof(WireBulkParams)            \
-     - sizeof(WireDacHwMute)           \
-     - sizeof(WireUserVolume)          \
-     - sizeof(WireLgSoundSync)         \
-     - sizeof(WireInputConfig)         \
-     - sizeof(WirePreampConfig)        \
-     - sizeof(WireMasterVolume)        \
-     - sizeof(WireI2SConfig)           \
-     - sizeof(WireLevellerConfig))
+// Backward compatibility is intentionally broken at V16 (unified channel model).
+// Only the current full-size layout is accepted; there are no legacy size
+// anchors or per-section version gates; every section is always present.
+// bulk_params_apply() rejects any payload whose format_version != current or
+// whose length != sizeof(WireBulkParams).
+#define WIRE_BULK_PARAMS_MIN_SIZE   WIRE_BULK_PARAMS_SIZE
 
-// Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE)
-#define WIRE_BULK_BUF_SIZE     4096
+// Buffer size for USB stream transfer (must be power of 2, >= WIRE_BULK_PARAMS_SIZE).
+// V25 is 5944 bytes (17-channel EQ/names/crossover + ADAT + leveller masks + psybass + upmixer); 8192 is the next power of 2.
+// Shared by both platforms (the wire format is platform-independent).
+#define WIRE_BULK_BUF_SIZE     8192
 
 // Collect current live DSP state into wire format
 void bulk_params_collect(WireBulkParams *out);

@@ -17,8 +17,10 @@ from ..device import OP, Stall
 from ..framework import test
 from ..helpers import bool_roundtrip, nan_rejected
 
-# FilterType enum.
+# FilterType enum (PEQ block).  ALLPASS (7) is the 2nd-order RBJ all-pass;
+# ALLPASS1 (8) is the first-order all-pass.  Crossover types occupy 32..63.
 FLAT, PEAKING, LOWSHELF, HIGHSHELF, LOWPASS, HIGHPASS, NOTCH, ALLPASS = range(8)
+ALLPASS1 = 8
 # EQ GET param selectors.
 P_TYPE, P_FREQ, P_Q, P_GAIN, P_BYPASS = 0, 1, 2, 3, 4
 
@@ -32,7 +34,10 @@ def _set_band(dev, ch, band, ftype, freq, Q, gain, bypass=0):
 
 
 def _get(dev, ch, band, param):
-    wv = (ch << 8) | (band << 4) | param
+    # GET_EQ_PARAM wValue: channel<<8 | band<<3 (5-bit band) | param (3-bit).
+    # The band field was widened from 4 to 5 bits when the crossover base
+    # moved 12 -> 20 (see crossover_filters_spec.md, 2026-06-04).
+    wv = (ch << 8) | (band << 3) | param
     if param in (P_FREQ, P_Q, P_GAIN):
         return dev.get_f32(OP.GET_EQ_PARAM, wvalue=wv)
     return dev.get_u32(OP.GET_EQ_PARAM, wvalue=wv)
@@ -52,12 +57,13 @@ def eq_band_roundtrip(dev, profile, chk):
 
 @test("eq", mutating=True)
 def eq_all_filter_types(dev, profile, chk):
-    """All filter types 0-7 set/read on (ch0,band0); unknown type 8 stored verbatim, no STALL."""
-    for t in range(8):
+    """All PEQ types 0-8 (incl. first-order all-pass) set/read on (ch0,band0); an out-of-range type stored verbatim, no STALL."""
+    for t in range(9):  # 0..8 = FLAT..ALLPASS1
         _set_band(dev, 0, 0, t, 500.0, 0.707, 3.0)
         chk.eq(_get(dev, 0, 0, P_TYPE), t, f"filter type {t}")
-    _set_band(dev, 0, 0, 8, 500.0, 0.707, 3.0)
-    chk.eq(_get(dev, 0, 0, P_TYPE), 8, "unknown type 8 stored verbatim")
+    # A crossover type in a PEQ slot is stored verbatim (flattened only in the audio path).
+    _set_band(dev, 0, 0, 32, 500.0, 0.707, 3.0)
+    chk.eq(_get(dev, 0, 0, P_TYPE), 32, "out-of-range type 32 stored verbatim")
 
 
 @test("eq", mutating=True)
@@ -148,16 +154,24 @@ def legacy_preamp(dev, profile, chk):
 
 @test("eq", mutating=True)
 def per_channel_preamp(dev, profile, chk):
-    """0xD0/0xD1 per-channel preamp: independent channels, NaN rejected, ch>=2 GET STALLs."""
-    dev.set_f32(OP.SET_PREAMP_CH, 3.0, wvalue=0)
-    dev.set_f32(OP.SET_PREAMP_CH, -3.0, wvalue=1)
-    chk.approx(dev.get_f32(OP.GET_PREAMP_CH, wvalue=0), 3.0, 1e-3, "ch0 independent")
-    chk.approx(dev.get_f32(OP.GET_PREAMP_CH, wvalue=1), -3.0, 1e-3, "ch1 independent")
+    """0xD0/0xD1 per-channel preamp across ALL input channels (8 on RP2350, 2 on
+    RP2040): each channel round-trips independently; NaN rejected; ch==NUM_INPUT
+    GET STALLs while a too-high SET is a silent no-op."""
+    ni = profile.num_input_channels
+    # Distinct value per input channel, then read each back independently — a
+    # cross-channel aliasing bug would show up as a mismatched read.
+    for ch in range(ni):
+        dev.set_f32(OP.SET_PREAMP_CH, float(ch) - 3.0, wvalue=ch)
+    for ch in range(ni):
+        chk.approx(dev.get_f32(OP.GET_PREAMP_CH, wvalue=ch), float(ch) - 3.0, 1e-3,
+                   f"input ch{ch} independent ({float(ch) - 3.0:+g} dB)")
     nan_rejected(dev, chk, OP.SET_PREAMP_CH, OP.GET_PREAMP_CH, wvalue=0, label="preamp ch0")
-    chk.stalls(lambda: dev.get_f32(OP.GET_PREAMP_CH, wvalue=profile.num_input_channels),
+    chk.stalls(lambda: dev.get_f32(OP.GET_PREAMP_CH, wvalue=ni),
                "GET preamp ch==NUM_INPUT STALL")
-    chk.no_stall(lambda: dev.set_f32(OP.SET_PREAMP_CH, 1.0, wvalue=profile.num_input_channels),
+    chk.no_stall(lambda: dev.set_f32(OP.SET_PREAMP_CH, 1.0, wvalue=ni),
                  "SET preamp bad ch no STALL")
+    for ch in range(ni):           # restore flat
+        dev.set_f32(OP.SET_PREAMP_CH, 0.0, wvalue=ch)
 
 
 @test("eq", mutating=True)

@@ -6,6 +6,9 @@
 LoudnessCoeffs loudness_tables[2][LOUDNESS_VOL_STEPS][LOUDNESS_BIQUAD_COUNT];
 LoudnessCoeffs (*loudness_active_table)[LOUDNESS_BIQUAD_COUNT] = NULL;
 
+// Per-output filter state (BSS; each output touched by exactly one core)
+LoudnessOutputState loudness_output_state[NUM_OUTPUT_CHANNELS];
+
 // Track which buffer is active (0 or 1)
 static uint8_t active_buf = 0;
 
@@ -171,8 +174,8 @@ void loudness_recompute_table(float ref_spl, float intensity_pct, float sample_r
     if (sample_rate < 1.0f) sample_rate = 48000.0f;
 
     // Clamp ref_spl to valid range
-    if (ref_spl < 40.0f) ref_spl = 40.0f;
-    if (ref_spl > 100.0f) ref_spl = 100.0f;
+    if (ref_spl < LOUDNESS_REF_SPL_MIN) ref_spl = LOUDNESS_REF_SPL_MIN;
+    if (ref_spl > LOUDNESS_REF_SPL_MAX) ref_spl = LOUDNESS_REF_SPL_MAX;
 
     // Write into the INACTIVE buffer
     uint8_t write_buf = 1 - active_buf;

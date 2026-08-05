@@ -13,16 +13,23 @@
 #include "config.h"
 #include "audio_input.h"
 #include "dsp_pipeline.h"
+#include "crossover.h"
 #include "usb_audio.h"
 #include "crossfeed.h"
 #include "leveller.h"
 #include "lg_sound_sync.h"
 #include "dac_hw_mute.h"
+#include "adat_output.h"
+#include "upmix.h"     // upmix_config / upmix_update_pending (RP2350; header body #if-guarded)
 #include "notify.h"
+#include "uart_control.h"
+#include "i2c_control.h"
 
 #include <string.h>
+#include <stdio.h>   // printf() for rejected-config diagnostics
 #include <math.h>    // powf() for master volume (db_to_linear() clamps at -60 dB, insufficient)
 #include <assert.h>  // _Static_assert
+#include <stddef.h>  // offsetof
 
 #include "hardware/sync.h"    // __dmb()
 #include "hardware/clocks.h"  // GPIO_TO_GPOUT_CLOCK_HANDLE() — MCK pin migration
@@ -33,8 +40,24 @@
 // and the host SDK consumes both via the same parser.  If they ever drift
 // (someone adds a field to one but not the other), this static assert
 // fails at compile time before silent struct mismatches reach runtime.
+_Static_assert(sizeof(WireInputConfig) == 16,
+               "input-config additions must be claimed from this section's "
+               "reserved bytes; growing it shifts every later wire offset");
 _Static_assert(sizeof(WireLgSoundSync) == sizeof(LgSoundSyncStatus),
                "WireLgSoundSync and LgSoundSyncStatus must have identical layout");
+_Static_assert(sizeof(WireBulkParams) <= WIRE_BULK_BUF_SIZE,
+               "WireBulkParams must fit in the bulk transfer buffer");
+_Static_assert(sizeof(WireUpmixParams) == 44, "V25 upmixer section must be 44 bytes");
+// Wire ABI pins: hosts hard-code these numbers (see upmixer_spec.md).  A
+// mid-struct edit that shifts them must bump WIRE_FORMAT_VERSION instead.
+_Static_assert(offsetof(WireBulkParams, upmix) == 5900,
+               "V25 upmixer section must sit at wire offset 5900");
+_Static_assert(sizeof(WireBulkParams) == 5944,
+               "V25 wire total must be 5944 bytes");
+#if PICO_RP2350
+_Static_assert(sizeof(WireUpmixParams) == sizeof(UpmixConfigPacket),
+               "WireUpmixParams and UpmixConfigPacket must have identical layout");
+#endif
 
 // External variables (defined in usb_audio.c)
 extern volatile float global_preamp_db[NUM_INPUT_CHANNELS];
@@ -52,6 +75,7 @@ extern volatile bool loudness_enabled;
 extern volatile float loudness_ref_spl;
 extern volatile float loudness_intensity_pct;
 extern volatile bool loudness_recompute_pending;
+extern volatile uint16_t loudness_output_mask;
 extern volatile CrossfeedConfig crossfeed_config;
 extern volatile bool crossfeed_update_pending;
 extern volatile LevellerConfig leveller_config;
@@ -99,6 +123,7 @@ void bulk_params_collect(WireBulkParams *out) {
     out->global.preamp_gain_db = global_preamp_db[0];  // Legacy field: channel 0
     out->global.bypass = bypass_master_eq ? 1 : 0;
     out->global.loudness_enabled = loudness_enabled ? 1 : 0;
+    out->global.loudness_output_mask = loudness_output_mask;
     out->global.loudness_ref_spl = loudness_ref_spl;
     out->global.loudness_intensity_pct = loudness_intensity_pct;
 
@@ -106,6 +131,7 @@ void bulk_params_collect(WireBulkParams *out) {
     out->crossfeed.enabled = crossfeed_config.enabled ? 1 : 0;
     out->crossfeed.preset = crossfeed_config.preset;
     out->crossfeed.itd_enabled = crossfeed_config.itd_enabled ? 1 : 0;
+    out->crossfeed.output_pair_mask = crossfeed_config.output_pair_mask;
     out->crossfeed.custom_fc = crossfeed_config.custom_fc;
     out->crossfeed.custom_feed_db = crossfeed_config.custom_feed_db;
 
@@ -120,7 +146,7 @@ void bulk_params_collect(WireBulkParams *out) {
         out->delays.delay_ms[i] = channel_delays_ms[i];
     }
 
-    // Matrix crosspoints
+    // Matrix crosspoints — inputs 0..N_in-1, direct (row-major).
     for (int in = 0; in < NUM_INPUT_CHANNELS; in++) {
         for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
             out->crosspoints[in][o].enabled = matrix_mixer.crosspoints[in][o].enabled;
@@ -148,8 +174,15 @@ void bulk_params_collect(WireBulkParams *out) {
         for (int b = 0; b < MAX_BANDS; b++) {
             out->eq[ch][b].type = filter_recipes[ch][b].type;
             out->eq[ch][b].bypass = (filter_recipes[ch][b].bypass == 1) ? 1 : 0;
-            out->eq[ch][b].reserved[0] = 0;
-            out->eq[ch][b].reserved[1] = 0;
+            // LT bands carry the target Q (Q*512) in reserved[2] LE; zero otherwise.
+            if (filter_recipes[ch][b].type == FILTER_LINKWITZ_TRANSFORM) {
+                uint16_t qp = peq_qp_x512[ch][b];
+                out->eq[ch][b].reserved[0] = (uint8_t)(qp & 0xFF);
+                out->eq[ch][b].reserved[1] = (uint8_t)(qp >> 8);
+            } else {
+                out->eq[ch][b].reserved[0] = 0;
+                out->eq[ch][b].reserved[1] = 0;
+            }
             out->eq[ch][b].freq = filter_recipes[ch][b].freq;
             out->eq[ch][b].q = filter_recipes[ch][b].Q;
             out->eq[ch][b].gain_db = filter_recipes[ch][b].gain_db;
@@ -171,6 +204,9 @@ void bulk_params_collect(WireBulkParams *out) {
         memset(&out->i2s_config, 0, sizeof(out->i2s_config));
         memcpy(out->i2s_config.output_types, output_types, NUM_SPDIF_INSTANCES);
         out->i2s_config.bck_pin = i2s_bck_pin;
+        // Clock-pin mode + slave BCK: +1 encoding so 0 stays "absent/keep-live".
+        out->i2s_config.clock_pin_mode_p1 = (uint8_t)(i2s_clock_pin_mode + 1);
+        out->i2s_config.bck_pin_slave = i2s_bck_pin_slave;
         out->i2s_config.mck_pin = i2s_mck_pin;
         out->i2s_config.mck_enabled = i2s_mck_enabled ? 1 : 0;
         out->i2s_config.mck_multiplier = (i2s_mck_multiplier == 256) ? 1 : 0;  // 0=128x, 1=256x
@@ -183,6 +219,8 @@ void bulk_params_collect(WireBulkParams *out) {
     out->leveller.amount = leveller_config.amount;
     out->leveller.max_gain_db = leveller_config.max_gain_db;
     out->leveller.gate_threshold_db = leveller_config.gate_threshold_db;
+    out->leveller.detector_mask = leveller_config.detector_mask;
+    out->leveller.apply_mask = leveller_config.apply_mask;
 
     // Per-channel preamp (V6+)
     for (int i = 0; i < NUM_INPUT_CHANNELS && i < WIRE_MAX_INPUT_CHANNELS; i++)
@@ -191,9 +229,26 @@ void bulk_params_collect(WireBulkParams *out) {
     // Master volume (V6+)
     out->master_volume.master_volume_db = master_volume_db;
 
-    // Input source configuration (V7+)
+    // Input source configuration (V7+; I2S fields V12+)
     out->input_config.input_source = active_input_source;
     out->input_config.spdif_rx_pin = spdif_rx_pin;
+    out->input_config.i2s_rx_pin = i2s_rx_pin[0];
+    out->input_config.i2s_input_rate = i2s_rate_encode(i2s_input_rate);
+    out->input_config.i2s_input_channels = i2s_input_channels;
+    for (int p = 0; p < 3; p++)
+        out->input_config.i2s_rx_pin_ext[p] =
+            (p + 1 < I2S_RX_MAX_PAIRS) ? i2s_rx_pin[p + 1] : 0;
+    // Optional SPDIF inputs 2..4: live pins and the enable mask + 1 (so a host
+    // that pushes zeros here reads as "absent, keep live", not "disable all").
+    for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++)
+        out->input_config.spdif_rx_pin_ext[i] = spdif_rx_pin_ext[i];
+    out->input_config.spdif_rx_enabled_ext_p1 = (uint8_t)(spdif_rx_enabled_ext + 1);
+    // I2S clock master/slave mode (V21+).
+    out->input_config.i2s_clock_mode = i2s_clock_mode;
+    // ADAT input (V24+): live pin (0xFF unset → 0 absent), enable + 1, mode + 1.
+    out->input_config.adat_input_pin        = (adat_input_pin == 0xFF) ? 0 : adat_input_pin;
+    out->input_config.adat_input_enabled_p1 = (uint8_t)(adat_input_enabled + 1);
+    out->input_config.adat_clock_mode_p1    = (uint8_t)(adat_clock_mode + 1);
 
     // LG Sound Sync (V8+).  All four fields are filled here so a single
     // GET round-trips both the user toggle and the runtime observation.
@@ -223,6 +278,66 @@ void bulk_params_collect(WireBulkParams *out) {
         dac_hw_mute_get_config(&hw);
         memcpy(&out->dac_hw_mute, &hw, sizeof(out->dac_hw_mute));
     }
+
+    // Crossover bands (V11+).  Mirror PEQ's per-band copy but with the
+    // crossover-side recipe array.  Master rows (channel < CH_OUT_1) are
+    // zeroed: crossovers are an output-channel-only feature, and emitting
+    // their live state on master rows would mislead the host into thinking
+    // crossover bands exist for inputs.
+    for (int ch = 0; ch < NUM_CHANNELS; ch++) {
+        bool is_master = (ch < CH_OUT_1);
+        for (int b = 0; b < MAX_XOVER_BANDS; b++) {
+            WireBandParams *wb = &out->crossovers.bands[ch][b];
+            if (is_master) {
+                memset(wb, 0, sizeof(*wb));
+                continue;
+            }
+            wb->type    = xover_recipes[ch][b].type;
+            wb->bypass  = (xover_recipes[ch][b].bypass == 1) ? 1 : 0;
+            wb->reserved[0] = 0;
+            wb->reserved[1] = 0;
+            wb->freq    = xover_recipes[ch][b].freq;
+            wb->q       = xover_recipes[ch][b].Q;
+            wb->gain_db = xover_recipes[ch][b].gain_db;
+        }
+    }
+
+    // ADAT output configuration (V17+).  RP2350 only; the whole section (including
+    // reserved) stays zeroed on RP2040 from the memset above.
+#if PICO_RP2350
+    out->adat_config.enabled = adat_output_config_enabled() ? 1 : 0;
+    out->adat_config.pin     = adat_output_pin();
+#endif
+
+    // Psychoacoustic bass (V23+).  One global config: enabled + output mask +
+    // five float parameters, copied straight from the live config.
+    out->psybass.enabled       = psybass_config.enabled ? 1 : 0;
+    out->psybass.reserved0     = 0;
+    out->psybass.output_mask   = psybass_config.output_mask;
+    out->psybass.cutoff_hz     = psybass_config.cutoff_hz;
+    out->psybass.harmonics_db  = psybass_config.harmonics_db;
+    out->psybass.drive_db      = psybass_config.drive_db;
+    out->psybass.character_pct = psybass_config.character_pct;
+    out->psybass.original_db   = psybass_config.original_db;
+
+    // Stereo upmixer (V25+).  RP2350 only; the whole section (including reserved)
+    // stays zeroed on RP2040 from the memset above.
+#if PICO_RP2350
+    out->upmix.enabled            = upmix_config.enabled ? 1 : 0;
+    out->upmix.center_mode        = upmix_config.center_mode;
+    out->upmix.surround_mode      = upmix_config.surround_mode;
+    out->upmix.presence_q1        = upmix_presence_encode(upmix_config.presence_db);
+    out->upmix.strength_pct       = upmix_config.strength_pct;
+    out->upmix.center_width_pct   = upmix_config.center_width_pct;
+    out->upmix.corr_threshold_pct = upmix_config.corr_threshold_pct;
+    out->upmix.attack_ms          = upmix_config.attack_ms;
+    out->upmix.release_ms         = upmix_config.release_ms;
+    out->upmix.detector_hpf_hz    = upmix_config.detector_hpf_hz;
+    out->upmix.surround_delay_ms  = upmix_config.surround_delay_ms;
+    out->upmix.surround_hpf_hz    = upmix_config.surround_hpf_hz;
+    out->upmix.surround_lpf_hz    = upmix_config.surround_lpf_hz;
+    out->upmix.decorr_pct         = upmix_config.decorr_pct;
+#endif
 }
 
 // ============================================================================
@@ -230,11 +345,6 @@ void bulk_params_collect(WireBulkParams *out) {
 // ============================================================================
 
 int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
-    // Validate header (accept V2-V7 for backward compat)
-    // V2: no I2S/leveller/preamp/master.  V3-V5: no preamp/master.  V6: preamp+master.  V7: +input source.
-    if (in->header.format_version < 2 || in->header.format_version > WIRE_FORMAT_VERSION)
-        return -1;
-
 #if PICO_RP2350
     if (in->header.platform_id != WIRE_PLATFORM_RP2350)
         return -2;
@@ -245,34 +355,23 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 
     if (in->header.num_channels != NUM_CHANNELS)
         return -3;
+    if (in->header.num_input_channels != NUM_INPUT_CHANNELS)
+        return -3;
     if (in->header.num_output_channels != NUM_OUTPUT_CHANNELS)
         return -3;
-    // Accept payload sizes from V2 through current.
-    // V2: no I2S/leveller/preamp/master/input/lg_sound_sync/user_volume/dac_hw_mute.
-    // V3-V5: no preamp/master/input/lg_sound_sync/user_volume/dac_hw_mute.
-    // V6: no input/lg_sound_sync/user_volume/dac_hw_mute.
-    // V7: no lg_sound_sync/user_volume/dac_hw_mute.
-    // V8: no user_volume/dac_hw_mute.  V9: no dac_hw_mute.  V10: current full size.
-    // The lower bound is shared with the dispatcher gate via WIRE_BULK_PARAMS_MIN_SIZE
-    // in bulk_params.h (== v2_size); per-section locals below are kept for the
-    // defense-in-depth size checks each section uses to refuse a short payload
-    // that claims a newer format_version.
-    uint16_t v9_size = sizeof(WireBulkParams) - sizeof(WireDacHwMute);
-    uint16_t v8_size = v9_size - sizeof(WireUserVolume);
-    uint16_t v7_size = v8_size - sizeof(WireLgSoundSync);
-    uint16_t v6_size = v7_size - sizeof(WireInputConfig);
-    uint16_t v5_size = v6_size - sizeof(WirePreampConfig) - sizeof(WireMasterVolume);
-    (void)v7_size; (void)v6_size;  // Currently only v5_size, v8_size, v9_size are referenced
-                                    // by apply gates below; keep the chain for documentation.
-    if (in->header.payload_length < WIRE_BULK_PARAMS_MIN_SIZE ||
-        in->header.payload_length > sizeof(WireBulkParams))
+    // Backward compatibility is intentionally broken at V16: accept ONLY the
+    // current full-size layout.  Every section is then guaranteed present, so
+    // the apply path below is unconditional (no per-version gates).
+    if (in->header.format_version != WIRE_FORMAT_VERSION ||
+        in->header.payload_length != sizeof(WireBulkParams))
         return -4;
 
     // Bracket the wholesale state rewrite.  Per-field writes are suppressed
     // and one BULK_INVALIDATED(source=BULK_SET) is emitted at notify_end_bulk().
     notify_begin_bulk(PARAM_SRC_BULK_SET);
 
-    // Global params — preamp from legacy field first (overridden by V6+ per-channel below)
+    // Global params — preamp from the legacy single field (a baseline applied to
+    // all inputs); overridden by the per-channel preamp section below.
     {
         float db = in->global.preamp_gain_db;
         float linear = db_to_linear(db);
@@ -286,6 +385,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     bypass_master_eq = (in->global.bypass != 0);
 
     loudness_enabled = (in->global.loudness_enabled != 0);
+    loudness_output_mask = in->global.loudness_output_mask;
     loudness_ref_spl = in->global.loudness_ref_spl;
     loudness_intensity_pct = in->global.loudness_intensity_pct;
     loudness_recompute_pending = true;
@@ -294,6 +394,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     crossfeed_config.enabled = (in->crossfeed.enabled != 0);
     crossfeed_config.preset = in->crossfeed.preset;
     crossfeed_config.itd_enabled = (in->crossfeed.itd_enabled != 0);
+    crossfeed_config.output_pair_mask = in->crossfeed.output_pair_mask & ((1u << NUM_SPDIF_INSTANCES) - 1);
     crossfeed_config.custom_fc = in->crossfeed.custom_fc;
     crossfeed_config.custom_feed_db = in->crossfeed.custom_feed_db;
     crossfeed_update_pending = true;
@@ -312,7 +413,7 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         channel_delays_ms[i] = in->delays.delay_ms[i];
     }
 
-    // Matrix crosspoints
+    // Matrix crosspoints — inputs 0..N_in-1, direct.
     for (int inp = 0; inp < NUM_INPUT_CHANNELS; inp++) {
         for (int o = 0; o < NUM_OUTPUT_CHANNELS; o++) {
             matrix_mixer.crosspoints[inp][o].enabled = in->crosspoints[inp][o].enabled;
@@ -346,25 +447,28 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
 #endif
         for (int i = 0; i < NUM_PIN_OUTPUTS; i++) {
             uint8_t pin = in->pins.pins[i];
-            bool valid = (pin <= 29) && (pin != 12) && !(pin >= 23 && pin <= 25);
+            bool valid = (pin <= 29) && !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
             if (pin > 28) valid = false;
 #endif
+            // Never let a pushed config steal a live control interface's
+            // GPIOs: over UART/I2C that would sever the link doing the push
+            // (the self-lockout the USB-only config rule exists to prevent).
+            if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) valid = false;
             output_pins[i] = valid ? pin : default_pins[i];
         }
 
-        // SPDIF RX pin: apply on the same gate as output pins (V7+
-        // payloads only; V6 and earlier have no input_config section).
-        // If valid AND it changed, fire the hot-swap when SPDIF input
-        // is currently active so the running RX library picks up the
-        // new GPIO without requiring a vendor-command round trip.
-        if (in->header.format_version >= 7) {
+        // SPDIF RX pin: if valid AND changed, fire the hot-swap when SPDIF
+        // input is currently active so the running RX library picks up the
+        // new GPIO without a vendor-command round trip.
+        {
             uint8_t pin = in->input_config.spdif_rx_pin;
-            bool valid = (pin > 0) && (pin <= 29) && (pin != 12) &&
+            bool valid = (pin > 0) && (pin <= 29) &&
                          !(pin >= 23 && pin <= 25);
 #if !PICO_RP2350
             if (pin > 28) valid = false;
 #endif
+            if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) valid = false;
             if (valid && pin != spdif_rx_pin) {
                 spdif_rx_pin = pin;
                 if (active_input_source == INPUT_SOURCE_SPDIF) {
@@ -373,6 +477,175 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
                 }
             }
         }
+
+        // Optional SPDIF inputs 2..4 RX pins.  Same validation as the
+        // spdif_rx_pin block above; 0 means absent (keep the live pin).  A
+        // pin that changed for the currently-active SPDIF source fires the
+        // RX hot-swap so the running library adopts it without a round trip.
+        for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
+            uint8_t pin = in->input_config.spdif_rx_pin_ext[i];
+            if (pin == 0) continue;  // absent; keep live
+            bool valid = (pin <= 29) && !(pin >= 23 && pin <= 25);
+#if !PICO_RP2350
+            if (pin > 28) valid = false;
+#endif
+            if (uart_ctrl_owns_pin(pin) || i2c_ctrl_owns_pin(pin)) valid = false;
+            if (valid && pin != spdif_rx_pin_ext[i]) {
+                spdif_rx_pin_ext[i] = pin;
+                if (input_source_is_spdif(active_input_source) &&
+                    spdif_index_for_source(active_input_source) == (uint8_t)(i + 1)) {
+                    extern volatile bool spdif_rx_pin_change_pending;
+                    spdif_rx_pin_change_pending = true;
+                }
+            }
+        }
+
+        // Optional SPDIF 2..4 enable mask.  Encoded PLUS ONE on the wire: 0 =
+        // absent (keep the live mask), else mask = enc - 1.  Applied AFTER the
+        // ext-pin block so a pin+enable pair pushed together validates against
+        // the new pin.  A newly enabled bit is accepted only if that input's
+        // pin is valid and unclaimed; a newly disabled bit that is the live
+        // source is refused (a pushed config must not silently kill the running
+        // input).
+        {
+            uint8_t enc = in->input_config.spdif_rx_enabled_ext_p1;
+            if (enc != 0) {
+                uint8_t mask = (uint8_t)((enc - 1) & SPDIF_RX_ENABLED_EXT_MASK);
+                // Commit each bit as it is decided so a later enable in one
+                // payload validates against the earlier ones (two pushed enables
+                // on the same GPIO must not both pass); disables run first so a
+                // push that moves an enable between inputs validates cleanly.
+                for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
+                    uint8_t bit = (uint8_t)(1u << i);
+                    if ((mask & bit) || !(spdif_rx_enabled_ext & bit)) continue;
+                    if (input_source_is_spdif(active_input_source) &&
+                        spdif_index_for_source(active_input_source) == (uint8_t)(i + 1)) {
+                        printf("Bulk apply: SPDIF input %u disable ignored (active source); kept enabled\n",
+                               (unsigned)(i + 2));
+                    } else {
+                        spdif_rx_enabled_ext &= (uint8_t)~bit;
+                    }
+                }
+                for (int i = 0; i < SPDIF_RX_NUM_INPUTS - 1; i++) {
+                    uint8_t bit = (uint8_t)(1u << i);
+                    if (!(mask & bit) || (spdif_rx_enabled_ext & bit)) continue;
+                    if (spdif_input_enable_acceptable(i + 1)) {
+                        spdif_rx_enabled_ext |= bit;
+                    } else {
+                        printf("Bulk apply: SPDIF input %u enable rejected (pin invalid/conflict); left disabled\n",
+                               (unsigned)(i + 2));
+                    }
+                }
+            }
+        }
+
+        // I2S RX data pins (pair 0 + multichannel extras) and channel count,
+        // validated as a SET so a pushed config can't bring two state machines
+        // up on one GPIO or on a clock pin.  0 = keep-live per field; an invalid
+        // count keeps the live count.  The proposed active set is checked against
+        // the BCK pin THIS transfer installs (in->i2s_config.bck_pin, applied
+        // unconditionally below), and applied only if acceptable — otherwise the
+        // whole I2S RX section is ignored (live config retained) and logged.  A
+        // change restarts the input so every pair re-syncs.
+        {
+            uint8_t proposed[I2S_RX_MAX_PAIRS];
+            proposed[0] = (in->input_config.i2s_rx_pin != 0)
+                              ? in->input_config.i2s_rx_pin : i2s_rx_pin[0];
+#if I2S_RX_MAX_PAIRS > 1
+            for (int p = 1; p < I2S_RX_MAX_PAIRS; p++) {
+                uint8_t pin = in->input_config.i2s_rx_pin_ext[p - 1];
+                proposed[p] = (pin != 0) ? pin : i2s_rx_pin[p];
+            }
+#endif
+            uint8_t ch = in->input_config.i2s_input_channels;
+            uint8_t count = (ch == 2 || ch == 4 || ch == 6 || ch == 8)
+                                ? ch : i2s_input_channels;
+            if (count / 2 > I2S_RX_MAX_PAIRS) count = i2s_input_channels;
+
+            // Validate the RX set against the BCK that will ACTUALLY be installed
+            // (the pushed BCK if it passes its own check below, else the kept-live
+            // pin), so a rejected/invalid BCK doesn't leave the RX validated
+            // against a value the device never adopts.  Output pins are already
+            // applied, so this matches the install-time check.
+            uint8_t eff_bck = i2s_bck_pin_acceptable(in->i2s_config.bck_pin)
+                                  ? in->i2s_config.bck_pin : i2s_bck_pin;
+            // Same reasoning for the clock-pin mode and slave BCK: the payload
+            // may change them below, so validate the RX set against the values
+            // that will actually be installed, not the live ones.
+            uint8_t eff_pin_mode =
+                (in->i2s_config.clock_pin_mode_p1 != 0 &&
+                 (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1) <= 1)
+                    ? (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1)
+                    : i2s_clock_pin_mode;
+            uint8_t inc_slave = in->i2s_config.bck_pin_slave;
+            uint8_t eff_slave =
+                (inc_slave != 0 && i2s_bck_pin_acceptable(inc_slave) &&
+                 inc_slave != eff_bck && inc_slave != (uint8_t)(eff_bck + 1) &&
+                 (uint8_t)(inc_slave + 1) != eff_bck)
+                    ? inc_slave : i2s_bck_pin_slave;
+            if (i2s_rx_pin_set_acceptable(proposed, count / 2, eff_bck,
+                                          (eff_pin_mode == I2S_CLOCK_PIN_MODE_SPLIT)
+                                              ? eff_slave : 0xFF)) {
+                bool changed = false;
+                for (int p = 0; p < I2S_RX_MAX_PAIRS; p++)
+                    if (proposed[p] != i2s_rx_pin[p]) {
+                        i2s_rx_pin[p] = proposed[p];
+                        changed = true;
+                    }
+                if (count != i2s_input_channels) {
+                    i2s_input_channels = count;
+                    changed = true;
+                }
+                if (changed && active_input_source == INPUT_SOURCE_I2S)
+                    i2s_input_restart_pending = true;
+            } else {
+                printf("Bulk apply: I2S RX pin/count config rejected (conflict); kept live\n");
+            }
+        }
+
+        // ADAT input pin + enable (V24+, RP2350).  0 = absent (keep live) for the
+        // pin; enable encoded PLUS ONE (0 absent, 1 disabled, 2 enabled).  Pin
+        // validated with adat_input_pin_acceptable; enable applied after so an
+        // enable+pin pair validates against the new pin (mirrors the SPDIF-ext
+        // ordering).  Enabling needs a valid pin (mirrors REQ_SET_ADAT_INPUT_ENABLE);
+        // a disable of the live source is refused (mirrors the SPDIF-ext precedent).
+        // A pin/enable change while ADAT is active arms a deferred input restart.
+#if PICO_RP2350
+        {
+            uint8_t pin = in->input_config.adat_input_pin;
+            if (pin != 0 && pin != adat_input_pin) {
+                if (adat_input_pin_acceptable(pin)) {
+                    adat_input_pin = pin;
+                    if (active_input_source == INPUT_SOURCE_ADAT)
+                        adat_input_restart_pending = true;
+                } else {
+                    printf("Bulk apply: ADAT input pin %u rejected (invalid/conflict); kept live\n",
+                           (unsigned)pin);
+                }
+            }
+            uint8_t enc = in->input_config.adat_input_enabled_p1;
+            if (enc == 1 || enc == 2) {
+                uint8_t want = (enc == 2) ? 1 : 0;
+                if (want && !adat_input_enabled) {
+                    if (adat_input_pin != 0xFF && adat_input_pin_acceptable(adat_input_pin)) {
+                        adat_input_enabled = 1;
+                        if (active_input_source == INPUT_SOURCE_ADAT)
+                            adat_input_restart_pending = true;
+                    } else {
+                        printf("Bulk apply: ADAT input enable rejected (pin unset/conflict); left disabled\n");
+                    }
+                } else if (!want && adat_input_enabled) {
+                    if (active_input_source == INPUT_SOURCE_ADAT ||
+                        (input_source_change_pending &&
+                         pending_input_source == INPUT_SOURCE_ADAT)) {
+                        printf("Bulk apply: ADAT input disable ignored (active source); kept enabled\n");
+                    } else {
+                        adat_input_enabled = 0;
+                    }
+                }
+            }
+        }
+#endif
     }
 
     // EQ bands
@@ -387,6 +660,14 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             filter_recipes[ch][b].freq = in->eq[ch][b].freq;
             filter_recipes[ch][b].Q = in->eq[ch][b].q;
             filter_recipes[ch][b].gain_db = in->eq[ch][b].gain_db;
+            // LT target Q rides in reserved[2] (Q*512 LE); zero for non-LT types.
+            // Caller recomputes all filters after apply returns.
+            if (in->eq[ch][b].type == FILTER_LINKWITZ_TRANSFORM) {
+                peq_qp_x512[ch][b] = (uint16_t)(in->eq[ch][b].reserved[0] |
+                                                (in->eq[ch][b].reserved[1] << 8));
+            } else {
+                peq_qp_x512[ch][b] = 0;
+            }
         }
     }
 
@@ -396,16 +677,58 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
         channel_names[ch][PRESET_NAME_LEN - 1] = '\0';  // Enforce NUL termination
     }
 
-    // I2S configuration (V3+ payloads — V2 payloads skip this)
-    if (in->header.format_version >= 3 &&
-        in->header.payload_length >= v5_size) {
+    // I2S configuration.
+    {
         extern uint8_t output_types[];
         extern uint8_t i2s_bck_pin;
         extern uint8_t i2s_mck_pin;
         extern bool    i2s_mck_enabled;
         extern uint16_t i2s_mck_multiplier;
         memcpy(output_types, in->i2s_config.output_types, NUM_SPDIF_INSTANCES);
-        i2s_bck_pin = in->i2s_config.bck_pin;
+        // Snapshot the effective input BCK before any pin install so we can tell
+        // whether the active pair actually moved and arm a restart below.
+        uint8_t old_eff_bck = i2s_effective_bck_pin();
+        // Validate the pushed BCK before installing it raw: BCK/LRCLK are clock
+        // OUTPUTS, so an invalid GPIO can fault pio_gpio_init() and a collision
+        // with an output pin is driver contention.  Reject (keep the live, known-
+        // valid pin) on failure.  Output pins are already applied above, so the
+        // conflict check sees the final config; the RX set is validated against
+        // the BCK separately.
+        if (i2s_bck_pin_acceptable(in->i2s_config.bck_pin)) {
+            i2s_bck_pin = in->i2s_config.bck_pin;
+        } else {
+            printf("Bulk apply: I2S BCK pin %u rejected (invalid/conflict); kept %u\n",
+                   (unsigned)in->i2s_config.bck_pin, (unsigned)i2s_bck_pin);
+        }
+
+        // Clock-pin mode: +1 encoded, 0 = absent (keep live); only 0/1 valid.
+        if (in->i2s_config.clock_pin_mode_p1 != 0 &&
+            (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1) <= 1) {
+            i2s_clock_pin_mode = (uint8_t)(in->i2s_config.clock_pin_mode_p1 - 1);
+        }
+
+        // Slave-mode BCK pin (SPLIT): 0 = absent (keep live).  Install only if
+        // acceptable and non-overlapping with the master pair just installed
+        // (equal, +1, or its +1 equals master); otherwise keep the live pin.
+        if (in->i2s_config.bck_pin_slave != 0) {
+            uint8_t sp = in->i2s_config.bck_pin_slave;
+            bool overlap = (sp == i2s_bck_pin) ||
+                           (sp == (uint8_t)(i2s_bck_pin + 1)) ||
+                           ((uint8_t)(sp + 1) == i2s_bck_pin);
+            if (i2s_bck_pin_acceptable(sp) && !overlap) {
+                i2s_bck_pin_slave = sp;
+            } else {
+                printf("Bulk apply: I2S slave BCK pin %u rejected (invalid/conflict); kept %u\n",
+                       (unsigned)sp, (unsigned)i2s_bck_pin_slave);
+            }
+        }
+
+        // If the effective input pair moved, arm a deferred restart.  Bracketed
+        // bulk-apply paths in main.c restart anyway and clear this flag; this
+        // covers unbracketed callers so the input re-syncs on the new pins.
+        if (i2s_effective_bck_pin() != old_eff_bck &&
+            active_input_source == INPUT_SOURCE_I2S)
+            i2s_input_restart_pending = true;
 
         // MCK pin migration mirrors flash_storage.c apply_slot_to_live():
         // CLK_GPOUTn requires the pin to map to clk_gpout0..3 on this
@@ -422,62 +745,83 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
             i2s_mck_enabled = (in->i2s_config.mck_enabled != 0);
         }
 
-        if (in->header.format_version >= 5) {
-            // V5+: 0=128x, 1=256x
-            i2s_mck_multiplier = (in->i2s_config.mck_multiplier == 1) ? 256 : 128;
-        } else {
-            // V3-V4: raw value (128 or 0 for 256)
-            i2s_mck_multiplier = (in->i2s_config.mck_multiplier == 0) ? 256 : in->i2s_config.mck_multiplier;
-        }
+        // mck_multiplier encoding: 0 = 128×, 1 = 256×.
+        i2s_mck_multiplier = (in->i2s_config.mck_multiplier == 1) ? 256 : 128;
     }
 
-    // Volume Leveller (V4+ payloads only)
-    if (in->header.format_version >= 4) {
+    // Volume Leveller
+    {
         leveller_config.enabled = (in->leveller.enabled != 0);
         leveller_config.speed = in->leveller.speed;
         leveller_config.lookahead = (in->leveller.lookahead != 0);
         leveller_config.amount = in->leveller.amount;
         leveller_config.max_gain_db = in->leveller.max_gain_db;
         leveller_config.gate_threshold_db = in->leveller.gate_threshold_db;
-    } else {
-        // V2/V3 payload: apply defaults
-        leveller_config.enabled = LEVELLER_DEFAULT_ENABLED;
-        leveller_config.amount = LEVELLER_DEFAULT_AMOUNT;
-        leveller_config.speed = LEVELLER_DEFAULT_SPEED;
-        leveller_config.max_gain_db = LEVELLER_DEFAULT_MAX_GAIN_DB;
-        leveller_config.lookahead = LEVELLER_DEFAULT_LOOKAHEAD;
-        leveller_config.gate_threshold_db = LEVELLER_DEFAULT_GATE_DB;
+        leveller_config.detector_mask = in->leveller.detector_mask;
+        leveller_config.apply_mask = in->leveller.apply_mask;
     }
     leveller_update_pending = true;
     leveller_reset_pending = true;
 
-    // Per-channel preamp (V6+ payloads — overrides the legacy single value set above)
-    if (in->header.format_version >= 6) {
-        for (int i = 0; i < NUM_INPUT_CHANNELS && i < WIRE_MAX_INPUT_CHANNELS; i++) {
-            float db = in->preamp.preamp_db[i];
-            float linear = db_to_linear(db);
-            global_preamp_db[i]      = db;
-            global_preamp_mul[i]     = (int32_t)(linear * (float)(1 << 28));
-            global_preamp_linear[i]  = linear;
-        }
+    // Per-channel preamp — overrides the legacy single value set above.
+    for (int i = 0; i < NUM_INPUT_CHANNELS; i++) {
+        float db = in->preamp.preamp_db[i];
+        float linear = db_to_linear(db);
+        global_preamp_db[i]      = db;
+        global_preamp_mul[i]     = (int32_t)(linear * (float)(1 << 28));
+        global_preamp_linear[i]  = linear;
     }
 
-    // Master volume (V6+ payloads — bulk params always applies, ignores directory flag).
+    // Master volume (bulk params always applies, ignoring the directory flag).
     // Delegated to update_master_volume() for consistent clamping and to emit
     // a device→host notification via interrupt EP 0x83.
-    if (in->header.format_version >= 6) {
+    {
         float db = in->master_volume.master_volume_db;
         if (!isfinite(db)) db = MASTER_VOL_MAX_DB;
         update_master_volume(db);
     }
 
-    // Input source (V7+ payloads)
-    if (in->header.format_version >= 7) {
+    // Input source
+    {
         uint8_t src = in->input_config.input_source;
-        if (input_source_valid(src) && src != active_input_source) {
+        // Gate on selectable (valid AND currently offered) so a pushed source
+        // that names a disabled optional SPDIF is refused; the enable-mask apply
+        // above runs first, so enabling SPDIF2 and selecting it in one payload
+        // works.
+        if (input_source_selectable(src) && src != active_input_source) {
             pending_input_source = src;
             __dmb();
             input_source_change_pending = true;
+        }
+    }
+
+    // I2S input rate.  Store only; the bulk_params_pending handler in main.c
+    // owns triggering a deferred rate change after it restarts the input, and
+    // an input-source switch picks the rate up on its own.
+    i2s_input_rate = i2s_rate_decode(in->input_config.i2s_input_rate);
+
+    // I2S clock master/slave mode (V21+).  Deferred, same semantics as the
+    // vendor path: the main loop rebuilds I2S clocking when the source is live.
+    if (in->input_config.i2s_clock_mode <= 1 &&
+        (in->input_config.i2s_clock_mode != i2s_clock_mode ||
+         i2s_clock_mode_change_pending)) {
+        pending_i2s_clock_mode = in->input_config.i2s_clock_mode;
+        __dmb();
+        i2s_clock_mode_change_pending = true;
+    }
+
+    // ADAT input clock master/slave mode (V24+).  Deferred like i2s_clock_mode;
+    // the main-loop handler applies dormant or live and notifies at apply time.
+    // enc PLUS ONE on the wire: 0 = absent (keep live), 1 = master, 2 = slave.
+    {
+        uint8_t enc = in->input_config.adat_clock_mode_p1;
+        if (enc == 1 || enc == 2) {
+            uint8_t m = (uint8_t)(enc - 1);
+            if (m != adat_clock_mode || adat_clock_mode_change_pending) {
+                pending_adat_clock_mode = m;
+                __dmb();
+                adat_clock_mode_change_pending = true;
+            }
         }
     }
 
@@ -487,27 +831,14 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // disable, streak reset on enable) fire correctly; the PARAM_CHANGED
     // notification it emits is suppressed by the bulk bracket and
     // replaced by a single BULK_INVALIDATED at end.
-    //
-    // Defense-in-depth size check: the version gate alone is not enough
-    // — a sender could legally claim format_version=8 with a payload
-    // length short of the V8 size, in which case in->lg_sound_sync would
-    // straddle the end of the actually-transferred bytes and we'd read
-    // bulk_param_buf garbage from a prior transfer.  Today the dispatcher
-    // gates wLength == sizeof(WireBulkParams), but that's one refactor
-    // away from being relaxed (e.g. for forward-compat smaller V8s),
-    // so guard here too.  Keeps the apply contract self-defending.
-    if (in->header.format_version >= 8 &&
-        in->header.payload_length >= v8_size) {
-        lg_sound_sync_set_enabled(in->lg_sound_sync.enabled != 0);
-    }
+    lg_sound_sync_set_enabled(in->lg_sound_sync.enabled != 0);
 
     // User volume + mute (V9+ payloads).  Routed through update_user_volume()
     // so the same clamp/encode/apply funnel runs as on REQ_SET_USER_VOLUME
     // (vol_mul + loudness coefficient pointer move together, LG cache is
     // invalidated).  user_mute is a plain bool so the apply is just a
     // store + notify_param_write, suppressed by the bulk bracket.
-    if (in->header.format_version >= 9 &&
-        in->header.payload_length >= v9_size) {
+    {
         update_user_volume(in->user_volume.user_volume_db);
         user_mute = (in->user_volume.user_mute != 0);
         uint8_t mv = user_mute ? 1 : 0;
@@ -523,14 +854,85 @@ int bulk_params_apply(const WireBulkParams *in, bool apply_pins) {
     // matches every other section that "best-effort applies" what it
     // can.  Bulk SETs that include a dac_hw_mute section that fails
     // validation leave the previous config in place.
-    if (in->header.format_version >= 10 &&
-        in->header.payload_length >= sizeof(WireBulkParams)) {
+    {
         DacHwMuteConfig hw;
         _Static_assert(sizeof(hw) == sizeof(in->dac_hw_mute),
                        "WireDacHwMute and DacHwMuteConfig must match");
         memcpy(&hw, &in->dac_hw_mute, sizeof(hw));
         (void)dac_hw_mute_set_config(&hw);
     }
+
+    // Crossover bands.  Output rows applied; input rows skipped (crossover is
+    // output-channel-only).  Band-field is always overwritten with the wire
+    // index `XOVER_BAND_BASE + i` so a stale local index in the payload cannot
+    // trigger the live-edit misrouting bug described in crossover_filters_spec.md.
+    for (int ch = CH_OUT_1; ch < NUM_CHANNELS; ch++) {
+        for (int b = 0; b < MAX_XOVER_BANDS; b++) {
+            const WireBandParams *wb = &in->crossovers.bands[ch][b];
+            xover_recipes[ch][b].channel = (uint8_t)ch;
+            xover_recipes[ch][b].band    = (uint8_t)(XOVER_BAND_BASE + b);
+            xover_recipes[ch][b].type    = wb->type;
+            xover_recipes[ch][b].bypass  = (wb->bypass == 1) ? 1 : 0;
+            xover_recipes[ch][b].freq    = wb->freq;
+            xover_recipes[ch][b].Q       = wb->q;
+            xover_recipes[ch][b].gain_db = wb->gain_db;
+        }
+    }
+    // Caller invokes dsp_recalculate_all_filters() after this returns.
+
+    // ADAT output configuration (V17+).  RP2350 only; RP2040 ignores the section.
+    // ADAT is a push-pull output driver, so the pin gets the full ownership
+    // check (adat_pin_acceptable) and a bad pin is rejected-and-kept-live.
+    // pin == 0 means the platform default.
+#if PICO_RP2350
+    {
+        uint8_t enabled = (in->adat_config.enabled != 0) ? 1 : 0;
+        uint8_t pin = (in->adat_config.pin != 0) ? in->adat_config.pin : PICO_ADAT_PIN;
+        if (!adat_pin_acceptable(pin)) {
+            printf("Bulk apply: ADAT pin %u rejected (invalid/conflict); kept %u\n",
+                   (unsigned)pin, (unsigned)adat_output_pin());
+            pin = adat_output_pin();
+        }
+        adat_output_set_config(enabled != 0, pin);
+    }
+#endif
+
+    // Psychoacoustic bass (V23+).  One global config copied straight in; the
+    // main loop recomputes coefficients from the raised pending flag, mirroring
+    // crossfeed_update_pending above.
+    psybass_config.enabled       = (in->psybass.enabled != 0);
+    psybass_config.output_mask   = in->psybass.output_mask;
+    psybass_config.cutoff_hz     = in->psybass.cutoff_hz;
+    psybass_config.harmonics_db  = in->psybass.harmonics_db;
+    psybass_config.drive_db      = in->psybass.drive_db;
+    psybass_config.character_pct = in->psybass.character_pct;
+    psybass_config.original_db   = in->psybass.original_db;
+    psybass_update_pending = true;
+
+    // Stereo upmixer (V25+).  RP2350 only; RP2040 ignores the section.  Config
+    // copied straight in (mode fields clamped; floats are clamped downstream in
+    // upmix_compute_coefficients); the main loop recomputes coefficients from
+    // the raised pending flag, mirroring psybass above.
+#if PICO_RP2350
+    {
+        uint8_t sm = in->upmix.surround_mode;
+        upmix_config.enabled            = (in->upmix.enabled != 0);
+        upmix_config.center_mode        = upmix_clamp_center_mode(in->upmix.center_mode);
+        upmix_config.surround_mode      = (sm > 2) ? 2 : sm;
+        upmix_config.strength_pct       = in->upmix.strength_pct;
+        upmix_config.center_width_pct   = in->upmix.center_width_pct;
+        upmix_config.corr_threshold_pct = in->upmix.corr_threshold_pct;
+        upmix_config.attack_ms          = in->upmix.attack_ms;
+        upmix_config.release_ms         = in->upmix.release_ms;
+        upmix_config.detector_hpf_hz    = in->upmix.detector_hpf_hz;
+        upmix_config.surround_delay_ms  = in->upmix.surround_delay_ms;
+        upmix_config.surround_hpf_hz    = in->upmix.surround_hpf_hz;
+        upmix_config.surround_lpf_hz    = in->upmix.surround_lpf_hz;
+        upmix_config.decorr_pct         = in->upmix.decorr_pct;
+        upmix_config.presence_db        = upmix_presence_decode(in->upmix.presence_q1);
+        upmix_update_pending = true;
+    }
+#endif
 
     // Close the bulk bracket — emits BULK_INVALIDATED(source=BULK_SET).
     notify_end_bulk();

@@ -182,6 +182,18 @@ void audio_spdif_set_enabled(audio_spdif_instance_t *inst, bool enabled);
  */
 void audio_spdif_change_pin(audio_spdif_instance_t *inst, uint new_pin);
 
+/** \brief Fully tear down an S/PDIF output instance for output-type switching
+ * \ingroup audio_spdif
+ *
+ * Counterpart to audio_spdif_setup() and mirror of audio_i2s_teardown().
+ * Releases the DMA channel, PIO SM, pin, and registry slot so this slot's DMA
+ * channel can be re-claimed by its I2S instance.  The caller-owned consumer
+ * pool is detached but not freed (re-formatted on the next connect).
+ *
+ * \param inst The S/PDIF instance to tear down
+ */
+void audio_spdif_teardown(audio_spdif_instance_t *inst);
+
 /** \brief Enable multiple S/PDIF instances with synchronized PIO start
  * \ingroup audio_spdif
  *
@@ -193,6 +205,28 @@ void audio_spdif_change_pin(audio_spdif_instance_t *inst, uint new_pin);
  * \param count Number of instances
  */
 void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count);
+
+/*! \brief Prepare-only half of audio_spdif_enable_sync
+ * \ingroup pico_audio_spdif_multi
+ *
+ * Primes DMA / IRQ refcounts and marks the instances enabled without
+ * starting the SMs; returns the SM mask for the shared PIO block so the
+ * caller can perform one combined pio_enable_sm_mask_in_sync (used by the
+ * I2S clock-slave path to gate the start on an external LRCLK edge).
+ */
+uint32_t audio_spdif_enable_sync_prepare(audio_spdif_instance_t *instances[], uint count);
+
+/*! \brief Eagerly program the instance's PIO clock divider for a sample rate
+ * \ingroup pico_audio_spdif_multi
+ *
+ * Recomputes and writes the nominal divider for \p sample_freq and updates
+ * the instance's rate bookkeeping (inst->freq) and the IEC 60958-3 channel
+ * status rate byte.  The normal divider update is lazy (wrap_consumer_take,
+ * gated on a rate mismatch against inst->freq); callers that trim the SM
+ * divider behind the library's back (input clock servos) use this to restore
+ * nominal even when the rate value is unchanged.
+ */
+void audio_spdif_apply_pio_frequency(audio_spdif_instance_t *inst, uint32_t sample_freq);
 
 /** \brief Enable/disable DMA-starvation monitoring
  * \ingroup audio_spdif

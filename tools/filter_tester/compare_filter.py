@@ -37,7 +37,9 @@ inner-loop DSP code end-to-end, use mode (1).  If you only want to check
 the coefficient formulas, mode (2) is faster.
 
 filter_type is one of: 'lowpass', 'highpass', 'bandpass', 'notch',
-                       'peaking', 'lowshelf', 'highshelf'.
+                       'peaking', 'lowshelf', 'highshelf', and the first-order
+                       types 'lowpass1', 'highpass1', 'lowshelf1', 'highshelf1',
+                       'allpass1'.
 
 EXAMPLES
 --------
@@ -137,6 +139,51 @@ def rbj_coefficients(filter_type, fc, Q, gain_db, Fs):
         a0 = 1 + alpha
         a1 = -2 * cs
         a2 = 1 - alpha
+    elif ft == 'lowpass1':
+        # First-order low-pass (degenerate biquad, b2 = a2 = 0).
+        b0 = sn
+        b1 = sn
+        b2 = 0
+        a0 = sn + 1 + cs
+        a1 = sn - 1 - cs
+        a2 = 0
+    elif ft == 'highpass1':
+        b0 = 1 + cs
+        b1 = -1 - cs
+        b2 = 0
+        a0 = sn + 1 + cs
+        a1 = sn - 1 - cs
+        a2 = 0
+    elif ft == 'lowshelf1':
+        # First-order low shelf: DC gain A^2, unity at Nyquist.
+        b0 = (A * sn) + 1 + cs
+        b1 = (A * sn) - 1 - cs
+        b2 = 0
+        a0 = (sn / A) + 1 + cs
+        a1 = (sn / A) - 1 - cs
+        a2 = 0
+    elif ft == 'highshelf1':
+        b0 = sn + A + (A * cs)
+        b1 = sn - A - (A * cs)
+        b2 = 0
+        a0 = sn + (1 / A) + (cs / A)
+        a1 = sn - (1 / A) - (cs / A)
+        a2 = 0
+    elif ft in ('allpass1', 'allpass1q28'):
+        # First-order all-pass REFERENCE, derived independently of the
+        # firmware's compact a=(t-1)/(t+1) form: bilinear-transform the analog
+        # prototype  H(s) = (1 - s/Wc)/(1 + s/Wc)  with frequency prewarping
+        # (Wc = k*tan(pi*fc/Fs), k = 2*Fs) so the -90 deg point lands exactly
+        # at fc.  Substituting s = k*(1 - z^-1)/(1 + z^-1) and clearing the
+        # shared (1 + z^-1) factor gives a 1st-order section (b2 = a2 = 0).
+        k = 2.0 * Fs
+        Wc = k * np.tan(np.pi * fc / Fs)
+        b0 = Wc - k
+        b1 = Wc + k
+        b2 = 0.0
+        a0 = Wc + k
+        a1 = Wc - k
+        a2 = 0.0
     else:
         raise ValueError(f"Unknown filter type: {filter_type}")
     return (b0, b1, b2, a0, a1, a2)
@@ -402,7 +449,8 @@ def run_quick_sweep(user_mod, types, Fs, threshold_db,
     failures = []
     total = 0
     for ft in types:
-        uses_gain = ft in ('peaking', 'lowshelf', 'highshelf')
+        uses_gain = ft in ('peaking', 'lowshelf', 'highshelf',
+                           'lowshelf1', 'highshelf1')
         for fc, Q, gain in QUICK_CONFIGS:
             g = gain if uses_gain else 0.0
             total += 1
@@ -431,7 +479,8 @@ def run_sweep(user_mod, types, fcs, Qs, gains_db, Fs, threshold_db,
     failures = []
     total = 0
     for ft in types:
-        uses_gain = ft in ('peaking', 'lowshelf', 'highshelf')
+        uses_gain = ft in ('peaking', 'lowshelf', 'highshelf',
+                           'lowshelf1', 'highshelf1')
         test_gains = gains_db if uses_gain else [0.0]
         for fc in fcs:
             for Q in Qs:
@@ -530,7 +579,8 @@ def main(argv=None):
     ap.add_argument('--fs', type=float, default=48000.0,
                     help='Sample rate (default 48000)')
     ap.add_argument('--types',
-                    default='lowpass,highpass,peaking,lowshelf,highshelf,notch,bandpass',
+                    default='lowpass,highpass,peaking,lowshelf,highshelf,notch,bandpass,'
+                            'lowpass1,highpass1,lowshelf1,highshelf1,allpass1',
                     help='Comma-separated filter types')
     ap.add_argument('--fcs', default=None,
                     help='Comma-separated center frequencies '

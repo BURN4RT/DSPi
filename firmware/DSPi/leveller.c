@@ -1,14 +1,20 @@
 /*
- * leveller.c — Volume Leveller (Dynamic Range Compressor)
+ * leveller.c; Volume Leveller (Dynamic Range Compressor)
  *
- * Implements a feedforward, stereo-linked, single-band RMS compressor.
- * See leveller.h for algorithm overview and coefficient conventions.
+ * Implements a feedforward, channel-linked, single-band RMS compressor over
+ * the active input channels.  See leveller.h for the multichannel model
+ * (detector_mask / apply_mask) and coefficient conventions.
  *
  * Signal flow per block:
- *   1. Per-sample: update RMS envelope (one-pole IIR on squared signal)
- *   2. Per-block:  compute gain from envelope via soft-knee compressor
+ *   1. Per-sample: update RMS envelopes for detector-mask channels
+ *   2. Per-block:  link = loudest envelope; compute gain via soft-knee curve
  *   3. Per-block:  smooth gain with asymmetric attack/release
- *   4. Per-sample: apply interpolated gain, optional lookahead delay, safety limiter
+ *   4. Per-sample: lookahead delay on ALL active channels (if enabled),
+ *      interpolated gain + safety limiter on apply-mask channels
+ *
+ * Alignment invariant: with lookahead on, every active input channel passes
+ * through its ring (same depth), so applied and non-applied channels stay
+ * sample-aligned and mask changes never cause a time shift.
  */
 
 #include <math.h>
@@ -80,9 +86,14 @@ void leveller_compute_coefficients(LevellerCoeffs *out,
     float max_g = cfg->max_gain_db;
     if (max_g < LEVELLER_MAX_GAIN_MIN) max_g = LEVELLER_MAX_GAIN_MIN;
     if (max_g > LEVELLER_MAX_GAIN_MAX) max_g = LEVELLER_MAX_GAIN_MAX;
+#if !PICO_RP2350
+    // Q28 linear gain tops out just below 8.0 (18 dB); higher settings
+    // would overflow the fixed-point conversion in the apply loop.
+    if (max_g > 18.0f) max_g = 18.0f;
+#endif
     out->max_gain_db = max_g;
 
-    // No makeup gain — upward compression provides the boost directly.
+    // No makeup gain; upward compression provides the boost directly.
     // Content below the threshold is boosted, content above is untouched.
     out->makeup_db = 0.0f;
 
@@ -117,7 +128,7 @@ void leveller_reset_state(LevellerState *state) {
 //
 // This is the inverse of a traditional downward compressor: instead of
 // pushing loud content down, it lifts quiet content up. No makeup gain
-// needed — the boost IS the compression. Loud content passes through
+// needed; the boost IS the compression. Loud content passes through
 // at unity, so the limiter rarely engages.
 // ---------------------------------------------------------------------------
 
@@ -148,34 +159,52 @@ DSP_TIME_CRITICAL
 void leveller_process_block(LevellerState *state,
                             const LevellerCoeffs *coeffs,
                             const LevellerConfig *cfg,
-                            float *buf_l, float *buf_r,
+                            float *const *bufs, uint32_t n_bufs,
                             uint32_t count) {
-    if (count == 0) return;
+    if (count == 0 || n_bufs == 0) return;
+    if (n_bufs > NUM_INPUT_CHANNELS) n_bufs = NUM_INPUT_CHANNELS;
 
-    // ---- Per-sample: update RMS envelopes ----
-    float env_l = state->env_sq_l;
-    float env_r = state->env_sq_r;
-    const float a_rms = coeffs->alpha_rms;
-    const float one_minus_a_rms = 1.0f - a_rms;
-
-    for (uint32_t i = 0; i < count; i++) {
-        float sl = buf_l[i];
-        float sr = buf_r[i];
-        env_l = a_rms * env_l + one_minus_a_rms * (sl * sl);
-        env_r = a_rms * env_r + one_minus_a_rms * (sr * sr);
+    // Inputs that just became active carry stale ring/envelope content from
+    // the last time this many channels streamed; clear before use.
+    if (n_bufs != state->active_prev) {
+        for (uint32_t k = state->active_prev; k < n_bufs; k++) {
+            memset(state->lookahead_buf[k], 0, sizeof(state->lookahead_buf[k]));
+            state->env_sq[k] = 0.0f;
+        }
+        state->active_prev = (uint8_t)n_bufs;
     }
 
-    // Prevent denormals in silent passages
-    if (env_l < 1e-30f) env_l = 0.0f;
-    if (env_r < 1e-30f) env_r = 0.0f;
-    state->env_sq_l = env_l;
-    state->env_sq_r = env_r;
+    // Snapshot masks once per block, gated to the active channel set
+    const uint32_t active_mask = (1u << n_bufs) - 1u;
+    const uint32_t det_mask = (uint32_t)cfg->detector_mask & active_mask;
+    const uint32_t app_mask = (uint32_t)cfg->apply_mask & active_mask;
 
-    // ---- Per-block: compute target gain ----
+    // ---- Per-sample: update RMS envelopes (detector channels only) ----
+    const float a_rms = coeffs->alpha_rms;
+    const float one_minus_a_rms = 1.0f - a_rms;
+    float link_sq = 0.0f;   // Loudest detector envelope (linked level)
 
-    // Stereo-linked: use the louder channel
-    float rms_sq = (env_l > env_r) ? env_l : env_r;
-    float rms_db = 10.0f * log10f(rms_sq + 1e-30f);
+    for (uint32_t k = 0; k < n_bufs; k++) {
+        if (!(det_mask & (1u << k))) {
+            // Outside the detector set: drop the envelope so a later mask
+            // re-enable starts fresh instead of pumping from a stale level.
+            state->env_sq[k] = 0.0f;
+            continue;
+        }
+        const float *s = bufs[k];
+        float env = state->env_sq[k];
+        for (uint32_t i = 0; i < count; i++) {
+            float x = s[i];
+            env = a_rms * env + one_minus_a_rms * (x * x);
+        }
+        // Prevent denormals in silent passages
+        if (env < 1e-30f) env = 0.0f;
+        state->env_sq[k] = env;
+        if (env > link_sq) link_sq = env;
+    }
+
+    // ---- Per-block: compute target gain from the linked level ----
+    float rms_db = 10.0f * log10f(link_sq + 1e-30f);
 
     float gc_db;
     if (rms_db < coeffs->gate_threshold_db) {
@@ -205,10 +234,21 @@ void leveller_process_block(LevellerState *state,
     state->gain_prev_linear = state->gain_linear;
     state->gain_linear = powf(10.0f, state->gain_smooth_db / 20.0f);
 
-    // ---- Per-sample: apply gain with interpolation + optional lookahead ----
+    // Snapshot the applied-channel buffers once (not per sample)
+    float *ap[NUM_INPUT_CHANNELS];
+    uint32_t na = 0;
+    for (uint32_t k = 0; k < n_bufs; k++) {
+        if (app_mask & (1u << k)) ap[na++] = bufs[k];
+    }
+
+    bool use_la = cfg->lookahead;
+    if (!use_la && na == 0) return;   // Gain state updated; nothing to touch
+
+    // ---- Per-sample: lookahead delay + interpolated gain + limiter ----
     // The limiter caps the GAIN (not the output level) so the leveller never
     // creates content above the ceiling, but content already above it passes
-    // through untouched. Per-sample: gain = min(leveller_gain, ceil / |input|).
+    // through untouched. Per-sample: gain = min(leveller_gain, ceil / |input|),
+    // linked over the applied channels so the mix balance is preserved.
     float gain_prev = state->gain_prev_linear;
     float gain_cur  = state->gain_linear;
     float gain, gain_step;
@@ -222,43 +262,45 @@ void leveller_process_block(LevellerState *state,
     }
 
     const float ceil = LEVELLER_LIMITER_CEIL;
-    bool use_la = cfg->lookahead;
     uint32_t la_idx = state->la_write_idx;
 
     for (uint32_t i = 0; i < count; i++) {
-        float out_l, out_r;
-
         if (use_la) {
-            out_l = state->lookahead_buf[0][la_idx];
-            out_r = state->lookahead_buf[1][la_idx];
-            state->lookahead_buf[0][la_idx] = buf_l[i];
-            state->lookahead_buf[1][la_idx] = buf_r[i];
+            // Every active channel goes through its ring so applied and
+            // non-applied channels stay sample-aligned (see header).
+            for (uint32_t k = 0; k < n_bufs; k++) {
+                float *ring = state->lookahead_buf[k];
+                float delayed = ring[la_idx];
+                ring[la_idx] = bufs[k][i];
+                bufs[k][i] = delayed;
+            }
             la_idx++;
             if (la_idx >= LEVELLER_LOOKAHEAD_SAMPLES) la_idx = 0;
-        } else {
-            out_l = buf_l[i];
-            out_r = buf_r[i];
         }
 
         // Cap gain so the leveller never boosts a sample above the ceiling.
-        // If the sample is already above the ceiling, gain is capped at 1.0
-        // (pass-through) — existing loud content is never attenuated.
-        float peak = fabsf(out_l);
-        float pr = fabsf(out_r);
-        if (pr > peak) peak = pr;
-
+        // If a sample is already above the ceiling, gain is capped at 1.0
+        // (pass-through); existing loud content is never attenuated.
         float g = gain;
-        if (peak > 0.0f && g > 1.0f) {
-            float max_g = ceil / peak;
-            if (max_g < g) g = (max_g > 1.0f) ? max_g : 1.0f;
+        if (g > 1.0f && na > 0) {
+            float peak = 0.0f;
+            for (uint32_t j = 0; j < na; j++) {
+                float a = fabsf(ap[j][i]);
+                if (a > peak) peak = a;
+            }
+            if (peak > 0.0f) {
+                float max_g = ceil / peak;
+                if (max_g < g) g = (max_g > 1.0f) ? max_g : 1.0f;
+            }
         }
 
-        buf_l[i] = out_l * g;
-        buf_r[i] = out_r * g;
+        for (uint32_t j = 0; j < na; j++) {
+            ap[j][i] *= g;
+        }
         gain += gain_step;
     }
 
-    state->la_write_idx = la_idx;
+    if (use_la) state->la_write_idx = la_idx;
 }
 
 #else  // RP2040
@@ -267,48 +309,79 @@ void leveller_process_block(LevellerState *state,
 // RP2040 Q28 Fixed-Point Block Processing
 //
 // Envelope update and gain application use Q28 arithmetic via fast_mul_q28().
-// Gain computation (log/exp/soft knee) uses float — runs once per block (~1ms),
-// so the cost of the Pico SDK ROM float routines is acceptable.
+// Gain computation (log/exp/soft knee) uses float; it runs once per block
+// (~1ms), so the cost of the Pico SDK ROM float routines is acceptable.
+// RP2040 has exactly 2 input channels, so the masked loops stay 2-wide.
 // ---------------------------------------------------------------------------
 
 DSP_TIME_CRITICAL
 void leveller_process_block(LevellerState *state,
                             const LevellerCoeffs *coeffs,
                             const LevellerConfig *cfg,
-                            int32_t *buf_l, int32_t *buf_r,
+                            int32_t *const *bufs, uint32_t n_bufs,
                             uint32_t count) {
-    if (count == 0) return;
+    if (count == 0 || n_bufs == 0) return;
+    if (n_bufs > NUM_INPUT_CHANNELS) n_bufs = NUM_INPUT_CHANNELS;
 
-    // ---- Per-sample: update RMS envelopes (Q28) ----
+    int32_t *buf_l = bufs[0];
+    int32_t *buf_r = (n_bufs > 1) ? bufs[1] : NULL;
+
+    const uint32_t active_mask = (1u << n_bufs) - 1u;
+    const uint32_t det_mask = (uint32_t)cfg->detector_mask & active_mask;
+    const uint32_t app_mask = (uint32_t)cfg->apply_mask & active_mask;
+    const bool det_l = (det_mask & 1u) != 0;
+    const bool det_r = (det_mask & 2u) != 0 && buf_r;
+    const bool app_l = (app_mask & 1u) != 0;
+    const bool app_r = (app_mask & 2u) != 0 && buf_r;
+
+    // ---- Per-sample: update RMS envelopes (Q28, detector channels only) ----
 
     // Pre-compute (1 - alpha_rms) in Q28 for the envelope update.
     // alpha_rms is a float in [0,1]; convert both coefficients to Q28.
     int32_t a_rms_q28 = (int32_t)(coeffs->alpha_rms * (float)(1 << FILTER_SHIFT));
     int32_t one_minus_a_q28 = (1 << FILTER_SHIFT) - a_rms_q28;
 
-    int32_t env_l = state->env_sq_l;
-    int32_t env_r = state->env_sq_r;
+    int32_t env_l = state->env_sq[0];
+    int32_t env_r = state->env_sq[1];
 
-    for (uint32_t i = 0; i < count; i++) {
-        int32_t sl = buf_l[i];
-        int32_t sr = buf_r[i];
-        int32_t sq_l = fast_mul_q28(sl, sl);
-        int32_t sq_r = fast_mul_q28(sr, sr);
-        env_l = fast_mul_q28(a_rms_q28, env_l) + fast_mul_q28(one_minus_a_q28, sq_l);
-        env_r = fast_mul_q28(a_rms_q28, env_r) + fast_mul_q28(one_minus_a_q28, sq_r);
+    // Channels outside the detector set drop their envelope so a later
+    // mask re-enable starts fresh instead of pumping from a stale level.
+    if (det_l) {
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t sl = buf_l[i];
+            int32_t sq = fast_mul_q28(sl, sl);
+            env_l = fast_mul_q28(a_rms_q28, env_l) + fast_mul_q28(one_minus_a_q28, sq);
+        }
+        state->env_sq[0] = env_l;
+    } else {
+        env_l = 0;
+        state->env_sq[0] = 0;
+    }
+    if (det_r) {
+        for (uint32_t i = 0; i < count; i++) {
+            int32_t sr = buf_r[i];
+            int32_t sq = fast_mul_q28(sr, sr);
+            env_r = fast_mul_q28(a_rms_q28, env_r) + fast_mul_q28(one_minus_a_q28, sq);
+        }
+        state->env_sq[1] = env_r;
+    } else {
+        env_r = 0;
+        state->env_sq[1] = 0;
     }
 
-    state->env_sq_l = env_l;
-    state->env_sq_r = env_r;
+    // ---- Per-block: compute target gain from the linked level (float) ----
 
-    // ---- Per-block: compute target gain (float math) ----
-
-    // Convert Q28 envelope to float for gain computation
     const float inv_q28 = 1.0f / (float)(1 << FILTER_SHIFT);
-    float env_l_f = (float)env_l * inv_q28;
-    float env_r_f = (float)env_r * inv_q28;
-    float rms_sq = (env_l_f > env_r_f) ? env_l_f : env_r_f;
-    float rms_db = 10.0f * log10f(rms_sq + 1e-30f);
+    float link_sq = 0.0f;
+    if (det_l) {
+        float e = (float)env_l * inv_q28;
+        if (e > link_sq) link_sq = e;
+    }
+    if (det_r) {
+        float e = (float)env_r * inv_q28;
+        if (e > link_sq) link_sq = e;
+    }
+    float rms_db = 10.0f * log10f(link_sq + 1e-30f);
 
     float gc_db;
     if (rms_db < coeffs->gate_threshold_db) {
@@ -328,20 +401,25 @@ void leveller_process_block(LevellerState *state,
     state->gain_smooth_db = alpha * state->gain_smooth_db
                           + (1.0f - alpha) * gc_db;
 
-    // Convert smoothed gain to Q28 linear
+    // Convert smoothed gain to Q28 linear; clamp below 8.0 so the
+    // conversion cannot overflow (coeffs already cap max gain at 18 dB)
     float gain_linear = powf(10.0f, state->gain_smooth_db / 20.0f);
+    if (gain_linear > 7.99f) gain_linear = 7.99f;
     state->gain_prev_q28 = state->gain_q28;
     state->gain_q28 = (int32_t)(gain_linear * (float)(1 << FILTER_SHIFT));
 
-    // ---- Per-sample: apply gain with interpolation + optional lookahead ----
+    bool use_la = cfg->lookahead;
+    if (!use_la && !app_l && !app_r) return;   // Gain state updated; no apply
+
+    // ---- Per-sample: lookahead delay + interpolated gain + limiter ----
     // Limiter caps the GAIN so the leveller never boosts a sample above the
-    // ceiling, but existing loud content passes through untouched.
+    // ceiling; existing loud content passes through untouched.  Linked over
+    // the applied channels only.
     int32_t g_prev = state->gain_prev_q28;
     int32_t g_cur  = state->gain_q28;
     const int32_t unity_q28 = (1 << FILTER_SHIFT);
     const float ceil = LEVELLER_LIMITER_CEIL;
 
-    bool use_la = cfg->lookahead;
     uint32_t la_idx = state->la_write_idx;
 
     for (uint32_t i = 0; i < count; i++) {
@@ -352,40 +430,50 @@ void leveller_process_block(LevellerState *state,
             gain = g_prev + (int32_t)(((int64_t)(g_cur - g_prev) * i) / (int32_t)(count - 1));
         }
 
-        int32_t out_l, out_r;
+        int32_t out_l, out_r = 0;
 
         if (use_la) {
+            // Both channels always pass through their rings so applied and
+            // non-applied channels stay sample-aligned.
             out_l = state->lookahead_buf[0][la_idx];
-            out_r = state->lookahead_buf[1][la_idx];
             state->lookahead_buf[0][la_idx] = buf_l[i];
-            state->lookahead_buf[1][la_idx] = buf_r[i];
+            buf_l[i] = out_l;
+            if (buf_r) {
+                out_r = state->lookahead_buf[1][la_idx];
+                state->lookahead_buf[1][la_idx] = buf_r[i];
+                buf_r[i] = out_r;
+            }
             la_idx++;
             if (la_idx >= LEVELLER_LOOKAHEAD_SAMPLES) la_idx = 0;
         } else {
             out_l = buf_l[i];
-            out_r = buf_r[i];
+            if (buf_r) out_r = buf_r[i];
         }
 
         // Cap gain so leveller never boosts above ceiling; pass-through if already loud
-        if (gain > unity_q28) {
-            float peak = fabsf((float)out_l * inv_q28);
-            float pr = fabsf((float)out_r * inv_q28);
-            if (pr > peak) peak = pr;
+        if (gain > unity_q28 && (app_l || app_r)) {
+            float peak = 0.0f;
+            if (app_l) peak = fabsf((float)out_l * inv_q28);
+            if (app_r) {
+                float pr = fabsf((float)out_r * inv_q28);
+                if (pr > peak) peak = pr;
+            }
             if (peak > 0.0f) {
                 float max_g_f = ceil / peak;
-                int32_t max_g_q28 = (int32_t)(max_g_f * (float)unity_q28);
-                if (max_g_q28 < gain) gain = (max_g_q28 > unity_q28) ? max_g_q28 : unity_q28;
+                // Beyond Q28 range the cap can never bind on a <8.0 gain,
+                // and converting it would overflow; skip instead.
+                if (max_g_f < 8.0f) {
+                    int32_t max_g_q28 = (int32_t)(max_g_f * (float)unity_q28);
+                    if (max_g_q28 < gain) gain = (max_g_q28 > unity_q28) ? max_g_q28 : unity_q28;
+                }
             }
         }
 
-        out_l = fast_mul_q28(out_l, gain);
-        out_r = fast_mul_q28(out_r, gain);
-
-        buf_l[i] = out_l;
-        buf_r[i] = out_r;
+        if (app_l) buf_l[i] = fast_mul_q28(out_l, gain);
+        if (app_r) buf_r[i] = fast_mul_q28(out_r, gain);
     }
 
-    state->la_write_idx = la_idx;
+    if (use_la) state->la_write_idx = la_idx;
 }
 
 #endif  // PICO_RP2350

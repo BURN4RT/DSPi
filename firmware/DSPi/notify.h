@@ -40,9 +40,40 @@
 // Packet: [ver=2, evt=0x04, flags=0, seq, slot, 0, 0, 0]
 #define NOTIFY_EVT_PRESET_LOADED     0x04
 
+// v2 input-format event: the active USB input channel count changed (host
+// switched the USB alt / format).  The app re-lays-out its mixer/sidebar.
+// Packet: [ver=2, evt=0x05, flags=0, seq, channels, 0, 0, 0]
+#define NOTIFY_EVT_INPUT_FORMAT      0x05
+
 // Reserved for future use.
-// 0x05 — error / overflow report
 // 0x06 — batched PARAM_CHANGED (see spec §10.5)
+
+// v2 test-signal-generator state event (start, stop, completion).
+// Packet: [ver=2, evt=0x07, flags=0, seq, state, reason, signal_type, channel]
+// state = SiggenState, reason = SIGGEN_STOP_*, channel = walk channel or 0xFF.
+#define NOTIFY_EVT_SIGGEN_STATE      0x07
+
+// v2 ADAT bulk-output state event (RP2350): stream started/stopped, including
+// rate-policy auto-suspend/resume (see adat_output.h).
+// Packet: [ver=2, evt=0x08, flags=0, seq, enabled, active, pin, 0]
+#define NOTIFY_EVT_ADAT_STATE        0x08
+
+// v2 I2S clock-slave lock-state event: acquiring, relocking, locked, inactive.
+// Payload: state byte + detected rate (Hz, 0 until LOCKED).
+// Packet (9 bytes): [ver=2, evt=0x09, flags=0, seq, state, rate_LE(4)]
+#define NOTIFY_EVT_I2S_SLAVE_STATE   0x09
+
+// v2 Control Surfaces IR learn completion: capture or timeout.
+// Packet: [ver=2, evt=0x0A, flags=0, seq, state, protocol, 0, 0, code_LE32]
+// state = CS_IR_LEARN_DONE or CS_IR_LEARN_TIMEOUT; protocol/code are valid
+// only for DONE (CS_IR_PROTO_* / the learned code).
+#define NOTIFY_EVT_CS_IR_LEARN       0x0A
+
+// v2 ADAT input lock-state event (RP2350): acquiring, syncing, locked,
+// relocking, inactive (see adat_input.h).
+// Packet (10 bytes): [ver=2, evt=0x0B, flags=0, seq, state, rate_LE(4),
+// clock_mode]; rate = 0 unless LOCKED.
+#define NOTIFY_EVT_ADAT_INPUT_STATE  0x0B
 
 // v2 protocol version byte (first byte of every v2 packet)
 #define NOTIFY_V2_VERSION            0x02
@@ -60,6 +91,8 @@ typedef enum {
     PARAM_SRC_GPIO     = 5,  // Hardware control (knobs, encoders, pads)
     PARAM_SRC_INTERNAL = 6,  // Firmware-initiated (clamp, auto-recalc)
     PARAM_SRC_UAC1     = 7,  // UAC1 Feature Unit SET_CUR (OS volume slider, mute key)
+    PARAM_SRC_UART     = 8,  // External UART control interface
+    PARAM_SRC_I2C      = 9,  // External I2C target control interface
 } ParamSource;
 
 // ---------------------------------------------------------------------------
@@ -105,26 +138,68 @@ void notify_push_master_volume_v1(float db);
 // Push discrete v2 events.
 void notify_push_preset_loaded(uint8_t slot);
 void notify_push_bulk_invalidated(ParamSource src);
+// Active USB input channel count changed (2/4/6/8) — host switched the alt.
+void notify_push_input_format(uint8_t channels);
+// Test-signal generator started/stopped/completed (see siggen.h).
+void notify_push_siggen_state(uint8_t state, uint8_t reason,
+                              uint8_t signal_type, uint8_t channel);
+// ADAT bulk-output stream state changed (RP2350; see adat_output.h).
+void notify_push_adat_state(uint8_t enabled, uint8_t active, uint8_t pin);
+// I2S clock-slave lock state changed (see i2s_input.h).
+void notify_push_i2s_slave_state(uint8_t state, uint32_t rate_hz);
+// ADAT input lock state changed (RP2350; see adat_input.h).
+void notify_push_adat_input_state(uint8_t state, uint32_t rate_hz,
+                                  uint8_t clock_mode);
+// Control Surfaces IR learn finished (state = CS_IR_LEARN_DONE / _TIMEOUT).
+void notify_push_cs_ir_learn(uint8_t state, uint8_t protocol, uint32_t code);
 
-// Drain interface used by usb_audio.c.
+// ---------------------------------------------------------------------------
+// Consumers
 //
-// peek: format the next pending packet into out_buf (max max_len bytes).
-//       Returns the packet length (always > 0 if pending, 0 if ring empty).
-//       Does NOT advance the tail — call notify_commit_pop() on successful
-//       xfer submission.
-uint16_t notify_peek_next(uint8_t *out_buf, uint16_t max_len);
+// The ring supports multiple independent consumers, each with its own tail:
+// USB (EP 0x83 drain in usb_audio.c) and the UART control transport's
+// notification frames.  One producer path feeds all of them.  A lagging
+// consumer never delays the producer or the other consumers: when the
+// producer catches a consumer's tail, that consumer's oldest entry is
+// force-dropped (counted in notify_consumer_drops) and the push proceeds.
+// Consumers detect their drops from the packet sequence-number gap and
+// recover with a full REQ_GET_ALL_PARAMS read.
+// ---------------------------------------------------------------------------
 
-// Commit the last peek — advances the ring tail.  Must be called iff the
-// packet returned by peek was successfully submitted to the USB stack.
-void notify_commit_pop(void);
+typedef enum {
+    NOTIFY_CONSUMER_USB  = 0,   // always active
+    NOTIFY_CONSUMER_UART = 1,   // active while the UART transport is live
+                                // with notifications enabled
+    NOTIFY_CONSUMER_COUNT
+} NotifyConsumer;
 
-// True when at least one entry is pending delivery.  Lock-free fast path.
-bool notify_has_pending(void);
+// Activate / deactivate a consumer.  Activation snaps the consumer's tail
+// to the current head (it sees events from now on, never a stale backlog).
+// Inactive consumers are ignored by the producer's room-making logic.
+void notify_consumer_set_active(NotifyConsumer c, bool active);
 
-// Clear all pending state.  Called on USB reset.
+// peek: format consumer `c`'s next pending packet into out_buf (max max_len
+// bytes).  Returns the packet length, or 0 when nothing is pending.  Skips
+// entries not meant for this consumer (the v1 legacy master-volume packet
+// is USB-only; every v1 event has a v2 twin).  Does NOT advance the tail;
+// call notify_commit_pop_for() once the packet is safely handed off.
+uint16_t notify_peek_next_for(NotifyConsumer c, uint8_t *out_buf, uint16_t max_len);
+
+// Commit the last peek for consumer `c`, advancing its tail.  A no-op if
+// the producer force-dropped past the peeked entry in the meantime.
+void notify_commit_pop_for(NotifyConsumer c);
+
+// True when consumer `c` is active and has at least one entry pending.
+bool notify_has_pending_for(NotifyConsumer c);
+
+// Reset the USB consumer's view (drop its pending backlog) and the global
+// source/bulk brackets.  Called on USB bus reset.  Other consumers'
+// backlogs and the global sequence counter are deliberately untouched.
 void notify_reset_queue(void);
 
-// Debug / diagnostics.
+// Debug / diagnostics.  notify_consumer_drops counts force-dropped entries
+// per consumer; the two legacy aggregates are kept for existing tooling.
+extern volatile uint32_t notify_consumer_drops[NOTIFY_CONSUMER_COUNT];
 extern volatile uint32_t notify_overflow_count;
 extern volatile uint32_t notify_drops_count;
 

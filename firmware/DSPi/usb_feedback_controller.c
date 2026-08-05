@@ -7,6 +7,9 @@
 
 #include "usb_feedback_controller.h"
 
+// These run every USB SOF in ISR context; keep them in RAM under XIP builds.
+#define FB_TIME_CRITICAL __attribute__((section(".time_critical.fb_ctrl")))
+
 // ---------------------------------------------------------------------------
 // Init / Reset
 // ---------------------------------------------------------------------------
@@ -49,6 +52,7 @@ void fb_ctrl_stream_stop(usb_feedback_ctrl_t *ctrl) {
 // SOF update (called every 1ms from USB IRQ)
 // ---------------------------------------------------------------------------
 
+FB_TIME_CRITICAL
 void fb_ctrl_sof_update(usb_feedback_ctrl_t *ctrl,
                         uint32_t current_total_words,
                         uint32_t rate_shift,
@@ -131,6 +135,7 @@ void fb_ctrl_sof_update(usb_feedback_ctrl_t *ctrl,
 // Endpoint serialization: Q16.16 → 10.14
 // ---------------------------------------------------------------------------
 
+FB_TIME_CRITICAL
 uint32_t fb_ctrl_get_10_14(const usb_feedback_ctrl_t *ctrl) {
     uint32_t q16 = ctrl->feedback_out_q16;
     if (q16 == 0)

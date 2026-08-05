@@ -30,7 +30,11 @@
 // Bump on descriptor-affecting changes so Windows re-reads instead of using
 // its cached descriptor.  0x0200 → 0x0201 for notification EP max-packet
 // bump (8 → 64 bytes) introduced with the v2 notification protocol.
-#define USB_BCD_DEVICE  0x0201
+// 0x0201 → 0x0202 for the RP2350 8-channel input alt (alt 3) + widened input
+// terminal/feature unit + larger iso OUT max-packet.
+// 0x0202 → 0x0203 for the 4ch/6ch input alts + the unified channel model
+// (per-input EQ/metering, wire V16 / slot V21).
+#define USB_BCD_DEVICE  0x0203
 
 // ----------------------------------------------------------------------------
 // ENDPOINT ADDRESSES
@@ -38,7 +42,16 @@
 
 #define AUDIO_OUT_ENDPOINT  0x01U
 #define AUDIO_IN_ENDPOINT   0x82U
+#if PICO_RP2350
+// RP2350 also serves an 8-channel/48 kHz/16-bit alt (3): 48 frames × 8 ch ×
+// 2 B = 768 B, + 1 jitter frame (16 B) = 784, rounded up to a 4-byte-aligned
+// 788.  This single value sizes the iso OUT EP for all alts (the EP buffer is
+// allocated once at the max), the receive scratch buffer, and the USB ring
+// slot.  Comfortably under the 1023-byte full-speed isochronous ceiling.
+#define AUDIO_EP_MAX_PKT    788U
+#else
 #define AUDIO_EP_MAX_PKT    582U   // Sized for 24-bit stereo 96 kHz + 1 jitter sample
+#endif
 
 // Bulk IN endpoint on the vendor interface — device→host notifications
 // (master volume changes, future knob events, etc.).
@@ -68,7 +81,16 @@
 #define ITF_NUM_AUDIO_CONTROL   0
 #define ITF_NUM_AUDIO_STREAMING 1
 #define ITF_NUM_VENDOR          2
+#ifdef DSPI_LOOPBACK
+// Loopback capture function (debug build only): a second, self-contained UAC1
+// audio function appended after the vendor interface.  Existing interface
+// numbers 0/1/2 are unchanged so normal-build descriptors are unaffected.
+#define ITF_NUM_LOOPBACK_AC     3   // capture AudioControl
+#define ITF_NUM_LOOPBACK_AS     4   // capture AudioStreaming
+#define ITF_NUM_TOTAL           5
+#else
 #define ITF_NUM_TOTAL           3
+#endif
 
 // ----------------------------------------------------------------------------
 // UAC1 ENTITY IDs
@@ -77,6 +99,36 @@
 #define UAC1_INPUT_TERMINAL_ID   1
 #define UAC1_FEATURE_UNIT_ID     2
 #define UAC1_OUTPUT_TERMINAL_ID  3
+
+// ----------------------------------------------------------------------------
+// LOOPBACK CAPTURE FUNCTION (DSPI_LOOPBACK, debug build only)
+//
+// A second UAC1 audio function exposing output slot 0 as a 2-ch 24-bit
+// isochronous IN (recording) endpoint.  Rates are capped at DSPi's operating
+// range (44.1/48 kHz) which also keeps the RP2040 USB DPRAM budget small.
+// ----------------------------------------------------------------------------
+#ifdef DSPI_LOOPBACK
+#define LOOPBACK_IN_ENDPOINT        0x81U  // isochronous async IN (capture)
+
+#define LOOPBACK_N_CHANNELS         2
+#define LOOPBACK_BYTES_PER_SAMPLE   3      // 24-bit
+#define LOOPBACK_BYTES_PER_FRAME    (LOOPBACK_N_CHANNELS * LOOPBACK_BYTES_PER_SAMPLE)  // 6
+// Servo never emits more than this per USB frame; sizes the iso IN EP buffer.
+// At 48 kHz the servo's hard max is floor(frac<1 + nominal 48 + SERVO_MAX_CORR 2)
+// = 50 frames; 52 leaves a 2-frame margin.  Sized at 52 (312 B) instead of 64
+// (384 B) so the host's full-speed iso reservation for input (788) + this
+// capture EP + feedback (3) = 1103 B/frame stays under the FS periodic ceiling
+// (input + the old 384 = 1175 over-subscribed and dropped output frames while
+// the capture stream was active).  Unlike the input OUT EP, this is the loopback
+// driver's own endpoint: wMaxPacketSize, usbd_edpt_iso_alloc(), and g_pkt all
+// derive from LOOPBACK_EP_IN_SIZE, so there is no maxpacket/queue mismatch.
+#define LOOPBACK_MAX_FRAMES_PER_PACKET  52
+#define LOOPBACK_EP_IN_SIZE         (LOOPBACK_MAX_FRAMES_PER_PACKET * LOOPBACK_BYTES_PER_FRAME)  // 312
+
+// Capture-function entity IDs (distinct from the playback function's 1/2/3).
+#define LOOPBACK_INPUT_TERMINAL_ID   4   // internal: output slot 0
+#define LOOPBACK_OUTPUT_TERMINAL_ID  5   // USB streaming
+#endif
 
 // ----------------------------------------------------------------------------
 // UAC1 REQUEST OPCODES (not exposed by TinyUSB — UAC2 constants are UAC2-only)
@@ -114,9 +166,9 @@ extern const uint16_t usb_config_descriptor_len;
 // Alt-setting endpoint descriptor pointers — resolved at link time so the
 // UAC1 class driver can call usbd_edpt_iso_activate() without re-walking the
 // config on every SET_INTERFACE.  Indexed [alt-1]: [0] = alt 1 (16-bit),
-// [1] = alt 2 (24-bit).
-extern const uint8_t *const usb_audio_data_ep_desc[2];
-extern const uint8_t *const usb_audio_fb_ep_desc[2];
+// [1] = alt 2 (24-bit), and on RP2350 [2] = alt 3 (8-channel 16-bit).
+extern const uint8_t *const usb_audio_data_ep_desc[];
+extern const uint8_t *const usb_audio_fb_ep_desc[];
 
 // MS OS 2.0 descriptor set (178 bytes).  Returned to the host on a vendor
 // SETUP request bRequest=MS_VENDOR_CODE wIndex=7 to advertise WinUSB binding

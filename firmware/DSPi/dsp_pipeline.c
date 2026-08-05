@@ -1,23 +1,48 @@
 #include <math.h>
 #include <string.h>
 #include "dsp_pipeline.h"
+#include "dsp_svf.h"
+#include "dsp_biquad.h"
 #include "dcp_inline.h"
+#include "crossover.h"
 
 static inline bool is_filter_flat(const EqParamPacket *p) {
     if (p->type == FILTER_FLAT) return true;
+    // Any type outside the PEQ block (see filter_is_peq_type / the FilterType
+    // value-space contract in config.h) is not a valid PEQ filter — bypass the
+    // band rather than producing garbage. The most important case this defends
+    // against is a crossover filter type (FILTER_XOVER_FIRST..FILTER_XOVER_LAST)
+    // ending up in a PEQ band slot via a host bug or a mis-routed
+    // REQ_SET_EQ_PARAM / bulk apply / preset load: on the RP2350 SVF path the
+    // unknown type leaves the output mix coefficients zeroed (svm0=svm1=svm2=0),
+    // and the band would output silence at low fc. Treat as bypass instead,
+    // recipe round-trips. (An undefined value in the reserved PEQ padding falls
+    // through to a unity passthrough via the coefficient switch default.)
+    if (!filter_is_peq_type(p->type)) return true;
     if (p->freq <= 0.0f) return true;
+
+    // Linkwitz Transform carries the target frequency fp in gain_db (Hz);
+    // a non-positive fp is unconfigured/invalid, treat as flat.
+    if (p->type == FILTER_LINKWITZ_TRANSFORM && p->gain_db <= 0.0f) return true;
 
     // Peaking/shelf with ~0dB gain is effectively flat
     if (p->type == FILTER_PEAKING ||
         p->type == FILTER_LOWSHELF ||
-        p->type == FILTER_HIGHSHELF) {
+        p->type == FILTER_HIGHSHELF ||
+        p->type == FILTER_LOWSHELF1 ||
+        p->type == FILTER_HIGHSHELF1) {
         if (fabsf(p->gain_db) < 0.01f) return true;
     }
     return false;
 }
 
-Biquad filters[NUM_CHANNELS][MAX_BANDS];
+Filter filters[NUM_CHANNELS][MAX_BANDS];
 EqParamPacket filter_recipes[NUM_CHANNELS][MAX_BANDS];
+
+// Linkwitz Transform target Q per PEQ band, fixed-point Q*512 (0 = 0.707
+// default).  Parallel to filter_recipes because EqParamPacket has no spare
+// field; only read when the band's type is FILTER_LINKWITZ_TRANSFORM.
+uint16_t peq_qp_x512[NUM_CHANNELS][MAX_BANDS];
 float channel_delays_ms[NUM_CHANNELS] = {0};  // All 11 channels initialized to 0
 bool channel_bypassed[NUM_CHANNELS];
 
@@ -33,15 +58,9 @@ uint32_t delay_write_idx = 0;
 int32_t channel_delay_samples[NUM_DELAY_CHANNELS] = {0};
 bool any_delay_active = false;
 
-uint8_t channel_band_counts[NUM_CHANNELS] = {
-#if PICO_RP2350
-    // Master L, Master R, Out1-9 (11 channels total)
-    10, 10, 10, 10, 10, 10, 10, 10, 10, 10, 10
-#else
-    // RP2040: 7 channels (2 master + 4 SPDIF + 1 PDM)
-    10, 10, 10, 10, 10, 10, 10
-#endif
-};
+// Every channel (inputs + outputs) has 10 active PEQ bands.  Range-designator
+// init keeps this correct as NUM_CHANNELS changes (17 on RP2350, 7 on RP2040).
+uint8_t channel_band_counts[NUM_CHANNELS] = {[0 ... NUM_CHANNELS-1] = 10};
 
 #if !PICO_RP2350
 DSP_TIME_CRITICAL int32_t fast_mul_q28(int32_t a, int32_t b) {
@@ -58,26 +77,27 @@ DSP_TIME_CRITICAL int32_t fast_mul_q28(int32_t a, int32_t b) {
 }
 #endif
 
-void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
+void dsp_compute_coefficients(EqParamPacket *p, Filter *f, float sample_rate) {
     // 0xFF-safe interpretation: bypass byte must be exactly 1 to bypass.
     // Any other value (0, 0xFF padding from legacy hosts, garbage) leaves
     // the band active.  See Documentation/Features/band_bypass_spec.md.
     bool user_bypass = (p->bypass == 1);
 
     if (user_bypass || is_filter_flat(p) || sample_rate == 0) {
-        bq->bypass = true;
+        f->bypass = true;
 #if PICO_RP2350
-        bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;
-        bq->sva1 = 0.0f; bq->sva2 = 0.0f; bq->sva3 = 0.0f;
-        bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 0.0f;
-        bq->use_svf = false;
+        f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f; f->a1 = 0.0f; f->a2 = 0.0f;
+        f->sva1 = 0.0f; f->sva2 = 0.0f; f->sva3 = 0.0f;
+        f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 0.0f;
+        f->use_svf = false;
+        f->first_order = false;
 #else
-        bq->b0 = 1 << FILTER_SHIFT; bq->b1 = 0; bq->b2 = 0; bq->a1 = 0; bq->a2 = 0;
+        f->b0 = 1 << FILTER_SHIFT; f->b1 = 0; f->b2 = 0; f->a1 = 0; f->a2 = 0;
 #endif
         return;
     }
 
-    bq->bypass = false;
+    f->bypass = false;
 
     // Input validation
     if (p->Q < 0.1f) p->Q = 0.1f;
@@ -85,18 +105,88 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
     if (p->freq < 10.0f) p->freq = 10.0f;
     if (p->freq > sample_rate * 0.45f) p->freq = sample_rate * 0.45f;
 
-    float A = powf(10.0f, p->gain_db / 40.0f);
+    // Linkwitz Transform: zeros at the driver's measured rolloff (freq = f0,
+    // Q = Q0), poles at the target alignment.  fp rides in gain_db (Hz, gain
+    // is unused by this type), Qp in peq_qp_x512[] as Q*512 (0 = 0.707).
+    // Both corners clamp to 0.15*Fs: that bounds every normalized biquad
+    // coefficient below 6.4, inside the RP2040 Q28 range of +/-8, and is far
+    // above any physical use of the filter.  Clamps stay local (no recipe
+    // write-back) so the stored fp round-trips to the host unmodified.
+    const bool is_lt = (p->type == FILTER_LINKWITZ_TRANSFORM);
+    float lt_fp = 0.0f, lt_qp = 0.707f;
+    if (is_lt) {
+        if (p->freq > sample_rate * 0.15f) p->freq = sample_rate * 0.15f;
+        lt_fp = p->gain_db;
+        if (lt_fp < 10.0f) lt_fp = 10.0f;
+        if (lt_fp > sample_rate * 0.15f) lt_fp = sample_rate * 0.15f;
+        uint16_t qpx = (p->channel < NUM_CHANNELS && p->band < MAX_BANDS)
+                           ? peq_qp_x512[p->channel][p->band] : 0;
+        if (qpx != 0) {
+            lt_qp = (float)qpx * (1.0f / 512.0f);
+            if (lt_qp < 0.1f) lt_qp = 0.1f;
+            if (lt_qp > 20.0f) lt_qp = 20.0f;
+        }
+    }
+
+    // gain_db holds fp for LT; skip the dB conversion (it could produce inf).
+    float A = is_lt ? 1.0f : powf(10.0f, p->gain_db / 40.0f);
 
 #if PICO_RP2350
     // SVF/biquad crossover decision + state reset on path change
-    bool was_svf = bq->use_svf;
-    bq->use_svf = (p->freq < (sample_rate / 7.5f));
-    if (was_svf != bq->use_svf) {
-        bq->s1 = 0.0f; bq->s2 = 0.0f;
-        bq->svic1eq = 0.0f; bq->svic2eq = 0.0f;
+    bool was_svf = f->use_svf;
+    bool was_first_order = f->first_order;
+    f->use_svf = (p->freq < (sample_rate / 7.5f));
+    f->filter_type = p->type;
+    // LT has two corner frequencies; both must sit below the SVF threshold,
+    // otherwise fall back to the exact-bilinear biquad.
+    if (is_lt && lt_fp >= (sample_rate / 7.5f)) f->use_svf = false;
+    // First-order types (all-pass, low/high shelf) are genuine 1st-order
+    // sections.  They can't use the 2nd-order SVF, but they DO follow the same
+    // hybrid rule: a one-pole SVF below Fs/7.5 (svf_first_order) and a
+    // degenerate TDF2 biquad above.
+    const bool is_first_order = (p->type == FILTER_LOWPASS1 ||
+                                 p->type == FILTER_HIGHPASS1 ||
+                                 p->type == FILTER_ALLPASS1 ||
+                                 p->type == FILTER_LOWSHELF1 ||
+                                 p->type == FILTER_HIGHSHELF1);
+    f->first_order = is_first_order;
+    if (was_svf != f->use_svf || was_first_order != f->first_order) {
+        f->s1 = 0.0f; f->s2 = 0.0f;
+        f->svic1eq = 0.0f; f->svic2eq = 0.0f;
     }
 
-    if (bq->use_svf) {
+    if (f->use_svf) {
+        if (f->first_order) {
+            // One-pole TPT SVF (1st-order types).  The 1/(1+g) reciprocal is
+            // folded into sva1 so the inner loop is multiply-only; svic2eq is
+            // unused (kept 0).  lp = v1, hp = in - v1.
+            float g = tanf(3.1415926535f * p->freq / sample_rate);
+            float svm0_f = 0.0f, svm1_f = 0.0f, svm2_f = 0.0f;
+            switch (p->type) {
+                case FILTER_HIGHPASS1:  // out = in - v1
+                    svm0_f = 0.0f; svm1_f = 0.0f; svm2_f = 1.0f; break;
+                case FILTER_LOWPASS1:   // out = v1
+                    svm0_f = 0.0f; svm1_f = 1.0f; svm2_f = 0.0f; break;
+                case FILTER_ALLPASS1:   // out = 2*lp - in
+                    svm0_f = 0.0f; svm1_f = 1.0f; svm2_f = -1.0f; break;
+                case FILTER_LOWSHELF1:  // 1st-order shelf prewarps by A, not sqrt(A)
+                    g = g / A;
+                    svm0_f = 1.0f; svm1_f = A * A - 1.0f; svm2_f = 0.0f; break;
+                case FILTER_HIGHSHELF1:
+                    g = g * A;
+                    svm0_f = 1.0f; svm1_f = 0.0f; svm2_f = A * A - 1.0f; break;
+                default: break;
+            }
+            float sva1_f = 1.0f / (1.0f + g);
+            float sva2_f = g * sva1_f;
+            f->sva1 = sva1_f; f->sva2 = sva2_f; f->sva3 = 0.0f;
+            f->svm0 = svm0_f; f->svm1 = svm1_f; f->svm2 = svm2_f;
+            f->g = g;
+            // Fallback biquad coeffs (unused in SVF path, keep sane)
+            f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f; f->a1 = 0.0f; f->a2 = 0.0f;
+            return;
+        }
+
         // SVF coefficients (Simper, "SvfLinearTrapAllOutputs", Cytomic 2021)
         // Shelf k = 1/Q matches RBJ Audio-EQ-Cookbook response exactly.
         float g = tanf(3.1415926535f * p->freq / sample_rate);
@@ -116,6 +206,11 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
                 g = g * sqrtA;
                 break;
             }
+            case FILTER_LINKWITZ_TRANSFORM:
+                // SVF is tuned at the pole pair (target alignment).
+                g = tanf(3.1415926535f * lt_fp / sample_rate);
+                k = 1.0f / lt_qp;
+                break;
             default: break;
         }
 
@@ -132,21 +227,31 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
             case FILTER_HIGHSHELF: svm0_f = A*A;  svm1_f = k*(1.0f-A)*A;    svm2_f = 1.0f - A*A; break;
             case FILTER_NOTCH:     svm0_f = 1.0f; svm1_f = -1*k;            svm2_f = 0.0f;       break;
             case FILTER_ALLPASS:   svm0_f = 1.0f; svm1_f = -2.0*k;          svm2_f = 0.0f;       break;
+            case FILTER_LINKWITZ_TRANSFORM: {
+                // H = hp + (g0/(Q0*gp))*bp + (g0/gp)^2*lp with hp = in - k*v1 - v2,
+                // bp = v1, lp = v2; zeros prewarped at f0, poles at fp.
+                float g0 = tanf(3.1415926535f * p->freq / sample_rate);
+                float r = g0 / g;
+                svm0_f = 1.0f;
+                svm1_f = r / p->Q - k;
+                svm2_f = r * r - 1.0f;
+                break;
+            }
             default: break;
         }
 
-        bq->sva1 = sva1_f; bq->sva2 = sva2_f; bq->sva3 = sva3_f;
-        bq->svm0 = svm0_f; bq->svm1 = svm1_f; bq->svm2 = svm2_f;
-        bq->svf_type = p->type;
+        f->sva1 = sva1_f; f->sva2 = sva2_f; f->sva3 = sva3_f;
+        f->svm0 = svm0_f; f->svm1 = svm1_f; f->svm2 = svm2_f;
+        f->g = g;
 
         // Also compute biquad coefficients as fallback (not used in SVF path)
-        bq->b0 = 1.0f; bq->b1 = 0.0f; bq->b2 = 0.0f; bq->a1 = 0.0f; bq->a2 = 0.0f;
+        f->b0 = 1.0f; f->b1 = 0.0f; f->b2 = 0.0f; f->a1 = 0.0f; f->a2 = 0.0f;
         return;
     }
 
     // Clear SVF coefficients for biquad path
-    bq->sva1 = 0.0f; bq->sva2 = 0.0f; bq->sva3 = 0.0f;
-    bq->svm0 = 0.0f; bq->svm1 = 0.0f; bq->svm2 = 0.0f;
+    f->sva1 = 0.0f; f->sva2 = 0.0f; f->sva3 = 0.0f;
+    f->svm0 = 0.0f; f->svm1 = 0.0f; f->svm2 = 0.0f;
 #endif
 
     float omega = 2.0f * 3.1415926535f * p->freq / sample_rate;
@@ -161,31 +266,80 @@ void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate) {
         case FILTER_HIGHSHELF: b0_f = A*((A+1)+(A-1)*cs+2*sqrtf(A)*alpha); b1_f = -2*A*((A-1)+(A+1)*cs); b2_f = A*((A+1)+(A-1)*cs-2*sqrtf(A)*alpha); a0_f = (A+1)-(A-1)*cs+2*sqrtf(A)*alpha; a1_f = 2*((A-1)-(A+1)*cs); a2_f = (A+1)-(A-1)*cs-2*sqrtf(A)*alpha; break;
         case FILTER_NOTCH: b0_f = 1.0f; b1_f = -2*cs; b2_f = 1.0f; a0_f = 1+alpha; a1_f=-2*cs; a2_f=1-alpha; break;
         case FILTER_ALLPASS: b0_f = 1-alpha; b1_f = -2*cs; b2_f = 1+alpha; a0_f = 1 + alpha; a1_f = -2*cs; a2_f = 1 - alpha; break;
+        case FILTER_ALLPASS1: {
+            // First-order all-pass. H(z) = (a + z^-1)/(1 + a*z^-1),
+            // a = (tan(pi*fc/Fs) - 1)/(tan(pi*fc/Fs) + 1). Flat magnitude,
+            // phase 0 → -180° (-90° at fc). Degenerate biquad (b2 = a2 = 0);
+            // runs unchanged on RP2040 (Q28) and RP2350 (float, TDF2 forced above).
+            float ta = tanf(3.1415926535f * p->freq / sample_rate);
+            float ap = (ta - 1.0f) / (ta + 1.0f);
+            b0_f = ap;   b1_f = 1.0f; b2_f = 0.0f;
+            a0_f = 1.0f; a1_f = ap;   a2_f = 0.0f;
+            break;
+        }
+        case FILTER_LOWSHELF1: {
+            // First-order low shelf (degenerate biquad, b2 = a2 = 0): DC gain
+            // A^2, unity at Nyquist.  RBJ-equivalent 1st-order form.
+            b0_f = (A * sn) + 1.0f + cs; b1_f = (A * sn) - 1.0f - cs; b2_f = 0.0f;
+            a0_f = (sn / A) + 1.0f + cs; a1_f = (sn / A) - 1.0f - cs; a2_f = 0.0f;
+            break;
+        }
+        case FILTER_HIGHSHELF1: {
+            // First-order high shelf: unity at DC, gain A^2 at Nyquist.
+            b0_f = sn + A + (A * cs); b1_f = sn - A - (A * cs); b2_f = 0.0f;
+            a0_f = sn + (1.0f / A) + (cs / A); a1_f = sn - (1.0f / A) - (cs / A); a2_f = 0.0f;
+            break;
+        }
+        case FILTER_LINKWITZ_TRANSFORM: {
+            // Bilinear transform, each corner prewarped independently:
+            // zeros from (f0, Q0) = freq/Q, poles from (fp, Qp).
+            // DC gain = (g0/gp)^2, unity toward Nyquist.
+            float g0 = tanf(3.1415926535f * p->freq / sample_rate);
+            float gp = tanf(3.1415926535f * lt_fp / sample_rate);
+            b0_f = 1.0f + g0 / p->Q + g0 * g0;
+            b1_f = 2.0f * (g0 * g0 - 1.0f);
+            b2_f = 1.0f - g0 / p->Q + g0 * g0;
+            a0_f = 1.0f + gp / lt_qp + gp * gp;
+            a1_f = 2.0f * (gp * gp - 1.0f);
+            a2_f = 1.0f - gp / lt_qp + gp * gp;
+            break;
+        }
+        case FILTER_LOWPASS1: {
+            b0_f = sn; b1_f = sn; b2_f = 0.0f;
+            a0_f = sn + 1.0f + cs; a1_f = sn - 1.0f - cs; a2_f = 0.0f;
+            break;
+        }
+        case FILTER_HIGHPASS1: {
+            b0_f = 1.0f + cs; b1_f = -1.0f - cs; b2_f = 0.0f;
+            a0_f = sn + 1.0f + cs; a1_f = sn - 1.0f - cs; a2_f = 0.0f;
+            break;
+        }
         default: break;
     }
 
 #if PICO_RP2350
     // Float storage
     float inv_a0 = 1.0f / a0_f;
-    bq->b0 = b0_f * inv_a0;
-    bq->b1 = b1_f * inv_a0;
-    bq->b2 = b2_f * inv_a0;
-    bq->a1 = a1_f * inv_a0;
-    bq->a2 = a2_f * inv_a0;
+    f->b0 = b0_f * inv_a0;
+    f->b1 = b1_f * inv_a0;
+    f->b2 = b2_f * inv_a0;
+    f->a1 = a1_f * inv_a0;
+    f->a2 = a2_f * inv_a0;
 #else
     // Q28 Fixed Point Storage
     float scale = (float)(1LL << FILTER_SHIFT);
-    bq->b0 = (int32_t)((b0_f / a0_f) * scale);
-    bq->b1 = (int32_t)((b1_f / a0_f) * scale);
-    bq->b2 = (int32_t)((b2_f / a0_f) * scale);
-    bq->a1 = (int32_t)((a1_f / a0_f) * scale);
-    bq->a2 = (int32_t)((a2_f / a0_f) * scale);
+    f->b0 = (int32_t)((b0_f / a0_f) * scale);
+    f->b1 = (int32_t)((b1_f / a0_f) * scale);
+    f->b2 = (int32_t)((b2_f / a0_f) * scale);
+    f->a1 = (int32_t)((a1_f / a0_f) * scale);
+    f->a2 = (int32_t)((a2_f / a0_f) * scale);
 #endif
 }
 
 void dsp_init_default_filters() {
     memset(filters, 0, sizeof(filters));
     memset(channel_delays_ms, 0, sizeof(channel_delays_ms));
+    memset(peq_qp_x512, 0, sizeof(peq_qp_x512));
 
     for (int ch = 0; ch < NUM_CHANNELS; ch++) {
         channel_bypassed[ch] = true;
@@ -194,7 +348,7 @@ void dsp_init_default_filters() {
 #if PICO_RP2350
             filters[ch][b].b0 = 1.0f;
             filters[ch][b].use_svf = false;
-            filters[ch][b].svf_type = FILTER_FLAT;
+            filters[ch][b].filter_type = FILTER_FLAT;
             filters[ch][b].svic1eq = 0.0f;
             filters[ch][b].svic2eq = 0.0f;
 #else
@@ -208,6 +362,10 @@ void dsp_init_default_filters() {
             filter_recipes[ch][b].gain_db = 0.0f;
         }
     }
+
+    // Crossover bands default-init.  Writes wire-band-index (XOVER_BAND_BASE + i)
+    // into each recipe's `band` field; see crossover_filters_spec.md.
+    xover_init_default_filters();
 }
 
 void dsp_update_delay_samples(float sample_rate) {
@@ -247,28 +405,39 @@ void dsp_recalculate_all_filters(float sample_rate) {
         }
         channel_bypassed[ch] = all_bypassed;
     }
+    // Rebuild all crossover sections at the new Fs.  Section state is reset
+    // on SVF/biquad path change inside xover_design_filter(), same convention
+    // as PEQ above.
+    xover_recalculate_all(sample_rate);
 }
 
 #if PICO_RP2350
 DSP_TIME_CRITICAL
-float dsp_process_channel(Biquad * __restrict biquads, float input, uint8_t channel) {
+float dsp_process_channel(Filter * __restrict filters, float input, uint8_t channel) {
     float sample = input;
     uint8_t count = channel_band_counts[channel];
     for (int i = 0; i < count; i++) {
-        Biquad *bq = &biquads[i];
-        if (bq->bypass) continue;
+        Filter *f = &filters[i];
+        if (f->bypass) continue;
 
-        if (bq->use_svf) {
-            float v3 = sample - bq->svic2eq;
-            float v1 = bq->sva1 * bq->svic1eq + bq->sva2 * v3;
-            float v2 = bq->svic2eq + bq->sva2 * bq->svic1eq + bq->sva3 * v3;
-            bq->svic1eq = 2.0f * v1 - bq->svic1eq;
-            bq->svic2eq = 2.0f * v2 - bq->svic2eq;
-            sample = bq->svm0 * sample + bq->svm1 * v1 + bq->svm2 * v2;
+        if (f->use_svf) {
+            if (f->first_order) {
+                // One-pole TPT SVF (1st-order). lp = v1, hp = sample - v1.
+                float v1 = f->sva2 * sample + f->sva1 * f->svic1eq;
+                f->svic1eq = 2.0f * v1 - f->svic1eq;
+                sample = f->svm0 * sample + f->svm1 * v1 + f->svm2 * (sample - v1);
+            } else {
+                float v3 = sample - f->svic2eq;
+                float v1 = f->sva1 * f->svic1eq + f->sva2 * v3;
+                float v2 = f->svic2eq + f->sva2 * f->svic1eq + f->sva3 * v3;
+                f->svic1eq = 2.0f * v1 - f->svic1eq;
+                f->svic2eq = 2.0f * v2 - f->svic2eq;
+                sample = f->svm0 * sample + f->svm1 * v1 + f->svm2 * v2;
+            }
         } else {
-            float out = bq->b0 * sample + bq->s1;
-            bq->s1 = bq->b1 * sample - bq->a1 * out + bq->s2;
-            bq->s2 = bq->b2 * sample - bq->a2 * out;
+            float out = f->b0 * sample + f->s1;
+            f->s1 = f->b1 * sample - f->a1 * out + f->s2;
+            f->s2 = f->b2 * sample - f->a2 * out;
             sample = out;
         }
     }
@@ -276,97 +445,32 @@ float dsp_process_channel(Biquad * __restrict biquads, float input, uint8_t chan
 }
 
 DSP_TIME_CRITICAL
-void dsp_process_channel_block(Biquad * __restrict biquads, float * __restrict samples,
+void dsp_process_channel_block(Filter * __restrict filters, float * __restrict samples,
                                uint32_t count, uint8_t channel) {
     uint8_t num_bands = channel_band_counts[channel];
 
     for (int band = 0; band < num_bands; band++) {
-        Biquad *bq = &biquads[band];
-        if (bq->bypass) continue;
+        Filter *f = &filters[band];
+        if (f->bypass) continue;
 
-        if (bq->use_svf) {
-            // Load SVF coefficients
-            float a1 = bq->sva1, a2 = bq->sva2, a3 = bq->sva3;
-            float m0 = bq->svm0, m1 = bq->svm1, m2 = bq->svm2;
-            float ic1eq = bq->svic1eq, ic2eq = bq->svic2eq;
-            float *sp = samples;
-
-            // Per-type specialization: eliminates zero-multiplies in inner loop
-            switch (bq->svf_type) {
-                case FILTER_LOWPASS:
-                    for (uint32_t i = 0; i < count; i++) {
-                        float in = *sp;
-                        float v3 = in - ic2eq;
-                        float v1 = a1 * ic1eq + a2 * v3;
-                        float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                        ic1eq = 2.0f * v1 - ic1eq;
-                        ic2eq = 2.0f * v2 - ic2eq;
-                        *sp++ = v2;
-                    }
-                    break;
-                case FILTER_HIGHPASS:
-                    for (uint32_t i = 0; i < count; i++) {
-                        float in = *sp;
-                        float v3 = in - ic2eq;
-                        float v1 = a1 * ic1eq + a2 * v3;
-                        float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                        ic1eq = 2.0f * v1 - ic1eq;
-                        ic2eq = 2.0f * v2 - ic2eq;
-                        *sp++ = in + m1 * v1 - v2;
-                    }
-                    break;
-                case FILTER_PEAKING:
-                case FILTER_NOTCH:
-                case FILTER_ALLPASS:
-                    for (uint32_t i = 0; i < count; i++) {
-                        float in = *sp;
-                        float v3 = in - ic2eq;
-                        float v1 = a1 * ic1eq + a2 * v3;
-                        float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                        ic1eq = 2.0f * v1 - ic1eq;
-                        ic2eq = 2.0f * v2 - ic2eq;
-                        *sp++ = in + m1 * v1;
-                    }
-                    break;
-                default: // FILTER_LOWSHELF, FILTER_HIGHSHELF
-                    for (uint32_t i = 0; i < count; i++) {
-                        float in = *sp;
-                        float v3 = in - ic2eq;
-                        float v1 = a1 * ic1eq + a2 * v3;
-                        float v2 = ic2eq + a2 * ic1eq + a3 * v3;
-                        ic1eq = 2.0f * v1 - ic1eq;
-                        ic2eq = 2.0f * v2 - ic2eq;
-                        *sp++ = m0 * in + m1 * v1 + m2 * v2;
-                    }
-                    break;
-            }
-            bq->svic1eq = ic1eq;
-            bq->svic2eq = ic2eq;
-
+        if (f->use_svf) {
+            if (f->first_order)
+                dsp_svf_first_order(f, samples, count);
+            else
+                dsp_svf_second_order(f, samples, count);
         } else {
-            // Single-precision TDF2 biquad
-            float b0 = bq->b0, b1 = bq->b1, b2 = bq->b2;
-            float a1 = bq->a1, a2 = bq->a2;
-            float s1 = bq->s1, s2 = bq->s2;
-            float *sp = samples;
-
-            for (uint32_t i = 0; i < count; i++) {
-                float in = *sp;
-                float out = b0 * in + s1;
-                s1 = b1 * in - a1 * out + s2;
-                s2 = b2 * in - a2 * out;
-                *sp++ = out;
-            }
-            bq->s1 = s1;
-            bq->s2 = s2;
+            if (f->first_order)
+                dsp_biquad_first_order(f, samples, count);
+            else
+                dsp_biquad_second_order(f, samples, count);
         }
     }
 }
 #else
 // RP2040: Per-sample implemented in dsp_process_rp2040.S
-extern int32_t dsp_process_channel(Biquad * __restrict biquads, int32_t input_32, uint8_t channel);
+extern int32_t dsp_process_channel(Filter * __restrict biquads, int32_t input_32, uint8_t channel);
 
 // RP2040: Block-based biquad implemented in dsp_process_rp2040.S (assembly)
-extern void dsp_process_channel_block(Biquad * __restrict biquads, int32_t * __restrict samples,
+extern void dsp_process_channel_block(Filter * __restrict biquads, int32_t * __restrict samples,
                                       uint32_t count, uint8_t channel);
 #endif

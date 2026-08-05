@@ -1,18 +1,29 @@
 /*
- * leveller.h — Volume Leveller (Dynamic Range Compressor)
+ * leveller.h; Volume Leveller (Dynamic Range Compressor)
  *
- * Feedforward, stereo-linked, single-band RMS compressor with soft knee.
- * Applied to the master L/R input pair after Master EQ, before Crossfeed.
+ * Feedforward, channel-linked, single-band RMS compressor with soft knee.
+ * Runs pre-matrix on the input channels (PASS 2.5, after per-input EQ).
+ *
+ * Multichannel model:
+ *   - detector_mask selects which input channels feed the RMS detector
+ *     (bit k = input channel k).  The link is the loudest selected envelope,
+ *     so one shared gain preserves the mix balance across channels.
+ *   - apply_mask selects which input channels the shared gain is applied to.
+ *     CPU is only spent on selected channels.
+ *   - With lookahead enabled, EVERY active input channel is delayed by the
+ *     lookahead length (applied channels through the gain stage, the rest
+ *     as a plain delay) so inter-channel alignment is preserved exactly.
+ *     Mask changes therefore never cause a time shift.
  *
  * Features:
  *   - RMS-based level detection (correlates with perceived loudness)
- *   - Soft-knee compression curve for transparent gain control
+ *   - Soft-knee upward compression for transparent gain control
  *   - Asymmetric attack/release with configurable speed presets
- *   - Optional 10ms lookahead for predictive transient handling
- *   - Safety limiter at 0 dBFS to prevent downstream clipping
+ *   - Optional 5ms lookahead for predictive transient handling
+ *   - Safety limiter (gain cap) to prevent downstream clipping
  *   - Silence gate to prevent noise-floor pumping
  *
- * Coefficient convention (Form A — "retention" form):
+ * Coefficient convention (Form A; "retention" form):
  *   alpha = exp(-log(10) / (Fs * T))
  *   Gives exact 90% step response at time T (0% -> 90%).
  *   alpha near 1.0 = slow (retains previous value)
@@ -31,7 +42,7 @@
 // Constants
 // ---------------------------------------------------------------------------
 
-#define LEVELLER_LOOKAHEAD_SAMPLES  480   // 10ms at 48kHz
+#define LEVELLER_LOOKAHEAD_SAMPLES  240   // 5ms at 48kHz
 
 // Speed presets
 #define LEVELLER_SPEED_SLOW    0   // Music, orchestral
@@ -61,8 +72,10 @@ typedef struct {
     float   amount;          // 0.0 - 100.0 (compression strength %)
     uint8_t speed;           // LEVELLER_SPEED_SLOW/MEDIUM/FAST
     float   max_gain_db;     // 0.0 - 35.0 dB (max boost for quiet content)
-    bool    lookahead;       // Enable 10ms lookahead delay
+    bool    lookahead;       // Enable 5ms lookahead delay
     float   gate_threshold_db; // -96.0 - 0.0 dBFS (silence gate level)
+    uint8_t detector_mask;   // Bit k: input channel k feeds the detector
+    uint8_t apply_mask;      // Bit k: gain is applied to input channel k
 } LevellerConfig;
 
 // Factory defaults
@@ -72,6 +85,8 @@ typedef struct {
 #define LEVELLER_DEFAULT_MAX_GAIN_DB  15.0f
 #define LEVELLER_DEFAULT_LOOKAHEAD    true
 #define LEVELLER_DEFAULT_GATE_DB      (-96.0f)
+#define LEVELLER_DEFAULT_DETECTOR_MASK 0xFF   // All inputs
+#define LEVELLER_DEFAULT_APPLY_MASK    0xFF   // All inputs
 
 // ---------------------------------------------------------------------------
 // Derived Coefficients (recomputed on config or sample rate change)
@@ -102,35 +117,39 @@ typedef struct {
 #if PICO_RP2350
 
 typedef struct {
-    // Per-channel RMS squared envelopes
-    float env_sq_l;
-    float env_sq_r;
+    // Per-input-channel RMS squared envelopes
+    float env_sq[NUM_INPUT_CHANNELS];
 
     // Smoothed gain output
     float gain_smooth_db;    // Current smoothed gain (dB)
     float gain_linear;       // Current linear gain multiplier
     float gain_prev_linear;  // Previous block's gain (for interpolation)
 
-    // Lookahead circular delay buffer (always allocated, only used when enabled)
-    float lookahead_buf[2][LEVELLER_LOOKAHEAD_SAMPLES];
+    // Per-input lookahead rings (always allocated, only used when enabled)
+    float lookahead_buf[NUM_INPUT_CHANNELS][LEVELLER_LOOKAHEAD_SAMPLES];
     uint32_t la_write_idx;
+
+    // Active-input count seen last block; rings of newly activated inputs
+    // are cleared so stale samples never reach the matrix.
+    uint8_t active_prev;
 } LevellerState;
 
 #else  // RP2040
 
 typedef struct {
-    // Per-channel RMS squared envelopes (Q28)
-    int32_t env_sq_l;
-    int32_t env_sq_r;
+    // Per-input-channel RMS squared envelopes (Q28)
+    int32_t env_sq[NUM_INPUT_CHANNELS];
 
     // Smoothed gain output (gain computation done in float, application in Q28)
-    float gain_smooth_db;    // Current smoothed gain (dB) — always float
+    float gain_smooth_db;    // Current smoothed gain (dB); always float
     int32_t gain_q28;        // Current Q28 linear gain
     int32_t gain_prev_q28;   // Previous block's Q28 gain (for interpolation)
 
-    // Lookahead circular delay buffer (Q28)
-    int32_t lookahead_buf[2][LEVELLER_LOOKAHEAD_SAMPLES];
+    // Per-input lookahead rings (Q28)
+    int32_t lookahead_buf[NUM_INPUT_CHANNELS][LEVELLER_LOOKAHEAD_SAMPLES];
     uint32_t la_write_idx;
+
+    uint8_t active_prev;    // Unused on RP2040 (input count fixed at 2)
 } LevellerState;
 
 #endif
@@ -149,21 +168,23 @@ void leveller_compute_coefficients(LevellerCoeffs *out,
 // clear lookahead buffer).  Called when leveller is enabled or lookahead toggled.
 void leveller_reset_state(LevellerState *state);
 
-// Process a block of stereo audio in-place.
-// Applies RMS envelope update, gain computation, lookahead delay (if enabled),
-// gain interpolation, and safety limiter.
-// Marked DSP_TIME_CRITICAL — runs in the audio callback.
+// Process a block of n_bufs active input channels in-place.
+// bufs[k] is input channel k's block (the pipeline's input_bufs).
+// Applies RMS envelope update (detector_mask), shared gain computation,
+// lookahead delay on ALL active channels (if enabled), gain interpolation
+// and safety limiter on apply_mask channels.
+// Marked DSP_TIME_CRITICAL; runs in the audio callback.
 #if PICO_RP2350
 void leveller_process_block(LevellerState *state,
                             const LevellerCoeffs *coeffs,
                             const LevellerConfig *cfg,
-                            float *buf_l, float *buf_r,
+                            float *const *bufs, uint32_t n_bufs,
                             uint32_t count);
 #else
 void leveller_process_block(LevellerState *state,
                             const LevellerCoeffs *coeffs,
                             const LevellerConfig *cfg,
-                            int32_t *buf_l, int32_t *buf_r,
+                            int32_t *const *bufs, uint32_t n_bufs,
                             uint32_t count);
 #endif
 

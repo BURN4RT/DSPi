@@ -43,6 +43,7 @@ def _set_enables(dev, states):
 
 def _busy_pins(dev, profile):
     pins = set(dev.get_u8(OP.GET_OUTPUT_PIN, wvalue=i) for i in range(profile.num_pin_outputs))
+    pins.add(dev.get_u8(OP.GET_I2S_RX_PIN))
     pins.add(dev.get_u8(OP.GET_SPDIF_RX_PIN))
     bck = dev.get_u8(OP.GET_I2S_BCK_PIN)
     pins.add(bck)

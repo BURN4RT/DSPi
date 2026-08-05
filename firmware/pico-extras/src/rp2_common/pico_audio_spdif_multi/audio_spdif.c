@@ -4,12 +4,9 @@
  * SPDX-License-Identifier: BSD-3-Clause
  */
 
-// RP2350: Force time-critical functions into RAM to avoid XIP cache misses
-#if PICO_RP2350
+// Per-block producer/consumer path; must stay in RAM under XIP builds
+// on both platforms (reached via connection function pointers).
 #define SPDIF_TIME_CRITICAL __attribute__((noinline, section(".time_critical")))
-#else
-#define SPDIF_TIME_CRITICAL
-#endif
 
 #include <stdio.h>
 #include <stddef.h>
@@ -167,7 +164,13 @@ const audio_format_t *audio_spdif_setup(audio_spdif_instance_t *inst,
     inst->playing_buffer = NULL;
     inst->freq = 0;
     inst->enabled = false;
-    inst->instance_index = (uint8_t)spdif_instance_count;
+    inst->words_consumed = 0;
+    inst->current_transfer_words = 0;
+    // Stable across teardown/re-setup: the DMA channel is this slot's permanent
+    // identity (0..NUM_SPDIF_INSTANCES-1), so the starvation-stats array index
+    // never collides when an instance is torn down and re-created on output-type
+    // switches.  (spdif_instance_count is not stable once de-registration exists.)
+    inst->instance_index = config->dma_channel;
 
     // Assert all instances share the same DMA IRQ line
     if (spdif_instance_count > 0) {
@@ -230,6 +233,11 @@ const audio_format_t *audio_spdif_setup(audio_spdif_instance_t *inst,
         irq_handler_installed[inst->dma_irq] = true;
     }
 
+    // Clear any stale completion flag from a prior user of this channel (e.g.
+    // this slot's I2S instance, on an output-type switch — I2S TX lives on a
+    // different DMA IRQ line, so its enable bit is independent, but the raw
+    // completion latch is shared) before unmasking.
+    dma_irqn_acknowledge_channel(inst->dma_irq, inst->dma_channel);
     dma_irqn_set_channel_enabled(inst->dma_irq, inst->dma_channel, 1);
 
     // Register instance
@@ -262,6 +270,14 @@ static void update_pio_frequency(audio_spdif_instance_t *inst, uint32_t sample_f
         case 96000: spdif_channel_status[3] = 0x0A; break;  // IEC958_AES3_CON_FS_96000
         default:    spdif_channel_status[3] = 0x01; break;  // not indicated
     }
+}
+
+// Public eager variant: the input clock servos (SPDIF input, I2S slave) trim
+// the SM divider directly without touching inst->freq, so the lazy
+// wrap_consumer_take update below never fires when the pipeline rate is
+// unchanged; this lets the application restore nominal explicitly.
+void audio_spdif_apply_pio_frequency(audio_spdif_instance_t *inst, uint32_t sample_freq) {
+    update_pio_frequency(inst, sample_freq);
 }
 
 // ---------------------------------------------------------------------------
@@ -517,10 +533,107 @@ void audio_spdif_set_enabled(audio_spdif_instance_t *inst, bool enabled) {
 }
 
 // ---------------------------------------------------------------------------
+// audio_spdif_teardown -- full resource release for output type switching
+//
+// Counterpart to audio_spdif_setup() and the mirror of audio_i2s_teardown().
+// Unlike audio_spdif_change_pin() (which keeps the instance set up and only
+// re-points its pin), this fully releases the DMA channel, PIO SM, pin, and
+// registry slot so this slot's DMA channel can be re-claimed by its I2S
+// instance.  The caller-owned static consumer pool is detached but NOT freed
+// (it is shared with the slot's I2S instance and re-formatted on next connect).
+// ---------------------------------------------------------------------------
+
+void audio_spdif_teardown(audio_spdif_instance_t *inst) {
+    // Disable if still running (also balances the shared DMA-IRQ refcount).
+    if (inst->enabled) {
+        audio_spdif_set_enabled(inst, false);
+    }
+
+    // Mask DMA IRQ for this channel and abort any in-flight transfer.
+    dma_irqn_set_channel_enabled(inst->dma_irq, inst->dma_channel, false);
+    dma_channel_abort(inst->dma_channel);
+    dma_irqn_acknowledge_channel(inst->dma_irq, inst->dma_channel);
+
+    // Return the in-flight buffer owned by this instance.
+    if (inst->playing_buffer != NULL) {
+        if (inst->consumer_pool != NULL) {
+            give_audio_buffer(inst->consumer_pool, inst->playing_buffer);
+        }
+        inst->playing_buffer = NULL;
+    }
+
+    // Return any partially filled producer->consumer staging buffer held by the
+    // embedded connection (lives outside the DMA path).
+    if (inst->connection.current_consumer_buffer != NULL) {
+        if (inst->consumer_pool != NULL) {
+            queue_free_audio_buffer(inst->consumer_pool,
+                                    inst->connection.current_consumer_buffer);
+        }
+        inst->connection.current_consumer_buffer = NULL;
+    }
+    inst->connection.current_consumer_buffer_pos = 0;
+
+    // Break bidirectional connection links before the pool is re-formatted so
+    // an accidental post-teardown take/give fails fast instead of touching it.
+    if (inst->consumer_pool &&
+        inst->consumer_pool->connection == &inst->connection.core) {
+        inst->consumer_pool->connection = NULL;
+    }
+    if (inst->connection.core.producer_pool &&
+        inst->connection.core.producer_pool->connection == &inst->connection.core) {
+        inst->connection.core.producer_pool->connection = NULL;
+    }
+    inst->connection.core.producer_pool_take = NULL;
+    inst->connection.core.producer_pool_give = NULL;
+    inst->connection.core.consumer_pool_take = NULL;
+    inst->connection.core.consumer_pool_give = NULL;
+    inst->connection.core.producer_pool = NULL;
+    inst->connection.core.consumer_pool = NULL;
+
+    // Detach (do NOT free) the caller-owned shared static consumer pool; it is
+    // re-formatted on the next connect (output-type switch).  The silence
+    // buffer is backed by static instance storage — also nothing to free.
+    inst->consumer_pool = NULL;
+
+    // Release the pin to high-Z.
+    gpio_set_function(inst->pin, GPIO_FUNC_NULL);
+    gpio_set_dir(inst->pin, GPIO_IN);
+
+    // Unclaim DMA channel and PIO SM so this slot's I2S instance can claim them.
+    dma_channel_unclaim(inst->dma_channel);
+    pio_sm_unclaim(inst->pio, inst->pio_sm);
+
+    // Remove from the instance registry atomically against DMA IRQ iteration.
+    uint32_t save = save_and_disable_interrupts();
+    for (uint i = 0; i < spdif_instance_count; i++) {
+        if (spdif_instances[i] == inst) {
+            for (uint j = i; j < spdif_instance_count - 1; j++) {
+                spdif_instances[j] = spdif_instances[j + 1];
+            }
+            spdif_instance_count--;
+            break;
+        }
+    }
+    restore_interrupts(save);
+
+    inst->enabled = false;
+
+    printf("S/PDIF teardown: SM%d, GPIO %d (instances remaining: %u)\n",
+           inst->pio_sm, inst->pin, spdif_instance_count);
+}
+
+// ---------------------------------------------------------------------------
 // audio_spdif_enable_sync -- synchronized start for multiple instances
 // ---------------------------------------------------------------------------
 
-void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count) {
+// Prepare-only half of the synchronized start: IRQ refcounts, DMA priming
+// and enabled-flag bookkeeping, WITHOUT starting the SMs.  Returns the SM
+// mask for the (single, shared) PIO block; the caller performs the
+// pio_enable_sm_mask_in_sync.  Lets a caller prime BOTH output types first
+// and then start every slot in one mask write (the I2S clock-slave path
+// gates that write on an external LRCLK edge; hoisting the priming keeps
+// the gate-to-start latency to a few hundred nanoseconds).
+uint32_t audio_spdif_enable_sync_prepare(audio_spdif_instance_t *instances[], uint count) {
     assert(count > 0 && count <= PICO_AUDIO_SPDIF_MAX_INSTANCES);
 
     // Enable DMA IRQ and prime DMA for all instances
@@ -531,32 +644,26 @@ void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count) {
         audio_start_dma_transfer(inst);
     }
 
-    // Build per-PIO-block SM bitmasks
-    uint32_t pio_sm_mask[3] = {0, 0, 0};
+    // All instances share one PIO block (asserted); build its SM mask
+    uint32_t sm_mask = 0;
     for (uint i = 0; i < count; i++) {
-        audio_spdif_instance_t *inst = instances[i];
-        for (uint p = 0; p < 3; p++) {
-            PIO block = pio_block_from_index(p);
-            if (inst->pio == block) {
-                pio_sm_mask[p] |= (1u << inst->pio_sm);
-                break;
-            }
-        }
+        assert(instances[i]->pio == instances[0]->pio);
+        sm_mask |= (1u << instances[i]->pio_sm);
     }
 
-    // Disable interrupts briefly and start all PIO blocks synchronously
-    uint32_t save = save_and_disable_interrupts();
-    for (uint p = 0; p < 3; p++) {
-        if (pio_sm_mask[p]) {
-            pio_enable_sm_mask_in_sync(pio_block_from_index(p), pio_sm_mask[p]);
-        }
-    }
-    restore_interrupts(save);
-
-    // Mark all instances enabled
     for (uint i = 0; i < count; i++) {
         instances[i]->enabled = true;
     }
+    return sm_mask;
+}
+
+void audio_spdif_enable_sync(audio_spdif_instance_t *instances[], uint count) {
+    uint32_t sm_mask = audio_spdif_enable_sync_prepare(instances, count);
+
+    // Disable interrupts briefly and start all SMs synchronously
+    uint32_t save = save_and_disable_interrupts();
+    pio_enable_sm_mask_in_sync(instances[0]->pio, sm_mask);
+    restore_interrupts(save);
 }
 
 void audio_spdif_set_starvation_monitoring(bool enabled) {

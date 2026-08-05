@@ -73,6 +73,8 @@ typedef struct audio_i2s_instance {
     uint8_t data_pin;           // Serial audio data GPIO
     uint8_t clock_pin_base;     // BCK GPIO; LRCLK = clock_pin_base + 1
     bool    clock_master;       // true = drives BCK/LRCLK, false = data only
+    bool    external_clock;     // true = wait-driven on external BCK/LRCLK inputs
+                                // (clock_master must be false; divider fixed 1.0)
 
     // Runtime state
     audio_buffer_t *playing_buffer;
@@ -110,6 +112,9 @@ typedef struct audio_i2s_config {
     uint8_t pio;                // PIO block index (0, 1, or 2 on RP2350)
     uint8_t dma_irq;            // DMA IRQ index (0 or 1)
     bool    clock_master;       // true = drive BCK/LRCLK (master), false = data only (slave)
+    bool    external_clock;     // true = slave to EXTERNAL BCK/LRCLK (pads are inputs;
+                                // clock_master ignored).  Wait-driven at divider 1.0;
+                                // rate changes do not touch these SMs' dividers.
 } audio_i2s_config_t;
 
 // ---------------------------------------------------------------------------
@@ -189,6 +194,43 @@ void audio_i2s_change_data_pin(audio_i2s_instance_t *inst, uint new_pin);
  */
 void audio_i2s_enable_sync(audio_i2s_instance_t *instances[], uint count);
 
+/** \brief Prepare-only half of audio_i2s_enable_sync
+ * \ingroup pico_audio_i2s_multi
+ *
+ * Rewinds each SM to its program entry, primes DMA / IRQ refcounts and
+ * marks the instances enabled without starting the SMs; returns the SM
+ * mask for the shared PIO block so the caller can perform one combined
+ * pio_enable_sm_mask_in_sync together with the SPDIF slots (used by the
+ * I2S clock-slave path to gate the start on an external LRCLK edge).
+ */
+uint32_t audio_i2s_enable_sync_prepare(audio_i2s_instance_t *instances[], uint count);
+
+/** \brief Enable/disable DMA-starvation monitoring
+ * \ingroup pico_audio_i2s_multi
+ *
+ * When enabled, the driver counts consumer-empty DMA starts (silence
+ * fallback).  Mirrors audio_spdif_set_starvation_monitoring().
+ */
+void audio_i2s_set_starvation_monitoring(bool enabled);
+
+/** \brief Reset DMA-starvation counters
+ * \ingroup pico_audio_i2s_multi
+ */
+void audio_i2s_reset_dma_starvations(void);
+
+/** \brief Get total DMA-starvation events across all instances
+ * \ingroup pico_audio_i2s_multi
+ */
+uint32_t audio_i2s_get_dma_starvations(void);
+
+/** \brief Get DMA-starvation events for one instance index (0..3)
+ * \ingroup pico_audio_i2s_multi
+ *
+ * Index is the slot index (== dma_channel, same convention as the S/PDIF
+ * library's instance_index).
+ */
+uint32_t audio_i2s_get_dma_starvations_instance(uint index);
+
 /** \brief Tear down an I2S instance, releasing all hardware resources
  * \ingroup pico_audio_i2s_multi
  *
@@ -218,6 +260,26 @@ void audio_i2s_update_all_frequencies(uint32_t sample_freq);
  * \ingroup pico_audio_i2s_multi
  */
 int8_t audio_i2s_get_clock_master_index(void);
+
+// ---------------------------------------------------------------------------
+// External-clock framing-slip flag
+// ---------------------------------------------------------------------------
+
+// PIO irq flag raised by audio_i2s_dataout_extclk.pio when its per-frame
+// LRCLK verification fails (external BCK glitch or LRCLK phase jump).  The
+// program re-frames itself; software must treat the flag like a clock loss
+// (the slipped slot is no longer sample-aligned with internally clocked
+// slots until the next synchronized output start).
+#define AUDIO_I2S_EXTCLK_SLIP_IRQ 7u
+
+/** \brief Read and clear the external-clock framing-slip flag
+ * \ingroup pico_audio_i2s_multi
+ *
+ * True if any external-clock I2S output SM flagged a framing slip since the
+ * last call.  Also cleared by audio_i2s_enable_sync_prepare() for extclk
+ * instances (a restart IS the slip handling).
+ */
+bool audio_i2s_extclk_framing_slipped(void);
 
 // ---------------------------------------------------------------------------
 // MCK (Master Clock) generator API

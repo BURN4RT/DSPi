@@ -4,8 +4,11 @@
 #include "config.h"
 
 // Filter storage
-extern Biquad filters[NUM_CHANNELS][MAX_BANDS];
+extern Filter filters[NUM_CHANNELS][MAX_BANDS];
 extern EqParamPacket filter_recipes[NUM_CHANNELS][MAX_BANDS];
+// Linkwitz Transform target Q per PEQ band (Q*512, 0 = 0.707 default);
+// parallel to filter_recipes, read only for FILTER_LINKWITZ_TRANSFORM bands.
+extern uint16_t peq_qp_x512[NUM_CHANNELS][MAX_BANDS];
 extern float channel_delays_ms[NUM_CHANNELS];
 extern bool channel_bypassed[NUM_CHANNELS];  // true if all bands in channel are flat
 
@@ -24,18 +27,18 @@ extern bool any_delay_active;  // True if any channel has non-zero delay
 
 // API
 void dsp_init_default_filters(void);
-void dsp_compute_coefficients(EqParamPacket *p, Biquad *bq, float sample_rate);
+void dsp_compute_coefficients(EqParamPacket *p, Filter *f, float sample_rate);
 void dsp_recalculate_all_filters(float sample_rate);
 void dsp_update_delay_samples(float sample_rate);
 
 // Optimized processing function
 #if PICO_RP2350
-float dsp_process_channel(Biquad * __restrict biquads, float input, uint8_t channel);
-void dsp_process_channel_block(Biquad * __restrict biquads, float * __restrict samples,
+float dsp_process_channel(Filter * __restrict filters, float input, uint8_t channel);
+void dsp_process_channel_block(Filter * __restrict filters, float * __restrict samples,
                                uint32_t count, uint8_t channel);
 #else
-int32_t dsp_process_channel(Biquad * __restrict biquads, int32_t input_32, uint8_t channel);
-void dsp_process_channel_block(Biquad * __restrict biquads, int32_t * __restrict samples,
+int32_t dsp_process_channel(Filter * __restrict filters, int32_t input_32, uint8_t channel);
+void dsp_process_channel_block(Filter * __restrict filters, int32_t * __restrict samples,
                                uint32_t count, uint8_t channel);
 #endif
 

@@ -9,15 +9,12 @@
 #include "pico/sample_conversion.h"
 
 // ======================
-// == RP2350 RAM PLACEMENT
-// RP2350's XIP cache can cause audio underruns when these functions
-// are called from the DMA IRQ handler. Force them into RAM.
+// == RAM PLACEMENT
+// The buffer take/give functions are called from output DMA interrupt
+// handlers on both platforms; force them into RAM so they stay valid under
+// XIP builds.
 // ======================
-#if PICO_RP2350
 #define AUDIO_TIME_CRITICAL __attribute__((noinline, section(".time_critical")))
-#else
-#define AUDIO_TIME_CRITICAL
-#endif
 
 // ======================
 // == DEBUGGING =========

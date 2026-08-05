@@ -4,7 +4,8 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include "config.h"
-#include "dac_hw_mute.h"   // DacHwMuteConfig (stored in PresetDirectory)
+#include "dac_hw_mute.h"        // DacHwMuteConfig (stored in PresetDirectory)
+#include "control_surfaces.h"   // CsFlashConfig (stored in PresetDirectory)
 
 // Legacy result codes (used by flash_save_params and the preset/boot API)
 #define FLASH_OK            0
@@ -103,6 +104,33 @@ float preset_get_saved_master_volume(void);
 void preset_set_dac_hw_mute(const DacHwMuteConfig *cfg);
 void preset_get_dac_hw_mute(DacHwMuteConfig *out);
 
+// External control-interface config (UART/I2C, board-level, directory-stored,
+// V6+).  Setter is synchronous and main-loop only; a NULL pointer leaves that
+// interface's stored config unchanged.  Getter copies out; either may be NULL.
+void preset_set_ctrl_iface(const UartCtrlConfig *uart, const I2cCtrlConfig *i2c);
+void preset_get_ctrl_iface(UartCtrlConfig *uart_out, I2cCtrlConfig *i2c_out);
+
+// Control Surfaces bindings (board-level, directory-stored, V7+).  Getter
+// copies out of the RAM cache; bindings persist only through
+// preset_set_cs_all below (the REQ_CS_SAVE path).
+void preset_get_cs_config(CsFlashConfig *out);
+
+// Control Surfaces IR command table (board-level, directory-stored, V11+).
+// Getter copies out of the RAM cache.  preset_set_cs_all persists bindings,
+// IR commands and slot names together in one directory-sector write (the
+// REQ_CS_SAVE path); synchronous and main-loop only, caller has validated
+// all three.  Returns PRESET_OK or PRESET_ERR_*.
+void preset_get_cs_ir_config(CsIrConfig *out);
+uint8_t preset_set_cs_all(const CsFlashConfig *cfg, const CsIrConfig *ir,
+                          const char (*names)[CS_NAME_LEN]);
+
+// Control Surfaces slot names (board-level, directory-stored, V10+).  User
+// labels for what each control slot is for; independent of the bindings
+// (survive binding changes and slot clears).  Names persist only through
+// preset_set_cs_all above; the getter copies CS_NAME_LEN bytes from the RAM
+// cache into `name_out`.  Returns PRESET_OK or PRESET_ERR_*.
+uint8_t preset_get_cs_name(uint8_t slot, char *name_out);
+
 // Get the currently active preset slot (always 0-9).
 uint8_t preset_get_active(void);
 
@@ -125,5 +153,17 @@ extern volatile uint32_t preset_mute_counter;
 
 // Number of samples to mute during preset switch (~5ms at 48kHz)
 #define PRESET_MUTE_SAMPLES  256
+
+// Margin (ms) added on top of the configured DAC hardware-mute hold when
+// flooring preset_mute_counter against a still-pending hold: preset_loading
+// auto-clears when the counter expires (update_preset_mute_envelope), and if
+// that happens while a deferred consumer of the flag is still waiting on
+// dac_hw_mute_hold_elapsed(), the prefill handshake that owns the mute
+// release never fires.  Both arming points enforce the floor:
+// prepare_pipeline_reset() (main.c) and flash_mute_hold_samples()
+// (flash_storage.c).  The margin covers the poll iterations between the hold
+// elapsing and the consumer running, plus slop; samples only decrement while
+// input is actually processed, so IRQ-off flash blackouts cost nothing.
+#define PRESET_MUTE_HOLD_MARGIN_MS  120u
 
 #endif // FLASH_STORAGE_H

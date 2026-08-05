@@ -13,12 +13,18 @@
  *
  * Mono signals pass through at unity gain at DC (complementary property).
  * Hard-panned HF content is unchanged (lowpass → 0 at HF).
+ *
+ * Per-output-pair design: coefficients are shared (one user config drives
+ * every selected pair); filter state is independent per output pair so the
+ * pipeline can run crossfeed on each stereo output pair in isolation.
  */
 
 #include <math.h>
 #include <string.h>
 #include "crossfeed.h"
 #include "dsp_pipeline.h"
+#include "usb_audio.h"   // matrix_mixer: per-output enables gate pair processing
+#include "siggen.h"      // siggen_raw_mask: RAW outputs bypass crossfeed
 
 // Preset definitions: {cutoff_hz, feed_db}
 // feed_db = level difference between direct and crossfeed at DC
@@ -28,13 +34,20 @@ static const float presets[][2] = {
     { 650.0f,  9.5f },  // Jan Meier - subtle, natural
 };
 
-void crossfeed_init(CrossfeedState *state) {
-    memset(state, 0, sizeof(CrossfeedState));
-}
+// Per-output-pair filter state, one entry per stereo output pair.
+CrossfeedPairState crossfeed_pair_state[NUM_SPDIF_INSTANCES];
 
-void crossfeed_compute_coefficients(CrossfeedState *state, const CrossfeedConfig *config, float sample_rate) {
+// Published coefficient set the pipeline snapshots each packet; NULL = disabled.
+volatile const CrossfeedCoeffs *current_crossfeed_coeffs = NULL;
+
+// Double buffer so crossfeed_apply_config() can compute into the inactive
+// buffer and publish, never writing through the currently published pointer.
+static CrossfeedCoeffs xf_coeff_bufs[2];
+static uint8_t xf_coeff_idx = 0;
+
+void crossfeed_compute_coefficients(CrossfeedCoeffs *coeffs, const CrossfeedConfig *config, float sample_rate) {
     if (!config->enabled || sample_rate < 1.0f) {
-        crossfeed_init(state);
+        memset(coeffs, 0, sizeof(CrossfeedCoeffs));
         return;
     }
 
@@ -109,73 +122,143 @@ void crossfeed_compute_coefficients(CrossfeedState *state, const CrossfeedConfig
     }
 
 #if PICO_RP2350
-    state->lp_a0 = lp_a0_f;
-    state->lp_b1 = lp_b1_f;
-    state->ap_a = ap_a_f;
+    coeffs->lp_a0 = lp_a0_f;
+    coeffs->lp_b1 = lp_b1_f;
+    coeffs->ap_a = ap_a_f;
 #else
     float scale = (float)(1LL << 28);
-    state->lp_a0 = (int32_t)(lp_a0_f * scale);
-    state->lp_b1 = (int32_t)(lp_b1_f * scale);
-    state->ap_a = (int32_t)(ap_a_f * scale);
+    coeffs->lp_a0 = (int32_t)(lp_a0_f * scale);
+    coeffs->lp_b1 = (int32_t)(lp_b1_f * scale);
+    coeffs->ap_a = (int32_t)(ap_a_f * scale);
 #endif
+}
 
-    // Clear filter states
-    state->lp_state_L = 0;
-    state->lp_state_R = 0;
-    state->ap_state_L = 0;
-    state->ap_state_R = 0;
+void crossfeed_apply_config(const CrossfeedConfig *config, float sample_rate) {
+    // Compute into the inactive buffer, then publish the pointer.
+    // Publish-then-snapshot contract: the pipeline reads current_crossfeed_coeffs
+    // once per packet, so a plain atomic pointer store is sufficient here; we
+    // never mutate the buffer the published pointer refers to.
+    CrossfeedCoeffs *next = &xf_coeff_bufs[xf_coeff_idx ^ 1];
+    crossfeed_compute_coefficients(next, config, sample_rate);
+    if (config->enabled) {
+        xf_coeff_idx ^= 1;
+        current_crossfeed_coeffs = next;
+    } else {
+        current_crossfeed_coeffs = NULL;
+    }
 }
 
 #if PICO_RP2350
 // RP2350 Float processing
 DSP_TIME_CRITICAL
-void crossfeed_process_stereo(CrossfeedState *state, float *left, float *right) {
-    float in_L = *left;
-    float in_R = *right;
+void crossfeed_process_pair_block(const CrossfeedCoeffs *coeffs, CrossfeedPairState *st,
+                                  float *left, float *right, uint32_t n) {
+    // Load shared coefficients and per-pair state into locals once.
+    const float lp_a0 = coeffs->lp_a0, lp_b1 = coeffs->lp_b1, ap_a = coeffs->ap_a;
+    float lp_state_L = st->lp_state_L, lp_state_R = st->lp_state_R;
+    float ap_state_L = st->ap_state_L, ap_state_R = st->ap_state_R;
 
-    // Lowpass filter both channels: cross = G × L(z) × input
-    float lp_out_L = state->lp_a0 * in_L + state->lp_b1 * state->lp_state_L;
-    float lp_out_R = state->lp_a0 * in_R + state->lp_b1 * state->lp_state_R;
-    state->lp_state_L = lp_out_L;
-    state->lp_state_R = lp_out_R;
+    for (uint32_t i = 0; i < n; i++) {
+        float in_L = left[i];
+        float in_R = right[i];
 
-    // All-pass filter on crossfeed signals for ITD
-    // First-order all-pass, transposed direct form II:
-    //   y[n] = a * x[n] + s[n]
-    //   s[n+1] = x[n] - a * y[n]
-    float ap_out_L = state->ap_a * lp_out_L + state->ap_state_L;
-    state->ap_state_L = lp_out_L - state->ap_a * ap_out_L;
-    float ap_out_R = state->ap_a * lp_out_R + state->ap_state_R;
-    state->ap_state_R = lp_out_R - state->ap_a * ap_out_R;
+        // Lowpass filter both channels: cross = G × L(z) × input
+        float lp_out_L = lp_a0 * in_L + lp_b1 * lp_state_L;
+        float lp_out_R = lp_a0 * in_R + lp_b1 * lp_state_R;
+        lp_state_L = lp_out_L;
+        lp_state_R = lp_out_R;
 
-    // Complementary mixing with ITD:
-    //   direct = input - own_lowpass (undelayed complement)
-    //   output = direct + allpass(opp_lowpass) (delayed crossfeed from opposite)
-    *left  = (in_L - lp_out_L) + ap_out_R;
-    *right = (in_R - lp_out_R) + ap_out_L;
+        // All-pass filter on crossfeed signals for ITD
+        // First-order all-pass, transposed direct form II:
+        //   y[n] = a * x[n] + s[n]
+        //   s[n+1] = x[n] - a * y[n]
+        float ap_out_L = ap_a * lp_out_L + ap_state_L;
+        ap_state_L = lp_out_L - ap_a * ap_out_L;
+        float ap_out_R = ap_a * lp_out_R + ap_state_R;
+        ap_state_R = lp_out_R - ap_a * ap_out_R;
+
+        // Complementary mixing with ITD:
+        //   direct = input - own_lowpass (undelayed complement)
+        //   output = direct + allpass(opp_lowpass) (delayed crossfeed from opposite)
+        left[i]  = (in_L - lp_out_L) + ap_out_R;
+        right[i] = (in_R - lp_out_R) + ap_out_L;
+    }
+
+    // Store per-pair state back.
+    st->lp_state_L = lp_state_L;
+    st->lp_state_R = lp_state_R;
+    st->ap_state_L = ap_state_L;
+    st->ap_state_R = ap_state_R;
 }
 
 #else
 // RP2040 Fixed-point processing (Q28)
 DSP_TIME_CRITICAL
-void crossfeed_process_stereo(CrossfeedState *state, int32_t *left, int32_t *right) {
-    int32_t in_L = *left;
-    int32_t in_R = *right;
+void crossfeed_process_pair_block(const CrossfeedCoeffs *coeffs, CrossfeedPairState *st,
+                                  int32_t *left, int32_t *right, uint32_t n) {
+    // Load shared coefficients and per-pair state into locals once.
+    const int32_t lp_a0 = coeffs->lp_a0, lp_b1 = coeffs->lp_b1, ap_a = coeffs->ap_a;
+    int32_t lp_state_L = st->lp_state_L, lp_state_R = st->lp_state_R;
+    int32_t ap_state_L = st->ap_state_L, ap_state_R = st->ap_state_R;
 
-    // Lowpass filter both channels
-    int32_t lp_out_L = fast_mul_q28(state->lp_a0, in_L) + fast_mul_q28(state->lp_b1, state->lp_state_L);
-    int32_t lp_out_R = fast_mul_q28(state->lp_a0, in_R) + fast_mul_q28(state->lp_b1, state->lp_state_R);
-    state->lp_state_L = lp_out_L;
-    state->lp_state_R = lp_out_R;
+    for (uint32_t i = 0; i < n; i++) {
+        int32_t in_L = left[i];
+        int32_t in_R = right[i];
 
-    // All-pass filter on crossfeed signals for ITD (Q28)
-    int32_t ap_out_L = fast_mul_q28(state->ap_a, lp_out_L) + state->ap_state_L;
-    state->ap_state_L = lp_out_L - fast_mul_q28(state->ap_a, ap_out_L);
-    int32_t ap_out_R = fast_mul_q28(state->ap_a, lp_out_R) + state->ap_state_R;
-    state->ap_state_R = lp_out_R - fast_mul_q28(state->ap_a, ap_out_R);
+        // Lowpass filter both channels
+        int32_t lp_out_L = fast_mul_q28(lp_a0, in_L) + fast_mul_q28(lp_b1, lp_state_L);
+        int32_t lp_out_R = fast_mul_q28(lp_a0, in_R) + fast_mul_q28(lp_b1, lp_state_R);
+        lp_state_L = lp_out_L;
+        lp_state_R = lp_out_R;
 
-    // Complementary mixing with ITD
-    *left  = (in_L - lp_out_L) + ap_out_R;
-    *right = (in_R - lp_out_R) + ap_out_L;
+        // All-pass filter on crossfeed signals for ITD (Q28)
+        int32_t ap_out_L = fast_mul_q28(ap_a, lp_out_L) + ap_state_L;
+        ap_state_L = lp_out_L - fast_mul_q28(ap_a, ap_out_L);
+        int32_t ap_out_R = fast_mul_q28(ap_a, lp_out_R) + ap_state_R;
+        ap_state_R = lp_out_R - fast_mul_q28(ap_a, ap_out_R);
+
+        // Complementary mixing with ITD
+        left[i]  = (in_L - lp_out_L) + ap_out_R;
+        right[i] = (in_R - lp_out_R) + ap_out_L;
+    }
+
+    // Store per-pair state back.
+    st->lp_state_L = lp_state_L;
+    st->lp_state_R = lp_state_R;
+    st->ap_state_L = ap_state_L;
+    st->ap_state_R = ap_state_R;
 }
 #endif
+
+// Per-pair dispatch: run crossfeed on selected pairs, reset the state of
+// skipped ones so a re-enabled pair starts clean.  A pair runs when coeffs
+// are published, its mask bit is set, neither channel carries a RAW test
+// signal, and BOTH channels are matrix-enabled.  Requiring both matters:
+// a disabled output's buffer is zeroed at matrix time and must stay silent,
+// but crossfeed writes both channels, so running on a half-enabled pair
+// would leak the enabled channel's bleed into the disabled (never re-zeroed)
+// buffer.  A half pair gets no crossfeed; disabled pairs also skip, saving
+// the cycles.
+DSP_TIME_CRITICAL
+#if PICO_RP2350
+void crossfeed_process_pairs(const CrossfeedCoeffs *coeffs, uint32_t pair_mask,
+                             int first_pair, int last_pair,
+                             float (*buf_out)[AUDIO_BUFFER_SAMPLES], uint32_t n) {
+#else
+void crossfeed_process_pairs(const CrossfeedCoeffs *coeffs, uint32_t pair_mask,
+                             int first_pair, int last_pair,
+                             int32_t (*buf_out)[AUDIO_BUFFER_SAMPLES], uint32_t n) {
+#endif
+    for (int p = first_pair; p <= last_pair; p++) {
+        int l = 2 * p;
+        bool run = coeffs && ((pair_mask >> p) & 1u)
+                && !(siggen_raw_mask & (3u << l))
+                && matrix_mixer.outputs[l].enabled
+                && matrix_mixer.outputs[l + 1].enabled;
+        if (run)
+            crossfeed_process_pair_block(coeffs, &crossfeed_pair_state[p],
+                                         buf_out[l], buf_out[l + 1], n);
+        else
+            crossfeed_reset_pair_state(&crossfeed_pair_state[p]);
+    }
+}

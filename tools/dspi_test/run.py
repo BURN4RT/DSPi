@@ -6,6 +6,18 @@ run.py — entry point for the DSPi control-plane QA suite.
     ./tools/dspi_test/run.py        [options]
 
 Options:
+    --all                   Run the COMPLETE suite: the audio-loopback group plus
+                            the flash and factory-reset tests (i.e. --audio
+                            --allow-flash --allow-factory-reset). One command, no
+                            other knowledge needed; the audio group runs first so
+                            its auto-probe sees a pristine device.
+    --audio                 Include the hardware audio-loopback group (needs the
+                            DSPI_LOOPBACK firmware + sounddevice; excluded by default).
+    --audio-rates HZ[,HZ]   Rates to run the full audio matrix at. Default:
+                            48000,44100 (both). Narrow it for a faster pass,
+                            e.g. --audio-rates 48000. DSPi follows the host USB
+                            rate; the harness moves it via the CoreAudio HAL
+                            (see tools/dspi_test/coreaudio.py).
     --group G[,G...]        Run only these test groups (default: all).
     --list                  List registered tests and exit (no device needed if
                             modules import; still imports the package).
@@ -25,6 +37,7 @@ Exit code: 0 if no FAIL/ERROR, 1 otherwise.
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from datetime import datetime, timezone
@@ -43,6 +56,15 @@ def main(argv=None):
                     help="write the test catalog (from metadata) and exit")
     ap.add_argument("--allow-flash", action="store_true")
     ap.add_argument("--allow-factory-reset", action="store_true")
+    ap.add_argument("--audio", action="store_true",
+                    help="include the hardware audio-loopback group (needs the "
+                         "DSPI_LOOPBACK firmware + sounddevice; excluded by default)")
+    ap.add_argument("--audio-rates", default=None, metavar="HZ[,HZ...]",
+                    help="rates to run the full audio matrix at "
+                         "(default: 48000,44100). Narrow for a faster pass.")
+    ap.add_argument("--all", action="store_true",
+                    help="run the COMPLETE suite: audio-loopback group + flash tests "
+                         "+ factory reset (= --audio --allow-flash --allow-factory-reset)")
     ap.add_argument("--flash-cap", type=int, default=None)
     ap.add_argument("--stress", type=int, default=0)
     ap.add_argument("--report", default=None)
@@ -51,12 +73,33 @@ def main(argv=None):
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
 
+    # --all is the one-flag "complete suite": run everything, no other knowledge needed.
+    if args.all:
+        args.audio = True
+        args.allow_flash = True
+        args.allow_factory_reset = True
+
+    # Must be set BEFORE the test modules import: the audio group decides which
+    # per-rate test variants to register at import time.
+    if args.audio_rates:
+        os.environ["DSPI_AUDIO_RATES"] = args.audio_rates
+
     _import_tests()
     from .framework import REGISTRY, Runner, catalog_markdown
     from .device import DspiDevice, Disconnected
 
     groups = set(g.strip() for g in args.group.split(",")) if args.group else None
     cases = [tc for tc in REGISTRY if (groups is None or tc.group in groups)]
+    # The "audio" hardware-loopback group is opt-in (needs the DSPI_LOOPBACK
+    # firmware + sounddevice): excluded from a default run unless --audio is given
+    # or an explicit --group selection names it.
+    if groups is None and not args.audio:
+        cases = [tc for tc in cases if tc.group != "audio"]
+
+    # Run the audio loopback group FIRST when present: its auto-probe needs a
+    # pristine device, so it must run before the control-plane tests mutate state
+    # (especially factory reset). Stable sort keeps every other group's order.
+    cases.sort(key=lambda tc: 0 if tc.group == "audio" else 1)
 
     if args.catalog:
         with open(args.catalog, "w") as f:
@@ -97,7 +140,8 @@ def main(argv=None):
     print(f"Running {len(cases)} tests"
           + (f" in groups {sorted(groups)}" if groups else "")
           + (" | flash ENABLED" if args.allow_flash else " | flash disabled")
-          + (" | factory-reset ENABLED" if args.allow_factory_reset else "") + "\n")
+          + (" | factory-reset ENABLED" if args.allow_factory_reset else "")
+          + (" | audio ENABLED" if args.audio else "") + "\n")
 
     print("Capturing pre-suite snapshot...")
     snap = lifecycle.capture(dev, profile)
@@ -128,6 +172,12 @@ def main(argv=None):
                     dir_after = dev.get(lifecycle.OP.PRESET_GET_DIR, 7)
                     if bytes(dir_after) != bytes(snap.directory):
                         print(f"  ⚠️ directory changed: {snap.directory.hex()} -> {bytes(dir_after).hex()}")
+                    # The operating rate is host driven, so the bulk restore
+                    # cannot put it back; only report drift.
+                    rate_after = dev.get_u32(lifecycle.OP.GET_STATUS, wvalue=15)
+                    if rate_after != snap.sample_rate:
+                        print(f"  ⚠️ sample rate changed: {snap.sample_rate} -> {rate_after} Hz "
+                              f"(host driven; re-open a stream at {snap.sample_rate} to restore)")
                 else:
                     print("  ✗ device unresponsive — cannot restore")
             except Exception as e:  # noqa: BLE001
