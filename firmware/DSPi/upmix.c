@@ -224,6 +224,7 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
 
     const bool sur = c->n_derived == UPMIX_NUM_DERIVED;
     const bool sur_adaptive = sur && c->surround_mode == UPMIX_SURROUND_ADAPTIVE;
+    const bool reprojector = c->center_mode == UPMIX_CENTER_REPROJECTOR;
     const float inv_n = 1.0f / (float)n;
 
     // ---- Control update (from the estimators as of the previous block) ----
@@ -329,9 +330,15 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
             dom_fb = a_dom * dom_fb + omd * dfb;
         }
 
-        // Centre extraction + constant-power removal from the mains
+        // Centre extraction + constant-power removal from the mains.
+        // Reprojector leaves the common bass below the stereo transition in
+        // L/R.  det_lp_* are the matched one-pole low-pass states, so their
+        // residuals form a phase-coherent high-pass sum without adding latency.
         float mid = l0 + r0;
-        float c0 = gc_i * mid;
+        float centre_mid = reprojector
+            ? (l0 - det_lp_l) + (r0 - det_lp_r)
+            : mid;
+        float c0 = gc_i * centre_mid;
         // Presence bell on the extracted centre (both centre modes).  Runs
         // unconditionally so gain sweeps through 0 dB stay continuous; at
         // 0 dB pres_m1 = 0 and the output is bit-exact c0.
@@ -344,7 +351,7 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
             c0 += c->pres_m1 * pv1;
         }
         cbuf[i] = c0;
-        float rem = rem_i * mid;
+        float rem = rem_i * centre_mid;
         float l1 = l0 - rem, r1 = r0 - rem;
         l[i] = l1;
         r[i] = r1;
