@@ -86,6 +86,8 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 #define UPMIX_CENTER_OFF        2
 // Appended for protocol compatibility: existing values 0..2 must never move.
 #define UPMIX_CENTER_REPROJECTOR 3
+// Riven: multi-band frequency-aware extraction (appended V28+).
+#define UPMIX_CENTER_RIVEN      4
 #define UPMIX_SURROUND_OFF      0
 #define UPMIX_SURROUND_PASSIVE  1
 #define UPMIX_SURROUND_ADAPTIVE 2
@@ -133,7 +135,7 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 // clamp's convention): OFF is the top value here, and a corrupt byte must not
 // silently switch the centre engine off.
 static inline uint8_t upmix_clamp_center_mode(long m) {
-    return (m >= 0 && m <= UPMIX_CENTER_REPROJECTOR) ? (uint8_t)m : UPMIX_DEFAULT_CENTER_MODE;
+    return (m >= 0 && m <= UPMIX_CENTER_RIVEN) ? (uint8_t)m : UPMIX_DEFAULT_CENTER_MODE;
 }
 
 // Fixed internals
@@ -247,6 +249,11 @@ typedef struct {
     float det_hp_a;            // detector one-pole HP coefficient; Reprojector stereo transition
     float pres_a1, pres_a2, pres_a3, pres_m1;  // centre presence bell, TPT SVF
                                                // (m1 = 0 at 0 dB: exact passthrough)
+    // Riven multi-band extraction
+    float riven_lp_a1, riven_lp_a2, riven_lp_a3;  // lowpass crossover (f1), TPT SVF BW
+    float riven_bp_a1, riven_bp_a2, riven_bp_a3;  // bandpass crossover (f2), TPT SVF BW
+    float riven_k;                                  // SVF damping k (1.4142)
+    float riven_band_gain[3];                       // per-band extraction gains (bass/mid/treble)
     // Dominance (adaptive surround)
     float alpha_dom;           // per-sample 40 ms smoother retention
     // Surround engine

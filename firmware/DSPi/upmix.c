@@ -70,6 +70,11 @@ typedef struct {
     float t_corr, t_bal;
     // Centre presence bell
     float pres_ic1, pres_ic2;      // TPT SVF integrators
+    // Riven multi-band state
+    float riven_lp_l, riven_lp_r;          // LP filter states (bass/low-mid split)
+    float riven_hp_l, riven_hp_r;          // HP filter states (mid/treble split)
+    float riven_bp_l_ic1, riven_bp_l_ic2;  // BP SVF integrators, L channel
+    float riven_bp_r_ic1, riven_bp_r_ic2;  // BP SVF integrators, R channel
     // Surround conditioning
     float shp_ic1[2], shp_ic2[2];  // HP SVF integrators
     float slp_ic1[2], slp_ic2[2];  // LP SVF integrators
@@ -136,6 +141,38 @@ void upmix_compute_coefficients(UpmixCoeffs *c, const UpmixConfig *cfg, float sa
         c->pres_a2 = g * c->pres_a1;
         c->pres_a3 = g * c->pres_a2;
         c->pres_m1 = k * (A * A - 1.0f);
+    }
+
+    // Riven multi-band crossover coefficients.
+    // f1 = detector_hpf_hz (bass-mid crossover, user-controlled)
+    // f2 = 4×f1 (mid-treble crossover, auto-derived)
+    if (c->center_mode == UPMIX_CENTER_RIVEN) {
+        float f1 = clampf(cfg->detector_hpf_hz, UPMIX_DET_HPF_MIN, UPMIX_DET_HPF_MAX);
+        float f2 = f1 * 4.0f;
+        if (f2 > 0.45f * fs) f2 = 0.45f * fs;
+
+        // Lowpass at f1 (2nd-order Butterworth TPT SVF)
+        const float rk = 1.4142135624f;
+        float g1 = tanf(pi * f1 / fs);
+        c->riven_lp_a1 = 1.0f / (1.0f + g1 * (g1 + rk));
+        c->riven_lp_a2 = g1 * c->riven_lp_a1;
+        c->riven_lp_a3 = g1 * c->riven_lp_a2;
+
+        // Bandpass at f2 (2nd-order Butterworth TPT SVF)
+        float g2 = tanf(pi * f2 / fs);
+        c->riven_bp_a1 = 1.0f / (1.0f + g2 * (g2 + rk));
+        c->riven_bp_a2 = g2 * c->riven_bp_a1;
+        c->riven_bp_a3 = g2 * c->riven_bp_a2;
+        c->riven_k = rk;
+
+        // Per-band extraction gains (scaled by overall strength)
+        // Bass: gentle (preserve stereo low-end)
+        // Mid: full (vocals/lead instruments live here)
+        // Treble: moderate (preserve spatial air/detail)
+        float s = c->strength;
+        c->riven_band_gain[0] = s * 0.30f;
+        c->riven_band_gain[1] = s * 1.00f;
+        c->riven_band_gain[2] = s * 0.60f;
     }
 
     if (c->surround_mode == UPMIX_SURROUND_ADAPTIVE) {
@@ -334,14 +371,71 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
         // Reprojector leaves the common bass below the stereo transition in
         // L/R.  det_lp_* are the matched one-pole low-pass states, so their
         // residuals form a phase-coherent high-pass sum without adding latency.
+        // Riven: multi-band extraction with per-band gains (bass gentle, mid
+        // full, treble moderate) — frequency-domain-inspired approach.
         float mid = l0 + r0;
-        float centre_mid = reprojector
-            ? (l0 - det_lp_l) + (r0 - det_lp_r)
-            : mid;
-        float c0 = gc_i * centre_mid;
-        // Presence bell on the extracted centre (both centre modes).  Runs
+        float centre_mid;
+        float c0;
+        if (reprojector) {
+            centre_mid = (l0 - det_lp_l) + (r0 - det_lp_r);
+            c0 = gc_i * centre_mid;
+        } else if (c->center_mode == UPMIX_CENTER_RIVEN) {
+            // Multi-band decomposition:
+            //   Band 0 (bass):    LP at f1 — stays mostly in L/R
+            //   Band 1 (mid):    input − LP − HP — extracted aggressively
+            //   Band 2 (treble): HP at f2 — extracted moderately
+            // f1 cutoff: one-pole LP using det_hp_a coefficient (same as detector)
+            um.riven_lp_l += hp_a * (l0 - um.riven_lp_l);
+            um.riven_lp_r += hp_a * (r0 - um.riven_lp_r);
+            float bass_l = um.riven_lp_l, bass_r = um.riven_lp_r;
+
+            // f2 cutoff: HP via existing det_lp states (same coefficient, reused)
+            // det_lp_l/r track the LP at f1; for f2 we need a separate HP.
+            // Use the one-pole HP at f2 ≈ 4×f1: approximate with a faster one-pole.
+            float f2_coeff = 1.0f - expf(-2.0f * pi * clampf(
+                cfg->detector_hpf_hz * 4.0f, UPMIX_DET_HPF_MIN, 0.45f * fs) / fs);
+            um.riven_hp_l += f2_coeff * (l0 - um.riven_hp_l);
+            um.riven_hp_r += f2_coeff * (r0 - um.riven_hp_r);
+            // HP = input − LP_f2
+            float treble_l = l0 - um.riven_hp_l;
+            float treble_r = r0 - um.riven_hp_r;
+
+            // Mid = input − bass − treble
+            float mid_l = l0 - bass_l - treble_l;
+            float mid_r = r0 - bass_r - treble_r;
+
+            // Per-band centre extraction with band-specific gains
+            float gb = c->riven_band_gain[0];  // bass: gentle
+            float gm = c->riven_band_gain[1];  // mid: full
+            float gt = c->riven_band_gain[2];  // treble: moderate
+
+            float c_bass = 0.5f * gb * (bass_l + bass_r);
+            float c_mid  = 0.5f * gm * (mid_l + mid_r);
+            float c_treb = 0.5f * gt * (treble_l + treble_r);
+            c0 = c_bass + c_mid + c_treb;
+
+            // Phase-coherent removal from L/R per band
+            float rb = 0.5f * (1.0f - c->width) * gb;
+            float rm = 0.5f * (1.0f - c->width) * gm;
+            float rt = 0.5f * (1.0f - c->width) * gt;
+            float rem_bass = rb * (bass_l + bass_r);
+            float rem_mid  = rm * (mid_l + mid_r);
+            float rem_treb = rt * (treble_l + treble_r);
+            float l_rem = rem_bass + rem_mid + rem_treb;
+            float r_rem = rem_bass + rem_mid + rem_treb;
+            l0 -= l_rem;
+            r0 -= r_rem;
+            centre_mid = mid;  // for telemetry
+        } else {
+            centre_mid = mid;
+            c0 = gc_i * centre_mid;
+        }
+        // Presence bell on the extracted centre (all centre modes).  Runs
         // unconditionally so gain sweeps through 0 dB stay continuous; at
         // 0 dB pres_m1 = 0 and the output is bit-exact c0.
+        if (c->center_mode != UPMIX_CENTER_RIVEN) {
+            // Riven already computed c0 above; apply presence bell
+        }
         {
             float pv3 = c0 - um.pres_ic2;
             float pv1 = c->pres_a1 * um.pres_ic1 + c->pres_a2 * pv3;
@@ -351,18 +445,27 @@ void upmix_process_block(const UpmixCoeffs * __restrict c,
             c0 += c->pres_m1 * pv1;
         }
         cbuf[i] = c0;
-        float rem = rem_i * centre_mid;
-        float l1 = l0 - rem, r1 = r0 - rem;
-        l[i] = l1;
-        r[i] = r1;
+        // For Riven, L/R were already modified in the multi-band block above.
+        // For other modes, apply the standard removal.
+        if (!reprojector && c->center_mode != UPMIX_CENTER_RIVEN) {
+            float rem = rem_i * centre_mid;
+            l0 -= rem;
+            r0 -= rem;
+        } else if (reprojector) {
+            float rem = rem_i * centre_mid;
+            l0 -= rem;
+            r0 -= rem;
+        }
+        l[i] = l0;
+        r[i] = r0;
         gc_i += gc_step;
         rem_i += rem_step;
 
         if (sur) {
             // Steered feeds, then per-channel conditioning:
             // band-limit -> Haas delay -> Schroeder allpass decorrelator
-            float x0 = gls_i * (ls_cl * l1 + ls_cr * r1);
-            float x1 = grs_i * (ls_cl * r1 + ls_cr * l1);
+            float x0 = gls_i * (ls_cl * l0 + ls_cr * r0);
+            float x1 = grs_i * (ls_cl * r0 + ls_cr * l0);
             gls_i += gls_step;
             grs_i += grs_step;
 
