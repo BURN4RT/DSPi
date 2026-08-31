@@ -157,7 +157,7 @@ identical. See `control_surfaces_spec.md` sections 4.3 and 5.
 | Offset | Type | Field |
 |---|---|---|
 | 0 | u8 | enabled (0/1) |
-| 1 | u8 | center_mode (0 = PASSIVE, 1 = ADAPTIVE, 2 = OFF, 3 = REPROJECTOR; V28+ for REPROJECTOR) |
+| 1 | u8 | center_mode (0 = PASSIVE, 1 = ADAPTIVE, 2 = OFF, 3 = REPROJECTOR; same 44-byte layout) |
 | 2 | u8 | surround_mode (0 = OFF, 1 = PASSIVE, 2 = ADAPTIVE) |
 | 3 | i8 | presence_q1: presence bell gain in 0.5 dB steps (dB x 2, -24..+24; V26+, was reserved; 0 = flat) |
 | 4 | f32 | strength_pct |
