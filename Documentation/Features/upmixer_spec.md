@@ -24,7 +24,7 @@ Two independent engines, each with a quality/CPU mode:
 
 | Engine | Modes | Algorithm |
 |---|---|---|
-| Centre | `PASSIVE` (0), `ADAPTIVE` (1), `OFF` (2) | Passive: fixed C = 0.7071(L+R). Adaptive: running normalized cross-correlation plus L/R balance steer the centre gain through a threshold gate with attack/release ballistics. Off: extraction gain forced to zero, so row 2 is silent and L/R pass through untouched. |
+| Centre | `PASSIVE` (0), `ADAPTIVE` (1), `OFF` (2), `REPROJECTOR` (3) | Passive: fixed C = 0.7071(L+R). Adaptive: running normalized cross-correlation plus L/R balance steer the centre gain through a threshold gate with attack/release ballistics. Reprojector: fixed centre extraction above `detector_hpf_hz`, used as a stereo transition; common bass below it remains in L/R. Off: extraction gain forced to zero, so row 2 is silent and L/R pass through untouched. |
 | Surround | `OFF` (0), `PASSIVE` (1), `ADAPTIVE` (2) | Passive: difference feed (L-R). Adaptive: Dolby low-complexity matrix decoder steering (WO2007067320A2) with Pro Logic II decode coefficients; front dominance ducks the surrounds, left/right dominance steers between Ls and Rs. |
 
 Both surround modes feed a built-in conditioning chain per rear channel: Butterworth high-pass and low-pass band-limit, Haas delay, and mirrored Schroeder allpass decorrelators.
@@ -96,14 +96,14 @@ All persisted in presets (slot V34) and carried in bulk params (wire V27). Float
 | # | Param id | Field | Range | Default | Meaning |
 |---|---|---|---|---|---|
 | 0 | `UPMIX_PARAM_ENABLED` | enabled | 0/1 | 0 | Master enable |
-| 1 | `UPMIX_PARAM_CENTER_MODE` | center_mode | 0-2 | 1 (ADAPTIVE) | Centre engine mode. 2 = OFF: no C output, L/R bit-exact, surrounds unaffected. Values above 2 fall back to the ADAPTIVE default (not clamped up to OFF, so a corrupt byte cannot silently disable the centre) |
+| 1 | `UPMIX_PARAM_CENTER_MODE` | center_mode | 0-3 | 1 (ADAPTIVE) | Centre engine mode. 2 = OFF, 3 = REPROJECTOR: no C output, L/R bit-exact, surrounds unaffected. Values above 2 fall back to the ADAPTIVE default (not clamped up to OFF, so a corrupt byte cannot silently disable the centre) |
 | 2 | `UPMIX_PARAM_SURROUND_MODE` | surround_mode | 0-2 | 2 (ADAPTIVE) | Surround engine mode |
 | 3 | `UPMIX_PARAM_STRENGTH` | strength_pct | 0-100 | 100 | Centre extraction strength; scales both the C output and the removal from L/R. **Both centre modes**; in passive mode it is the fixed centre gain (the primary passive control) |
 | 4 | `UPMIX_PARAM_CENTER_WIDTH` | center_width_pct | 0-100 | 25 | How much extracted centre stays in L/R. 0 = full removal (discrete centre), 100 = L/R untouched (C is additive; expect combing if a real centre speaker plays). **Both centre modes** |
 | 5 | `UPMIX_PARAM_THRESHOLD` | corr_threshold_pct | 0-95 | 30 | Correlation gate. Centre presence below this extracts nothing; above it, extraction scales smoothly to full. Raise to extract only strongly-correlated content. **Adaptive centre mode only**; no effect in passive |
 | 6 | `UPMIX_PARAM_ATTACK` | attack_ms | 1-500 | 10 | Centre gain rise time. **Adaptive centre mode only** (in passive mode it still smooths strength/mode changes, but has no steady-state effect) |
 | 7 | `UPMIX_PARAM_RELEASE` | release_ms | 5-2000 | 100 | Centre gain fall time. **Adaptive centre mode only** (same passive-mode caveat as attack) |
-| 8 | `UPMIX_PARAM_DET_HPF` | detector_hpf_hz | 20-1000 | 200 | Detector bass-cut corner. Bass correlates by coincidence and would pump the steering; content below this corner is ignored by the detector (the audio itself is not filtered). **Adaptive centre mode only**; no effect in passive |
+| 8 | `UPMIX_PARAM_DET_HPF` | detector_hpf_hz | 20-1000 | 200 | Detector bass-cut corner. In REPROJECTOR mode this is the stereo transition: common content below it remains in L/R and is excluded from C. Bass correlates by coincidence and would pump the steering; content below this corner is ignored by the detector (the audio itself is not filtered). **Adaptive centre mode only**; no effect in passive |
 | 9 | `UPMIX_PARAM_SUR_DELAY` | surround_delay_ms | 0-20 | 12 | Haas delay on Ls/Rs. Rule of thumb ~1 ms per foot of listener distance |
 | 10 | `UPMIX_PARAM_SUR_HPF` | surround_hpf_hz | 20-2000 | 300 | Surround band-limit high-pass (keeps rumble out of the rears) |
 | 11 | `UPMIX_PARAM_SUR_LPF` | surround_lpf_hz | 1000-20000 | 7000 | Surround band-limit low-pass (classic 7 kHz surround voicing; raise for full-band rears) |
@@ -157,7 +157,7 @@ identical. See `control_surfaces_spec.md` sections 4.3 and 5.
 | Offset | Type | Field |
 |---|---|---|
 | 0 | u8 | enabled (0/1) |
-| 1 | u8 | center_mode (0 = PASSIVE, 1 = ADAPTIVE, 2 = OFF; V27+ for OFF) |
+| 1 | u8 | center_mode (0 = PASSIVE, 1 = ADAPTIVE, 2 = OFF, 3 = REPROJECTOR; V28+ for REPROJECTOR) |
 | 2 | u8 | surround_mode (0 = OFF, 1 = PASSIVE, 2 = ADAPTIVE) |
 | 3 | i8 | presence_q1: presence bell gain in 0.5 dB steps (dB x 2, -24..+24; V26+, was reserved; 0 = flat) |
 | 4 | f32 | strength_pct |
