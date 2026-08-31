@@ -37,6 +37,10 @@
 //               through a threshold gate and attack/release ballistics, so only
 //               genuinely centre-panned correlated content is extracted and the
 //               image does not pump.
+//     REPROJECTOR: a fixed, phase-coherent centre extraction with an adjustable
+//               stereo transition.  The common signal above that transition is
+//               sent to C and removed from L/R; common bass below it remains
+//               stereo so it can continue to feed side midbass/subwoofer paths.
 //     Extracted centre energy is subtracted from L/R (scaled by width) so a
 //     physical centre speaker and the L/R phantom don't comb-filter.
 //     Both modes: a broad presence bell (TPT SVF, 3 kHz, Q 0.6, +-12 dB) on
@@ -80,6 +84,8 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 // enum): the vendor interface has no per-command version negotiation, so moving
 // PASSIVE/ADAPTIVE would silently remap every existing host and saved preset.
 #define UPMIX_CENTER_OFF        2
+// Appended for protocol compatibility: existing values 0..2 must never move.
+#define UPMIX_CENTER_REPROJECTOR 3
 #define UPMIX_SURROUND_OFF      0
 #define UPMIX_SURROUND_PASSIVE  1
 #define UPMIX_SURROUND_ADAPTIVE 2
@@ -127,7 +133,7 @@ _Static_assert(NUM_STEREO_INPUTS + UPMIX_NUM_DERIVED <= NUM_INPUT_CHANNELS,
 // clamp's convention): OFF is the top value here, and a corrupt byte must not
 // silently switch the centre engine off.
 static inline uint8_t upmix_clamp_center_mode(long m) {
-    return (m >= 0 && m <= UPMIX_CENTER_OFF) ? (uint8_t)m : UPMIX_DEFAULT_CENTER_MODE;
+    return (m >= 0 && m <= UPMIX_CENTER_REPROJECTOR) ? (uint8_t)m : UPMIX_DEFAULT_CENTER_MODE;
 }
 
 // Fixed internals
@@ -238,7 +244,7 @@ typedef struct {
     float inv_thresh_range;    // 1 / (1 - corr_thresh)
     float alpha_att, alpha_rel;// per-sample gain smoothing retentions
     float alpha_corr;          // per-sample estimator retention
-    float det_hp_a;            // detector one-pole HP coefficient
+    float det_hp_a;            // detector one-pole HP coefficient; Reprojector stereo transition
     float pres_a1, pres_a2, pres_a3, pres_m1;  // centre presence bell, TPT SVF
                                                // (m1 = 0 at 0 dB: exact passthrough)
     // Dominance (adaptive surround)
